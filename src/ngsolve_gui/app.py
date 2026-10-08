@@ -399,7 +399,17 @@ class NGSolveGui(App):
     def _load_file(self):
         from ngapp.utils import EnvironmentType, get_environment
 
-        if get_environment().type == EnvironmentType.LOCAL_APP:
+        # A local app normally uses the host OS dialog. Headless hosts (for
+        # example a GUI served from a VirtualBox guest) have no desktop for
+        # that dialog, so they can explicitly use the browser's file picker.
+        use_browser_picker = (
+            os.environ.get("NGSOLVE_GUI_FILE_PICKER", "").strip().lower()
+            == "browser"
+        )
+        if (
+            get_environment().type == EnvironmentType.LOCAL_APP
+            and not use_browser_picker
+        ):
             from .native_dialog import open_file_dialog
 
             initialdir = (
