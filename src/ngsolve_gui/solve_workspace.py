@@ -331,8 +331,20 @@ class SolveWorkspace(Div):
   window.__ngsolveSketchPointerCaptureInstalled = true;
   let active = false;
   const pointerEvents = window.__ngsolveSketchPointerEvents = [];
+  const forwardedEvents = new WeakSet();
   const selector = 'svg.solve-sketch-canvas';
+  const remember = (event) => {
+    window.__ngsolveSketchPointer = [event.clientX, event.clientY];
+    pointerEvents.push({
+      type: event.type,
+      timeStamp: event.timeStamp,
+      x: event.clientX,
+      y: event.clientY,
+    });
+    if (pointerEvents.length > 256) pointerEvents.splice(0, pointerEvents.length - 256);
+  };
   const capture = (event) => {
+    if (forwardedEvents.has(event)) return;
     const svg = document.querySelector(selector);
     if (!svg) return;
     const targetIsCanvas = event.target && event.target.closest
@@ -343,15 +355,24 @@ class SolveWorkspace(Div):
     } else if (!active) {
       return;
     }
-    window.__ngsolveSketchPointer = [event.clientX, event.clientY];
-    pointerEvents.push({
-      type: event.type,
-      timeStamp: event.timeStamp,
-      x: event.clientX,
-      y: event.clientY,
-    });
-    if (pointerEvents.length > 256) pointerEvents.splice(0, pointerEvents.length - 256);
-    if (event.type === 'mouseup') active = false;
+    remember(event);
+    if (event.type === 'mouseup') {
+      const shouldForward = active && !targetIsCanvas;
+      active = false;
+      if (shouldForward) {
+        const forwarded = new MouseEvent('mouseup', {
+          bubbles: true,
+          button: event.button,
+          clientX: event.clientX,
+          clientY: event.clientY,
+          shiftKey: event.shiftKey,
+          ctrlKey: event.ctrlKey,
+        });
+        forwardedEvents.add(forwarded);
+        remember(forwarded);
+        svg.dispatchEvent(forwarded);
+      }
+    }
   };
   document.addEventListener('mousedown', capture, true);
   document.addEventListener('mousemove', capture, true);
