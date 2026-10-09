@@ -1,6 +1,13 @@
 import os
+import sys
 import threading
 import time
+import copy
+import contextlib
+import io
+import re
+import importlib.util
+from pathlib import Path
 
 from ngapp.app import App
 from ngapp.components import *
@@ -16,6 +23,38 @@ from . import cerbsim_style as cb
 from .cerbsim_style import theme, kb_theme, flex_fill, panel_full
 from .system_monitor import SystemMonitor, available as system_monitor_available
 from .footer import StatusFooter
+from .solve_workspace import SolveWorkspace
+from .axisymmetric_model import unpack_model, package_model
+
+
+class _WorkspaceLogBuffer(io.StringIO):
+    """Capture solver output and publish it to the Solve log as it arrives."""
+
+    def __init__(self, workspace):
+        super().__init__()
+        self.workspace = workspace
+        self._pending = ""
+        self._write_lock = threading.Lock()
+
+    def write(self, text):
+        if not isinstance(text, str):
+            text = str(text)
+        with self._write_lock:
+            count = super().write(text)
+            self._pending += text
+            complete = self._pending.splitlines(keepends=True)
+            ready = [line.rstrip("\r\n") for line in complete if line.endswith(("\n", "\r"))]
+            self._pending = "".join(line for line in complete if not line.endswith(("\n", "\r")))
+        if ready:
+            self.workspace.append_solver_output(ready)
+        return count
+
+    def flush(self):
+        with self._write_lock:
+            pending, self._pending = self._pending, ""
+            super().flush()
+        if pending.strip():
+            self.workspace.append_solver_output([pending])
 
 
 class StackHost(Div):
@@ -307,8 +346,8 @@ class NGSolveGui(App):
         upload_file = _tbtn(
             "mdi-file-plus-outline", "Load file  ·  geometry / mesh / .py", self._load_file
         )
-        savebtn = _tbtn("mdi-content-save-outline", "Save Project", self.save_local)
-        loadbtn = _tbtn("mdi-folder-open-outline", "Load Project", self.load_local)
+        savebtn = _tbtn("mdi-content-save-outline", "Save Project", self.save_project)
+        loadbtn = _tbtn("mdi-folder-open-outline", "Load Project", self.load_project)
         file_group = Div(upload_file, savebtn, loadbtn, ui_class=cb.tb_group)
 
         # Settings + quit (panel toggles removed — sidebars are draggable;
@@ -423,7 +462,12 @@ class NGSolveGui(App):
                 "min-height:0; width:100%;"
             ),
         )
+        self.solve_workspace = SolveWorkspace(
+            on_run=lambda: self._run_axisymmetric_solver(mesh_only=False),
+            on_mesh=lambda: self._run_axisymmetric_solver(mesh_only=True),
+        )
         self._solve_workspace = Div(
+            self.solve_workspace,
             ui_style="flex:1 1 auto; min-height:0; width:100%;",
             ui_hidden=True,
         )
@@ -457,9 +501,8 @@ class NGSolveGui(App):
         keybinding_styles.inject(self)
         self.on_load(self.__on_load)
 
-        # Post Process is the existing/default view. Solve is intentionally an
-        # empty workspace for now; retain the hidden Post Process tree so its
-        # viewport and current loaded data survive a mode switch.
+        # Post Process is the existing/default view. Retain its hidden tree so
+        # the viewport and loaded data survive a mode switch to Solve.
         self._workspace_mode = "post_process"
 
         # -- Global keybindings (always active) --
@@ -492,6 +535,186 @@ class NGSolveGui(App):
         self._workspace_mode = mode
         self._post_process_workspace.ui_hidden = solving
         self._solve_workspace.ui_hidden = not solving
+
+    def save_project(self):
+        """Save a declarative axisymmetric project in Solve, or the GUI state otherwise."""
+        if self._workspace_mode != "solve":
+            return self.save_local()
+        from ngapp.utils import get_environment
+
+        model = self.solve_workspace.model
+        errors = self.solve_workspace.validation_errors()
+        # Empty sketches are useful drafts; structural errors still prevent
+        # saving, while the status message explains the missing geometry.
+        try:
+            data = package_model(model, self.solve_workspace.studies, self.solve_workspace.layout)
+            title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in model.get("name", "axisymmetric-model")).strip()
+            filename = (title or "axisymmetric-model") + ".ngsmodel"
+            write = get_environment().begin_save_file_local(filename)
+            if write is None:
+                return
+            write(data)
+            self._notify("Axisymmetric model saved.", type="positive", timeout=2500)
+            self.solve_workspace._message(f"Saved {filename}.")
+            if errors:
+                self._notify("Model saved as a draft. Review Geometry and Physics before running.", type="warning", timeout=5000)
+        except Exception as error:
+            self._notify(f"Could not save model: {error}", type="negative", timeout=7000)
+            self.solve_workspace._message(f"Save failed: {error}", error=True)
+
+    def load_project(self):
+        """Load the active workspace's native project format."""
+        if self._workspace_mode != "solve":
+            return self.load_local()
+        from ngapp.utils import EnvironmentType, get_environment
+
+        env = get_environment()
+        use_browser_picker = os.environ.get("NGSOLVE_GUI_FILE_PICKER", "").strip().lower() == "browser"
+        try:
+            if env.type == EnvironmentType.LOCAL_APP and not use_browser_picker:
+                from .native_dialog import open_file_dialog
+
+                path = open_file_dialog(
+                    title="Open NGSolve axisymmetric model",
+                    initialdir=self._local_path or self.usersettings.get("load_dir", "") or os.path.expanduser("~"),
+                    filters=[("NGSolve model", "*.ngsmodel")],
+                )
+                if not path:
+                    return
+                self._local_path = os.path.dirname(path)
+                self.usersettings.set("load_dir", self._local_path)
+                with open(path, "rb") as model_file:
+                    data = model_file.read()
+            else:
+                handles = self.js.showOpenFilePicker({
+                    "multiple": False,
+                    "types": [{"description": "NGSolve axisymmetric model", "accept": {"application/zip": [".ngsmodel"]}}],
+                })
+                if not handles:
+                    return
+                js_file = handles[0].getFile()
+                data = js_file.arrayBuffer()
+            model, studies, layout = unpack_model(data)
+            self.solve_workspace.set_model(model, studies, layout)
+            if self._workspace_mode != "solve":
+                self._workspace_mode_toggle.select("solve")
+            self._notify("Axisymmetric model loaded.", type="positive", timeout=2500)
+        except Exception as error:
+            self._notify(f"Could not load model: {error}", type="negative", timeout=7000)
+            self.solve_workspace._message(f"Load failed: {error}", error=True)
+
+    def _run_axisymmetric_solver(self, *, mesh_only=False):
+        """Run a saved model on the machine hosting this GUI, off the UI thread."""
+        workspace = self.solve_workspace
+        model = copy.deepcopy(workspace.model)
+        studies = copy.deepcopy(workspace.studies)
+        layout = copy.deepcopy(workspace.layout)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        model_name = re.sub(r"[^A-Za-z0-9_-]+", "_", model.get("name", "axisymmetric_model")).strip("_") or "axisymmetric_model"
+        output_dir = Path.home() / "NGSolve_results" / f"{model_name}_{stamp}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        model_path = output_dir / f"{model_name}.ngsmodel"
+
+        try:
+            from .axisymmetric_model import evaluate_expression
+
+            h_global = evaluate_expression(model.get("mesh", {}).get("element_size", "0.01"), {
+                item["name"]: item["expression"] for item in model.get("parameters", [])
+            })
+            if h_global <= 0:
+                raise ValueError("Target element size must be positive")
+            model_path.write_bytes(package_model(model, studies, layout))
+        except Exception as error:
+            workspace.finish_solver_job(f"Could not prepare solver input: {error}", error=True)
+            return
+
+        workspace._message(("Generating mesh" if mesh_only else "Running study") + f" in {output_dir}")
+
+        def run_job():
+            log_buffer = _WorkspaceLogBuffer(workspace)
+            try:
+                solver_root = self._find_solver_root()
+                solver_entry = solver_root / "main.py"
+                if not solver_entry.is_file():
+                    raise FileNotFoundError(
+                        "Could not find the coupled_solver checkout containing main.py. "
+                        "Open NGSolve GUI from the coupled_solver directory."
+                    )
+                root_text = str(solver_root)
+                src_text = str(solver_root / "src")
+                for entry in (root_text, src_text):
+                    if entry not in sys.path:
+                        sys.path.insert(0, entry)
+                spec = importlib.util.spec_from_file_location("_ngsolve_gui_solver_main", solver_entry)
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"Could not load solver entry point: {solver_entry}")
+                solver_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(solver_module)
+                with contextlib.redirect_stdout(log_buffer), contextlib.redirect_stderr(log_buffer):
+                    result = solver_module.main(
+                        h_global=h_global,
+                        p=int(model.get("mesh", {}).get("polynomial_order", 3)),
+                        problem_name=str(model_path),
+                        h_local=h_global,
+                        dt=1e-3,
+                        output_path=str(output_dir),
+                        mesh_only=mesh_only,
+                    )
+                log_buffer.flush()
+                run_kind = "Mesh" if mesh_only else "Study"
+                run_name = f"{run_kind}: {model.get('name', 'axisymmetric model')}"
+                if mesh_only:
+                    workspace.finish_solver_job(
+                        f"Mesh generated successfully: {output_dir}",
+                        run_kind=run_kind,
+                        run_name=run_name,
+                        output_path=output_dir,
+                    )
+                else:
+                    fields_dir = output_dir / "ngsolve_gui" / "fields"
+                    workspace.finish_solver_job(
+                        f"Study complete. GUI-ready fields: {fields_dir}",
+                        run_kind=run_kind,
+                        run_name=run_name,
+                        output_path=output_dir,
+                    )
+                    self._notify(f"Study complete. Results saved to {output_dir}", type="positive", timeout=7000)
+            except Exception as error:
+                log_buffer.flush()
+                workspace.finish_solver_job(
+                    f"Solver failed: {error}",
+                    error=True,
+                    run_kind="Mesh" if mesh_only else "Study",
+                    run_name=f"{'Mesh' if mesh_only else 'Study'}: {model.get('name', 'axisymmetric model')}",
+                    output_path=output_dir,
+                )
+                self._notify(f"Solver failed: {error}", type="negative", timeout=9000)
+
+        threading.Thread(target=run_job, name="NGSolveAxisymmetricStudy", daemon=True).start()
+
+    @staticmethod
+    def _find_solver_root():
+        candidates = []
+        configured = os.environ.get("COUPLED_SOLVER_ROOT")
+        if configured:
+            candidates.append(Path(configured).expanduser())
+        candidates.append(Path.cwd())
+        candidates.append(Path(sys.argv[0]).expanduser().resolve().parent)
+        expanded = []
+        for candidate in candidates:
+            try:
+                resolved = candidate.expanduser().resolve()
+            except OSError:
+                continue
+            expanded.extend([resolved, *resolved.parents])
+        for candidate in expanded:
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if (resolved / "main.py").is_file() and (resolved / "src" / "axi").is_dir():
+                return resolved
+        raise FileNotFoundError("The coupled_solver directory is not available from this GUI process")
 
     def _load_file(self):
         from ngapp.utils import EnvironmentType, get_environment
