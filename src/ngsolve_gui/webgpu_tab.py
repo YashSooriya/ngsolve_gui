@@ -20,6 +20,26 @@ from . import cerbsim_style as cb
 from .cerbsim_style import overlay_tr, VIEWPORT_CLEAR, VIEWPORT_TEXT
 
 
+_CAMERA_VIEW_PRESETS = (
+    ("Isometric", "isometric", "mdi-cube-outline", None),
+    ("Top (+Z)", "top", "mdi-axis-z-arrow", None),
+    ("Bottom (−Z)", "bottom", "mdi-axis-z-arrow", "scaleY(-1)"),
+    ("Front (+Y)", "front", "mdi-axis-y-arrow", None),
+    ("Back (−Y)", "back", "mdi-axis-y-arrow", "scaleY(-1)"),
+    ("Right (+X)", "right", "mdi-axis-x-arrow", None),
+    ("Left (−X)", "left", "mdi-axis-x-arrow", "scaleX(-1)"),
+)
+
+_CAMERA_VIEW_AXES = {
+    "top": ("xy", False),
+    "bottom": ("xy", True),
+    "front": ("xz", False),
+    "back": ("xz", True),
+    "right": ("yz", False),
+    "left": ("yz", True),
+}
+
+
 def sync_default_viewport_clear():
     """Set the webgpu Canvas default clear color from the active theme so a new
     scene renders the right background on its very first frame (no flash)."""
@@ -656,6 +676,35 @@ class WebgpuTab(PropertyPanelMixin, Div):
         self._last_view_flip = flip
         self.scene.render()
 
+    def set_camera_view(self, view):
+        """Set one explicit isometric or axis-aligned camera orientation.
+
+        Orthographic presets keep the current camera target and zoom. The
+        isometric preset restores the familiar default 3D orientation while
+        preserving that same target and scale.
+        """
+        camera = self.scene.options.camera
+        if view == "isometric":
+            transform = camera.transform
+            transform.reset_xy()
+            transform.rotate(270, 0)
+            transform.rotate(0, -20)
+            transform.rotate(20, 0)
+            camera._notify_observers()
+            self._last_view_plane = None
+            self._last_view_flip = False
+        else:
+            try:
+                plane, flip = _CAMERA_VIEW_AXES[view]
+            except KeyError as exc:
+                raise ValueError(f"Unknown camera view: {view}") from exc
+            getattr(camera, f"reset_{plane}")(flip=flip)
+            self._last_view_plane = plane
+            self._last_view_flip = flip
+        self.scene.render()
+        if hasattr(self, "_camera_views_pop"):
+            self._close_camera_views()
+
     def set_orthographic(self, value):
         """Switch between orthographic and perspective camera projection."""
         camera = self.scene.options.camera
@@ -698,12 +747,7 @@ class WebgpuTab(PropertyPanelMixin, Div):
         if self._link_tool is not None:
             tools.append(self._link_tool)
         if self._supports_clipping():
-            for axis, plane in (("x", "yz"), ("y", "xz"), ("z", "xy")):
-                btn = Div(Div(axis.upper(), ui_style="font-weight: 600; font-size: 12px;"),
-                          QTooltip(f"Look along {axis.upper()}  ·  v {axis}  (again: opposite side)"),
-                          ui_class=str(cb.vp_tool))
-                btn.on("click", lambda e=None, plane=plane: self.set_view(plane))
-                tools.append(btn)
+            tools.append(self._build_camera_views_tool())
         if hasattr(self, "wireframe_visible"):
             self._wf_tool = self._vtool("mdi-grid", "Wireframe  ·  w", self.toggle_wireframe)
             self._set_tool_active(self._wf_tool, self.wireframe_visible.value)
@@ -758,6 +802,46 @@ class WebgpuTab(PropertyPanelMixin, Div):
         btn.on("click", lambda e=None: self._toggle_bookmarks())
         self._rebuild_bookmark_menu()
         return btn
+
+    def _build_camera_views_tool(self):
+        """Build a compact menu of standard engineering camera orientations."""
+        self._camera_views_pop = Div(ui_class=str(cb.bm_pop))
+        self._camera_views_pop.ui_hidden = True
+        self._camera_views_pop.on("mouseleave", lambda e=None: self._close_camera_views())
+        btn = Div(
+            QIcon(ui_name="mdi-cube-outline"),
+            QTooltip("Camera views"),
+            self._camera_views_pop,
+            ui_class=str(cb.vp_tool) + " relative-position",
+        )
+        btn.on("click", lambda e=None: self._toggle_camera_views())
+        self._rebuild_camera_views_menu()
+        return btn
+
+    def _toggle_camera_views(self):
+        if self._camera_views_pop.ui_hidden:
+            self._camera_views_pop.ui_hidden = False
+        else:
+            self._camera_views_pop.ui_hidden = True
+
+    def _close_camera_views(self):
+        self._camera_views_pop.ui_hidden = True
+
+    def _rebuild_camera_views_menu(self):
+        rows = [Div("Camera views", ui_class=str(cb.bm_title))]
+        for label, view, icon, mirror in _CAMERA_VIEW_PRESETS:
+            icon_style = (
+                f"display: inline-block; transform: {mirror};"
+                if mirror else None
+            )
+            row = Div(
+                QIcon(ui_name=icon, ui_style=icon_style),
+                label,
+                ui_class=str(cb.bm_row),
+            )
+            row.on("click", lambda e=None, view=view: self.set_camera_view(view))
+            rows.append(row)
+        self._camera_views_pop.ui_children = rows
 
     def _build_clip_toolbar(self):
         if not self._supports_clipping():
