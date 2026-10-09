@@ -53,6 +53,9 @@ class RegionsSection(Section):
         # Reflect programmatic changes (keybindings, undo, show-all).
         comp.hidden_regions.on_change(self._sync_from_state)
         comp.boundary_overrides.on_change(self._sync_from_state)
+        # Streamline seed materials are temporarily hidden while the lines are
+        # active; keep their checkboxes in sync with that derived visibility.
+        comp.field_lines_visible.on_change(self._sync_from_state)
 
     # -- rows --------------------------------------------------------------
 
@@ -132,6 +135,9 @@ class RegionsSection(Section):
         if self._updating:
             return
         self.comp.set_region_visible(name, bool(visible))
+        # A temporary override (such as a streamline seed) can make the
+        # requested state a no-op; put the checkbox back to effective state.
+        self._sync_from_state()
 
     def _on_bnd_cycle(self, name):
         if self._updating:

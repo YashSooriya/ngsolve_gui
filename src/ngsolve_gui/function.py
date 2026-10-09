@@ -3,6 +3,7 @@ from ngsolve_webgpu import *
 from .webgpu_tab import WebgpuTab, _usersettings
 from .region_state import RegionState
 from . import cerbsim_style as cb
+from ._visualization import visualization_cf
 import ngsolve as ngs
 import math
 
@@ -56,6 +57,7 @@ class FunctionComponent(WebgpuTab):
         self.name = name
         self.mdata = None
         self.cf = cf
+        self.visualization_cf = visualization_cf(cf)
         self.region_or_mesh = data["mesh"]
         self.draw_vol = data.get("draw_vol", True)
         self.draw_surf = data.get("draw_surf", True)
@@ -108,14 +110,14 @@ class FunctionComponent(WebgpuTab):
         # -- Observable properties ------------------------------------------
         s = saved
         self.wireframe_visible = Observable(
-            s.get("wireframe_visible", data.get("wireframe", True)), "wireframe_visible"
+            data.get("wireframe", s.get("wireframe_visible", True)), "wireframe_visible"
         )
         self.elements2d_visible = Observable(
             s.get("elements2d_visible", True), "elements2d_visible"
         )
         self.subdivision = Observable(
-            s.get("subdivision",
-                  data.get("subdivision",
+            data.get("subdivision",
+                     s.get("subdivision",
                            int(_usersettings.get("default_subdivision", -1)))),
             "subdivision", converter=int,
         )
@@ -198,13 +200,13 @@ class FunctionComponent(WebgpuTab):
             s.get("contact_enabled", True), "contact_enabled"
         )
         self.fieldlines_num_lines = Observable(
-            s.get("fieldlines_num_lines", data.get("fieldlines_num_lines", 100)), "fieldlines_num_lines", converter=int
+            data.get("fieldlines_num_lines", s.get("fieldlines_num_lines", 20)), "fieldlines_num_lines", converter=int
         )
         self.fieldlines_length = Observable(
             s.get("fieldlines_length", data.get("fieldlines_length", 0.5)), "fieldlines_length", converter=float
         )
         self.fieldlines_thickness = Observable(
-            s.get("fieldlines_thickness", data.get("fieldlines_thickness", 0.0015)), "fieldlines_thickness", converter=float
+            data.get("fieldlines_thickness", s.get("fieldlines_thickness", 0.0001)), "fieldlines_thickness", converter=float
         )
         self.fieldlines_direction = Observable(
             s.get("fieldlines_direction", 0), "fieldlines_direction", converter=int
@@ -396,10 +398,40 @@ class FunctionComponent(WebgpuTab):
             self.surface_vectors.active = val
         self.wgpu.scene.render()
 
+    def _fieldline_seed_material(self):
+        """Material selected for streamline seeding, if this field has one."""
+        data = self.data if isinstance(getattr(self, "data", None), dict) else {}
+        name = getattr(
+            getattr(self, "fieldlines", None),
+            "_ngsolve_gui_start_region_name",
+            None,
+        )
+        if name is None:
+            if data.get("_ngsolve_gui_fast_fieldlines", False):
+                name = data.get("_ngsolve_gui_fieldline_seed_material")
+        if name is None:
+            return None
+        return name if name in {str(m) for m in self.mesh.GetMaterials()} else None
+
+    def _sync_fieldline_seed_visibility(self, active):
+        """Temporarily hide the streamline seed material while lines are shown."""
+        region_state = getattr(self, "region_state", None)
+        if region_state is None:
+            return False
+        seed = self._fieldline_seed_material() if active else None
+        auto_hidden = {seed} if seed is not None else set()
+        if region_state.auto_hidden == auto_hidden:
+            return False
+        region_state.auto_hidden = auto_hidden
+        return True
+
     def _apply_fieldlines(self, val, _old):
-        if self.fieldlines is not None:
+        if getattr(self, "fieldlines", None) is not None:
             self.fieldlines.active = val
-        self.wgpu.scene.render()
+        if self._sync_fieldline_seed_visibility(bool(val)):
+            self._apply_region_change()
+        else:
+            self.wgpu.scene.render()
 
     def _apply_clipping_function(self, val, _old):
         if self.clippingcf is not None:
@@ -606,7 +638,7 @@ class FunctionComponent(WebgpuTab):
             doms = st.fd_doms[result.region_index]
             names = [st.material_name(d - 1) for d in doms if d >= 1]
             names = [n for n in names if n is not None]
-            visible = [n for n in names if n not in st.hidden]
+            visible = [n for n in names if st.material_visible(n)]
             return (visible or names or [None])[0]
         return None
 
@@ -659,7 +691,7 @@ class FunctionComponent(WebgpuTab):
         import re
 
         st = self.region_state
-        visible_mats = [m for m in st.unique_materials if m not in st.hidden]
+        visible_mats = [m for m in st.unique_materials if st.material_visible(m)]
         if not visible_mats:
             return None
         regions = []
@@ -973,13 +1005,14 @@ class FunctionComponent(WebgpuTab):
             self.region_visibility = RegionVisibility()
             self._full_range = None
         self._sync_region_state()
+        self._sync_fieldline_seed_visibility(self.field_lines_visible.value)
         self.region_visibility.set_alphas(
             vol=self.region_state.vol_alphas(),
             surf=self.region_state.surf_alphas(),
         )
 
         func_data = self.app_data.get_function_gpu_data(
-            self.cf, self.region_or_mesh, order=self.order
+            self.visualization_cf, self.region_or_mesh, order=self.order
         )
         mdata = func_data.mesh_data
 
@@ -1024,9 +1057,9 @@ class FunctionComponent(WebgpuTab):
         # field, vs a ClippingLIC (3D) that overlays the cutting plane.
         self._lic_is_surface = False
         if self.cf.dim == self.mesh.dim:
-            vec3 = self.cf
+            vec3 = self.visualization_cf
             if self.cf.dim == 2:
-                vec3 = ngs.CF((self.cf[0], self.cf[1], 0))
+                vec3 = ngs.CF((self.visualization_cf[0], self.visualization_cf[1], 0))
             vec_data = self.app_data.get_function_gpu_data(
                 vec3, self.region_or_mesh, order=self.order
             )
@@ -1073,6 +1106,19 @@ class FunctionComponent(WebgpuTab):
                 colormap=self.colormap,
                 clipping=self.clipping,
             )
+            draw_data = self.data if isinstance(self.data, dict) else {}
+            if self.mesh.dim == 3 and draw_data.get(
+                "_ngsolve_gui_fast_fieldlines", False
+            ):
+                seed_material = draw_data.get(
+                    "_ngsolve_gui_fieldline_seed_material"
+                )
+                if seed_material in {str(material) for material in self.mesh.GetMaterials()}:
+                    self.fieldlines.start_region = self.mesh.Materials(seed_material)
+                    self.fieldlines._ngsolve_gui_start_region_name = seed_material
+                from .fast_fieldlines import install_fast_fieldline_update
+
+                install_fast_fieldline_update(self.fieldlines)
             self.fieldlines.active = self.field_lines_visible.value
         if self.mesh.dim == 3 and self.draw_vol:
             self.clippingcf = ClippingIsolineRenderer(func_data, clipping=self.clipping,
