@@ -195,25 +195,35 @@ def test_canvas_render_keeps_background_and_layer_components_mounted(standalone_
     )
 
 
-def test_model_tree_sections_are_siblings_and_show_clear_workflow_names(standalone_components):
+def test_model_tree_groups_sections_and_places_children_under_their_parent(standalone_components):
     workspace = SolveWorkspace()
 
     assert [button.ui_label for button in workspace._section_buttons.values()] == [
         "Geometry",
+        "Parameters",
         "Materials",
         "Physics & coupling",
         "Boundary conditions",
+        "Sources & loads",
         "Mesh",
         "Solver settings",
-        "Studies",
+        "Study",
         "Run history",
-        "Model parameters",
     ]
     assert all(button.ui_align == "left" for button in workspace._section_buttons.values())
+    assert len(workspace._left_items.ui_children) == 3
+    model_group, analysis_group, results_group = workspace._left_items.ui_children
+    assert model_group.ui_children[1].ui_children[0] is workspace._section_buttons["geometry"]
+    geometry_children = model_group.ui_children[1].ui_children[1]
+    assert geometry_children.ui_children[0].ui_children[0] == "REGIONS · 0"
+    assert analysis_group.ui_children[1].ui_children[0] is workspace._section_buttons["mesh"]
+    assert results_group.ui_children[1].ui_children[0] is workspace._section_buttons["runs"]
     assert workspace._tree_splitter.ui_slot_before == [workspace._tree]
     assert workspace._tree_splitter.ui_slot_after == [workspace._properties_splitter]
     assert workspace._properties_splitter.ui_slot_before == [workspace._canvas_panel]
     assert workspace._properties_splitter.ui_slot_after == [workspace._right]
+    assert "flex:1 1 auto" in workspace._tree_splitter._props["style"]
+    assert "flex:1 1 auto" in workspace._properties_splitter._props["style"]
 
 
 def test_blank_axisymmetric_view_starts_at_r_zero_with_world_space_ticks(standalone_components):
@@ -248,8 +258,56 @@ def test_added_model_parameter_is_listed_in_tree(standalone_components):
 
     workspace.add_parameter()
 
-    parameter_list = workspace._left_items.ui_children[-1]
+    model_group = workspace._left_items.ui_children[0]
+    parameter_row = model_group.ui_children[2]
+    parameter_list = parameter_row.ui_children[1]
     assert any(child.ui_label == "length_1" for child in parameter_list.ui_children[1:])
+    assert workspace.selected_parameter_id == workspace.model["parameters"][0]["id"]
+
+
+def test_parameter_removal_is_available_and_blocked_while_referenced(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.add_parameter()
+    parameter = workspace.model["parameters"][0]
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    workspace._set_region_dimension(region["id"], "width", "length_1*1000")
+
+    workspace.remove_parameter(parameter["id"])
+
+    assert workspace.model["parameters"] == [parameter]
+    assert "Cannot remove 'length_1'" in workspace.message
+    assert "region 'Region 1' width" in workspace.message
+
+    workspace._set_region_dimension(region["id"], "width", "20")
+    workspace.remove_parameter(parameter["id"])
+    assert workspace.model["parameters"] == []
+    assert "Removed parameter 'length_1'" in workspace.message
+
+
+def test_physics_panel_does_not_duplicate_frequency_or_regional_load_fields(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    physics = workspace._physics_properties()
+    sources = workspace._sources_properties()
+
+    def component_labels(nodes):
+        labels = []
+        for node in nodes:
+            label = getattr(node, "ui_label", None)
+            if label:
+                labels.append(label)
+            labels.extend(component_labels(getattr(node, "ui_children", [])))
+        return labels
+
+    physics_labels = component_labels(physics)
+    source_labels = component_labels(sources)
+    assert "Configure study frequencies" in physics_labels
+    assert "Study frequencies" not in physics_labels
+    assert "DC current density" not in physics_labels
+    assert "DC current density" in source_labels
+    assert "Radial body force" in source_labels
+    assert "Region sources apply to" in source_labels
 
 
 def test_model_and_properties_panels_can_be_collapsed_and_restored(standalone_components):
