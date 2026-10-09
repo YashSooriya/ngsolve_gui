@@ -43,9 +43,9 @@ def _input(label, value, callback, *, number=False, suffix=None, width=None, hin
     return widget
 
 
-def _button(label, icon, callback, *, color=None, disable=False):
+def _button(label, icon, callback, *, color=None, disable=False, tooltip=None, style=None):
     button = QBtn(
-        QTooltip(label),
+        QTooltip(tooltip or label),
         ui_label=label,
         ui_icon=icon,
         ui_dense=True,
@@ -54,6 +54,7 @@ def _button(label, icon, callback, *, color=None, disable=False):
         ui_color=color,
         ui_disable=disable,
         ui_class="q-px-sm",
+        ui_style=style,
     )
     if callback:
         button.on_click(callback)
@@ -142,13 +143,36 @@ class SolveWorkspace(Div):
         )
 
         toolbar = Div(
-            _button("Select or drag a selection box", "mdi-cursor-default-outline", lambda *a: self.set_sketch_tool("select")),
-            _button("Draw rectangle by dragging its corners", "mdi-rectangle-outline", lambda *a: self.set_sketch_tool("rectangle")),
-            _button("Draw circle by dragging from its centre", "mdi-circle-outline", lambda *a: self.set_sketch_tool("circle")),
+            _button(
+                "Select", "mdi-cursor-default-outline",
+                lambda *a: self.set_sketch_tool("select"),
+                tooltip="Select an edge or drag a box; Shift adds to the selection.",
+                style="flex:0 0 auto; white-space:nowrap;",
+            ),
+            _button(
+                "Rectangle", "mdi-rectangle-outline",
+                lambda *a: self.set_sketch_tool("rectangle"),
+                tooltip="Draw a rectangle by dragging between opposite corners.",
+                style="flex:0 0 auto; white-space:nowrap;",
+            ),
+            _button(
+                "Circle", "mdi-circle-outline",
+                lambda *a: self.set_sketch_tool("circle"),
+                tooltip="Draw a circle by dragging from its centre to its radius.",
+                style="flex:0 0 auto; white-space:nowrap;",
+            ),
             QSeparator(ui_vertical=True),
-            _button("Fit view", "mdi-fit-to-screen-outline", lambda *a: self.render_canvas()),
+            _button(
+                "Fit view", "mdi-fit-to-screen-outline",
+                lambda *a: self.render_canvas(),
+                tooltip="Fit the sketch to the viewport.",
+                style="flex:0 0 auto; white-space:nowrap;",
+            ),
             Div(ui_style="flex:1;"),
-            Div("Drag to sketch · left→right selects enclosed edges · right→left selects crossed edges · Shift adds", ui_style="color:var(--fg-muted); font-size:11px; padding:0 10px;"),
+            Div(
+                "Drag to draw · ←→ encloses · →← crosses · Shift adds",
+                ui_style="color:var(--fg-muted); font-size:11px; padding:0 10px;",
+            ),
             ui_style="display:flex; align-items:center; gap:4px; flex:none; min-height:42px; padding:4px 8px; border-bottom:1px solid var(--border); background:var(--surface);",
         )
         self._tool_buttons = {
@@ -177,7 +201,7 @@ class SolveWorkspace(Div):
             Div(ui_style="flex:1;"),
             Div(f"Regions: 0  ·  Mesh order: {self.model['mesh']['polynomial_order']}", ui_style="font-size:11px; color:var(--fg-muted);"),
             log_button,
-            ui_style="display:flex; align-items:center; gap:10px; flex:0 0 30px; min-height:30px; padding:0 10px; border-top:1px solid var(--border); background:var(--surface);",
+            ui_style="display:flex; align-items:center; gap:10px; flex:0 0 30px; min-height:30px; padding:0 205px 0 10px; border-top:1px solid var(--border); background:var(--surface);",
         )
         self._bottom_count = bottom.ui_slots["default"][2]
         self._bottom_count.ui_style += " margin-left:12px;"
