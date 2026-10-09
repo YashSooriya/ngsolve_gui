@@ -157,10 +157,14 @@ def test_canvas_mouse_gesture_creates_rectangle_and_maps_screen_coordinates(stan
     assert workspace.sketch_tool == "select"
 
 
-def test_canvas_drag_motion_does_not_rebuild_the_svg_until_mouseup(standalone_components):
+def test_canvas_drag_motion_and_release_do_not_rebuild_the_canvas(standalone_components):
     workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
     project, _ = workspace._canvas_projection()
-    start, end = project((0.002, 0.002)), project((0.010, 0.010))
+    points = [point for edge in workspace.model["geometry"]["edges"] for point in edge["vertices"]]
+    projected = [project(point) for point in points]
+    start = (min(point[0] for point in projected) - 2, min(point[1] for point in projected) - 2)
+    end = (max(point[0] for point in projected) + 2, max(point[1] for point in projected) + 2)
     points = iter((start, end, end))
     workspace._canvas_event_point = lambda event, refresh_transform=False: next(points)
     workspace.set_sketch_tool("select", announce=False)
@@ -172,7 +176,23 @@ def test_canvas_drag_motion_does_not_rebuild_the_svg_until_mouseup(standalone_co
     assert renders == []
 
     workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
-    assert renders == ["render"]
+    assert renders == []
+    assert len(workspace.selected_edge_ids) == 4
+
+
+def test_canvas_render_keeps_background_and_layer_components_mounted(standalone_components):
+    workspace = SolveWorkspace()
+    root_layers = tuple(workspace._canvas.ui_children)
+
+    workspace._add_primitive("rectangle")
+
+    assert tuple(workspace._canvas.ui_children) == root_layers
+    assert root_layers == (
+        workspace._canvas_background,
+        workspace._canvas_grid,
+        workspace._canvas_scene,
+        workspace._canvas_preview,
+    )
 
 
 def test_canvas_event_reads_pointer_cache_when_ngapp_omits_coordinates(standalone_components):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 import time
 
@@ -102,6 +103,28 @@ class SolveWorkspace(Div):
         self._canvas_drag = None
         self._screen_to_svg = None
 
+        self._canvas_background = _svg(
+            "rect", x=0, y=0, width=900, height=640,
+            fill="var(--canvas-bg, #f4f6f8)",
+        )
+        self._canvas_grid = Component("g")
+        self._canvas_scene = Component("g")
+        self._canvas_preview = Component(
+            "g",
+            _svg(
+                "rect", id="solve-sketch-drag-rect", x=0, y=0, width=0, height=0,
+                display="none", fill="#2385bd20", stroke="#0877b9",
+                stroke_width="2", stroke_dasharray="6 4",
+                style="pointer-events:none;",
+            ),
+            _svg(
+                "circle", id="solve-sketch-drag-circle", cx=0, cy=0, r=0,
+                display="none", fill="#2385bd20", stroke="#0877b9",
+                stroke_width="2", stroke_dasharray="6 4",
+                style="pointer-events:none;",
+            ),
+        )
+
         self._section_buttons = {}
         for key, label, icon in _SECTIONS:
             button = _button(label, icon, lambda *_, selected=key: self.select_section(selected))
@@ -110,6 +133,10 @@ class SolveWorkspace(Div):
         self._left_items = Div(*self._section_buttons.values(), ui_style="display:flex; flex-direction:column; gap:2px; padding:8px;")
         self._canvas = Component(
             "svg",
+            self._canvas_background,
+            self._canvas_grid,
+            self._canvas_scene,
+            self._canvas_preview,
             ui_class="solve-sketch-canvas",
             ui_style="display:block; width:100%; height:100%; min-height:0; background:var(--canvas-bg, #f4f6f8); cursor:default;",
         )
@@ -119,7 +146,6 @@ class SolveWorkspace(Div):
             "role": "img",
             "aria-label": "Axisymmetric radial-axial sketch",
         })
-        self._canvas.ui_slots["default"] = []
         self._canvas.on_mounted(self._install_canvas_pointer_capture)
         self._canvas.on("mousedown", self._on_canvas_mouse_down)
         self._canvas.on("mousemove", self._on_canvas_mouse_move)
@@ -550,7 +576,6 @@ class SolveWorkspace(Div):
             self._select_edges_in_canvas_box(start, end, additive=drag["additive"])
         elif moved and drag["tool"] in {"rectangle", "circle"}:
             self._create_region_from_canvas_drag(drag["tool"], start, end)
-        self.render_canvas()
 
     def _select_edges_in_canvas_box(self, start, end, *, additive=False):
         project, _ = self._canvas_projection()
@@ -577,6 +602,7 @@ class SolveWorkspace(Div):
         self._message(f"Selected {len(selected)} {kind} edge{'s' if len(selected) != 1 else ''}.")
         self._refresh_model_tree()
         self._render_inspector()
+        self._sync_canvas_selection()
 
     def _create_region_from_canvas_drag(self, tool, start, end):
         _, unproject = self._canvas_projection()
@@ -913,7 +939,36 @@ class SolveWorkspace(Div):
         self.active_section = "geometry"
         self._refresh_model_tree()
         self._render_inspector()
-        self.render_canvas()
+        self._sync_canvas_selection()
+
+    def _sync_canvas_selection(self):
+        """Update selected sketch styling without replacing canvas geometry."""
+        edge_ids = json.dumps(self.selected_edge_ids)
+        region_id = json.dumps(self.selected_region_id)
+        script = f"""
+(() => {{
+  const svg = document.querySelector('svg.solve-sketch-canvas');
+  if (!svg) return;
+  const selectedEdges = new Set({edge_ids});
+  const selectedRegion = {region_id};
+  svg.querySelectorAll('[data-sketch-edge-id]').forEach((line) => {{
+    const selected = selectedEdges.has(line.getAttribute('data-sketch-edge-id'));
+    line.setAttribute('stroke', selected ? '#0877b9' : '#263746');
+    line.setAttribute('stroke-width', selected ? '2.2' : '1.6');
+  }});
+  svg.querySelectorAll('[data-sketch-region-id]').forEach((shape) => {{
+    const selected = shape.getAttribute('data-sketch-region-id') === selectedRegion;
+    shape.setAttribute('fill-opacity', selected ? '0.48' : '0.33');
+    shape.setAttribute('stroke', selected ? '#1b73ae' : '#344658');
+    shape.setAttribute('stroke-width', selected ? '2.2' : '1.6');
+  }});
+}})()
+"""
+        try:
+            self.js.eval(script)
+        except Exception:
+            # Standalone tests and non-browser frontends have no JS runtime.
+            pass
 
     def _selected_region(self):
         return next((region for region in self.model["geometry"]["regions"] if region["id"] == self.selected_region_id), None)
@@ -1283,20 +1338,19 @@ class SolveWorkspace(Div):
         plot = (54, 34, 820, 560)
         xy, _ = self._canvas_projection()
         regions = self.model["geometry"]["regions"]
-        children = [
-            _svg("rect", x=0, y=0, width=width, height=height, fill="var(--canvas-bg, #f4f6f8)"),
-        ]
+        grid_children = []
+        scene_children = []
         # Light grid and engineering axes.
         for i in range(11):
             x = plot[0] + i * (plot[2] - plot[0]) / 10
             y = plot[1] + i * (plot[3] - plot[1]) / 10
-            children.append(_svg("line", x1=x, y1=plot[1], x2=x, y2=plot[3], stroke="var(--border, #d9dfe7)", stroke_width="1"))
-            children.append(_svg("line", x1=plot[0], y1=y, x2=plot[2], y2=y, stroke="var(--border, #d9dfe7)", stroke_width="1"))
+            grid_children.append(_svg("line", x1=x, y1=plot[1], x2=x, y2=plot[3], stroke="var(--border, #d9dfe7)", stroke_width="1"))
+            grid_children.append(_svg("line", x1=plot[0], y1=y, x2=plot[2], y2=y, stroke="var(--border, #d9dfe7)", stroke_width="1"))
         xaxis = xy((0, 0))[0]
-        children.append(_svg("line", x1=xaxis, y1=plot[1], x2=xaxis, y2=plot[3], stroke="#557187", stroke_width="1.6", stroke_dasharray="5 4"))
-        children.append(_svg("text", x=xaxis + 5, y=plot[1] + 16, fill="#557187", font_size="13", children="r = 0"))
-        children.append(_svg("text", x=plot[2] - 12, y=height - 12, fill="var(--fg-muted, #697586)", font_size="13", children="r  [m]"))
-        children.append(_svg("text", x=12, y=plot[1] + 4, fill="var(--fg-muted, #697586)", font_size="13", children="z  [m]"))
+        grid_children.append(_svg("line", x1=xaxis, y1=plot[1], x2=xaxis, y2=plot[3], stroke="#557187", stroke_width="1.6", stroke_dasharray="5 4"))
+        grid_children.append(_svg("text", x=xaxis + 5, y=plot[1] + 16, fill="#557187", font_size="13", children="r = 0"))
+        grid_children.append(_svg("text", x=plot[2] - 12, y=height - 12, fill="var(--fg-muted, #697586)", font_size="13", children="r  [m]"))
+        grid_children.append(_svg("text", x=12, y=plot[1] + 4, fill="var(--fg-muted, #697586)", font_size="13", children="z  [m]"))
 
         material_index = {item["id"]: index for index, item in enumerate(self.model["materials"])}
         for region in regions:
@@ -1310,15 +1364,16 @@ class SolveWorkspace(Div):
                 fill_opacity="0.33" if not selected else "0.48",
                 stroke="#344658" if not selected else "#1b73ae",
                 stroke_width="2.2" if selected else "1.6",
+                data_sketch_region_id=region["id"],
                 tabindex="0",
                 style="cursor:pointer;",
             )
             shape.on("click", lambda event, rid=region["id"]: self.select_region(rid))
-            children.append(shape)
+            scene_children.append(shape)
             center = (sum(p[0] for p in region["vertices"]) / len(region["vertices"]), sum(p[1] for p in region["vertices"]) / len(region["vertices"]))
             cx, cy = xy(center)
             label = _svg("text", x=cx, y=cy, fill="#263746", font_size="13", text_anchor="middle", style="pointer-events:none; font-weight:600;", children=region["name"])
-            children.append(label)
+            scene_children.append(label)
             if selected:
                 shape_data = region.get("shape", {})
                 if shape_data.get("type") == "rectangle":
@@ -1328,7 +1383,7 @@ class SolveWorkspace(Div):
                     dim_style = "stroke:#455f78; stroke-width:1; fill:none; pointer-events:none;"
                     text_style = "fill:#263746; font-size:11px; font-weight:600; pointer-events:none;"
                     offset = 18
-                    children.extend([
+                    scene_children.extend([
                         _svg("line", x1=p0[0], y1=p0[1] + offset, x2=p1[0], y2=p1[1] + offset, style=dim_style),
                         _svg("line", x1=p0[0], y1=p0[1] + 4, x2=p0[0], y2=p0[1] + offset + 3, style=dim_style),
                         _svg("line", x1=p1[0], y1=p1[1] + 4, x2=p1[0], y2=p1[1] + offset + 3, style=dim_style),
@@ -1342,8 +1397,8 @@ class SolveWorkspace(Div):
                     center = xy((shape_data["r_center"], shape_data["z_center"]))
                     radial = xy((shape_data["r_center"] + shape_data["radius"], shape_data["z_center"]))
                     radius_mm = float(shape_data.get("radius", 0)) * 1000
-                    children.append(_svg("line", x1=center[0], y1=center[1], x2=radial[0], y2=radial[1], stroke="#455f78", stroke_width="1", style="pointer-events:none;"))
-                    children.append(_svg("text", x=(center[0] + radial[0]) / 2, y=center[1] - 7, text_anchor="middle", fill="#263746", font_size="11", font_weight="600", style="pointer-events:none;", children=f"R {radius_mm:.4g} mm"))
+                    scene_children.append(_svg("line", x1=center[0], y1=center[1], x2=radial[0], y2=radial[1], stroke="#455f78", stroke_width="1", style="pointer-events:none;"))
+                    scene_children.append(_svg("text", x=(center[0] + radial[0]) / 2, y=center[1] - 7, text_anchor="middle", fill="#263746", font_size="11", font_weight="600", style="pointer-events:none;", children=f"R {radius_mm:.4g} mm"))
 
         for edge in self.model["geometry"].get("edges", []):
             start, end = edge["vertices"]
@@ -1351,29 +1406,16 @@ class SolveWorkspace(Div):
             x2, y2 = xy(end)
             selected = edge["id"] in self.selected_edge_ids
             edge_color = "#0877b9" if selected else "#263746"
-            visible = _svg("line", x1=x1, y1=y1, x2=x2, y2=y2, stroke=edge_color, stroke_width="2.2" if selected else "1.6", style="pointer-events:none;")
+            visible = _svg("line", x1=x1, y1=y1, x2=x2, y2=y2, stroke=edge_color, stroke_width="2.2" if selected else "1.6", data_sketch_edge_id=edge["id"], style="pointer-events:none;")
             hit = _svg("line", x1=x1, y1=y1, x2=x2, y2=y2, stroke="transparent", stroke_width="12", style="cursor:pointer; pointer-events:stroke;")
             hit.on("click", lambda event, eid=edge["id"]: self.select_edge(eid, additive=bool((getattr(event, "value", None) or {}).get("shiftKey", False))))
-            children.extend([visible, hit])
+            scene_children.extend([visible, hit])
 
         if not regions:
-            children.append(_svg("text", x=width / 2, y=height / 2 - 8, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="16", children="Create a rectangle or circle region to begin"))
-            children.append(_svg("text", x=width / 2, y=height / 2 + 18, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="12", children="r is radial distance from the symmetry axis; z is axial height"))
-        children.extend([
-            _svg(
-                "rect", id="solve-sketch-drag-rect", x=0, y=0, width=0, height=0,
-                display="none", fill="#2385bd20", stroke="#0877b9",
-                stroke_width="2", stroke_dasharray="6 4",
-                style="pointer-events:none;",
-            ),
-            _svg(
-                "circle", id="solve-sketch-drag-circle", cx=0, cy=0, r=0,
-                display="none", fill="#2385bd20", stroke="#0877b9",
-                stroke_width="2", stroke_dasharray="6 4",
-                style="pointer-events:none;",
-            ),
-        ])
-        self._canvas.ui_children = children
+            scene_children.append(_svg("text", x=width / 2, y=height / 2 - 8, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="16", children="Create a rectangle or circle region to begin"))
+            scene_children.append(_svg("text", x=width / 2, y=height / 2 + 18, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="12", children="r is radial distance from the symmetry axis; z is axial height"))
+        self._canvas_grid.ui_children = grid_children
+        self._canvas_scene.ui_children = scene_children
 
     def _set_region_value(self, region_id, key, value):
         region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
