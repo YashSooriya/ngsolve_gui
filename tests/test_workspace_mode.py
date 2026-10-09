@@ -29,12 +29,20 @@ def test_workspace_mode_toggle_updates_selection_and_notifies(monkeypatch):
 def test_workspace_mode_switch_changes_workspace_and_keeps_header_visible():
     post_process = SimpleNamespace(ui_hidden=False)
     solve = SimpleNamespace(ui_hidden=True)
-    header_components = [SimpleNamespace(ui_hidden=False) for _ in range(6)]
+    brand, files, actions, monitor, separator, mode_bar = [
+        SimpleNamespace(ui_hidden=False) for _ in range(6)
+    ]
+    header_components = [brand, files, actions, monitor, separator, mode_bar]
     app = SimpleNamespace(
         _post_process_workspace=post_process,
         _solve_workspace=solve,
-        # These stand in for the fixed app bar and the mode row beneath it.
-        _header_components=header_components,
+        # These stand in for fixed app-bar controls and the mode row beneath it.
+        _brand=brand,
+        _file_group=files,
+        _view_group=actions,
+        system_monitor=monitor,
+        _system_monitor_separator=separator,
+        _workspace_mode_bar=mode_bar,
     )
 
     NGSolveGui._set_workspace_mode(app, "solve")
