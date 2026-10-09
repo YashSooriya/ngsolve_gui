@@ -56,6 +56,63 @@ class StackHost(Div):
         self.ui_children = list(self._panels.values())
 
 
+class WorkspaceModeToggle(Div):
+    """Prominent top-bar switch between the Solve and Post Process workspaces."""
+
+    _MODES = ("solve", "post_process")
+
+    def __init__(self, value="post_process", on_change=None):
+        if value not in self._MODES:
+            raise ValueError(f"Unknown workspace mode: {value}")
+        self._value = value
+        self._on_change = on_change
+        self._buttons = {}
+
+        for mode, label in (("solve", "Solve"), ("post_process", "Post Process")):
+            button = Div(label, ui_style=self._button_style(mode))
+            button.on("click", lambda event=None, selected=mode: self.select(selected))
+            self._buttons[mode] = button
+
+        super().__init__(
+            self._buttons["solve"], self._buttons["post_process"],
+            ui_style=(
+                "display:flex; width:264px; height:36px; flex:none; "
+                "overflow:hidden; border:1px solid var(--border-strong); "
+                "border-radius:var(--r-sm); background:var(--surface);"
+            ),
+        )
+
+    def _button_style(self, mode):
+        active = mode == self._value
+        style = (
+            "display:flex; flex:1; align-items:center; justify-content:center; "
+            "height:36px; padding:0 14px; white-space:nowrap; cursor:pointer; "
+            "user-select:none; font-size:13px; transition:background-color 100ms ease, color 100ms ease;"
+        )
+        if mode == "post_process":
+            style += " border-left:1px solid var(--border);"
+        if active:
+            style += " background:var(--accent-subtle); color:var(--accent); font-weight:600;"
+        else:
+            style += " background:var(--surface); color:var(--fg-muted); font-weight:500;"
+        return style
+
+    @property
+    def value(self):
+        return self._value
+
+    def select(self, mode):
+        if mode not in self._MODES:
+            raise ValueError(f"Unknown workspace mode: {mode}")
+        if mode == self._value:
+            return
+        self._value = mode
+        for key, button in self._buttons.items():
+            button.ui_style = self._button_style(key)
+        if self._on_change:
+            self._on_change(mode)
+
+
 class Panel(StackHost):
     def __init__(self, app_data):
         self.app_data = app_data
@@ -275,6 +332,9 @@ class NGSolveGui(App):
             Div("Netgen / NGSolve", ui_class=cb.brand_wordmark),
             ui_class=cb.brand,
         )
+        self._workspace_mode_toggle = WorkspaceModeToggle(
+            "post_process", self._set_workspace_mode
+        )
 
         self.system_monitor = SystemMonitor() if system_monitor_available() else None
 
@@ -285,14 +345,17 @@ class NGSolveGui(App):
         self._last_redraw_time = 0.0
         self._redraw_interval = max(0, int(self.usersettings.get("redraw_interval_ms", 50))) / 1000.0
 
-        bar = QBar(
-            ngs_logo,
-            file_group,
-            QSpace(),
-            *([self.system_monitor, Div(ui_class=cb.tb_sep)] if self.system_monitor is not None else []),
-            view_group,
-            ui_class=cb.app_bar,
+        self._brand = ngs_logo
+        self._file_group = file_group
+        self._view_group = view_group
+        self._system_monitor_separator = (
+            Div(ui_class=cb.tb_sep) if self.system_monitor is not None else None
         )
+        bar_children = [ngs_logo, QSpace(), self._workspace_mode_toggle, QSpace(), file_group]
+        if self.system_monitor is not None:
+            bar_children.extend([self.system_monitor, self._system_monitor_separator])
+        bar_children.append(view_group)
+        bar = QBar(*bar_children, ui_class=cb.app_bar)
 
         # Three-column layout using flex
         self.navigator = Navigator(self.app_data, self._click_tab, self._load_file)
@@ -345,6 +408,17 @@ class NGSolveGui(App):
         self._outer_splitter.on_update_model_value(self._on_nav_width_change)
 
         page = self._outer_splitter
+        self._post_process_workspace = Div(
+            page, self.controls, self.footer,
+            ui_style=(
+                "display:flex; flex-direction:column; flex:1 1 auto; "
+                "min-height:0; width:100%;"
+            ),
+        )
+        self._solve_workspace = Div(
+            ui_style="flex:1 1 auto; min-height:0; width:100%;",
+            ui_hidden=True,
+        )
 
         # Timer / profiling diagnostics dialog (opened from the settings menu).
         self._timer_body = Div()
@@ -360,7 +434,7 @@ class NGSolveGui(App):
         ))
 
         super().__init__(
-            bar, page, self.controls, self.footer, self._timer_dialog,
+            bar, self._post_process_workspace, self._solve_workspace, self._timer_dialog,
             self.kb.indicator, self.kb.help_overlay,
             ui_class=str(cb.app_root),
         )
@@ -373,6 +447,11 @@ class NGSolveGui(App):
         sync_default_viewport_clear()
         keybinding_styles.inject(self)
         self.on_load(self.__on_load)
+
+        # Post Process is the existing/default view. Solve is intentionally an
+        # empty workspace for now; retain the hidden Post Process tree so its
+        # viewport and current loaded data survive a mode switch.
+        self._workspace_mode = "post_process"
 
         # -- Global keybindings (always active) --
         kb = self.kb
@@ -395,6 +474,27 @@ class NGSolveGui(App):
         elif isinstance(filename, list):
             for f in filename:
                 self._load_with_status(f)
+
+    def _set_workspace_mode(self, mode):
+        if mode not in WorkspaceModeToggle._MODES:
+            raise ValueError(f"Unknown workspace mode: {mode}")
+
+        solving = mode == "solve"
+        self._workspace_mode = mode
+        self._post_process_workspace.ui_hidden = solving
+        self._solve_workspace.ui_hidden = not solving
+
+        # In Solve mode, leave only the mode switch in the top bar so the
+        # workspace below it is genuinely clear and the user can switch back.
+        for component in (
+            self._brand,
+            self._file_group,
+            self._view_group,
+            self.system_monitor,
+            self._system_monitor_separator,
+        ):
+            if component is not None:
+                component.ui_hidden = solving
 
     def _load_file(self):
         from ngapp.utils import EnvironmentType, get_environment
