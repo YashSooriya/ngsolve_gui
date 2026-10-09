@@ -359,7 +359,9 @@ class NGSolveGui(App):
             self._workspace_mode_toggle,
             ui_style=(
                 "display:flex; flex:0 0 52px; height:52px; width:100%; "
-                "align-items:center; justify-content:center; padding:8px 12px;"
+                "box-sizing:border-box; align-items:center; justify-content:center; "
+                "padding:8px 12px; background:var(--panel-header); "
+                "border-bottom:1px solid var(--border);"
             ),
         )
 
