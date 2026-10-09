@@ -119,10 +119,10 @@ class SolveWorkspace(Div):
             "aria-label": "Axisymmetric radial-axial sketch",
         })
         self._canvas.ui_slots["default"] = []
+        self._canvas.on_mounted(self._install_canvas_pointer_capture)
         self._canvas.on("mousedown", self._on_canvas_mouse_down)
         self._canvas.on("mousemove", self._on_canvas_mouse_move)
         self._canvas.on("mouseup", self._on_canvas_mouse_up)
-        self._canvas.on("mouseleave", self._on_canvas_mouse_leave)
         self._inspector = Div(ui_style="display:flex; flex-direction:column; gap:12px; padding:12px; overflow:auto; min-height:0;")
         self._status = Div(ui_style="display:flex; align-items:center; gap:8px; min-width:0; overflow:hidden; white-space:nowrap;")
         self._log_panel = Div(ui_hidden=True, ui_style="height:170px; flex:none; overflow:auto; border-top:1px solid var(--border); background:var(--surface); padding:10px 14px; font:12px/1.5 monospace;")
@@ -293,13 +293,89 @@ class SolveWorkspace(Div):
         except Exception:
             return None
 
+    def _install_canvas_pointer_capture(self, *_):
+        """Keep absolute pointer coordinates from the browser's native events.
+
+        ngapp's generic mouse-event bridge forwards buttons and modifiers but
+        omits clientX/clientY.  The sketch callbacks still arrive in Python,
+        so retain the latest screen coordinates in the page for those handlers
+        to read when a gesture starts, moves, or ends.
+        """
+        script = r"""
+(() => {
+  if (window.__ngsolveSketchPointerCaptureInstalled) return;
+  window.__ngsolveSketchPointerCaptureInstalled = true;
+  let active = false;
+  const pointerEvents = window.__ngsolveSketchPointerEvents = [];
+  const selector = 'svg.solve-sketch-canvas';
+  const capture = (event) => {
+    const svg = document.querySelector(selector);
+    if (!svg) return;
+    const targetIsCanvas = event.target && event.target.closest
+      && event.target.closest(selector) === svg;
+    if (event.type === 'mousedown') {
+      if (!targetIsCanvas || event.button !== 0) return;
+      active = true;
+    } else if (!active) {
+      return;
+    }
+    window.__ngsolveSketchPointer = [event.clientX, event.clientY];
+    pointerEvents.push({
+      type: event.type,
+      timeStamp: event.timeStamp,
+      x: event.clientX,
+      y: event.clientY,
+    });
+    if (pointerEvents.length > 256) pointerEvents.splice(0, pointerEvents.length - 256);
+    if (event.type === 'mouseup') active = false;
+  };
+  document.addEventListener('mousedown', capture, true);
+  document.addEventListener('mousemove', capture, true);
+  document.addEventListener('mouseup', capture, true);
+})()
+"""
+        try:
+            self.js.eval(script)
+        except Exception:
+            # Tests and non-browser frontends may not expose a JS runtime.
+            return
+
+    def _read_canvas_pointer(self, value):
+        try:
+            event_type = value.get("type")
+            timestamp = value.get("timeStamp")
+            if event_type in {"mousedown", "mousemove", "mouseup"} and timestamp is not None:
+                values = self.js.eval(
+                    "((type, timestamp) => { "
+                    "const events = window.__ngsolveSketchPointerEvents || []; "
+                    "const index = events.findIndex(event => event.type === type "
+                    "&& Math.abs(event.timeStamp - timestamp) < 1); "
+                    "if (index >= 0) { const event = events.splice(index, 1)[0]; "
+                    "return [event.x, event.y]; } "
+                    "return window.__ngsolveSketchPointer || null; })"
+                    f"('{event_type}', {float(timestamp)!r})"
+                )
+            else:
+                values = self.js.eval(
+                    "(() => window.__ngsolveSketchPointer || null)()"
+                )
+            if values is None or len(values) != 2:
+                return None
+            return float(values[0]), float(values[1])
+        except Exception:
+            return None
+
     def _canvas_event_point(self, event, *, refresh_transform=False):
         value = getattr(event, "value", None)
         if not isinstance(value, dict):
             return None
         try:
-            screen_x = float(value["x"])
-            screen_y = float(value["y"])
+            coordinates = (value.get("x"), value.get("y"))
+            if any(coordinate is None for coordinate in coordinates):
+                coordinates = self._read_canvas_pointer(value)
+            if coordinates is None:
+                return None
+            screen_x, screen_y = (float(coordinate) for coordinate in coordinates)
             if refresh_transform or self._screen_to_svg is None:
                 self._screen_to_svg = self._read_screen_to_svg_transform()
             if self._screen_to_svg is None:
@@ -361,12 +437,6 @@ class SolveWorkspace(Div):
         elif moved and drag["tool"] in {"rectangle", "circle"}:
             self._create_region_from_canvas_drag(drag["tool"], start, end)
         self.render_canvas()
-
-    def _on_canvas_mouse_leave(self, event):
-        if self._canvas_drag is not None:
-            self._canvas_drag = None
-            self._screen_to_svg = None
-            self.render_canvas()
 
     def _select_edges_in_canvas_box(self, start, end, *, additive=False):
         project, _ = self._canvas_projection()

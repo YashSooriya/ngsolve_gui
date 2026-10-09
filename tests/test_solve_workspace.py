@@ -155,3 +155,15 @@ def test_canvas_mouse_gesture_creates_rectangle_and_maps_screen_coordinates(stan
     assert len(workspace.model["geometry"]["regions"]) == 1
     assert workspace.model["geometry"]["regions"][0]["shape"]["width"] == pytest.approx(0.005)
     assert workspace.sketch_tool == "select"
+
+
+def test_canvas_event_reads_pointer_cache_when_ngapp_omits_coordinates(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._screen_to_svg = (1.25, 0.0, 0.0, 1.25, 100.0, 200.0)
+    workspace._read_canvas_pointer = lambda value: (125.0, 300.0)
+
+    point = workspace._canvas_event_point(
+        SimpleNamespace(value={"type": "mousedown", "button": 0, "timeStamp": 12.5})
+    )
+
+    assert point == pytest.approx((20.0, 80.0))
