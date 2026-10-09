@@ -135,6 +135,7 @@ class SolveWorkspace(Div):
         )
         self._canvas_grid = Component("g")
         self._canvas_scene = Component("g")
+        self._canvas_dimensions = Component("g")
         self._canvas_preview = Component(
             "g",
             _svg(
@@ -166,6 +167,7 @@ class SolveWorkspace(Div):
             self._canvas_background,
             self._canvas_grid,
             self._canvas_scene,
+            self._canvas_dimensions,
             self._canvas_preview,
             ui_class="solve-sketch-canvas",
             ui_style="display:block; width:100%; height:100%; min-height:0; background:var(--canvas-bg, #f4f6f8); cursor:default;",
@@ -722,6 +724,7 @@ class SolveWorkspace(Div):
         self._refresh_model_tree()
         self._render_inspector()
         self._sync_canvas_selection()
+        self._render_canvas_dimensions()
 
     def _create_region_from_canvas_drag(self, tool, start, end):
         _, unproject = self._canvas_projection()
@@ -1183,6 +1186,7 @@ class SolveWorkspace(Div):
         self._refresh_model_tree()
         self._render_inspector()
         self._sync_canvas_selection()
+        self._render_canvas_dimensions()
 
     def select_region(self, region_id):
         self.selected_region_id = region_id
@@ -1193,7 +1197,8 @@ class SolveWorkspace(Div):
         self.layout["active_section"] = self.active_section
         self._refresh_model_tree()
         self._render_inspector()
-        self.render_canvas()
+        self._sync_canvas_selection()
+        self._render_canvas_dimensions()
 
     def select_edge(self, edge_id, additive=False):
         if additive:
@@ -1213,6 +1218,7 @@ class SolveWorkspace(Div):
         self._refresh_model_tree()
         self._render_inspector()
         self._sync_canvas_selection()
+        self._render_canvas_dimensions()
 
     def _sync_canvas_selection(self):
         """Update selected sketch styling without replacing canvas geometry."""
@@ -1260,6 +1266,45 @@ class SolveWorkspace(Div):
     def _selected_edges(self):
         selected = set(self.selected_edge_ids)
         return [edge for edge in self.model["geometry"]["edges"] if edge["id"] in selected]
+
+    def _canvas_dimension_components(self):
+        """Build the selected region's dimension annotations separately."""
+        region = self._selected_region()
+        if region is None:
+            return []
+
+        xy, _ = self._canvas_projection()
+        shape_data = region.get("shape", {})
+        if shape_data.get("type") == "rectangle":
+            p0, p1, p2, _ = [xy(point) for point in region["vertices"][:4]]
+            width_mm = float(shape_data.get("width", 0)) * 1000
+            height_mm = float(shape_data.get("height", 0)) * 1000
+            dim_style = "stroke:#455f78; stroke-width:1; fill:none; pointer-events:none;"
+            text_style = "fill:#263746; font-size:11px; font-weight:600; pointer-events:none;"
+            offset = 18
+            return [
+                _svg("line", x1=p0[0], y1=p0[1] + offset, x2=p1[0], y2=p1[1] + offset, style=dim_style),
+                _svg("line", x1=p0[0], y1=p0[1] + 4, x2=p0[0], y2=p0[1] + offset + 3, style=dim_style),
+                _svg("line", x1=p1[0], y1=p1[1] + 4, x2=p1[0], y2=p1[1] + offset + 3, style=dim_style),
+                _svg("text", x=(p0[0] + p1[0]) / 2, y=p0[1] + offset + 14, text_anchor="middle", style=text_style, children=f"W {width_mm:.4g} mm"),
+                _svg("line", x1=p1[0] + offset, y1=p1[1], x2=p2[0] + offset, y2=p2[1], style=dim_style),
+                _svg("line", x1=p1[0] + 4, y1=p1[1], x2=p1[0] + offset + 3, y2=p1[1], style=dim_style),
+                _svg("line", x1=p2[0] + 4, y1=p2[1], x2=p2[0] + offset + 3, y2=p2[1], style=dim_style),
+                _svg("text", x=p1[0] + offset + 5, y=(p1[1] + p2[1]) / 2, style=text_style, children=f"H {height_mm:.4g} mm"),
+            ]
+        if shape_data.get("type") == "circle":
+            center = xy((shape_data["r_center"], shape_data["z_center"]))
+            radial = xy((shape_data["r_center"] + shape_data["radius"], shape_data["z_center"]))
+            radius_mm = float(shape_data.get("radius", 0)) * 1000
+            return [
+                _svg("line", x1=center[0], y1=center[1], x2=radial[0], y2=radial[1], stroke="#455f78", stroke_width="1", style="pointer-events:none;"),
+                _svg("text", x=(center[0] + radial[0]) / 2, y=center[1] - 7, text_anchor="middle", fill="#263746", font_size="11", font_weight="600", style="pointer-events:none;", children=f"R {radius_mm:.4g} mm"),
+            ]
+        return []
+
+    def _render_canvas_dimensions(self):
+        """Update selected dimensions without replacing the full sketch scene."""
+        self._canvas_dimensions.ui_children = self._canvas_dimension_components()
 
     def _render_inspector(self):
         if self.active_section == "geometry":
@@ -1796,31 +1841,6 @@ class SolveWorkspace(Div):
             cx, cy = xy(center)
             label = _svg("text", x=cx, y=cy, fill="#263746", font_size="13", text_anchor="middle", style="pointer-events:none; font-weight:600;", children=region["name"])
             scene_children.append(label)
-            if selected:
-                shape_data = region.get("shape", {})
-                if shape_data.get("type") == "rectangle":
-                    p0, p1, p2, p3 = [xy(point) for point in region["vertices"][:4]]
-                    width_mm = float(shape_data.get("width", 0)) * 1000
-                    height_mm = float(shape_data.get("height", 0)) * 1000
-                    dim_style = "stroke:#455f78; stroke-width:1; fill:none; pointer-events:none;"
-                    text_style = "fill:#263746; font-size:11px; font-weight:600; pointer-events:none;"
-                    offset = 18
-                    scene_children.extend([
-                        _svg("line", x1=p0[0], y1=p0[1] + offset, x2=p1[0], y2=p1[1] + offset, style=dim_style),
-                        _svg("line", x1=p0[0], y1=p0[1] + 4, x2=p0[0], y2=p0[1] + offset + 3, style=dim_style),
-                        _svg("line", x1=p1[0], y1=p1[1] + 4, x2=p1[0], y2=p1[1] + offset + 3, style=dim_style),
-                        _svg("text", x=(p0[0] + p1[0]) / 2, y=p0[1] + offset + 14, text_anchor="middle", style=text_style, children=f"W {width_mm:.4g} mm"),
-                        _svg("line", x1=p1[0] + offset, y1=p1[1], x2=p2[0] + offset, y2=p2[1], style=dim_style),
-                        _svg("line", x1=p1[0] + 4, y1=p1[1], x2=p1[0] + offset + 3, y2=p1[1], style=dim_style),
-                        _svg("line", x1=p2[0] + 4, y1=p2[1], x2=p2[0] + offset + 3, y2=p2[1], style=dim_style),
-                        _svg("text", x=p1[0] + offset + 5, y=(p1[1] + p2[1]) / 2, style=text_style, children=f"H {height_mm:.4g} mm"),
-                    ])
-                elif shape_data.get("type") == "circle":
-                    center = xy((shape_data["r_center"], shape_data["z_center"]))
-                    radial = xy((shape_data["r_center"] + shape_data["radius"], shape_data["z_center"]))
-                    radius_mm = float(shape_data.get("radius", 0)) * 1000
-                    scene_children.append(_svg("line", x1=center[0], y1=center[1], x2=radial[0], y2=radial[1], stroke="#455f78", stroke_width="1", style="pointer-events:none;"))
-                    scene_children.append(_svg("text", x=(center[0] + radial[0]) / 2, y=center[1] - 7, text_anchor="middle", fill="#263746", font_size="11", font_weight="600", style="pointer-events:none;", children=f"R {radius_mm:.4g} mm"))
 
         for edge in self.model["geometry"].get("edges", []):
             start, end = edge["vertices"]
@@ -1838,6 +1858,7 @@ class SolveWorkspace(Div):
             scene_children.append(_svg("text", x=width / 2, y=height / 2 + 18, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="12", children="Click a region or edge to edit it; dimensions are entered in mm"))
         self._canvas_grid.ui_children = grid_children
         self._canvas_scene.ui_children = scene_children
+        self._render_canvas_dimensions()
 
     def _set_region_value(self, region_id, key, value):
         region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)

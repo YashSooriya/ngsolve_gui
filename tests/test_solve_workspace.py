@@ -180,6 +180,27 @@ def test_canvas_drag_motion_and_release_do_not_rebuild_the_canvas(standalone_com
     assert len(workspace.selected_edge_ids) == 4
 
 
+def test_region_click_updates_selection_without_rebuilding_sketch_scene(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region_id = workspace.model["geometry"]["regions"][0]["id"]
+    scene = workspace._canvas_scene
+    scene_children = tuple(scene.ui_children)
+    renders = []
+    workspace.render_canvas = lambda: renders.append("render")
+
+    workspace.select_region(region_id)
+
+    assert renders == []
+    assert tuple(scene.ui_children) == scene_children
+    dimension_labels = [
+        child._props["textContent"]
+        for child in workspace._canvas_dimensions.ui_children
+        if child._props.get("textContent")
+    ]
+    assert dimension_labels == ["W 20 mm", "H 20 mm"]
+
+
 def test_canvas_render_keeps_background_and_layer_components_mounted(standalone_components):
     workspace = SolveWorkspace()
     root_layers = tuple(workspace._canvas.ui_children)
@@ -191,6 +212,7 @@ def test_canvas_render_keeps_background_and_layer_components_mounted(standalone_
         workspace._canvas_background,
         workspace._canvas_grid,
         workspace._canvas_scene,
+        workspace._canvas_dimensions,
         workspace._canvas_preview,
     )
 
