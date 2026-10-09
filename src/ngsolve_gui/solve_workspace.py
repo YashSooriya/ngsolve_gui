@@ -97,6 +97,9 @@ class SolveWorkspace(Div):
         self._log_visible = False
         self._log_messages = ["Axisymmetric model editor ready."]
         self.runs = []
+        self.sketch_tool = "select"
+        self._canvas_drag = None
+        self._screen_to_svg = None
 
         self._section_buttons = {}
         for key, label, icon in _SECTIONS:
@@ -104,7 +107,11 @@ class SolveWorkspace(Div):
             self._section_buttons[key] = button
 
         self._left_items = Div(*self._section_buttons.values(), ui_style="display:flex; flex-direction:column; gap:2px; padding:8px;")
-        self._canvas = Component("svg", ui_style="display:block; width:100%; height:100%; min-height:0; background:var(--canvas-bg, #f4f6f8);")
+        self._canvas = Component(
+            "svg",
+            ui_class="solve-sketch-canvas",
+            ui_style="display:block; width:100%; height:100%; min-height:0; background:var(--canvas-bg, #f4f6f8); cursor:default;",
+        )
         self._canvas._props.update({
             "viewBox": "0 0 900 640",
             "preserveAspectRatio": "xMidYMid meet",
@@ -112,6 +119,10 @@ class SolveWorkspace(Div):
             "aria-label": "Axisymmetric radial-axial sketch",
         })
         self._canvas.ui_slots["default"] = []
+        self._canvas.on("mousedown", self._on_canvas_mouse_down)
+        self._canvas.on("mousemove", self._on_canvas_mouse_move)
+        self._canvas.on("mouseup", self._on_canvas_mouse_up)
+        self._canvas.on("mouseleave", self._on_canvas_mouse_leave)
         self._inspector = Div(ui_style="display:flex; flex-direction:column; gap:12px; padding:12px; overflow:auto; min-height:0;")
         self._status = Div(ui_style="display:flex; align-items:center; gap:8px; min-width:0; overflow:hidden; white-space:nowrap;")
         self._log_panel = Div(ui_hidden=True, ui_style="height:170px; flex:none; overflow:auto; border-top:1px solid var(--border); background:var(--surface); padding:10px 14px; font:12px/1.5 monospace;")
@@ -131,15 +142,20 @@ class SolveWorkspace(Div):
         )
 
         toolbar = Div(
-            _button("Select", "mdi-cursor-default-outline", lambda *a: self.select_section("geometry")),
-            _button("Rectangle", "mdi-rectangle-outline", self.open_rectangle_dialog),
-            _button("Circle", "mdi-circle-outline", self.open_circle_dialog),
+            _button("Select or drag a selection box", "mdi-cursor-default-outline", lambda *a: self.set_sketch_tool("select")),
+            _button("Draw rectangle by dragging its corners", "mdi-rectangle-outline", lambda *a: self.set_sketch_tool("rectangle")),
+            _button("Draw circle by dragging from its centre", "mdi-circle-outline", lambda *a: self.set_sketch_tool("circle")),
             QSeparator(ui_vertical=True),
             _button("Fit view", "mdi-fit-to-screen-outline", lambda *a: self.render_canvas()),
             Div(ui_style="flex:1;"),
-            Div("Sketch", ui_style="color:var(--fg-muted); font-size:12px; padding-right:10px;"),
+            Div("Drag to sketch · left→right selects enclosed edges · right→left selects crossed edges · Shift adds", ui_style="color:var(--fg-muted); font-size:11px; padding:0 10px;"),
             ui_style="display:flex; align-items:center; gap:4px; flex:none; min-height:42px; padding:4px 8px; border-bottom:1px solid var(--border); background:var(--surface);",
         )
+        self._tool_buttons = {
+            "select": toolbar.ui_slots["default"][0],
+            "rectangle": toolbar.ui_slots["default"][1],
+            "circle": toolbar.ui_slots["default"][2],
+        }
         self._canvas_panel = Div(
             toolbar,
             self._canvas_host,
@@ -192,6 +208,7 @@ class SolveWorkspace(Div):
         )
         self._refresh_model_tree()
         self._render_inspector()
+        self._refresh_sketch_tool_buttons()
         self.render_canvas()
 
     @property
@@ -220,6 +237,9 @@ class SolveWorkspace(Div):
         self.selected_region_id = None
         self.selected_edge_id = None
         self.selected_edge_ids = []
+        self._canvas_drag = None
+        self._screen_to_svg = None
+        self.set_sketch_tool("select", announce=False)
         self._message(f"Loaded {self.model.get('name', 'axisymmetric model')}.")
         self._refresh_model_tree()
         self._render_inspector()
@@ -235,6 +255,171 @@ class SolveWorkspace(Div):
             button.ui_flat = key != section
         self._render_inspector()
         self._refresh_model_tree()
+
+    def set_sketch_tool(self, tool, *, announce=True):
+        if tool not in {"select", "rectangle", "circle"}:
+            return
+        self.sketch_tool = tool
+        self._canvas.ui_style = (
+            "display:block; width:100%; height:100%; min-height:0; "
+            "background:var(--canvas-bg, #f4f6f8); cursor:"
+            + ("crosshair;" if tool != "select" else "default;")
+        )
+        self._refresh_sketch_tool_buttons()
+        if announce:
+            help_text = {
+                "select": "Click an edge; drag left-to-right for enclosed edges or right-to-left for crossing edges.",
+                "rectangle": "Drag between opposite corners to sketch a rectangle; its dimensions remain editable.",
+                "circle": "Drag from the circle centre to its radius; its position and radius remain editable.",
+            }
+            self._message(help_text[tool])
+
+    def _refresh_sketch_tool_buttons(self):
+        for tool, button in getattr(self, "_tool_buttons", {}).items():
+            button.ui_color = "primary" if tool == self.sketch_tool else None
+            button.ui_flat = tool != self.sketch_tool
+
+    def _read_screen_to_svg_transform(self):
+        """Read the current SVG screen matrix once when a pointer gesture starts."""
+        try:
+            values = self.js.eval(
+                "(() => { const svg = document.querySelector('svg.solve-sketch-canvas'); "
+                "const m = svg && svg.getScreenCTM(); "
+                "return m ? [m.a, m.b, m.c, m.d, m.e, m.f] : null; })()"
+            )
+            if values is None or len(values) != 6:
+                return None
+            return tuple(float(values[index]) for index in range(6))
+        except Exception:
+            return None
+
+    def _canvas_event_point(self, event, *, refresh_transform=False):
+        value = getattr(event, "value", None)
+        if not isinstance(value, dict):
+            return None
+        try:
+            screen_x = float(value["x"])
+            screen_y = float(value["y"])
+            if refresh_transform or self._screen_to_svg is None:
+                self._screen_to_svg = self._read_screen_to_svg_transform()
+            if self._screen_to_svg is None:
+                return None
+            a, b, c, d, e, f = self._screen_to_svg
+            determinant = a * d - b * c
+            if abs(determinant) <= 1e-15:
+                return None
+            dx, dy = screen_x - e, screen_y - f
+            return (
+                (d * dx - c * dy) / determinant,
+                (-b * dx + a * dy) / determinant,
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+
+    def _on_canvas_mouse_down(self, event):
+        value = getattr(event, "value", None)
+        if not isinstance(value, dict) or int(value.get("button", 0) or 0) != 0:
+            return
+        point = self._canvas_event_point(event, refresh_transform=True)
+        if point is None:
+            return
+        self._canvas_drag = {
+            "tool": self.sketch_tool,
+            "start": point,
+            "current": point,
+            "additive": bool(value.get("shiftKey") or value.get("ctrlKey")),
+            "moved": False,
+        }
+
+    def _on_canvas_mouse_move(self, event):
+        if self._canvas_drag is None:
+            return
+        point = self._canvas_event_point(event)
+        if point is None:
+            return
+        self._canvas_drag["current"] = point
+        start = self._canvas_drag["start"]
+        moved = math.hypot(point[0] - start[0], point[1] - start[1]) >= 4.0
+        if moved != self._canvas_drag["moved"] or moved:
+            self._canvas_drag["moved"] = moved
+            self.render_canvas()
+
+    def _on_canvas_mouse_up(self, event):
+        drag = self._canvas_drag
+        if drag is None:
+            self._screen_to_svg = None
+            return
+        point = self._canvas_event_point(event)
+        if point is not None:
+            drag["current"] = point
+        start, end = drag["start"], drag["current"]
+        moved = math.hypot(end[0] - start[0], end[1] - start[1]) >= 4.0
+        self._canvas_drag = None
+        self._screen_to_svg = None
+        if moved and drag["tool"] == "select":
+            self._select_edges_in_canvas_box(start, end, additive=drag["additive"])
+        elif moved and drag["tool"] in {"rectangle", "circle"}:
+            self._create_region_from_canvas_drag(drag["tool"], start, end)
+        self.render_canvas()
+
+    def _on_canvas_mouse_leave(self, event):
+        if self._canvas_drag is not None:
+            self._canvas_drag = None
+            self._screen_to_svg = None
+            self.render_canvas()
+
+    def _select_edges_in_canvas_box(self, start, end, *, additive=False):
+        project, _ = self._canvas_projection()
+        box = (min(start[0], end[0]), max(start[0], end[0]), min(start[1], end[1]), max(start[1], end[1]))
+        window_selection = end[0] >= start[0]
+        selected = []
+        for edge in self.model["geometry"].get("edges", []):
+            points = [project(point) for point in edge.get("vertices", [])]
+            if len(points) != 2:
+                continue
+            if window_selection:
+                matches = all(_point_in_box(point, box) for point in points)
+            else:
+                matches = _segment_intersects_box(points[0], points[1], box)
+            if matches:
+                selected.append(edge["id"])
+        if additive:
+            selected = list(dict.fromkeys([*self.selected_edge_ids, *selected]))
+        self.selected_edge_ids = selected
+        self.selected_edge_id = selected[-1] if selected else None
+        self.selected_region_id = None
+        self.active_section = "geometry"
+        kind = "enclosed" if window_selection else "crossed"
+        self._message(f"Selected {len(selected)} {kind} edge{'s' if len(selected) != 1 else ''}.")
+        self._refresh_model_tree()
+        self._render_inspector()
+
+    def _create_region_from_canvas_drag(self, tool, start, end):
+        _, unproject = self._canvas_projection()
+        first = unproject(start)
+        second = unproject(end)
+        before = len(self.model["geometry"]["regions"])
+        if tool == "rectangle":
+            r_min, r_max = sorted((first[0], second[0]))
+            z_min, z_max = sorted((first[1], second[1]))
+            values = {
+                "r_min": r_min * 1000,
+                "z_min": z_min * 1000,
+                "width": (r_max - r_min) * 1000,
+                "height": (z_max - z_min) * 1000,
+            }
+        else:
+            radius = math.hypot(second[0] - first[0], second[1] - first[1])
+            values = {
+                "r_center": first[0] * 1000,
+                "z_center": first[1] * 1000,
+                "radius": radius * 1000,
+            }
+        for key, value in values.items():
+            self._primitive_values[(tool, key)] = value
+        self._add_primitive(tool)
+        if len(self.model["geometry"]["regions"]) > before:
+            self.set_sketch_tool("select", announce=False)
 
     def _message(self, text, error=False):
         self.message = str(text)
@@ -406,12 +591,14 @@ class SolveWorkspace(Div):
                 {"type": "vertical", "target": "edge-1", "driving": False},
                 {"type": "horizontal", "target": "edge-2", "driving": False},
                 {"type": "vertical", "target": "edge-3", "driving": False},
+                {"type": "radial_position", "target": "shape", "driving": True},
+                {"type": "axial_position", "target": "shape", "driving": True},
                 {"type": "width", "target": "shape", "driving": True},
                 {"type": "height", "target": "shape", "driving": True},
-                {"type": "fixed_position", "target": "shape", "driving": True},
             ]
         return [
-            {"type": "coincident_center", "target": "shape", "driving": True},
+            {"type": "radial_position", "target": "shape", "driving": True},
+            {"type": "axial_position", "target": "shape", "driving": True},
             {"type": "radius", "target": "shape", "driving": True},
             {"type": "equal_segments", "target": "tessellation", "driving": False},
         ]
@@ -700,6 +887,8 @@ class SolveWorkspace(Div):
                 name,
                 material,
                 mechanical,
+                Div("Driving dimensions", ui_style="font-size:11px; font-weight:700; letter-spacing:.05em; padding-top:4px;"),
+                Div("Edit these dimensions directly; the sketch updates while preserving the rectangle or circle constraints. Selected-region dimensions are annotated in the viewport.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
                 *shape_fields,
                 Div("EM source density", ui_style="font-size:11px; font-weight:700; letter-spacing:.05em; padding-top:4px;"),
                 *source_fields,
@@ -861,7 +1050,7 @@ class SolveWorkspace(Div):
     def _render_canvas(self):
         return self.render_canvas()
 
-    def render_canvas(self):
+    def _canvas_projection(self):
         width, height = 900, 640
         plot = (54, 34, 820, 560)
         regions = self.model["geometry"]["regions"]
@@ -897,6 +1086,19 @@ class SolveWorkspace(Div):
             y = plot[3] - (z - zmin) / (zmax - zmin) * (plot[3] - plot[1])
             return x, y
 
+        def rz(point):
+            x, y = point
+            r = rmin + (x - plot[0]) / (plot[2] - plot[0]) * (rmax - rmin)
+            z = zmin + (plot[3] - y) / (plot[3] - plot[1]) * (zmax - zmin)
+            return r, z
+
+        return xy, rz
+
+    def render_canvas(self):
+        width, height = 900, 640
+        plot = (54, 34, 820, 560)
+        xy, _ = self._canvas_projection()
+        regions = self.model["geometry"]["regions"]
         children = [
             _svg("rect", x=0, y=0, width=width, height=height, fill="var(--canvas-bg, #f4f6f8)"),
         ]
@@ -906,7 +1108,7 @@ class SolveWorkspace(Div):
             y = plot[1] + i * (plot[3] - plot[1]) / 10
             children.append(_svg("line", x1=x, y1=plot[1], x2=x, y2=plot[3], stroke="var(--border, #d9dfe7)", stroke_width="1"))
             children.append(_svg("line", x1=plot[0], y1=y, x2=plot[2], y2=y, stroke="var(--border, #d9dfe7)", stroke_width="1"))
-        xaxis = xy((0, zmin))[0]
+        xaxis = xy((0, 0))[0]
         children.append(_svg("line", x1=xaxis, y1=plot[1], x2=xaxis, y2=plot[3], stroke="#557187", stroke_width="1.6", stroke_dasharray="5 4"))
         children.append(_svg("text", x=xaxis + 5, y=plot[1] + 16, fill="#557187", font_size="13", children="r = 0"))
         children.append(_svg("text", x=plot[2] - 12, y=height - 12, fill="var(--fg-muted, #697586)", font_size="13", children="r  [m]"))
@@ -933,6 +1135,31 @@ class SolveWorkspace(Div):
             cx, cy = xy(center)
             label = _svg("text", x=cx, y=cy, fill="#263746", font_size="13", text_anchor="middle", style="pointer-events:none; font-weight:600;", children=region["name"])
             children.append(label)
+            if selected:
+                shape_data = region.get("shape", {})
+                if shape_data.get("type") == "rectangle":
+                    p0, p1, p2, p3 = [xy(point) for point in region["vertices"][:4]]
+                    width_mm = float(shape_data.get("width", 0)) * 1000
+                    height_mm = float(shape_data.get("height", 0)) * 1000
+                    dim_style = "stroke:#455f78; stroke-width:1; fill:none; pointer-events:none;"
+                    text_style = "fill:#263746; font-size:11px; font-weight:600; pointer-events:none;"
+                    offset = 18
+                    children.extend([
+                        _svg("line", x1=p0[0], y1=p0[1] + offset, x2=p1[0], y2=p1[1] + offset, style=dim_style),
+                        _svg("line", x1=p0[0], y1=p0[1] + 4, x2=p0[0], y2=p0[1] + offset + 3, style=dim_style),
+                        _svg("line", x1=p1[0], y1=p1[1] + 4, x2=p1[0], y2=p1[1] + offset + 3, style=dim_style),
+                        _svg("text", x=(p0[0] + p1[0]) / 2, y=p0[1] + offset + 14, text_anchor="middle", style=text_style, children=f"W {width_mm:.4g} mm"),
+                        _svg("line", x1=p1[0] + offset, y1=p1[1], x2=p2[0] + offset, y2=p2[1], style=dim_style),
+                        _svg("line", x1=p1[0] + 4, y1=p1[1], x2=p1[0] + offset + 3, y2=p1[1], style=dim_style),
+                        _svg("line", x1=p2[0] + 4, y1=p2[1], x2=p2[0] + offset + 3, y2=p2[1], style=dim_style),
+                        _svg("text", x=p1[0] + offset + 5, y=(p1[1] + p2[1]) / 2, style=text_style, children=f"H {height_mm:.4g} mm"),
+                    ])
+                elif shape_data.get("type") == "circle":
+                    center = xy((shape_data["r_center"], shape_data["z_center"]))
+                    radial = xy((shape_data["r_center"] + shape_data["radius"], shape_data["z_center"]))
+                    radius_mm = float(shape_data.get("radius", 0)) * 1000
+                    children.append(_svg("line", x1=center[0], y1=center[1], x2=radial[0], y2=radial[1], stroke="#455f78", stroke_width="1", style="pointer-events:none;"))
+                    children.append(_svg("text", x=(center[0] + radial[0]) / 2, y=center[1] - 7, text_anchor="middle", fill="#263746", font_size="11", font_weight="600", style="pointer-events:none;", children=f"R {radius_mm:.4g} mm"))
 
         for edge in self.model["geometry"].get("edges", []):
             start, end = edge["vertices"]
@@ -948,10 +1175,27 @@ class SolveWorkspace(Div):
         if not regions:
             children.append(_svg("text", x=width / 2, y=height / 2 - 8, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="16", children="Create a rectangle or circle region to begin"))
             children.append(_svg("text", x=width / 2, y=height / 2 + 18, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="12", children="r is radial distance from the symmetry axis; z is axial height"))
-        if self._canvas._id:
-            self._canvas.ui_children = children
-        else:
-            self._canvas.ui_slots["default"] = children
+        drag = self._canvas_drag
+        if drag and drag.get("moved"):
+            start, end = drag["start"], drag["current"]
+            if drag["tool"] == "select":
+                left, right = sorted((start[0], end[0]))
+                top, bottom = sorted((start[1], end[1]))
+                window = end[0] >= start[0]
+                children.append(_svg(
+                    "rect", x=left, y=top, width=right-left, height=bottom-top,
+                    fill="#2385bd22" if window else "#dd8a3222",
+                    stroke="#2385bd" if window else "#c66f16",
+                    stroke_width="1.5", stroke_dasharray="6 4",
+                    style="pointer-events:none;",
+                ))
+            elif drag["tool"] == "rectangle":
+                left, right = sorted((start[0], end[0]))
+                top, bottom = sorted((start[1], end[1]))
+                children.append(_svg("rect", x=left, y=top, width=right-left, height=bottom-top, fill="#2385bd20", stroke="#0877b9", stroke_width="2", stroke_dasharray="6 4", style="pointer-events:none;"))
+            else:
+                children.append(_svg("circle", cx=start[0], cy=start[1], r=math.hypot(end[0]-start[0], end[1]-start[1]), fill="#2385bd20", stroke="#0877b9", stroke_width="2", stroke_dasharray="6 4", style="pointer-events:none;"))
+        self._canvas.ui_children = children
 
     def _set_region_value(self, region_id, key, value):
         region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
@@ -1278,6 +1522,22 @@ class SolveWorkspace(Div):
 
 def _bounds(points):
     return min(p[0] for p in points), max(p[0] for p in points), min(p[1] for p in points), max(p[1] for p in points)
+
+
+def _point_in_box(point, box):
+    left, right, top, bottom = box
+    return left <= point[0] <= right and top <= point[1] <= bottom
+
+
+def _segment_intersects_box(start, end, box):
+    left, right, top, bottom = box
+    corners = ((left, top), (right, top), (right, bottom), (left, bottom))
+    if _point_in_box(start, box) or _point_in_box(end, box):
+        return True
+    return any(
+        _segments_intersect(start, end, corners[index], corners[(index + 1) % 4])
+        for index in range(4)
+    )
 
 
 def _polygon_area(points):
