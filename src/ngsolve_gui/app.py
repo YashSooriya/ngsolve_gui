@@ -465,6 +465,7 @@ class NGSolveGui(App):
         self.solve_workspace = SolveWorkspace(
             on_run=lambda: self._run_axisymmetric_solver(mesh_only=False),
             on_mesh=lambda: self._run_axisymmetric_solver(mesh_only=True),
+            on_open_file=self._open_run_result,
         )
         self._solve_workspace = Div(
             self.solve_workspace,
@@ -691,6 +692,14 @@ class NGSolveGui(App):
                 self._notify(f"Solver failed: {error}", type="negative", timeout=9000)
 
         threading.Thread(target=run_job, name="NGSolveAxisymmetricStudy", daemon=True).start()
+
+    def _open_run_result(self, filename):
+        """Open a generated field in the existing Post Process workspace."""
+        if not os.path.isfile(filename):
+            self.solve_workspace._message(f"Result file no longer exists: {filename}", error=True)
+            return
+        self._set_workspace_mode("post_process")
+        self._load_with_status(filename)
 
     @staticmethod
     def _find_solver_root():

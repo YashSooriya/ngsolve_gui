@@ -195,6 +195,68 @@ def test_canvas_render_keeps_background_and_layer_components_mounted(standalone_
     )
 
 
+def test_model_tree_sections_are_siblings_and_show_clear_workflow_names(standalone_components):
+    workspace = SolveWorkspace()
+
+    assert [button.ui_label for button in workspace._section_buttons.values()] == [
+        "Geometry",
+        "Materials",
+        "Physics & coupling",
+        "Boundary conditions",
+        "Mesh",
+        "Solver settings",
+        "Studies",
+        "Run history",
+        "Model parameters",
+    ]
+    assert all(button.ui_align == "left" for button in workspace._section_buttons.values())
+    assert workspace._tree_splitter.ui_slot_before == [workspace._tree]
+    assert workspace._tree_splitter.ui_slot_after == [workspace._properties_splitter]
+    assert workspace._properties_splitter.ui_slot_before == [workspace._canvas_panel]
+    assert workspace._properties_splitter.ui_slot_after == [workspace._right]
+
+
+def test_blank_axisymmetric_view_starts_at_r_zero_with_world_space_ticks(standalone_components):
+    workspace = SolveWorkspace()
+    project, unproject = workspace._canvas_projection()
+
+    assert project((0.0, 0.0))[0] == pytest.approx(72.0)
+    assert unproject((72.0, 320.0))[0] == pytest.approx(0.0)
+    ticks = workspace._coordinate_ticks(0.0, 0.022)
+    assert ticks[0] == pytest.approx(0.0)
+    steps = {round(b - a, 10) for a, b in zip(ticks, ticks[1:])}
+    assert len(steps) == 1
+
+
+def test_axisymmetric_view_keeps_axis_visible_for_regions_away_from_axis(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.model["geometry"]["regions"] = [{"vertices": [[0.01, 0.0], [0.02, 0.0], [0.02, 0.01], [0.01, 0.01]]}]
+
+    project, unproject = workspace._canvas_projection()
+
+    assert project((0.0, 0.0))[0] == pytest.approx(72.0)
+    assert project((0.01, 0.0))[0] > 72.0
+    assert unproject((72.0, 320.0))[0] == pytest.approx(0.0)
+
+
+def test_added_model_parameter_is_listed_in_tree(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.select_section("parameters")
+
+    workspace.add_parameter()
+
+    parameter_list = workspace._left_items.ui_children[-1]
+    assert any(child.ui_label == "length_1" for child in parameter_list.ui_children[1:])
+
+
+def test_setup_validation_checks_actual_study_frequency_list(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.studies["studies"][0]["frequency_hz"] = ["0"]
+
+    assert any("Study frequency" in error for error in workspace.validation_errors())
+    assert workspace._validation_issue_section("Study frequency must be positive") == "studies"
+
+
 def test_canvas_event_reads_pointer_cache_when_ngapp_omits_coordinates(standalone_components):
     workspace = SolveWorkspace()
     workspace._screen_to_svg = (1.25, 0.0, 0.0, 1.25, 100.0, 200.0)

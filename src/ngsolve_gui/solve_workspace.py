@@ -6,22 +6,24 @@ import copy
 import json
 import math
 import time
+from pathlib import Path
 
-from ngapp.components import Component, Div, QBtn, QCheckbox, QDialog, QInput, QSelect, QSeparator, QTooltip, QCard, QCardSection
+from ngapp.components import Component, Div, QBtn, QCheckbox, QDialog, QInput, QSelect, QSeparator, QTooltip, QCard, QCardSection, QSplitter
 
 from . import cerbsim_style as cb
 from .axisymmetric_model import evaluate_expression, new_id, new_model, new_studies, validate_model, validate_studies
 
 
 _SECTIONS = [
-    ("parameters", "Parameters", "mdi-variable"),
     ("geometry", "Geometry", "mdi-vector-square"),
-    ("boundaries", "Boundaries", "mdi-vector-link"),
     ("materials", "Materials", "mdi-cube-scan"),
-    ("physics", "Physics", "mdi-magnet"),
+    ("physics", "Physics & coupling", "mdi-magnet"),
+    ("boundaries", "Boundary conditions", "mdi-vector-link"),
     ("mesh", "Mesh", "mdi-vector-triangle"),
+    ("solver", "Solver settings", "mdi-tune-variant"),
     ("studies", "Studies", "mdi-play-box-multiple-outline"),
-    ("runs", "Runs", "mdi-history"),
+    ("runs", "Run history", "mdi-history"),
+    ("parameters", "Model parameters", "mdi-variable"),
 ]
 
 _MATERIAL_COLORS = ["#6886ac", "#d58651", "#69a77b", "#ae8bb7", "#d1b44f", "#4cabb0"]
@@ -44,7 +46,7 @@ def _input(label, value, callback, *, number=False, suffix=None, width=None, hin
     return widget
 
 
-def _button(label, icon, callback, *, color=None, disable=False, tooltip=None, style=None):
+def _button(label, icon, callback, *, color=None, disable=False, tooltip=None, style=None, align=None):
     button = QBtn(
         QTooltip(tooltip or label),
         ui_label=label,
@@ -56,6 +58,7 @@ def _button(label, icon, callback, *, color=None, disable=False, tooltip=None, s
         ui_disable=disable,
         ui_class="q-px-sm",
         ui_style=style,
+        ui_align=align,
     )
     if callback:
         button.on_click(callback)
@@ -83,22 +86,30 @@ def _section_title(title, subtitle=None):
 class SolveWorkspace(Div):
     """Editable axisymmetric r-z model with a selectable sketch viewport."""
 
-    def __init__(self, on_log=None, on_run=None, on_mesh=None):
+    def __init__(self, on_log=None, on_run=None, on_mesh=None, on_open_file=None):
         self.model = new_model()
         self.studies = new_studies()
         self.layout = {"schema_version": 1, "active_section": "geometry", "camera": "fit"}
         self.on_log = on_log
         self.on_run = on_run
         self.on_mesh = on_mesh
+        self.on_open_file = on_open_file
         self.active_section = "geometry"
         self.selected_region_id = None
         self.selected_edge_id = None
         self.selected_edge_ids = []
-        self.message = "Create a region with Rectangle or Circle to begin. Dimensions use SI units."
+        self.message = "Choose Rectangle or Circle in the viewport toolbar to begin. Dimensions are entered in mm."
         self.message_is_error = False
         self._log_visible = False
         self._log_messages = ["Axisymmetric model editor ready."]
         self.runs = []
+        self.selected_material_id = None
+        self.selected_boundary_id = None
+        self._selected_condition_id = None
+        self._tree_panel_width = 240
+        self._properties_panel_width = 340
+        self._messages_visible = False
+        self.validation_issues = []
         self.sketch_tool = "select"
         self._canvas_drag = None
         self._screen_to_svg = None
@@ -128,9 +139,13 @@ class SolveWorkspace(Div):
         self._section_buttons = {}
         for key, label, icon in _SECTIONS:
             button = _button(label, icon, lambda *_, selected=key: self.select_section(selected))
+            button.ui_align = "left"
+            button.ui_no_wrap = True
+            button.ui_class = "full-width q-px-sm text-left"
+            button.ui_style = "width:100%; justify-content:flex-start; text-align:left; min-height:34px;"
             self._section_buttons[key] = button
 
-        self._left_items = Div(*self._section_buttons.values(), ui_style="display:flex; flex-direction:column; gap:2px; padding:8px;")
+        self._left_items = Div(*self._section_buttons.values(), ui_style="display:flex; flex-direction:column; gap:3px; padding:8px;")
         self._canvas = Component(
             "svg",
             self._canvas_background,
@@ -153,26 +168,37 @@ class SolveWorkspace(Div):
         self._inspector = Div(ui_style="display:flex; flex-direction:column; gap:12px; padding:12px; overflow:auto; min-height:0;")
         self._status = Div(ui_style="display:flex; align-items:center; gap:8px; min-width:0; overflow:hidden; white-space:nowrap;")
         self._log_panel = Div(ui_hidden=True, ui_style="height:170px; flex:none; overflow:auto; border-top:1px solid var(--border); background:var(--surface); padding:10px 14px; font:12px/1.5 monospace;")
+        self._messages_panel = Div(ui_hidden=True, ui_style="max-height:180px; flex:none; overflow:auto; border-top:1px solid var(--border); background:var(--surface); padding:8px 14px;")
         self._canvas_host = Div(
             self._canvas,
             ui_style="flex:1 1 auto; min-width:0; min-height:0; overflow:hidden;",
         )
+        tree_header = Div(
+            Div("MODEL TREE", ui_style="font-size:11px; font-weight:700; letter-spacing:.08em;"),
+            _button("", "mdi-chevron-left", self._toggle_tree_panel, tooltip="Collapse model tree", style="margin-left:auto;"),
+            ui_style="display:flex; align-items:center; padding:14px 12px 10px; border-bottom:1px solid var(--border); color:var(--fg-muted);",
+        )
         self._tree = Div(
-            _section_title("Model tree", "Axisymmetric · r-z · SI units"),
+            tree_header,
             self._left_items,
-            ui_style="width:218px; flex:0 0 218px; min-height:0; overflow:auto; background:var(--surface); border-right:1px solid var(--border);",
+            ui_style="display:flex; flex-direction:column; min-width:0; min-height:0; overflow:auto; background:var(--surface);",
+        )
+        self._right_header = Div(
+            Div("PROPERTIES", ui_style="font-size:11px; font-weight:700; letter-spacing:.08em; color:var(--fg-muted);"),
+            _button("", "mdi-chevron-right", self._toggle_properties_panel, tooltip="Collapse properties", style="margin-left:auto;"),
+            ui_style="display:flex; align-items:center; padding:14px 12px 10px; border-bottom:1px solid var(--border); flex:none;",
         )
         self._right = Div(
-            _section_title("Properties"),
+            self._right_header,
             self._inspector,
-            ui_style="width:310px; flex:0 0 310px; min-height:0; overflow:hidden; background:var(--surface); border-left:1px solid var(--border); display:flex; flex-direction:column;",
+            ui_style="display:flex; flex-direction:column; min-width:0; min-height:0; overflow:hidden; background:var(--surface);",
         )
 
         toolbar = Div(
             _button(
                 "Select", "mdi-cursor-default-outline",
                 lambda *a: self.set_sketch_tool("select"),
-                tooltip="Select an edge or drag a box; Shift adds to the selection.",
+                tooltip="Click a region or edge to edit it. Drag right-to-left to select crossing edges; Shift adds to the selection.",
                 style="flex:0 0 auto; white-space:nowrap;",
             ),
             _button(
@@ -194,11 +220,9 @@ class SolveWorkspace(Div):
                 tooltip="Fit the sketch to the viewport.",
                 style="flex:0 0 auto; white-space:nowrap;",
             ),
+            _button("Model", "mdi-file-tree-outline", self._toggle_tree_panel, tooltip="Show or hide the model tree", style="flex:0 0 auto;"),
+            _button("Properties", "mdi-tune-variant", self._toggle_properties_panel, tooltip="Show or hide properties", style="flex:0 0 auto;"),
             Div(ui_style="flex:1;"),
-            Div(
-                "Drag to draw · ←→ encloses · →← crosses · Shift adds",
-                ui_style="color:var(--fg-muted); font-size:11px; padding:0 10px;",
-            ),
             ui_style="display:flex; align-items:center; gap:4px; flex:none; min-height:42px; padding:4px 8px; border-bottom:1px solid var(--border); background:var(--surface);",
         )
         self._tool_buttons = {
@@ -214,42 +238,62 @@ class SolveWorkspace(Div):
 
         self._rectangle_dialog = self._make_primitive_dialog("rectangle")
         self._circle_dialog = self._make_primitive_dialog("circle")
-        self._add_region_button = _button("Add region", "mdi-plus", self.open_rectangle_dialog, color="primary")
-        self._validate_button = _button("Validate", "mdi-check-decagram-outline", self.validate_action)
+        self._model_title = Div(self.model.get("name", "Untitled axisymmetric model"), ui_style="font-size:13px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:420px;")
+        self._validate_button = _button("Check setup", "mdi-check-decagram-outline", self.validate_action)
         self._mesh_button = _button("Generate mesh", "mdi-vector-triangle", self.run_mesh_action)
         self._run_button = _button("Run study", "mdi-play", self.run_study_action, color="primary")
 
         self._status_text = Div(self.message, ui_style="overflow:hidden; text-overflow:ellipsis; font-size:11px;")
-        log_button = QBtn(QTooltip("Show or hide solver and validation messages"), ui_icon="mdi-console", ui_label="Log", ui_flat=True, ui_dense=True, ui_no_caps=True)
+        self._messages_button = QBtn(QTooltip("Show setup issues and validation results"), ui_icon="mdi-message-alert-outline", ui_label="Messages", ui_flat=True, ui_dense=True, ui_no_caps=True)
+        self._messages_button.on_click(self.toggle_messages)
+        log_button = QBtn(QTooltip("Show solver output"), ui_icon="mdi-console", ui_label="Log", ui_flat=True, ui_dense=True, ui_no_caps=True)
         log_button.on_click(self.toggle_log)
         bottom = Div(
             self._status_text,
             Div(ui_style="flex:1;"),
             Div(f"Regions: 0  ·  Mesh order: {self.model['mesh']['polynomial_order']}", ui_style="font-size:11px; color:var(--fg-muted);"),
+            self._messages_button,
             log_button,
-            ui_style="display:flex; align-items:center; gap:10px; flex:0 0 30px; min-height:30px; padding:0 205px 0 10px; border-top:1px solid var(--border); background:var(--surface);",
+            ui_style="display:flex; align-items:center; gap:8px; flex:0 0 34px; min-height:34px; padding:0 10px; border-top:1px solid var(--border); background:var(--surface);",
         )
         self._bottom_count = bottom.ui_slots["default"][2]
         self._bottom_count.ui_style += " margin-left:12px;"
 
         top = Div(
-            Div("AXISYMMETRIC MODEL", ui_style="font-size:11px; font-weight:700; letter-spacing:.08em; color:var(--fg-muted);"),
+            self._model_title,
             Div(ui_style="flex:1;"),
             self._validate_button,
             self._mesh_button,
             self._run_button,
-            self._add_region_button,
             ui_style="display:flex; align-items:center; gap:8px; flex:none; min-height:40px; padding:4px 12px; border-bottom:1px solid var(--border); background:var(--surface);",
         )
         self._content = Div(
-            self._tree,
-            self._canvas_panel,
-            self._right,
             ui_style="display:flex; flex:1 1 auto; min-height:0; min-width:0;",
         )
+        self._properties_splitter = QSplitter(
+            ui_model_value=self._properties_panel_width,
+            ui_reverse=True,
+            ui_unit="px",
+            ui_limits=[240, 500],
+            ui_emit_immediately=True,
+            ui_slots={"before": [self._canvas_panel], "after": [self._right]},
+            ui_class="solve-properties-splitter",
+        )
+        self._properties_splitter.on_update_model_value(self._on_properties_width_change)
+        self._tree_splitter = QSplitter(
+            ui_model_value=self._tree_panel_width,
+            ui_unit="px",
+            ui_limits=[180, 420],
+            ui_emit_immediately=True,
+            ui_slots={"before": [self._tree], "after": [self._properties_splitter]},
+            ui_class="solve-tree-splitter",
+        )
+        self._tree_splitter.on_update_model_value(self._on_tree_width_change)
+        self._content.ui_children = [self._tree_splitter]
         super().__init__(
             top,
             self._content,
+            self._messages_panel,
             self._log_panel,
             bottom,
             self._rectangle_dialog,
@@ -282,6 +326,9 @@ class SolveWorkspace(Div):
         self.studies = studies
         self.layout = copy.deepcopy(layout or {"schema_version": 1, "active_section": "geometry", "camera": "fit"})
         self.runs = []
+        self.selected_material_id = None
+        self.selected_boundary_id = None
+        self._selected_condition_id = None
         requested_section = self.layout.get("active_section", "geometry")
         self.active_section = requested_section if requested_section in {key for key, _, _ in _SECTIONS} else "geometry"
         self.selected_region_id = None
@@ -300,11 +347,44 @@ class SolveWorkspace(Div):
             return
         self.active_section = section
         self.layout["active_section"] = section
+        if section != "boundaries":
+            self._selected_condition_id = None
         for key, button in self._section_buttons.items():
             button.ui_color = "primary" if key == section else None
             button.ui_flat = key != section
         self._render_inspector()
         self._refresh_model_tree()
+        if section == "boundaries":
+            self._selected_condition_id = self.selected_boundary_id
+        self._sync_canvas_selection()
+
+    def _on_tree_width_change(self, event):
+        value = float(event.value)
+        if value > 30:
+            self._tree_panel_width = value
+
+    def _on_properties_width_change(self, event):
+        value = float(event.value)
+        if value > 30:
+            self._properties_panel_width = value
+
+    def _toggle_tree_panel(self, *_):
+        if self._tree_splitter.ui_model_value > 30:
+            self._tree_panel_width = float(self._tree_splitter.ui_model_value)
+            self._tree_splitter.ui_limits = [0, 420]
+            self._tree_splitter.ui_model_value = 0
+        else:
+            self._tree_splitter.ui_limits = [180, 420]
+            self._tree_splitter.ui_model_value = self._tree_panel_width
+
+    def _toggle_properties_panel(self, *_):
+        if self._properties_splitter.ui_model_value > 30:
+            self._properties_panel_width = float(self._properties_splitter.ui_model_value)
+            self._properties_splitter.ui_limits = [0, 500]
+            self._properties_splitter.ui_model_value = 0
+        else:
+            self._properties_splitter.ui_limits = [240, 500]
+            self._properties_splitter.ui_model_value = self._properties_panel_width
 
     def set_sketch_tool(self, tool, *, announce=True):
         if tool not in {"select", "rectangle", "circle"}:
@@ -597,6 +677,7 @@ class SolveWorkspace(Div):
         self.selected_edge_ids = selected
         self.selected_edge_id = selected[-1] if selected else None
         self.selected_region_id = None
+        self._selected_condition_id = None
         self.active_section = "geometry"
         kind = "enclosed" if window_selection else "crossed"
         self._message(f"Selected {len(selected)} {kind} edge{'s' if len(selected) != 1 else ''}.")
@@ -644,6 +725,54 @@ class SolveWorkspace(Div):
         self._log_panel.ui_children = [Div(line) for line in self._log_messages]
         if self.on_log:
             self.on_log(self.message, error)
+
+    def toggle_messages(self, *args):
+        self._messages_visible = not self._messages_visible
+        self._messages_panel.ui_hidden = not self._messages_visible
+
+    def _show_validation_issues(self, errors):
+        self.validation_issues = list(errors)
+        self._messages_button.ui_label = f"Messages ({len(errors)})" if errors else "Messages"
+        if not errors:
+            self._messages_panel.ui_children = [Div(
+                "Setup checks passed. Meshing and solving still need to complete successfully.",
+                ui_style="font-size:12px; color:var(--positive); padding:5px 0;",
+            )]
+            self._messages_visible = True
+            self._messages_panel.ui_hidden = False
+            return
+        rows = []
+        for issue in errors:
+            section = self._validation_issue_section(issue)
+            rows.append(_button(
+                issue,
+                "mdi-alert-circle-outline",
+                lambda *a, selected=section: self.select_section(selected),
+                style="width:100%; justify-content:flex-start; text-align:left; white-space:normal;",
+                align="left",
+            ))
+        self._messages_panel.ui_children = rows
+        self._messages_visible = True
+        self._messages_panel.ui_hidden = False
+
+    @staticmethod
+    def _validation_issue_section(issue):
+        text = issue.lower()
+        if "parameter" in text:
+            return "parameters"
+        if "material" in text:
+            return "materials"
+        if "study" in text or "frequency" in text:
+            return "studies"
+        if "mesh" in text:
+            return "mesh"
+        if "solver" in text or "anderson" in text or "iteration" in text or "tolerance" in text:
+            return "solver"
+        if "boundary" in text or "edge" in text or "support" in text:
+            return "boundaries"
+        if "physics" in text or "magnetic" in text or "mechanic" in text or "coupl" in text:
+            return "physics"
+        return "geometry"
 
     def append_solver_output(self, lines):
         additions = [str(line).rstrip() for line in lines if str(line).strip()]
@@ -781,6 +910,8 @@ class SolveWorkspace(Div):
             self._rebuild_edges()
             self.selected_region_id = region["id"]
             self.selected_edge_id = None
+            self.selected_edge_ids = []
+            self._selected_condition_id = None
             self.active_section = "geometry"
             self._close_dialog(kind)
             self._message(f"Created {region['name']} with {len(region['constraints'])} driving sketch constraints.")
@@ -889,36 +1020,95 @@ class SolveWorkspace(Div):
                 self.selected_edge_id = self.selected_edge_ids[-1] if self.selected_edge_ids else None
 
     def _refresh_model_tree(self):
-        labels = {
-            "parameters": f"Parameters  ·  {len(self.model.get('parameters', []))}",
-            "geometry": f"Geometry  ·  {len(self.model['geometry']['regions'])} regions",
-            "boundaries": f"Boundaries  ·  {len(self.model.get('boundary_conditions', []))}",
-            "materials": f"Materials  ·  {len(self.model.get('materials', []))}",
-            "physics": "Physics",
-            "mesh": "Mesh",
-            "studies": f"Studies  ·  {len(self.studies.get('studies', []))}",
-            "runs": f"Runs  ·  {len(self.runs)}",
-        }
+        labels = {key: label for key, label, _ in _SECTIONS}
         for key, button in self._section_buttons.items():
             button.ui_label = labels[key]
             button.ui_color = "primary" if key == self.active_section else None
             button.ui_flat = key != self.active_section
         children = list(self._section_buttons.values())
+        subsection = None
         if self.active_section == "geometry":
-            children += [
-                _button(region["name"], "mdi-vector-square-outline", lambda *a, rid=region["id"]: self.select_region(rid))
+            entries = [
+                (region["name"], "mdi-vector-square-outline", lambda *a, rid=region["id"]: self.select_region(rid))
                 for region in self.model["geometry"]["regions"]
             ]
+            subsection = (f"REGIONS  ·  {len(entries)}", entries)
+        elif self.active_section == "materials":
+            entries = [
+                (item["name"], "mdi-cube-outline", lambda *a, mid=item["id"]: self.select_material(mid))
+                for item in self.model.get("materials", [])
+            ]
+            subsection = (f"MATERIALS  ·  {len(entries)}", entries)
+        elif self.active_section == "boundaries":
+            entries = [
+                (item["name"], "mdi-vector-link", lambda *a, bid=item["id"]: self.select_boundary(bid))
+                for item in self.model.get("boundary_conditions", [])
+            ]
+            subsection = (f"CONDITIONS  ·  {len(entries)}", entries)
+        elif self.active_section == "studies":
+            entries = [
+                (item.get("name", "Study"), "mdi-play-box-outline", lambda *a: self.select_section("studies"))
+                for item in self.studies.get("studies", [])
+            ]
+            subsection = (f"STUDIES  ·  {len(entries)}", entries)
+        elif self.active_section == "runs":
+            entries = [
+                (item.get("name", "Run"), "mdi-file-chart-outline", lambda *a: self.select_section("runs"))
+                for item in reversed(self.runs)
+            ]
+            subsection = (f"RUNS  ·  {len(entries)}", entries)
+        elif self.active_section == "parameters":
+            entries = [
+                (item.get("name", "Parameter"), "mdi-variable", lambda *a: self.select_section("parameters"))
+                for item in self.model.get("parameters", [])
+            ]
+            subsection = (f"PARAMETERS  ·  {len(entries)}", entries)
+        if subsection:
+            title, entries = subsection
+            children.append(Div(
+                Div(title, ui_style="font-size:10px; font-weight:700; letter-spacing:.06em; color:var(--fg-muted); padding:10px 8px 4px 14px;"),
+                *[
+                    _button(label, icon, callback, style="width:100%; justify-content:flex-start; text-align:left; padding-left:18px; min-height:30px;", align="left")
+                    for label, icon, callback in entries
+                ],
+                ui_style="display:flex; flex-direction:column; gap:1px; margin-left:8px; border-left:1px solid var(--border);",
+            ))
         self._left_items.ui_children = children
         if hasattr(self, "_bottom_count"):
             self._bottom_count.ui_children = [
                 f"Regions: {len(self.model['geometry']['regions'])}  ·  Mesh order: {self.model['mesh']['polynomial_order']}"
             ]
+        if hasattr(self, "_model_title"):
+            self._model_title.ui_children = [self.model.get("name", "Untitled axisymmetric model")]
+
+    def select_material(self, material_id):
+        self.selected_material_id = material_id
+        self.active_section = "materials"
+        self._selected_condition_id = None
+        self._refresh_model_tree()
+        self._render_inspector()
+        self._sync_canvas_selection()
+
+    def select_boundary(self, boundary_id):
+        self.selected_boundary_id = boundary_id
+        self._selected_condition_id = boundary_id
+        self.active_section = "boundaries"
+        self._refresh_model_tree()
+        self._render_inspector()
+        self._sync_canvas_selection()
+
+    def _select_physics_region(self, region_id):
+        self.selected_region_id = region_id
+        self.selected_edge_id = None
+        self.selected_edge_ids = []
+        self._render_inspector()
+        self.render_canvas()
 
     def select_region(self, region_id):
         self.selected_region_id = region_id
         self.selected_edge_id = None
         self.selected_edge_ids = []
+        self._selected_condition_id = None
         self.active_section = "geometry"
         self._refresh_model_tree()
         self._render_inspector()
@@ -936,6 +1126,7 @@ class SolveWorkspace(Div):
             self.selected_edge_ids = [edge_id]
         self.selected_edge_id = self.selected_edge_ids[-1] if self.selected_edge_ids else None
         self.selected_region_id = None
+        self._selected_condition_id = None
         self.active_section = "geometry"
         self._refresh_model_tree()
         self._render_inspector()
@@ -945,16 +1136,24 @@ class SolveWorkspace(Div):
         """Update selected sketch styling without replacing canvas geometry."""
         edge_ids = json.dumps(self.selected_edge_ids)
         region_id = json.dumps(self.selected_region_id)
+        highlighted_edges = [
+            edge["id"] for edge in self.model.get("geometry", {}).get("edges", [])
+            if self._selected_condition_id in _edge_condition_ids(edge)
+        ]
+        highlighted_ids = json.dumps(highlighted_edges)
         script = f"""
 (() => {{
   const svg = document.querySelector('svg.solve-sketch-canvas');
   if (!svg) return;
   const selectedEdges = new Set({edge_ids});
   const selectedRegion = {region_id};
+  const highlightedEdges = new Set({highlighted_ids});
   svg.querySelectorAll('[data-sketch-edge-id]').forEach((line) => {{
-    const selected = selectedEdges.has(line.getAttribute('data-sketch-edge-id'));
-    line.setAttribute('stroke', selected ? '#0877b9' : '#263746');
-    line.setAttribute('stroke-width', selected ? '2.2' : '1.6');
+    const id = line.getAttribute('data-sketch-edge-id');
+    const selected = selectedEdges.has(id);
+    const highlighted = highlightedEdges.has(id);
+    line.setAttribute('stroke', selected ? '#0877b9' : (highlighted ? '#c66f16' : '#263746'));
+    line.setAttribute('stroke-width', selected || highlighted ? '2.2' : '1.6');
   }});
   svg.querySelectorAll('[data-sketch-region-id]').forEach((shape) => {{
     const selected = shape.getAttribute('data-sketch-region-id') === selectedRegion;
@@ -993,6 +1192,8 @@ class SolveWorkspace(Div):
             children = self._physics_properties()
         elif self.active_section == "mesh":
             children = self._mesh_properties()
+        elif self.active_section == "solver":
+            children = self._solver_properties()
         elif self.active_section == "studies":
             children = self._study_properties()
         else:
@@ -1016,6 +1217,18 @@ class SolveWorkspace(Div):
                 Div(run["output_path"], ui_style="font-size:10px; line-height:1.35; color:var(--fg-muted); overflow-wrap:anywhere; margin-top:4px;"),
                 ui_style="padding:9px; border:1px solid var(--border); border-radius:6px;",
             ))
+            fields_dir = Path(run.get("output_path", "")) / "ngsolve_gui" / "fields"
+            try:
+                field_files = sorted(fields_dir.glob("*.pkl")) if fields_dir.is_dir() else []
+            except OSError:
+                field_files = []
+            for field_file in field_files:
+                if self.on_open_file:
+                    children.append(Div(
+                        Div(field_file.name, ui_style="font-size:11px; overflow-wrap:anywhere; flex:1;"),
+                        _button("Open in Post Process", "mdi-open-in-app", lambda *a, path=str(field_file): self.on_open_file(path)),
+                        ui_style="display:flex; align-items:center; gap:6px; padding:3px 6px 3px 12px;",
+                    ))
         return children
 
     def _geometry_properties(self):
@@ -1101,83 +1314,104 @@ class SolveWorkspace(Div):
                 expressions = shape.get("dimension_expressions", {})
                 for key, label, display in (("r_min", "Inner radius", "mm"), ("z_min", "Bottom", "mm"), ("width", "Radial width", "mm"), ("height", "Axial height", "mm")):
                     value = expressions.get(key, str(1000 * float(shape[key])))
-                    shape_fields.append(_input(label, value, lambda event, rid=region["id"], k=key: self._set_region_dimension(rid, k, event.value), suffix=display, hint="Expression in mm; multiply SI parameters by 1000."))
+                    shape_fields.append(_input(label, value, lambda event, rid=region["id"], k=key: self._set_region_dimension(rid, k, event.value), suffix=display, hint="Enter mm. SI parameters in m need ×1000 here."))
             elif shape.get("type") == "circle":
                 expressions = shape.get("dimension_expressions", {})
                 for key, label in (("r_center", "Centre radius"), ("z_center", "Centre height"), ("radius", "Radius")):
                     value = expressions.get(key, str(1000 * float(shape[key])))
-                    shape_fields.append(_input(label, value, lambda event, rid=region["id"], k=key: self._set_region_dimension(rid, k, event.value), suffix="mm", hint="Expression in mm; multiply SI parameters by 1000."))
+                    shape_fields.append(_input(label, value, lambda event, rid=region["id"], k=key: self._set_region_dimension(rid, k, event.value), suffix="mm", hint="Enter mm. SI parameters in m need ×1000 here."))
             delete_button = _button("Delete region", "mdi-delete-outline", lambda *a, rid=region["id"]: self.delete_region(rid), color="negative")
             constraints = [Div(f"{constraint['type'].replace('_', ' ').title()}  ·  {'driving' if constraint.get('driving') else 'reference'}", ui_style="font-size:11px; padding:3px 0; color:var(--fg-muted);") for constraint in region.get("constraints", [])]
             parent = next((item["name"] for item in self.model["geometry"]["regions"] if item["id"] == region.get("parent_id")), "Exterior")
-            sources = region.setdefault("sources", {})
-            source_fields = [
-                _input("DC current density", sources.get("dc_current_density", "0"), lambda event, rid=region["id"]: self._set_region_source(rid, "dc_current_density", event.value), suffix="A/m²"),
-                _input("AC current density (real)", sources.get("ac_current_density_real", "0"), lambda event, rid=region["id"]: self._set_region_source(rid, "ac_current_density_real", event.value), suffix="A/m²"),
-                _input("AC current density (imaginary)", sources.get("ac_current_density_imaginary", "0"), lambda event, rid=region["id"]: self._set_region_source(rid, "ac_current_density_imaginary", event.value), suffix="A/m²"),
-            ]
-            body_force = sources.setdefault("mechanical_body_force", {"r": "0", "z": "0"})
-            body_force_fields = [
-                _input("Radial body force", body_force.get("r", "0"), lambda event, rid=region["id"]: self._set_region_body_force(rid, "r", event.value), suffix="N/m³"),
-                _input("Axial body force", body_force.get("z", "0"), lambda event, rid=region["id"]: self._set_region_body_force(rid, "z", event.value), suffix="N/m³"),
-            ]
             return [
                 _section_title("Region properties", f"{region.get('shape', {}).get('type', 'polygon').title()} · parent: {parent}"),
+                Div("GEOMETRY", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted);"),
                 name,
+                Div("Driving dimensions", ui_style="font-size:11px; font-weight:700; letter-spacing:.05em; padding-top:4px;"),
+                Div("Dimensions are shown in mm. The sketch updates while preserving the current rectangle or circle shape.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+                *shape_fields,
+                Div("ASSIGNMENTS", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:6px;"),
                 material,
                 mechanical,
-                Div("Driving dimensions", ui_style="font-size:11px; font-weight:700; letter-spacing:.05em; padding-top:4px;"),
-                Div("Edit these dimensions directly; the sketch updates while preserving the rectangle or circle constraints. Selected-region dimensions are annotated in the viewport.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
-                *shape_fields,
-                Div("EM source density", ui_style="font-size:11px; font-weight:700; letter-spacing:.05em; padding-top:4px;"),
-                *source_fields,
-                Div("Mechanical body force", ui_style="font-size:11px; font-weight:700; letter-spacing:.05em; padding-top:4px;"),
-                *body_force_fields,
-                Div("Sketch constraints", ui_style="font-size:11px; font-weight:700; letter-spacing:.05em; padding-top:4px;"),
+                Div("SKETCH CONSTRAINTS", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:6px;"),
                 *constraints,
                 delete_button,
             ]
         return [
             _section_title("Geometry", "Click a region or edge to edit it."),
-            Div("Draw a rectangle or circle, then assign its material and edge conditions. Nested regions are assigned as distinct material domains.", ui_style="font-size:12px; line-height:1.5; color:var(--fg-muted);"),
-            _button("Create rectangle", "mdi-rectangle-outline", self.open_rectangle_dialog, color="primary"),
-            _button("Create circle", "mdi-circle-outline", self.open_circle_dialog),
-            Div("r ≥ 0 is enforced for axisymmetric geometry.", ui_style="font-size:11px; color:var(--fg-muted);"),
+            Div("Choose Rectangle or Circle in the viewport toolbar. Select a region to edit its dimensions and assignments; select an edge to set boundary conditions.", ui_style="font-size:12px; line-height:1.5; color:var(--fg-muted);"),
+            Div("r ≥ 0 is enforced for axisymmetric geometry. Nested regions must be strictly contained or disjoint.", ui_style="font-size:11px; color:var(--fg-muted); line-height:1.45;"),
         ]
 
     def _parameter_properties(self):
-        children = [_section_title("Parameters", "Reusable scalar expressions in SI units.")]
+        children = [_section_title("Model parameters", "Optional named scalar values reused by geometry, materials and studies.")]
+        parameter_map = {item["name"]: item for item in self.model.get("parameters", [])}
+        children.append(Div(
+            Div("Name", ui_style="font-size:10px; font-weight:700; color:var(--fg-muted);"),
+            Div("Expression", ui_style="font-size:10px; font-weight:700; color:var(--fg-muted);"),
+            Div("Unit", ui_style="font-size:10px; font-weight:700; color:var(--fg-muted);"),
+            Div("Evaluated", ui_style="font-size:10px; font-weight:700; color:var(--fg-muted);"),
+            ui_style="display:grid; grid-template-columns:minmax(65px,.85fr) minmax(80px,1fr) 52px minmax(60px,.8fr); gap:5px;",
+        ))
         for parameter in self.model.get("parameters", []):
+            try:
+                value = f"{evaluate_expression(parameter['expression'], parameter_map):.6g}"
+                evaluated_color = "var(--fg-muted);"
+            except (ValueError, TypeError, SyntaxError, OverflowError):
+                value = "Invalid"
+                evaluated_color = "var(--negative);"
             children.append(Div(
                 _input("Name", parameter["name"], lambda event, pid=parameter["id"]: self._set_parameter(pid, "name", event.value)),
                 _input("Expression", parameter["expression"], lambda event, pid=parameter["id"]: self._set_parameter(pid, "expression", event.value)),
                 _input("Unit", parameter.get("unit", ""), lambda event, pid=parameter["id"]: self._set_parameter(pid, "unit", event.value)),
-                _button("Remove", "mdi-delete-outline", lambda *a, pid=parameter["id"]: self.remove_parameter(pid)),
-                ui_style="display:flex; flex-direction:column; gap:7px; padding:8px; border:1px solid var(--border); border-radius:6px;",
+                Div(f"{value} {parameter.get('unit', '')}".strip(), ui_style=f"font-size:11px; align-self:center; color:{evaluated_color}"),
+                ui_style="display:grid; grid-template-columns:minmax(65px,.85fr) minmax(80px,1fr) 52px minmax(60px,.8fr); gap:5px; align-items:center; padding:5px 0; border-bottom:1px solid var(--border);",
             ))
-        add = _button("Add parameter", "mdi-plus", self.add_parameter, color="primary")
-        children.append(add)
+        children.extend([
+            _button("Add parameter", "mdi-plus", self.add_parameter, color="primary"),
+            Div("Parameters are optional. Geometry dimensions are entered in mm; when using a parameter stored in m, multiply it by 1000 in a dimension expression.", ui_style="font-size:11px; line-height:1.45; color:var(--fg-muted);"),
+        ])
         return children
 
     def _material_properties(self):
-        children = [_section_title("Materials", "Properties are defined independently from region names.")]
-        property_names = [
-            ("relative_permeability", "Relative permeability", ""),
-            ("electrical_conductivity", "Conductivity", "S/m"),
-            ("youngs_modulus", "Young's modulus", "Pa"),
-            ("poissons_ratio", "Poisson's ratio", ""),
-            ("density", "Density", "kg/m³"),
-        ]
+        children = [_section_title("Materials", "Define material values once, then assign them to regions.")]
+        if not self.model["materials"]:
+            return children + [Div("Add a material to assign it to a region.", ui_style="font-size:12px; color:var(--fg-muted);")]
+        valid_ids = {item["id"] for item in self.model["materials"]}
+        if self.selected_material_id not in valid_ids:
+            self.selected_material_id = self.model["materials"][0]["id"]
+        children.append(Div(
+            Div("Material", ui_style="font-size:10px; font-weight:700; color:var(--fg-muted);"),
+            Div("Assigned regions", ui_style="font-size:10px; font-weight:700; color:var(--fg-muted); text-align:right;"),
+            ui_style="display:grid; grid-template-columns:1fr 110px; gap:8px; padding:4px 7px;",
+        ))
         for material in self.model["materials"]:
-            card = [
-                _input("Material name", material["name"], lambda event, mid=material["id"]: self._set_material_name(mid, event.value)),
-            ]
-            for key, label, _unit in property_names:
-                card.append(_input(label, material.get("properties", {}).get(key, ""), lambda event, mid=material["id"], prop=key: self._set_material_property(mid, prop, event.value), suffix=_unit or None))
-            if material["id"] not in {"material-air", "material-copper"}:
-                card.append(_button("Remove material", "mdi-delete-outline", lambda *a, mid=material["id"]: self.remove_material(mid)))
-            children.append(Div(*card, ui_style="display:flex; flex-direction:column; gap:7px; padding:8px; border:1px solid var(--border); border-radius:6px;"))
-        children.append(_button("Add material", "mdi-plus", self.add_material, color="primary"))
+            assigned = sum(region.get("material_id") == material["id"] for region in self.model["geometry"]["regions"])
+            row = _button(
+                f"{material['name']}  ·  {assigned} assigned",
+                "mdi-cube-outline",
+                lambda *a, mid=material["id"]: self.select_material(mid),
+                color="primary" if material["id"] == self.selected_material_id else None,
+                style="width:100%; justify-content:flex-start; text-align:left;",
+                align="left",
+            )
+            children.append(row)
+        material = next(item for item in self.model["materials"] if item["id"] == self.selected_material_id)
+        properties = material.get("properties", {})
+        children.extend([
+            Div(ui_style="height:1px; background:var(--border); margin:5px 0;"),
+            _input("Material name", material["name"], lambda event, mid=material["id"]: self._set_material_name(mid, event.value)),
+            Div("ELECTROMAGNETIC", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:4px;"),
+            _input("Relative permeability", properties.get("relative_permeability", ""), lambda event, mid=material["id"]: self._set_material_property(mid, "relative_permeability", event.value)),
+            _input("Electrical conductivity", properties.get("electrical_conductivity", ""), lambda event, mid=material["id"]: self._set_material_property(mid, "electrical_conductivity", event.value), suffix="S/m"),
+            Div("MECHANICAL", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:4px;"),
+            _input("Young's modulus", properties.get("youngs_modulus", ""), lambda event, mid=material["id"]: self._set_material_property(mid, "youngs_modulus", event.value), suffix="Pa"),
+            _input("Poisson's ratio", properties.get("poissons_ratio", ""), lambda event, mid=material["id"]: self._set_material_property(mid, "poissons_ratio", event.value)),
+            _input("Density", properties.get("density", ""), lambda event, mid=material["id"]: self._set_material_property(mid, "density", event.value), suffix="kg/m³"),
+            _button("Add material", "mdi-plus", self.add_material),
+        ])
+        if material["id"] not in {"material-air", "material-copper"}:
+            children.append(_button("Remove material", "mdi-delete-outline", lambda *a, mid=material["id"]: self.remove_material(mid)))
         return children
 
     def _boundary_properties(self):
@@ -1191,46 +1425,64 @@ class SolveWorkspace(Div):
             ("mechanical_traction", "Vector traction"),
             ("mechanical_robin", "Robin support"),
         ]
-        for condition in self.model.get("boundary_conditions", []):
-            card = [
-                _input("Boundary name", condition["name"], lambda event, bid=condition["id"]: self._set_boundary_value(bid, "name", event.value)),
-                QSelect(
-                    ui_label="Condition type",
-                    ui_options=[{"label": label, "value": value} for value, label in kinds],
-                    ui_option_label="label",
-                    ui_option_value="value",
-                    ui_model_value=condition.get("type"),
-                    ui_emit_value=True,
-                    ui_map_options=True,
-                    ui_dense=True,
-                    ui_filled=True,
-                ),
-            ]
-            card[-1].on_update_model_value(lambda event, bid=condition["id"]: self._set_boundary_value(bid, "type", event.value))
+        conditions = self.model.get("boundary_conditions", [])
+        valid_ids = {item["id"] for item in conditions}
+        if self.selected_boundary_id not in valid_ids:
+            self.selected_boundary_id = conditions[0]["id"] if conditions else None
+        children.append(Div("Condition definitions · assigned edges", ui_style="font-size:10px; font-weight:700; color:var(--fg-muted); padding:3px 6px;"))
+        for condition in conditions:
+            assigned = sum(condition["id"] in _edge_condition_ids(edge) for edge in self.model["geometry"].get("edges", []))
+            children.append(_button(
+                f"{condition['name']}  ·  {assigned} edges",
+                "mdi-vector-link",
+                lambda *a, bid=condition["id"]: self.select_boundary(bid),
+                color="primary" if condition["id"] == self.selected_boundary_id else None,
+                style="width:100%; justify-content:flex-start; text-align:left;",
+                align="left",
+            ))
+        condition = next((item for item in conditions if item["id"] == self.selected_boundary_id), None)
+        if condition:
+            type_select = QSelect(
+                ui_label="Condition type",
+                ui_options=[{"label": label, "value": value} for value, label in kinds],
+                ui_option_label="label",
+                ui_option_value="value",
+                ui_model_value=condition.get("type"),
+                ui_emit_value=True,
+                ui_map_options=True,
+                ui_dense=True,
+                ui_filled=True,
+            )
+            type_select.on_update_model_value(lambda event, bid=condition["id"]: self._set_boundary_value(bid, "type", event.value))
+            children.extend([
+                Div(ui_style="height:1px; background:var(--border); margin:5px 0;"),
+                _input("Condition name", condition["name"], lambda event, bid=condition["id"]: self._set_boundary_value(bid, "name", event.value)),
+                type_select,
+            ])
             if condition.get("type") == "mechanical_prescribed":
-                card.extend([
+                children.extend([
                     _input("Radial displacement", condition.get("displacement_r", "0"), lambda event, bid=condition["id"]: self._set_boundary_value(bid, "displacement_r", event.value), suffix="m"),
                     _input("Axial displacement", condition.get("displacement_z", "0"), lambda event, bid=condition["id"]: self._set_boundary_value(bid, "displacement_z", event.value), suffix="m"),
                 ])
             elif condition.get("type") == "mechanical_traction":
-                card.extend([
+                children.extend([
                     _input("Radial traction", condition.get("traction_r", "0"), lambda event, bid=condition["id"]: self._set_boundary_value(bid, "traction_r", event.value), suffix="N/m²"),
                     _input("Axial traction", condition.get("traction_z", "0"), lambda event, bid=condition["id"]: self._set_boundary_value(bid, "traction_z", event.value), suffix="N/m²"),
                 ])
             elif condition.get("type") == "mechanical_robin":
-                card.extend([
+                children.extend([
                     _input("Normal stiffness", condition.get("stiffness_normal", "0"), lambda event, bid=condition["id"]: self._set_boundary_value(bid, "stiffness_normal", event.value), suffix="N/m³"),
                     _input("Tangential stiffness", condition.get("stiffness_tangential", "0"), lambda event, bid=condition["id"]: self._set_boundary_value(bid, "stiffness_tangential", event.value), suffix="N/m³"),
                 ])
-            if condition.get("id") not in {"boundary-axis", "boundary-outer"}:
-                card.append(_button("Remove condition", "mdi-delete-outline", lambda *a, bid=condition["id"]: self.remove_boundary(bid)))
-            children.append(Div(*card, ui_style="display:flex; flex-direction:column; gap:7px; padding:8px; border:1px solid var(--border); border-radius:6px;"))
-        children.append(_button("Add boundary condition", "mdi-plus", self.add_boundary, color="primary"))
+            children.append(Div("Highlighted orange edges use this condition. Select edges in Geometry to assign or change their conditions.", ui_style="font-size:11px; line-height:1.45; color:var(--fg-muted);"))
+            if condition["id"] not in {"boundary-axis", "boundary-outer"}:
+                children.append(_button("Remove condition", "mdi-delete-outline", lambda *a, bid=condition["id"]: self.remove_boundary(bid)))
+        children.append(_button("Add boundary condition", "mdi-plus", self.add_boundary))
         return children
 
     def _physics_properties(self):
         physics = self.model["physics"]
-        children = [_section_title("Physics", "Choose the equations for this analysis.")]
+        children = [_section_title("Physics & coupling", "Choose which equations the study will solve.")]
         options = [
             ("dc_magnetic", "Static magnetic field", "DC magnetic solution"),
             ("harmonic_electromagnetic", "Time-harmonic EM", "Complex-valued EM field"),
@@ -1241,15 +1493,55 @@ class SolveWorkspace(Div):
             toggle = QCheckbox(ui_model_value=bool(physics[key].get("enabled")), ui_label=label, ui_dense=True)
             toggle.on_update_model_value(lambda event, selected=key: self._set_physics(selected, "enabled", bool(event.value)))
             children.append(Div(toggle, Div(hint, ui_style="font-size:11px; color:var(--fg-muted); margin-left:30px; margin-top:-5px;"), ui_style="padding:7px 0; border-bottom:1px solid var(--border);"))
-        children.append(_input("Default frequency", physics["harmonic_electromagnetic"].get("frequency_hz", "500"), lambda event: self._set_physics("harmonic_electromagnetic", "frequency_hz", event.value), suffix="Hz"))
-        children.append(Div("The GUI will pass these named, unit-aware inputs to the axisymmetric solver adapter.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"))
+        study_frequencies = self.studies.get("studies", [{}])[0].get("frequency_hz", []) if self.studies.get("studies") else []
+        children.append(Div("Study frequencies", ui_style="font-size:11px; font-weight:600; padding-top:6px;"))
+        children.append(Div(", ".join(str(value) for value in study_frequencies) + (" Hz" if study_frequencies else "No frequency points defined"), ui_style="font-size:12px; color:var(--fg-muted);"))
+        regions = self.model["geometry"]["regions"]
+        selected_region = next((item for item in regions if item["id"] == self.selected_region_id), None)
+        if regions:
+            region_select = QSelect(
+                ui_label="Region sources apply to",
+                ui_options=[{"label": item["name"], "value": item["id"]} for item in regions],
+                ui_option_label="label",
+                ui_option_value="value",
+                ui_model_value=selected_region["id"] if selected_region else regions[0]["id"],
+                ui_emit_value=True,
+                ui_map_options=True,
+                ui_dense=True,
+                ui_filled=True,
+            )
+            region_select.on_update_model_value(lambda event: self._select_physics_region(event.value))
+            source_region = selected_region or regions[0]
+            sources = source_region.setdefault("sources", {})
+            body_force = sources.setdefault("mechanical_body_force", {"r": "0", "z": "0"})
+            children.extend([
+                Div("REGION SOURCES", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:10px;"),
+                region_select,
+                _input("DC current density", sources.get("dc_current_density", "0"), lambda event, rid=source_region["id"]: self._set_region_source(rid, "dc_current_density", event.value), suffix="A/m²"),
+                _input("AC current density (real)", sources.get("ac_current_density_real", "0"), lambda event, rid=source_region["id"]: self._set_region_source(rid, "ac_current_density_real", event.value), suffix="A/m²"),
+                _input("AC current density (imaginary)", sources.get("ac_current_density_imaginary", "0"), lambda event, rid=source_region["id"]: self._set_region_source(rid, "ac_current_density_imaginary", event.value), suffix="A/m²"),
+                Div("MECHANICAL BODY FORCE", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:4px;"),
+                _input("Radial body force", body_force.get("r", "0"), lambda event, rid=source_region["id"]: self._set_region_body_force(rid, "r", event.value), suffix="N/m³"),
+                _input("Axial body force", body_force.get("z", "0"), lambda event, rid=source_region["id"]: self._set_region_body_force(rid, "z", event.value), suffix="N/m³"),
+            ])
+        else:
+            children.append(Div("Create a geometry region before setting regional sources.", ui_style="font-size:11px; color:var(--fg-muted);"))
+        children.append(Div("Coupling requires DC magnetic, time-harmonic EM and mechanics to be enabled.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"))
         return children
 
     def _mesh_properties(self):
         mesh = self.model["mesh"]
-        solver = self.model["solver"]
         order = QSelect(ui_label="Polynomial order", ui_options=[1, 2, 3, 4, 5, 6], ui_model_value=mesh["polynomial_order"], ui_dense=True, ui_filled=True)
         order.on_update_model_value(lambda event: self._set_mesh("polynomial_order", int(event.value)))
+        return [
+            _section_title("Mesh", "Control mesh density and approximation order."),
+            _input("Target element size", mesh["element_size"], lambda event: self._set_mesh("element_size", event.value), suffix="m"),
+            order,
+            Div("The sketch must contain valid, non-overlapping regions before mesh generation.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+        ]
+
+    def _solver_properties(self):
+        solver = self.model["solver"]
         anderson = QCheckbox(ui_label="Use Anderson acceleration", ui_model_value=solver["anderson"], ui_dense=True)
         anderson.on_update_model_value(lambda event: self._set_solver("anderson", bool(event.value)))
         depth = QInput(ui_label="Anderson depth", ui_type="number", ui_model_value=solver["anderson_depth"], ui_dense=True, ui_filled=True)
@@ -1261,9 +1553,7 @@ class SolveWorkspace(Div):
         iterations = QInput(ui_label="Maximum iterations", ui_type="number", ui_model_value=solver["maximum_iterations"], ui_dense=True, ui_filled=True)
         iterations.on_update_model_value(lambda event: self._set_solver("maximum_iterations", int(event.value)))
         return [
-            _section_title("Mesh and solver", "Numerical settings saved separately from the geometry model."),
-            _input("Target element size", mesh["element_size"], lambda event: self._set_mesh("element_size", event.value), suffix="m"),
-            order,
+            _section_title("Solver settings", "Controls for nonlinear and fixed-point iterations."),
             Div("Nonlinear / fixed-point solver", ui_style="font-weight:600; font-size:12px; padding-top:6px;"),
             anderson,
             depth,
@@ -1291,29 +1581,29 @@ class SolveWorkspace(Div):
 
     def _canvas_projection(self):
         width, height = 900, 640
-        plot = (54, 34, 820, 560)
+        plot = (72, 34, 854, 566)
         regions = self.model["geometry"]["regions"]
         points = [point for region in regions for point in region["vertices"]]
         if points:
-            rmin = min(point[0] for point in points)
             rmax = max(point[0] for point in points)
             zmin = min(point[1] for point in points)
             zmax = max(point[1] for point in points)
-            dr = max(rmax - rmin, 0.01)
+            dr = max(rmax, 0.01)
             dz = max(zmax - zmin, 0.01)
-            pad_r, pad_z = dr * 0.12, dz * 0.12
-            rmin -= pad_r
+            pad_r, pad_z = dr * 0.08, dz * 0.08
+            # Radius is non-negative; keep the rotation axis visible even
+            # when the first region begins some distance away from it.
+            rmin = 0.0
             rmax += pad_r
             zmin -= pad_z
             zmax += pad_z
         else:
-            rmin, rmax, zmin, zmax = -0.002, 0.022, -0.002, 0.022
+            rmin, rmax, zmin, zmax = 0.0, 0.024, -0.002, 0.022
         target_ratio = (plot[2] - plot[0]) / (plot[3] - plot[1])
         ratio = (rmax - rmin) / max(zmax - zmin, 1e-12)
         if ratio < target_ratio:
             extra = ((zmax - zmin) * target_ratio - (rmax - rmin)) / 2
-            rmin -= extra
-            rmax += extra
+            rmax += extra * 2
         else:
             extra = ((rmax - rmin) / target_ratio - (zmax - zmin)) / 2
             zmin -= extra
@@ -1333,24 +1623,44 @@ class SolveWorkspace(Div):
 
         return xy, rz
 
+    @staticmethod
+    def _coordinate_ticks(minimum, maximum, target_count=10):
+        span = maximum - minimum
+        if not math.isfinite(span) or span <= 0:
+            return []
+        raw_step = span / max(target_count, 1)
+        power = 10 ** math.floor(math.log10(raw_step))
+        fraction = raw_step / power
+        step = (1 if fraction <= 1 else 2 if fraction <= 2 else 5 if fraction <= 5 else 10) * power
+        first = math.ceil((minimum - step * 1e-10) / step) * step
+        count = min(200, max(0, int(math.floor((maximum - first) / step)) + 1))
+        return [first + index * step for index in range(count)]
+
     def render_canvas(self):
         width, height = 900, 640
-        plot = (54, 34, 820, 560)
-        xy, _ = self._canvas_projection()
+        plot = (72, 34, 854, 566)
+        xy, unproject = self._canvas_projection()
         regions = self.model["geometry"]["regions"]
+        lower_left = unproject((plot[0], plot[3]))
+        upper_right = unproject((plot[2], plot[1]))
+        radial_ticks = self._coordinate_ticks(max(0.0, lower_left[0]), max(0.0, upper_right[0]))
+        axial_ticks = self._coordinate_ticks(lower_left[1], upper_right[1])
         grid_children = []
         scene_children = []
-        # Light grid and engineering axes.
-        for i in range(11):
-            x = plot[0] + i * (plot[2] - plot[0]) / 10
-            y = plot[1] + i * (plot[3] - plot[1]) / 10
+        for value in radial_ticks:
+            x = xy((value, 0))[0]
             grid_children.append(_svg("line", x1=x, y1=plot[1], x2=x, y2=plot[3], stroke="var(--border, #d9dfe7)", stroke_width="1"))
+            grid_children.append(_svg("text", x=x, y=plot[3] + 18, fill="var(--fg-muted, #697586)", font_size="10", text_anchor="middle", children=f"{value:.5g}"))
+        for value in axial_ticks:
+            y = xy((0, value))[1]
             grid_children.append(_svg("line", x1=plot[0], y1=y, x2=plot[2], y2=y, stroke="var(--border, #d9dfe7)", stroke_width="1"))
-        xaxis = xy((0, 0))[0]
-        grid_children.append(_svg("line", x1=xaxis, y1=plot[1], x2=xaxis, y2=plot[3], stroke="#557187", stroke_width="1.6", stroke_dasharray="5 4"))
-        grid_children.append(_svg("text", x=xaxis + 5, y=plot[1] + 16, fill="#557187", font_size="13", children="r = 0"))
-        grid_children.append(_svg("text", x=plot[2] - 12, y=height - 12, fill="var(--fg-muted, #697586)", font_size="13", children="r  [m]"))
-        grid_children.append(_svg("text", x=12, y=plot[1] + 4, fill="var(--fg-muted, #697586)", font_size="13", children="z  [m]"))
+            grid_children.append(_svg("text", x=plot[0] - 8, y=y + 4, fill="var(--fg-muted, #697586)", font_size="10", text_anchor="end", children=f"{value:.5g}"))
+        if lower_left[0] <= 0 <= upper_right[0]:
+            xaxis = xy((0, 0))[0]
+            grid_children.append(_svg("line", x1=xaxis, y1=plot[1], x2=xaxis, y2=plot[3], stroke="#557187", stroke_width="2", stroke_dasharray="6 4"))
+            grid_children.append(_svg("text", x=xaxis + 7, y=plot[1] + 15, fill="#405e75", font_size="12", font_weight="600", children="Axis of rotation  ·  r = 0"))
+        grid_children.append(_svg("text", x=plot[2], y=height - 8, fill="var(--fg-muted, #697586)", font_size="12", text_anchor="end", children="r  [m]"))
+        grid_children.append(_svg("text", x=12, y=plot[1] - 8, fill="var(--fg-muted, #697586)", font_size="12", children="z  [m]"))
 
         material_index = {item["id"]: index for index, item in enumerate(self.model["materials"])}
         for region in regions:
@@ -1412,8 +1722,8 @@ class SolveWorkspace(Div):
             scene_children.extend([visible, hit])
 
         if not regions:
-            scene_children.append(_svg("text", x=width / 2, y=height / 2 - 8, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="16", children="Create a rectangle or circle region to begin"))
-            scene_children.append(_svg("text", x=width / 2, y=height / 2 + 18, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="12", children="r is radial distance from the symmetry axis; z is axial height"))
+            scene_children.append(_svg("text", x=width / 2, y=height / 2 - 8, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="16", children="Choose Rectangle or Circle in the toolbar to begin"))
+            scene_children.append(_svg("text", x=width / 2, y=height / 2 + 18, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="12", children="Click a region or edge to edit it; dimensions are entered in mm"))
         self._canvas_grid.ui_children = grid_children
         self._canvas_scene.ui_children = scene_children
 
@@ -1528,10 +1838,12 @@ class SolveWorkspace(Div):
         index = len(self.model["parameters"]) + 1
         self.model["parameters"].append({"id": new_id("parameter"), "name": f"length_{index}", "expression": "0.01", "unit": "m"})
         self._message("Added a parameter; use arithmetic and supported math functions in its expression.")
+        self._refresh_model_tree()
         self._render_inspector()
 
     def remove_parameter(self, parameter_id):
         self.model["parameters"] = [item for item in self.model["parameters"] if item["id"] != parameter_id]
+        self._refresh_model_tree()
         self._render_inspector()
 
     def _set_parameter(self, parameter_id, key, value):
@@ -1564,10 +1876,14 @@ class SolveWorkspace(Div):
                     ]
             self._recompute_parent_links()
             self._rebuild_edges()
+            self._refresh_model_tree()
+            self._render_inspector()
+            self.render_canvas()
             self._message("Updated geometry from parameter expressions.")
         except (ValueError, TypeError, OverflowError) as error:
             self.model["geometry"] = old_geometry
             self._rebuild_edges()
+            self._render_inspector()
             self._message(f"Geometry was not updated: {error}", error=True)
 
     def add_material(self, *args):
@@ -1575,6 +1891,7 @@ class SolveWorkspace(Div):
         material = copy.deepcopy(self.model["materials"][0])
         material.update({"id": new_id("material"), "name": f"Material {index}"})
         self.model["materials"].append(material)
+        self.selected_material_id = material["id"]
         self._message(f"Added {material['name']}.")
         self._refresh_model_tree()
         self._render_inspector()
@@ -1584,6 +1901,8 @@ class SolveWorkspace(Div):
             self._message("This material is assigned to a region. Reassign the region before deleting it.", error=True)
             return
         self.model["materials"] = [item for item in self.model["materials"] if item["id"] != material_id]
+        if self.selected_material_id == material_id:
+            self.selected_material_id = self.model["materials"][0]["id"] if self.model["materials"] else None
         self._refresh_model_tree()
         self._render_inspector()
 
@@ -1600,25 +1919,36 @@ class SolveWorkspace(Div):
 
     def add_boundary(self, *args):
         index = len(self.model.get("boundary_conditions", [])) + 1
-        self.model.setdefault("boundary_conditions", []).append({"id": new_id("boundary"), "name": f"Boundary {index}", "type": "natural"})
+        condition = {"id": new_id("boundary"), "name": f"Boundary {index}", "type": "natural"}
+        self.model.setdefault("boundary_conditions", []).append(condition)
+        self.selected_boundary_id = condition["id"]
+        self._selected_condition_id = condition["id"]
+        self.active_section = "boundaries"
         self._refresh_model_tree()
         self._render_inspector()
+        self._sync_canvas_selection()
 
     def remove_boundary(self, boundary_id):
         if any(boundary_id in _edge_condition_ids(edge) for edge in self.model["geometry"].get("edges", [])):
             self._message("This condition is assigned to an edge. Reassign the edge before deleting it.", error=True)
             return
         self.model["boundary_conditions"] = [item for item in self.model.get("boundary_conditions", []) if item["id"] != boundary_id]
+        if self.selected_boundary_id == boundary_id:
+            self.selected_boundary_id = self.model["boundary_conditions"][0]["id"] if self.model["boundary_conditions"] else None
+        if self._selected_condition_id == boundary_id:
+            self._selected_condition_id = None
         self._refresh_model_tree()
         self._render_inspector()
+        self._sync_canvas_selection()
 
     def _set_boundary_value(self, boundary_id, key, value):
         condition = next((item for item in self.model.get("boundary_conditions", []) if item["id"] == boundary_id), None)
         if condition:
             condition[key] = str(value).strip() if key != "type" else value
+            self._refresh_model_tree()
             if key == "type":
                 self._render_inspector()
-                self.render_canvas()
+                self._sync_canvas_selection()
 
     def _set_region_source(self, region_id, key, value):
         region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
@@ -1692,19 +2022,33 @@ class SolveWorkspace(Div):
             for edge in self.model["geometry"].get("edges", [])
         ):
             errors.append("Assign a fixed or prescribed mechanical boundary condition to at least one edge.")
+        parameter_map = {
+            item.get("name"): item
+            for item in self.model.get("parameters", [])
+            if isinstance(item, dict) and item.get("name")
+        }
+        errors.extend(validate_studies(self.studies, parameter_map))
+        return errors
+
+    def mesh_validation_errors(self):
+        errors = validate_model(self.model)
+        if not self.model["geometry"].get("regions"):
+            errors.append("Create at least one material region before generating a mesh.")
         return errors
 
     def validate_action(self, *args):
         errors = self.validation_errors()
+        self._show_validation_issues(errors)
         if errors:
-            self._message("Model needs attention: " + " ".join(errors), error=True)
+            self._message(f"Setup check found {len(errors)} issue{'s' if len(errors) != 1 else ''}. Select a message for guidance.", error=True)
         else:
-            self._message("Model is ready to mesh and solve.")
+            self._message("Setup checks passed. Mesh and solver results are reported separately.")
 
     def run_mesh_action(self, *args):
-        errors = self.validation_errors()
+        errors = self.mesh_validation_errors()
         if errors:
-            self._message("Cannot generate mesh yet: " + " ".join(errors), error=True)
+            self._show_validation_issues(errors)
+            self._message(f"Mesh setup found {len(errors)} issue{'s' if len(errors) != 1 else ''}.", error=True)
             return
         if self.on_mesh:
             self._mesh_button.ui_loading = True
@@ -1715,7 +2059,8 @@ class SolveWorkspace(Div):
     def run_study_action(self, *args):
         errors = self.validation_errors()
         if errors:
-            self._message("Cannot run the study yet: " + " ".join(errors), error=True)
+            self._show_validation_issues(errors)
+            self._message(f"Study setup found {len(errors)} issue{'s' if len(errors) != 1 else ''}.", error=True)
             return
         if self.on_run:
             self._run_button.ui_loading = True
