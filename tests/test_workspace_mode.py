@@ -26,32 +26,28 @@ def test_workspace_mode_toggle_updates_selection_and_notifies(monkeypatch):
     assert "background:var(--surface)" in toggle._buttons["post_process"].ui_style
 
 
-def test_workspace_mode_switch_shows_only_the_selected_workspace():
-    components = [SimpleNamespace(ui_hidden=False) for _ in range(7)]
-    (
-        post_process, solve, brand, files, actions, monitor, separator
-    ) = components
+def test_workspace_mode_switch_changes_workspace_and_keeps_header_visible():
+    post_process = SimpleNamespace(ui_hidden=False)
+    solve = SimpleNamespace(ui_hidden=True)
+    header_components = [SimpleNamespace(ui_hidden=False) for _ in range(6)]
     app = SimpleNamespace(
         _post_process_workspace=post_process,
         _solve_workspace=solve,
-        _brand=brand,
-        _file_group=files,
-        _view_group=actions,
-        system_monitor=monitor,
-        _system_monitor_separator=separator,
+        # These stand in for the fixed app bar and the mode row beneath it.
+        _header_components=header_components,
     )
 
     NGSolveGui._set_workspace_mode(app, "solve")
     assert app._workspace_mode == "solve"
     assert post_process.ui_hidden
     assert not solve.ui_hidden
-    assert all(item.ui_hidden for item in (brand, files, actions, monitor, separator))
+    assert all(not item.ui_hidden for item in header_components)
 
     NGSolveGui._set_workspace_mode(app, "post_process")
     assert app._workspace_mode == "post_process"
     assert not post_process.ui_hidden
     assert solve.ui_hidden
-    assert all(not item.ui_hidden for item in (brand, files, actions, monitor, separator))
+    assert all(not item.ui_hidden for item in header_components)
 
 
 def test_workspace_mode_rejects_unknown_mode():

@@ -57,7 +57,7 @@ class StackHost(Div):
 
 
 class WorkspaceModeToggle(Div):
-    """Prominent top-bar switch between the Solve and Post Process workspaces."""
+    """Prominent switch between the Solve and Post Process workspaces."""
 
     _MODES = ("solve", "post_process")
 
@@ -345,17 +345,23 @@ class NGSolveGui(App):
         self._last_redraw_time = 0.0
         self._redraw_interval = max(0, int(self.usersettings.get("redraw_interval_ms", 50))) / 1000.0
 
-        self._brand = ngs_logo
-        self._file_group = file_group
-        self._view_group = view_group
-        self._system_monitor_separator = (
-            Div(ui_class=cb.tb_sep) if self.system_monitor is not None else None
+        # Keep this app bar's established layout stable: brand and file actions
+        # stay at the left, system status and settings/quit stay at the right.
+        bar = QBar(
+            ngs_logo,
+            file_group,
+            QSpace(),
+            *([self.system_monitor, Div(ui_class=cb.tb_sep)] if self.system_monitor is not None else []),
+            view_group,
+            ui_class=cb.app_bar,
         )
-        bar_children = [ngs_logo, QSpace(), self._workspace_mode_toggle, QSpace(), file_group]
-        if self.system_monitor is not None:
-            bar_children.extend([self.system_monitor, self._system_monitor_separator])
-        bar_children.append(view_group)
-        bar = QBar(*bar_children, ui_class=cb.app_bar)
+        workspace_mode_bar = Div(
+            self._workspace_mode_toggle,
+            ui_style=(
+                "display:flex; flex:0 0 52px; height:52px; width:100%; "
+                "align-items:center; justify-content:center; padding:8px 12px;"
+            ),
+        )
 
         # Three-column layout using flex
         self.navigator = Navigator(self.app_data, self._click_tab, self._load_file)
@@ -434,7 +440,8 @@ class NGSolveGui(App):
         ))
 
         super().__init__(
-            bar, self._post_process_workspace, self._solve_workspace, self._timer_dialog,
+            bar, workspace_mode_bar, self._post_process_workspace,
+            self._solve_workspace, self._timer_dialog,
             self.kb.indicator, self.kb.help_overlay,
             ui_class=str(cb.app_root),
         )
@@ -483,18 +490,6 @@ class NGSolveGui(App):
         self._workspace_mode = mode
         self._post_process_workspace.ui_hidden = solving
         self._solve_workspace.ui_hidden = not solving
-
-        # In Solve mode, leave only the mode switch in the top bar so the
-        # workspace below it is genuinely clear and the user can switch back.
-        for component in (
-            self._brand,
-            self._file_group,
-            self._view_group,
-            self.system_monitor,
-            self._system_monitor_separator,
-        ):
-            if component is not None:
-                component.ui_hidden = solving
 
     def _load_file(self):
         from ngapp.utils import EnvironmentType, get_environment
