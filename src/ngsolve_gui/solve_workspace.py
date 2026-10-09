@@ -71,7 +71,13 @@ def _svg(tag, **props):
     component = Component(tag)
     component._props.update({key.replace("_", "-"): value for key, value in props.items() if value is not None})
     if children is not None:
-        component.ui_slots["default"] = [children]
+        if tag == "text":
+            # Generic ngapp slots wrap strings in HTML divs, which are invalid
+            # children of SVG <text>. Vue maps textContent to the native DOM
+            # property, keeping the text inside the SVG namespace.
+            component._props["textContent"] = str(children)
+        else:
+            component.ui_slots["default"] = [children]
     return component
 
 

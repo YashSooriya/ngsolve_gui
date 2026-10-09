@@ -226,6 +226,9 @@ def test_blank_axisymmetric_view_starts_at_r_zero_with_world_space_ticks(standal
     assert ticks[0] == pytest.approx(0.0)
     steps = {round(b - a, 10) for a, b in zip(ticks, ticks[1:])}
     assert len(steps) == 1
+    svg_text = [item for item in workspace._canvas_grid.ui_children if item._component_name == "text"]
+    assert any(item._props.get("textContent") == "Axis of rotation  ·  r = 0" for item in svg_text)
+    assert all(not item.ui_children for item in svg_text)
 
 
 def test_axisymmetric_view_keeps_axis_visible_for_regions_away_from_axis(standalone_components):
