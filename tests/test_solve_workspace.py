@@ -256,11 +256,15 @@ def test_model_and_properties_panels_can_be_collapsed_and_restored(standalone_co
     workspace._toggle_properties_panel()
     assert workspace._tree_splitter.ui_model_value == 0
     assert workspace._properties_splitter.ui_model_value == 0
+    assert workspace._tree_splitter.ui_limits == [0, 420]
+    assert workspace._properties_splitter.ui_limits == [0, 500]
 
     workspace._toggle_tree_panel()
     workspace._toggle_properties_panel()
     assert workspace._tree_splitter.ui_model_value == 240
     assert workspace._properties_splitter.ui_model_value == 340
+    assert workspace._tree_splitter.ui_limits == [180, 420]
+    assert workspace._properties_splitter.ui_limits == [240, 500]
 
 
 def test_setup_validation_checks_actual_study_frequency_list(standalone_components):

@@ -377,8 +377,8 @@ class SolveWorkspace(Div):
             self._tree_splitter.ui_limits = [0, 420]
             self._tree_splitter.ui_model_value = 0
         else:
-            self._tree_splitter.ui_limits = [180, 420]
             self._tree_splitter.ui_model_value = self._tree_panel_width
+            self._tree_splitter.ui_limits = [180, 420]
 
     def _toggle_properties_panel(self, *_):
         if self._properties_splitter.ui_model_value > 30:
@@ -386,8 +386,8 @@ class SolveWorkspace(Div):
             self._properties_splitter.ui_limits = [0, 500]
             self._properties_splitter.ui_model_value = 0
         else:
-            self._properties_splitter.ui_limits = [240, 500]
             self._properties_splitter.ui_model_value = self._properties_panel_width
+            self._properties_splitter.ui_limits = [240, 500]
 
     def set_sketch_tool(self, tool, *, announce=True):
         if tool not in {"select", "rectangle", "circle"}:
