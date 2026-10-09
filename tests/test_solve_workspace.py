@@ -157,6 +157,24 @@ def test_canvas_mouse_gesture_creates_rectangle_and_maps_screen_coordinates(stan
     assert workspace.sketch_tool == "select"
 
 
+def test_canvas_drag_motion_does_not_rebuild_the_svg_until_mouseup(standalone_components):
+    workspace = SolveWorkspace()
+    project, _ = workspace._canvas_projection()
+    start, end = project((0.002, 0.002)), project((0.010, 0.010))
+    points = iter((start, end, end))
+    workspace._canvas_event_point = lambda event, refresh_transform=False: next(points)
+    workspace.set_sketch_tool("select", announce=False)
+    renders = []
+    workspace.render_canvas = lambda: renders.append("render")
+
+    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0}))
+    workspace._on_canvas_mouse_move(SimpleNamespace(value={}))
+    assert renders == []
+
+    workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
+    assert renders == ["render"]
+
+
 def test_canvas_event_reads_pointer_cache_when_ngapp_omits_coordinates(standalone_components):
     workspace = SolveWorkspace()
     workspace._screen_to_svg = (1.25, 0.0, 0.0, 1.25, 100.0, 200.0)

@@ -284,6 +284,11 @@ class SolveWorkspace(Div):
         if tool not in {"select", "rectangle", "circle"}:
             return
         self.sketch_tool = tool
+        try:
+            self.js.eval(f"window.__ngsolveSketchTool = '{tool}'")
+        except Exception:
+            # Standalone tests and non-browser frontends have no JS runtime.
+            pass
         self._canvas.ui_style = (
             "display:block; width:100%; height:100%; min-height:0; "
             "background:var(--canvas-bg, #f4f6f8); cursor:"
@@ -327,9 +332,11 @@ class SolveWorkspace(Div):
         """
         script = r"""
 (() => {
+  window.__ngsolveSketchTool = '__SKETCH_TOOL__';
   if (window.__ngsolveSketchPointerCaptureInstalled) return;
   window.__ngsolveSketchPointerCaptureInstalled = true;
   let active = false;
+  let dragStart = null;
   const pointerEvents = window.__ngsolveSketchPointerEvents = [];
   const forwardedEvents = new WeakSet();
   const selector = 'svg.solve-sketch-canvas';
@@ -343,6 +350,63 @@ class SolveWorkspace(Div):
     });
     if (pointerEvents.length > 256) pointerEvents.splice(0, pointerEvents.length - 256);
   };
+  const svgPoint = (svg, event) => {
+    const point = svg.createSVGPoint();
+    point.x = event.clientX;
+    point.y = event.clientY;
+    const matrix = svg.getScreenCTM();
+    if (!matrix) return null;
+    const mapped = point.matrixTransform(matrix.inverse());
+    return [mapped.x, mapped.y];
+  };
+  const clearPreview = (svg) => {
+    if (!svg) return;
+    for (const id of ['solve-sketch-drag-rect', 'solve-sketch-drag-circle']) {
+      const shape = svg.querySelector('#' + id);
+      if (shape) shape.setAttribute('display', 'none');
+    }
+    dragStart = null;
+  };
+  const updatePreview = (svg, point) => {
+    if (!dragStart || !point) return;
+    const dx = point[0] - dragStart[0];
+    const dy = point[1] - dragStart[1];
+    const tool = window.__ngsolveSketchTool || 'select';
+    const isSelection = tool === 'select';
+    const rect = svg.querySelector('#solve-sketch-drag-rect');
+    const circle = svg.querySelector('#solve-sketch-drag-circle');
+    if (Math.hypot(dx, dy) < 4) {
+      if (rect) rect.setAttribute('display', 'none');
+      if (circle) circle.setAttribute('display', 'none');
+      return;
+    }
+    if (tool === 'circle') {
+      if (rect) rect.setAttribute('display', 'none');
+      if (!circle) return;
+      circle.setAttribute('display', 'inline');
+      circle.setAttribute('cx', dragStart[0]);
+      circle.setAttribute('cy', dragStart[1]);
+      circle.setAttribute('r', Math.hypot(dx, dy));
+      return;
+    }
+    if (circle) circle.setAttribute('display', 'none');
+    if (!rect) return;
+    const windowSelection = point[0] >= dragStart[0];
+    const fill = isSelection
+      ? (windowSelection ? '#2385bd22' : '#dd8a3222')
+      : '#2385bd20';
+    const stroke = isSelection
+      ? (windowSelection ? '#2385bd' : '#c66f16')
+      : '#0877b9';
+    rect.setAttribute('display', 'inline');
+    rect.setAttribute('x', Math.min(dragStart[0], point[0]));
+    rect.setAttribute('y', Math.min(dragStart[1], point[1]));
+    rect.setAttribute('width', Math.abs(dx));
+    rect.setAttribute('height', Math.abs(dy));
+    rect.setAttribute('fill', fill);
+    rect.setAttribute('stroke', stroke);
+    rect.setAttribute('stroke-width', isSelection ? '1.5' : '2');
+  };
   const capture = (event) => {
     if (forwardedEvents.has(event)) return;
     const svg = document.querySelector(selector);
@@ -352,13 +416,19 @@ class SolveWorkspace(Div):
     if (event.type === 'mousedown') {
       if (!targetIsCanvas || event.button !== 0) return;
       active = true;
+      clearPreview(svg);
+      dragStart = svgPoint(svg, event);
     } else if (!active) {
       return;
     }
     remember(event);
+    if (event.type === 'mousemove') {
+      updatePreview(svg, svgPoint(svg, event));
+    }
     if (event.type === 'mouseup') {
       const shouldForward = active && !targetIsCanvas;
       active = false;
+      clearPreview(svg);
       if (shouldForward) {
         const forwarded = new MouseEvent('mouseup', {
           bubbles: true,
@@ -380,7 +450,7 @@ class SolveWorkspace(Div):
 })()
 """
         try:
-            self.js.eval(script)
+            self.js.eval(script.replace("__SKETCH_TOOL__", self.sketch_tool))
         except Exception:
             # Tests and non-browser frontends may not expose a JS runtime.
             return
@@ -461,9 +531,8 @@ class SolveWorkspace(Div):
         self._canvas_drag["current"] = point
         start = self._canvas_drag["start"]
         moved = math.hypot(point[0] - start[0], point[1] - start[1]) >= 4.0
-        if moved != self._canvas_drag["moved"] or moved:
+        if moved != self._canvas_drag["moved"]:
             self._canvas_drag["moved"] = moved
-            self.render_canvas()
 
     def _on_canvas_mouse_up(self, event):
         drag = self._canvas_drag
@@ -1290,26 +1359,20 @@ class SolveWorkspace(Div):
         if not regions:
             children.append(_svg("text", x=width / 2, y=height / 2 - 8, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="16", children="Create a rectangle or circle region to begin"))
             children.append(_svg("text", x=width / 2, y=height / 2 + 18, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="12", children="r is radial distance from the symmetry axis; z is axial height"))
-        drag = self._canvas_drag
-        if drag and drag.get("moved"):
-            start, end = drag["start"], drag["current"]
-            if drag["tool"] == "select":
-                left, right = sorted((start[0], end[0]))
-                top, bottom = sorted((start[1], end[1]))
-                window = end[0] >= start[0]
-                children.append(_svg(
-                    "rect", x=left, y=top, width=right-left, height=bottom-top,
-                    fill="#2385bd22" if window else "#dd8a3222",
-                    stroke="#2385bd" if window else "#c66f16",
-                    stroke_width="1.5", stroke_dasharray="6 4",
-                    style="pointer-events:none;",
-                ))
-            elif drag["tool"] == "rectangle":
-                left, right = sorted((start[0], end[0]))
-                top, bottom = sorted((start[1], end[1]))
-                children.append(_svg("rect", x=left, y=top, width=right-left, height=bottom-top, fill="#2385bd20", stroke="#0877b9", stroke_width="2", stroke_dasharray="6 4", style="pointer-events:none;"))
-            else:
-                children.append(_svg("circle", cx=start[0], cy=start[1], r=math.hypot(end[0]-start[0], end[1]-start[1]), fill="#2385bd20", stroke="#0877b9", stroke_width="2", stroke_dasharray="6 4", style="pointer-events:none;"))
+        children.extend([
+            _svg(
+                "rect", id="solve-sketch-drag-rect", x=0, y=0, width=0, height=0,
+                display="none", fill="#2385bd20", stroke="#0877b9",
+                stroke_width="2", stroke_dasharray="6 4",
+                style="pointer-events:none;",
+            ),
+            _svg(
+                "circle", id="solve-sketch-drag-circle", cx=0, cy=0, r=0,
+                display="none", fill="#2385bd20", stroke="#0877b9",
+                stroke_width="2", stroke_dasharray="6 4",
+                style="pointer-events:none;",
+            ),
+        ])
         self._canvas.ui_children = children
 
     def _set_region_value(self, region_id, key, value):
