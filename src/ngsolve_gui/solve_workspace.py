@@ -257,7 +257,7 @@ class SolveWorkspace(Div):
             # ngapp's powered-by link is positioned over the root's lower
             # right corner, so leave it room rather than drawing controls
             # underneath it.
-            ui_style="display:flex; align-items:center; gap:8px; flex:0 0 34px; min-height:34px; padding:0 205px 0 10px; border-top:1px solid var(--border); background:var(--surface);",
+            ui_style="display:flex; align-items:center; gap:8px; flex:0 0 34px; min-height:34px; padding:0 225px 0 10px; border-top:1px solid var(--border); background:var(--surface);",
         )
         self._bottom_count = bottom.ui_slots["default"][2]
         self._bottom_count.ui_style += " margin-left:12px;"
