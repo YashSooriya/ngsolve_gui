@@ -249,6 +249,20 @@ def test_added_model_parameter_is_listed_in_tree(standalone_components):
     assert any(child.ui_label == "length_1" for child in parameter_list.ui_children[1:])
 
 
+def test_model_and_properties_panels_can_be_collapsed_and_restored(standalone_components):
+    workspace = SolveWorkspace()
+
+    workspace._toggle_tree_panel()
+    workspace._toggle_properties_panel()
+    assert workspace._tree_splitter.ui_model_value == 0
+    assert workspace._properties_splitter.ui_model_value == 0
+
+    workspace._toggle_tree_panel()
+    workspace._toggle_properties_panel()
+    assert workspace._tree_splitter.ui_model_value == 240
+    assert workspace._properties_splitter.ui_model_value == 340
+
+
 def test_setup_validation_checks_actual_study_frequency_list(standalone_components):
     workspace = SolveWorkspace()
     workspace.studies["studies"][0]["frequency_hz"] = ["0"]
