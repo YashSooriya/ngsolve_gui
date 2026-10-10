@@ -1,3 +1,5 @@
+import math
+
 import pytest
 from types import SimpleNamespace
 
@@ -198,17 +200,18 @@ def test_region_creation_updates_canvas_before_side_panels(standalone_components
     assert len(updated_components) == len(set(map(id, updated_components)))
     assert all(component in updated_components for component in (
         workspace._left_items,
-        workspace._inspector,
         workspace._canvas_grid,
         workspace._canvas_scene,
         workspace._canvas_dimensions,
+        workspace._region_panel,
+        workspace._region_name_input,
     ))
     positions = {id(component): index for index, component in enumerate(updated_components)}
     assert max(positions[id(component)] for component in (
         workspace._canvas_grid,
         workspace._canvas_scene,
         workspace._canvas_dimensions,
-    )) < positions[id(workspace._inspector)]
+    )) < positions[id(workspace._region_panel)]
     assert len(workspace.model["geometry"]["regions"]) == 1
 
 
@@ -218,19 +221,36 @@ def test_region_click_updates_selection_without_rebuilding_sketch_scene(standalo
     region_id = workspace.model["geometry"]["regions"][0]["id"]
     scene = workspace._canvas_scene
     scene_children = tuple(scene.ui_children)
+    tree_children = tuple(workspace._left_items.ui_children)
+    inspector_children = tuple(workspace._inspector.ui_children)
+    tree_button = workspace._tree_entry_buttons[f"geometry:{region_id}"]
     renders = []
     workspace.render_canvas = lambda: renders.append("render")
+    workspace._refresh_model_tree = lambda: (_ for _ in ()).throw(AssertionError("tree rebuilt on selection"))
+    workspace._render_inspector = lambda: (_ for _ in ()).throw(AssertionError("inspector rebuilt on selection"))
 
     workspace.select_region(region_id)
 
     assert renders == []
     assert tuple(scene.ui_children) == scene_children
+    assert tuple(workspace._left_items.ui_children) == tree_children
+    assert tuple(workspace._inspector.ui_children) == inspector_children
+    assert tree_button.ui_color == "primary"
+    assert not workspace._region_panel.ui_hidden
+    assert workspace._region_name_input.ui_model_value == "Region 1"
     dimension_labels = [
         child._props["textContent"]
         for child in workspace._canvas_dimensions.ui_children
         if child._props.get("textContent")
     ]
     assert dimension_labels == ["W 20 mm", "H 20 mm"]
+
+    edge_id = workspace.model["geometry"]["edges"][0]["id"]
+    workspace.select_edge(edge_id)
+    assert tuple(workspace._left_items.ui_children) == tree_children
+    assert tuple(workspace._inspector.ui_children) == inspector_children
+    assert workspace._region_panel.ui_hidden
+    assert not workspace._edge_panel.ui_hidden
 
 
 def test_region_properties_explain_the_current_sketch_constraint_scope(standalone_components):
@@ -339,6 +359,73 @@ def test_axisymmetric_view_keeps_axis_visible_for_regions_away_from_axis(standal
     assert project((0.0, 0.0))[0] == pytest.approx(72.0)
     assert project((0.01, 0.0))[0] > 72.0
     assert unproject((72.0, 320.0))[0] == pytest.approx(0.0)
+
+
+def test_grid_zoom_keeps_world_geometry_and_anchor_aligned(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    project_before, unproject_before = workspace._canvas_projection()
+    anchor = (700.0, 210.0)
+    anchor_world = unproject_before(anchor)
+    original_vertices = [
+        tuple(point)
+        for point in workspace.model["geometry"]["regions"][0]["vertices"]
+    ]
+    span_before = project_before((0.020, 0.0))[0] - project_before((0.0, 0.0))[0]
+
+    workspace.zoom_canvas(0.5, anchor)
+
+    project_after, unproject_after = workspace._canvas_projection()
+    span_after = project_after((0.020, 0.0))[0] - project_after((0.0, 0.0))[0]
+    assert unproject_after(anchor) == pytest.approx(anchor_world)
+    assert span_after == pytest.approx(2 * span_before)
+    assert [tuple(point) for point in workspace.model["geometry"]["regions"][0]["vertices"]] == original_vertices
+
+
+def test_canvas_wheel_zooms_at_the_current_pointer(standalone_components):
+    workspace = SolveWorkspace()
+    calls = []
+    anchor = (740.0, 200.0)
+    workspace._canvas_event_point = lambda event, refresh_transform=False: anchor
+    workspace.zoom_canvas = lambda factor, point=None: calls.append((factor, point))
+
+    workspace._on_canvas_wheel(SimpleNamespace(value={"deltaY": 120.0}))
+
+    assert calls == [(pytest.approx(math.exp(0.18)), anchor)]
+
+
+def test_grid_zoom_out_expands_without_a_fixed_view_boundary(standalone_components):
+    workspace = SolveWorkspace()
+    _, initial_width, _ = workspace._current_canvas_world_view()
+    workspace.render_canvas = lambda: None
+
+    for _ in range(500):
+        workspace.zoom_canvas(1.2)
+
+    _, zoomed_width, _ = workspace._current_canvas_world_view()
+    assert zoomed_width > initial_width * 1e30
+    assert math.isfinite(zoomed_width)
+    step = workspace._canvas_grid_step()
+    ticks = workspace._ticks_for_step(-zoomed_width / 2, zoomed_width / 2, step)
+    assert 0 < len(ticks) <= 200
+    assert all(math.isfinite(tick) for tick in ticks)
+
+
+def test_grid_snap_toggle_snaps_sketch_points_to_grid_intersections(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.toggle_snap_to_grid()
+    assert workspace.snap_to_grid
+    project, unproject = workspace._canvas_projection()
+    grid_step = workspace._canvas_grid_step()
+    unsnapped = project((grid_step * 1.37, grid_step * 2.62))
+    snapped = workspace._snap_canvas_point(unsnapped)
+    radial, axial = unproject(snapped)
+    assert radial == pytest.approx(round(radial / grid_step) * grid_step)
+    assert axial == pytest.approx(round(axial / grid_step) * grid_step)
+
+    workspace.toggle_snap_to_grid()
+    assert not workspace.snap_to_grid
+    assert workspace._snap_canvas_point(unsnapped) == unsnapped
 
 
 def test_added_model_parameter_is_listed_in_tree(standalone_components):
