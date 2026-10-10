@@ -464,7 +464,7 @@ class SolveWorkspace(Div):
         select_button = _button(
             "Select", "mdi-cursor-default-outline",
             lambda *a: self.set_sketch_tool("select"),
-            tooltip="Drag a region to move it; drag empty space to pan. Hold Shift and drag to select edges.",
+            tooltip="Drag regions to move them; drag empty space to select edges; middle-drag to pan. Hold Shift to add to the selection.",
             style="flex:0 0 auto; white-space:nowrap;",
         )
         rectangle_button = _button(
@@ -923,7 +923,7 @@ class SolveWorkspace(Div):
         self._sync_canvas_interaction_settings()
         if announce:
             help_text = {
-                "select": "Drag a region to move it; drag empty space to pan. Hold Shift and drag to select edges.",
+                "select": "Drag regions to move them; drag empty space to select edges; middle-drag to pan. Hold Shift to add to the selection.",
                 "rectangle": "Drag between opposite corners to sketch a rectangle; its dimensions remain editable.",
                 "circle": "Drag from the circle centre to its radius; its position and radius remain editable.",
             }
@@ -1228,8 +1228,8 @@ class SolveWorkspace(Div):
         script = r"""
 (() => {
   window.__ngsolveSketchTool = '__SKETCH_TOOL__';
-  if (window.__ngsolveSketchPointerCaptureVersion === 4) return;
-  window.__ngsolveSketchPointerCaptureVersion = 4;
+  if (window.__ngsolveSketchPointerCaptureVersion === 5) return;
+  window.__ngsolveSketchPointerCaptureVersion = 5;
   let active = false;
   let activePointerId = null;
   let dragStart = null;
@@ -1458,7 +1458,8 @@ class SolveWorkspace(Div):
     rect.setAttribute('stroke-width', isSelection ? '1.5' : '2');
   };
   const beginGesture = (event, svg) => {
-    if (!targetIsSvg(event, svg) || event.button !== 0 || event.isPrimary === false) return;
+    if (!targetIsSvg(event, svg) || ![0, 1].includes(event.button) || event.isPrimary === false) return;
+    const middlePan = event.button === 1;
     if (active) clearPreview(svg, false, true);
     window.__ngsolveSketchCompletedGesture = null;
     active = true;
@@ -1470,7 +1471,7 @@ class SolveWorkspace(Div):
     dragBaseScale = visualScale;
     dragBaseTranslateX = visualTranslateX;
     dragBaseTranslateY = visualTranslateY;
-    dragStart = sketchPoint(toScenePoint(screenStart));
+    dragStart = middlePan ? toScenePoint(screenStart) : sketchPoint(toScenePoint(screenStart));
     const region = event.target && event.target.closest
       ? event.target.closest('[data-sketch-region-id]')
       : null;
@@ -1485,18 +1486,20 @@ class SolveWorkspace(Div):
       : null;
     window.__ngsolveSketchLastRegionId = dragRegionId;
     const tool = window.__ngsolveSketchTool || 'select';
-    dragMode = tool !== 'select'
-      ? 'draw'
-      : (event.shiftKey || event.ctrlKey)
-        ? 'marquee'
-        : dragEdgeId
-          ? 'edge'
-          : dragRegionId
-            ? 'region'
-            : 'pan';
+    dragMode = middlePan
+      ? 'pan'
+      : tool !== 'select'
+        ? 'draw'
+        : (event.shiftKey || event.ctrlKey)
+          ? 'marquee'
+          : dragEdgeId
+            ? 'edge'
+            : dragRegionId
+              ? 'region'
+              : 'marquee';
     window.__ngsolveSketchGestureActive = true;
     if (dragMode === 'pan') svg.style.cursor = 'grabbing';
-    if (tool === 'select') {
+    if (tool === 'select' && !middlePan) {
       window.__ngsolveSketchRegionForNextMouseDown = dragRegionId || '';
       window.__ngsolveSketchRegionForNextMouseDownKnown = true;
     }
@@ -1688,7 +1691,12 @@ class SolveWorkspace(Div):
       return;
     }
     if (pointerSupported) {
-      if (event.type === 'mousedown' && targetIsCanvas && event.button === 0) remember(event);
+      if (event.type === 'mousedown' && targetIsCanvas && [0, 1].includes(event.button)) {
+        remember(event);
+        // Avoid the browser's middle-click autoscroll while preserving the
+        // compatibility mouse events used by the canvas callbacks.
+        if (event.button === 1) event.preventDefault();
+      }
       else if (event.type === 'mouseup' && (targetIsCanvas || active)) remember(event);
       return;
     }
@@ -1826,24 +1834,34 @@ class SolveWorkspace(Div):
 
     def _on_canvas_mouse_down(self, event):
         value = getattr(event, "value", None)
-        if not isinstance(value, dict) or int(value.get("button", 0) or 0) != 0:
+        if not isinstance(value, dict):
+            return
+        try:
+            button = int(value.get("button", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if button not in {0, 1}:
             return
         tool = self.sketch_tool
+        middle_pan = button == 1
         # Resolve the hit target before _canvas_event_point consumes the
         # matching browser pointer record to obtain clientX/clientY.
-        region_id = self._read_canvas_region_id(value) if tool == "select" else None
-        edge_id = self._read_canvas_edge_id(value) if tool == "select" else None
+        region_id = self._read_canvas_region_id(value) if tool == "select" and not middle_pan else None
+        edge_id = self._read_canvas_edge_id(value) if tool == "select" and not middle_pan else None
         browser_hit_is_known = region_id == ""
         if browser_hit_is_known:
             region_id = None
         point = self._canvas_event_point(event, refresh_transform=True)
         if point is None:
             return
-        if tool != "select":
-            point = self._snap_canvas_point(point)
-        elif not region_id and not browser_hit_is_known:
-            region_id = self._region_at_canvas_point(point)
-        if tool != "select":
+        if not middle_pan:
+            if tool != "select":
+                point = self._snap_canvas_point(point)
+            elif not region_id and not browser_hit_is_known:
+                region_id = self._region_at_canvas_point(point)
+        if middle_pan:
+            operation = "pan"
+        elif tool != "select":
             operation = "draw"
         elif value.get("shiftKey") or value.get("ctrlKey"):
             operation = "marquee"
@@ -1852,7 +1870,7 @@ class SolveWorkspace(Div):
         elif region_id:
             operation = "region"
         else:
-            operation = "pan"
+            operation = "marquee"
         self._canvas_drag = {
             "tool": tool,
             "operation": operation,
@@ -1889,7 +1907,7 @@ class SolveWorkspace(Div):
         point = self._canvas_event_point(event)
         if point is None:
             return
-        if self._canvas_drag["tool"] != "select":
+        if self._canvas_drag["operation"] == "draw":
             point = self._snap_canvas_point(point)
         self._canvas_drag["current"] = point
         start = self._canvas_drag["start"]
@@ -1959,7 +1977,7 @@ class SolveWorkspace(Div):
             return
         point = self._canvas_event_point(event)
         if point is not None:
-            if drag["tool"] != "select":
+            if drag["operation"] == "draw":
                 point = self._snap_canvas_point(point)
             drag["current"] = point
         start, end = drag["start"], drag["current"]

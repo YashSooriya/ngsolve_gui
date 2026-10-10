@@ -957,7 +957,7 @@ def test_canvas_blank_hit_from_browser_does_not_move_a_nearby_region(standalone_
 
     workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0}))
 
-    assert workspace._canvas_drag["operation"] == "pan"
+    assert workspace._canvas_drag["operation"] == "marquee"
     assert workspace._canvas_drag["region_id"] is None
 
 
@@ -985,14 +985,14 @@ def test_canvas_drag_motion_and_release_do_not_rebuild_the_canvas(standalone_com
     assert len(workspace.selected_edge_ids) == 4
 
 
-def test_empty_canvas_drag_pans_and_shift_drag_retains_marquee_selection(standalone_components):
+def test_middle_drag_pans_and_left_empty_canvas_drag_marquees(standalone_components):
     workspace = SolveWorkspace()
     center_before, width_before, _ = workspace._current_canvas_world_view()
     start, end = (100.0, 120.0), (138.0, 146.0)
     points = iter((start, end, end))
     workspace._canvas_event_point = lambda event, refresh_transform=False: next(points)
 
-    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0}))
+    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 1}))
     assert workspace._canvas_drag["operation"] == "pan"
     workspace._on_canvas_mouse_move(SimpleNamespace(value={}))
     workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
@@ -1003,12 +1003,24 @@ def test_empty_canvas_drag_pans_and_shift_drag_retains_marquee_selection(standal
     assert center_after[1] == pytest.approx(center_before[1] + 26.0 / pixels_per_world)
     assert width_after == pytest.approx(width_before)
 
-    points = iter(((160.0, 180.0), (190.0, 210.0)))
+    points = iter(((160.0, 180.0), (190.0, 210.0), (190.0, 210.0)))
     workspace._canvas_event_point = lambda event, refresh_transform=False: next(points)
-    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0, "shiftKey": True}))
+    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0}))
     assert workspace._canvas_drag["operation"] == "marquee"
-    workspace._on_canvas_pointer_cancel()
+    workspace._on_canvas_mouse_move(SimpleNamespace(value={}))
+    workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
     assert workspace._canvas_drag is None
+
+
+def test_middle_drag_pans_even_when_a_shape_tool_is_selected(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.set_sketch_tool("rectangle", announce=False)
+    workspace._canvas_event_point = lambda event, refresh_transform=False: (120.0, 180.0)
+
+    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 1}))
+
+    assert workspace._canvas_drag["operation"] == "pan"
+    assert workspace._canvas_drag["tool"] == "rectangle"
 
 
 def test_canvas_pointer_cancel_clears_an_incomplete_sketch(standalone_components):
@@ -1200,6 +1212,9 @@ def test_canvas_drag_suppresses_the_click_that_follows_mouseup(standalone_compon
     assert "regionKnown" in scripts[0]
     assert "edgeId" in scripts[0]
     assert "data-sketch-edge-id" in scripts[0]
+    assert "![0, 1].includes(event.button)" in scripts[0]
+    assert "const middlePan = event.button === 1" in scripts[0]
+    assert "? 'marquee'" in scripts[0]
 
 
 def test_stationary_region_pointer_gesture_selects_region_after_pointer_capture(standalone_components, monkeypatch):
