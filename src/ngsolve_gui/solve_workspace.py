@@ -140,6 +140,7 @@ class SolveWorkspace(Div):
         self._geometry_inspector_ready = False
         self._tree_entry_buttons = {}
         self._messages_visible = False
+        self._status_flash_variant = 0
         self.validation_issues = []
         self.sketch_tool = "select"
         self._canvas_drag = None
@@ -201,7 +202,26 @@ class SolveWorkspace(Div):
         self._canvas.on("wheel", self._on_canvas_wheel)
         self._inspector = Div(ui_style="display:flex; flex-direction:column; gap:12px; padding:12px; overflow:auto; min-height:0;")
         self._status = Div(ui_style="display:flex; align-items:center; gap:8px; min-width:0; overflow:hidden; white-space:nowrap;")
-        self._log_panel = Div(ui_hidden=True, ui_style="height:170px; flex:none; overflow:auto; border-top:1px solid var(--border); background:var(--surface); padding:10px 14px; font:12px/1.5 monospace;")
+        self._log_body = Div(
+            *[Div(line) for line in self._log_messages],
+            ui_style="flex:1 1 auto; min-height:0; overflow:auto; padding:6px 14px 10px; font:12px/1.5 monospace;",
+        )
+        self._log_close_button = _button(
+            "", "mdi-close", self.hide_log,
+            tooltip="Minimise solver log",
+            style="margin-left:auto;",
+        )
+        log_header = Div(
+            Div("Log", ui_style="font-size:12px; font-weight:600;"),
+            self._log_close_button,
+            ui_style="display:flex; align-items:center; gap:8px; flex:none; min-height:34px; padding:0 8px 0 14px; border-bottom:1px solid var(--border);",
+        )
+        self._log_panel = Div(
+            log_header,
+            self._log_body,
+            ui_hidden=True,
+            ui_style="display:flex; flex-direction:column; flex:0 0 170px; min-height:0; overflow:hidden; border-top:1px solid var(--border); background:var(--surface);",
+        )
         self._messages_panel = Div(ui_hidden=True, ui_style="max-height:180px; flex:none; overflow:auto; border-top:1px solid var(--border); background:var(--surface); padding:8px 14px;")
         self._canvas_host = Div(
             self._canvas,
@@ -320,7 +340,7 @@ class SolveWorkspace(Div):
         self._messages_button.on_click(self.toggle_messages)
         log_button = QBtn(QTooltip("Show solver output"), ui_icon="mdi-console", ui_label="Log", ui_flat=True, ui_dense=True, ui_no_caps=True)
         log_button.on_click(self.toggle_log)
-        bottom = Div(
+        self._bottom_bar = Div(
             self._status_text,
             Div(ui_style="flex:1;"),
             Div(f"Regions: 0  ·  Mesh order: {self.model['mesh']['polynomial_order']}", ui_style="font-size:11px; color:var(--fg-muted);"),
@@ -329,9 +349,10 @@ class SolveWorkspace(Div):
             # ngapp's powered-by link is positioned over the root's lower
             # right corner, so leave it room rather than drawing controls
             # underneath it.
+            ui_class="mmfem-solve-status-bar",
             ui_style="display:flex; align-items:center; gap:8px; flex:0 0 34px; min-height:34px; padding:0 225px 0 10px; border-top:1px solid var(--border); background:var(--surface);",
         )
-        self._bottom_count = bottom.ui_slots["default"][2]
+        self._bottom_count = self._bottom_bar.ui_slots["default"][2]
         self._bottom_count.ui_style += " margin-left:12px;"
 
         top = Div(
@@ -372,7 +393,7 @@ class SolveWorkspace(Div):
             self._content,
             self._messages_panel,
             self._log_panel,
-            bottom,
+            self._bottom_bar,
             self._rectangle_dialog,
             self._circle_dialog,
             ui_style="display:flex; flex-direction:column; width:100%; height:100%; min-height:0; overflow:hidden; background:var(--app-bg, #f7f8fa); color:var(--fg, #202631);",
@@ -1304,7 +1325,7 @@ class SolveWorkspace(Div):
         )
         self._log_messages.append(self.message)
         self._log_messages = self._log_messages[-200:]
-        self._log_panel.ui_children = [Div(line) for line in self._log_messages]
+        self._log_body.ui_children = [Div(line) for line in self._log_messages]
         if self.on_log:
             self.on_log(self.message, error)
 
@@ -1364,11 +1385,26 @@ class SolveWorkspace(Div):
             return
         self._log_messages.extend(additions)
         self._log_messages = self._log_messages[-200:]
-        self._log_panel.ui_children = [Div(line) for line in self._log_messages]
+        self._log_body.ui_children = [Div(line) for line in self._log_messages]
 
     def toggle_log(self, *args):
-        self._log_visible = not self._log_visible
-        self._log_panel.ui_hidden = not self._log_visible
+        if self._log_visible:
+            self.hide_log()
+        else:
+            self.show_log()
+
+    def show_log(self, *args):
+        self._log_visible = True
+        self._log_panel.ui_hidden = False
+
+    def hide_log(self, *args):
+        self._log_visible = False
+        self._log_panel.ui_hidden = True
+
+    def _flash_status_bar(self):
+        self._status_flash_variant = 1 - self._status_flash_variant
+        variant = "a" if self._status_flash_variant else "b"
+        self._bottom_bar.ui_class = f"mmfem-solve-status-bar mmfem-solve-status-flash-{variant}"
 
     def _make_primitive_dialog(self, kind):
         rectangle = kind == "rectangle"
@@ -3037,6 +3073,7 @@ class SolveWorkspace(Div):
             self._message(f"Setup check found {len(errors)} issue{'s' if len(errors) != 1 else ''}. Select a message for guidance.", error=True)
         else:
             self._message("Setup checks passed. Mesh and solver results are reported separately.")
+        self._flash_status_bar()
 
     def run_mesh_action(self, *args):
         errors = self.mesh_validation_errors()
@@ -3058,6 +3095,7 @@ class SolveWorkspace(Div):
             return
         if self.on_run:
             self._run_button.ui_loading = True
+            self.show_log()
             self.on_run()
         else:
             self._message("The solver is unavailable in this environment.", error=True)

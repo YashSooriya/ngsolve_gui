@@ -84,6 +84,47 @@ def test_model_title_supports_inline_rename_commit_and_cancel(standalone_compone
     assert not workspace._model_title_editing
 
 
+def test_setup_check_flashes_bottom_status_for_pass_and_failure(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.validation_errors = lambda: []
+
+    workspace.validate_action()
+
+    assert "Setup checks passed" in workspace.message
+    assert "mmfem-solve-status-flash-a" in workspace._bottom_bar.ui_class
+
+    workspace.validation_errors = lambda: ["Create a geometry region."]
+    workspace.validate_action()
+
+    assert "found 1 issue" in workspace.message
+    assert "mmfem-solve-status-flash-b" in workspace._bottom_bar.ui_class
+
+
+def test_study_opens_solver_log_and_close_button_minimises_it(standalone_components):
+    workspace = None
+    run_observations = []
+
+    def on_run():
+        run_observations.append(workspace._log_visible)
+
+    workspace = SolveWorkspace(on_run=on_run)
+    workspace.validation_errors = lambda: []
+    workspace.run_study_action()
+
+    assert run_observations == [True]
+    assert workspace._log_visible
+    assert not workspace._log_panel.ui_hidden
+
+    workspace._log_close_button._callbacks["click.stop"][0](None)
+    assert not workspace._log_visible
+    assert workspace._log_panel.ui_hidden
+
+    workspace.validation_errors = lambda: ["Create a geometry region."]
+    workspace.run_study_action()
+    assert run_observations == [True]
+    assert not workspace._log_visible
+
+
 def test_same_edge_can_have_independent_em_and_mechanical_conditions(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")

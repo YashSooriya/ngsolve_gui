@@ -27,6 +27,35 @@ from .solve_workspace import SolveWorkspace
 from .axisymmetric_model import unpack_model, package_model
 
 
+def _inject_solve_status_styles(js):
+    style = js.document.createElement("style")
+    style.id = "mmfem-solve-status-styles"
+    style.textContent = """
+@keyframes mmfem-solve-status-flash-a {
+  0%, 100% { background-color: var(--surface); }
+  50% { background-color: var(--accent-subtle); box-shadow: inset 0 0 0 1px var(--accent); }
+}
+@keyframes mmfem-solve-status-flash-b {
+  0%, 100% { background-color: var(--surface); }
+  50% { background-color: var(--accent-subtle); box-shadow: inset 0 0 0 1px var(--accent); }
+}
+.mmfem-solve-status-flash-a {
+  animation: mmfem-solve-status-flash-a 0.48s ease-in-out 3;
+}
+.mmfem-solve-status-flash-b {
+  animation: mmfem-solve-status-flash-b 0.48s ease-in-out 3;
+}
+@media (prefers-reduced-motion: reduce) {
+  .mmfem-solve-status-flash-a,
+  .mmfem-solve-status-flash-b {
+    animation-duration: 0.12s;
+    animation-iteration-count: 1;
+  }
+}
+"""
+    js.document.head.appendChild(style)
+
+
 class _WorkspaceLogBuffer(io.StringIO):
     """Capture solver output and publish it to the Solve log as it arrives."""
 
@@ -500,6 +529,7 @@ class NGSolveGui(App):
         from .webgpu_tab import sync_default_viewport_clear
         sync_default_viewport_clear()
         keybinding_styles.inject(self)
+        self.call_js(_inject_solve_status_styles)
         self.on_load(self.__on_load)
 
         # Post Process is the existing/default view. Retain its hidden tree so
