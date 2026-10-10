@@ -186,7 +186,7 @@ class SolveWorkspace(Div):
             self._canvas_dimensions,
             self._canvas_preview,
             ui_class="solve-sketch-canvas",
-            ui_style="display:block; width:100%; height:100%; min-height:0; background:var(--canvas-bg, #f4f6f8); cursor:default;",
+            ui_style="display:block; width:100%; height:100%; min-height:0; background:var(--canvas-bg, #f4f6f8); cursor:default; user-select:none; -webkit-user-select:none;",
         )
         self._canvas._props.update({
             "viewBox": "0 0 900 640",
@@ -2524,6 +2524,7 @@ class SolveWorkspace(Div):
         grid_step = self._canvas_grid_step()
         radial_ticks = self._ticks_for_step(max(0.0, lower_left[0]), max(0.0, upper_right[0]), grid_step)
         axial_ticks = self._ticks_for_step(lower_left[1], upper_right[1], grid_step)
+        grid_text_style = "pointer-events:none; user-select:none; -webkit-user-select:none;"
         grid_children = []
         scene_children = []
         for value in radial_ticks:
@@ -2531,23 +2532,23 @@ class SolveWorkspace(Div):
                 continue
             x = xy((value, 0))[0]
             grid_children.append(_svg("line", x1=x, y1=plot[1], x2=x, y2=plot[3], stroke="var(--border, #d9dfe7)", stroke_width="1"))
-            grid_children.append(_svg("text", x=x, y=plot[3] + 18, fill="var(--fg-muted, #697586)", font_size="10", text_anchor="middle", children=f"{value:.5g}"))
+            grid_children.append(_svg("text", x=x, y=plot[3] + 18, fill="var(--fg-muted, #697586)", font_size="10", text_anchor="middle", style=grid_text_style, children=f"{value:.5g}"))
         for value in axial_ticks:
             if abs(value) <= grid_step * 1e-10:
                 continue
             y = xy((0, value))[1]
             grid_children.append(_svg("line", x1=plot[0], y1=y, x2=plot[2], y2=y, stroke="var(--border, #d9dfe7)", stroke_width="1"))
-            grid_children.append(_svg("text", x=plot[0] - 8, y=y + 4, fill="var(--fg-muted, #697586)", font_size="10", text_anchor="end", children=f"{value:.5g}"))
+            grid_children.append(_svg("text", x=plot[0] - 8, y=y + 4, fill="var(--fg-muted, #697586)", font_size="10", text_anchor="end", style=grid_text_style, children=f"{value:.5g}"))
         if lower_left[0] <= 0 <= upper_right[0]:
             xaxis = xy((0, 0))[0]
             grid_children.append(_svg("line", x1=xaxis, y1=plot[1], x2=xaxis, y2=plot[3], stroke="#557187", stroke_width="2", stroke_dasharray="6 4"))
-            grid_children.append(_svg("text", x=xaxis + 7, y=plot[1] + 15, fill="#405e75", font_size="12", font_weight="600", children="Axis of rotation  ·  r = 0"))
+            grid_children.append(_svg("text", x=xaxis + 7, y=plot[1] + 15, fill="#405e75", font_size="12", font_weight="600", style=grid_text_style, children="Axis of rotation  ·  r = 0"))
         if lower_left[1] <= 0 <= upper_right[1]:
             zaxis = xy((0, 0))[1]
             grid_children.append(_svg("line", x1=plot[0], y1=zaxis, x2=plot[2], y2=zaxis, stroke="#557187", stroke_width="1.5"))
-            grid_children.append(_svg("text", x=plot[2] - 4, y=zaxis - 5, fill="#405e75", font_size="10", text_anchor="end", children="z = 0"))
-        grid_children.append(_svg("text", x=plot[2], y=height - 8, fill="var(--fg-muted, #697586)", font_size="12", text_anchor="end", children="r  [m]"))
-        grid_children.append(_svg("text", x=12, y=plot[1] - 8, fill="var(--fg-muted, #697586)", font_size="12", children="z  [m]"))
+            grid_children.append(_svg("text", x=plot[2] - 4, y=zaxis - 5, fill="#405e75", font_size="10", text_anchor="end", style=grid_text_style, children="z = 0"))
+        grid_children.append(_svg("text", x=plot[2], y=height - 8, fill="var(--fg-muted, #697586)", font_size="12", text_anchor="end", style=grid_text_style, children="r  [m]"))
+        grid_children.append(_svg("text", x=12, y=plot[1] - 8, fill="var(--fg-muted, #697586)", font_size="12", style=grid_text_style, children="z  [m]"))
 
         material_index = {item["id"]: index for index, item in enumerate(self.model["materials"])}
         for region in regions:

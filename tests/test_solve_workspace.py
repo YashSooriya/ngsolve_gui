@@ -614,6 +614,17 @@ def test_blank_axisymmetric_view_starts_at_r_zero_with_world_space_ticks(standal
     assert all(not item.ui_children for item in svg_text)
 
 
+def test_sketch_grid_labels_do_not_intercept_or_select_canvas_drags(standalone_components):
+    workspace = SolveWorkspace()
+    svg_text = [item for item in workspace._canvas_grid.ui_children if item._component_name == "text"]
+
+    assert svg_text
+    assert "user-select:none" in workspace._canvas._props["style"]
+    assert "-webkit-user-select:none" in workspace._canvas._props["style"]
+    assert all("pointer-events:none" in item._props["style"] for item in svg_text)
+    assert all("user-select:none" in item._props["style"] for item in svg_text)
+
+
 def test_axisymmetric_view_keeps_axis_visible_for_regions_away_from_axis(standalone_components):
     workspace = SolveWorkspace()
     workspace.model["geometry"]["regions"] = [{"vertices": [[0.01, 0.0], [0.02, 0.0], [0.02, 0.01], [0.01, 0.01]]}]
