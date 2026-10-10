@@ -227,7 +227,7 @@ class SolveWorkspace(Div):
         self._messages_panel = Div(ui_hidden=True, ui_style="max-height:180px; flex:none; overflow:auto; border-top:1px solid var(--border); background:var(--surface); padding:8px 14px;")
         self._canvas_host = Div(
             self._canvas,
-            ui_style="flex:1 1 auto; min-width:0; min-height:0; overflow:hidden;",
+            ui_style="display:flex; flex:1 1 auto; flex-direction:column; min-width:0; min-height:0; overflow:hidden;",
         )
         tree_header = Div(
             Div("MODEL TREE", ui_style="font-size:11px; font-weight:700; letter-spacing:.08em;"),
@@ -2759,10 +2759,36 @@ class SolveWorkspace(Div):
 
         renderers = []
         if preview_solids:
+            import numpy as np
+
             geometry = OCCGeometry(Compound(preview_solids))
             renderer = GeometryRenderer(geometry)
             renderer.faces.active = True
             renderer.edges.active = True
+
+            # Parent domains enclose their child materials. Keep those faces
+            # translucent so the inner regions are visible from outside.
+            material_index = {
+                material.get("id"): index
+                for index, material in enumerate(self.model.get("materials", []))
+            }
+            parent_ids = {region.get("parent_id") for region in regions}
+            face_color_by_hash = {}
+            for region, solid in zip(regions, preview_solids):
+                palette = _MATERIAL_COLORS[
+                    material_index.get(region.get("material_id"), 0) % len(_MATERIAL_COLORS)
+                ]
+                rgb = tuple(int(palette[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+                alpha = 0.20 if region["id"] in parent_ids else 0.92
+                for face in solid.faces:
+                    face_color_by_hash[hash(face)] = (*rgb, alpha)
+            faces = list(geometry.faces)
+            face_colors = np.tile(np.array([0.42, 0.55, 0.68, 0.20], dtype=np.float32), len(faces))
+            for face_index, face in enumerate(faces):
+                color = face_color_by_hash.get(hash(face))
+                if color is not None:
+                    face_colors[4 * face_index:4 * face_index + 4] = color
+            renderer.faces.set_colors(face_colors)
             renderers.append(renderer)
         axes = CoordinateAxes()
         navigation_cube = NavigationCube()
