@@ -390,6 +390,7 @@ class SolveWorkspace(Div):
             "aria-label": "Axisymmetric radial-axial sketch",
         })
         self._canvas.on_mounted(self._install_canvas_pointer_capture)
+        self._canvas.on("mousedown", self._on_canvas_mouse_down)
         self._canvas.on("mouseup", self._on_canvas_mouse_up)
         self._canvas.on("wheel", self._on_canvas_wheel)
         self._inspector = Div(ui_style="display:flex; flex-direction:column; gap:12px; padding:12px; overflow:auto; min-height:0;")
@@ -1823,6 +1824,13 @@ class SolveWorkspace(Div):
             "additive": bool(value.get("shiftKey") or value.get("ctrlKey")),
             "moved": False,
         }
+        # Activate a region as soon as the user presses it. The browser-side
+        # pointer capture keeps the gesture alive for dragging, but it can
+        # retarget the eventual click away from the SVG region element. Doing
+        # selection here makes a simple viewport press reliable and exposes
+        # that region's properties before the pointer is released.
+        if operation == "region" and region_id:
+            self.select_region(region_id)
 
     def _region_at_canvas_point(self, point):
         """Hit-test a canvas position against regions, preferring the innermost."""
@@ -1901,7 +1909,8 @@ class SolveWorkspace(Div):
                 elif edge_id:
                     self.select_edge(edge_id, additive=additive)
                 elif operation == "region" and region_id:
-                    self.select_region(region_id)
+                    if self.selected_region_id != region_id:
+                        self.select_region(region_id)
                 elif self._commit_browser_canvas_view(view, render=False):
                     self.render_canvas()
                 return
@@ -1929,7 +1938,8 @@ class SolveWorkspace(Div):
         elif drag.get("edge_id"):
             self.select_edge(drag["edge_id"], additive=drag["additive"])
         elif drag["operation"] == "region" and drag.get("region_id"):
-            self.select_region(drag["region_id"])
+            if self.selected_region_id != drag["region_id"]:
+                self.select_region(drag["region_id"])
 
     def _on_canvas_pointer_cancel(self, event=None):
         """Discard an incomplete sketch gesture after a cancelled pointer."""

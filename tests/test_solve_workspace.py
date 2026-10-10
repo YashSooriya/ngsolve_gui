@@ -920,6 +920,31 @@ def test_canvas_region_hit_test_finds_region_when_browser_target_is_missing(stan
     assert workspace._canvas_drag["region_id"] == region["id"]
 
 
+def test_pressing_a_canvas_region_selects_it_for_editing(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    first_region_id = workspace.model["geometry"]["regions"][0]["id"]
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.003,
+        ("rectangle", "z_min"): 0.003,
+        ("rectangle", "width"): 0.004,
+        ("rectangle", "height"): 0.005,
+    })
+    workspace._add_primitive("rectangle")
+    second_region_id = workspace.model["geometry"]["regions"][1]["id"]
+    assert workspace.selected_region_id == second_region_id
+
+    monkeypatch.setattr(workspace, "_read_canvas_region_id", lambda _value: first_region_id)
+    monkeypatch.setattr(workspace, "_read_canvas_edge_id", lambda _value: None)
+    workspace._canvas_event_point = lambda _event, refresh_transform=False: (450.0, 320.0)
+
+    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0}))
+
+    assert workspace.selected_region_id == first_region_id
+    assert workspace._region_name_input.ui_model_value == "square 1"
+    assert workspace._canvas._callbacks["mousedown"] == [workspace._on_canvas_mouse_down]
+
+
 def test_canvas_blank_hit_from_browser_does_not_move_a_nearby_region(standalone_components, monkeypatch):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
@@ -1349,14 +1374,14 @@ def test_browser_view_transform_commits_once_at_its_final_zoom_and_pan(standalon
     assert center_after_pan[1] < center_after_zoom[1]
 
 
-def test_sketch_uses_browser_local_motion_and_only_sends_completed_events(standalone_components):
+def test_sketch_keeps_motion_browser_local_and_sends_discrete_pointer_events(standalone_components):
     workspace = SolveWorkspace()
     callbacks = workspace._canvas._callbacks
 
+    assert "mousedown" in callbacks
     assert "mouseup" in callbacks
     assert "wheel" in callbacks
     assert "mousemove" not in callbacks
-    assert "mousedown" not in callbacks
 
 
 def test_region_names_are_not_drawn_inside_sketch_regions(standalone_components):
