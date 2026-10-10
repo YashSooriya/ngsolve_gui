@@ -278,7 +278,16 @@ class SolveWorkspace(Div):
 
         self._rectangle_dialog = self._make_primitive_dialog("rectangle")
         self._circle_dialog = self._make_primitive_dialog("circle")
-        self._model_title = Div(self.model.get("name", "Untitled axisymmetric model"), ui_style="font-size:13px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:420px;")
+        self._model_title_editing = False
+        self._model_title_input = None
+        self._model_title_draft = self.model.get("name", "Untitled axisymmetric model")
+        self._model_title = Div(
+            self._model_title_draft,
+            QTooltip("Double-click to rename this model"),
+            ui_class="solve-model-title",
+            ui_style="font-size:13px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:420px; cursor:text; border-radius:3px;",
+        )
+        self._model_title.on("dblclick", self._begin_model_rename)
         self._validate_button = _button(
             "Check setup",
             "mdi-check-decagram-outline",
@@ -383,6 +392,7 @@ class SolveWorkspace(Div):
         study_errors = validate_studies(studies, parameter_map)
         if study_errors:
             raise ValueError("Invalid studies: " + " ".join(study_errors))
+        self._cancel_model_rename()
         self.model = copy.deepcopy(model)
         self.studies = studies
         self.layout = copy.deepcopy(layout or {"schema_version": 1, "active_section": "geometry", "camera": "fit"})
@@ -420,6 +430,60 @@ class SolveWorkspace(Div):
         if section == "boundaries":
             self._selected_condition_id = self.selected_boundary_id
         self._sync_canvas_selection()
+
+    def _begin_model_rename(self, event=None):
+        """Replace the model title with an inline editor on double-click."""
+        if self._model_title_editing:
+            return
+        self._model_title_editing = True
+        self._model_title_draft = str(self.model.get("name", "Untitled axisymmetric model"))
+        editor = QInput(
+            ui_model_value=self._model_title_draft,
+            ui_dense=True,
+            ui_borderless=True,
+            ui_autofocus=True,
+            ui_hide_bottom_space=True,
+            ui_input_style="font-size:13px; font-weight:600; padding:0; min-width:180px;",
+            ui_style="width:min(420px, 100%); min-height:30px;",
+        )
+        editor.on_update_model_value(self._update_model_rename_draft)
+        editor.on_blur(self._commit_model_rename)
+        editor.on("keydown", self._on_model_rename_keydown)
+        editor.on_mounted(lambda: (editor.ui_focus(), editor.ui_select()))
+        self._model_title_input = editor
+        self._model_title.ui_children = [editor]
+
+    def _update_model_rename_draft(self, event):
+        self._model_title_draft = str(getattr(event, "value", "") or "")
+
+    def _on_model_rename_keydown(self, event):
+        payload = getattr(event, "value", None)
+        key = payload.get("key") if isinstance(payload, dict) else getattr(payload, "key", None)
+        key = str(key or "").lower()
+        if key in {"enter", "numpadenter"}:
+            self._commit_model_rename()
+        elif key == "escape":
+            self._cancel_model_rename()
+
+    def _commit_model_rename(self, event=None):
+        if not self._model_title_editing:
+            return
+        name = str(self._model_title_draft or "").strip()
+        if name:
+            self.model["name"] = name
+        self._finish_model_rename()
+
+    def _cancel_model_rename(self, event=None):
+        if not getattr(self, "_model_title_editing", False):
+            return
+        self._finish_model_rename()
+
+    def _finish_model_rename(self):
+        self._model_title_editing = False
+        self._model_title_input = None
+        self._model_title_draft = str(self.model.get("name", "Untitled axisymmetric model"))
+        if hasattr(self, "_model_title"):
+            self._model_title.ui_children = [self._model_title_draft]
 
     def _tree_selected_entry(self):
         if self.active_section == "geometry" and self.selected_region_id:
@@ -1582,7 +1646,7 @@ class SolveWorkspace(Div):
             self._bottom_count.ui_children = [
                 f"Regions: {len(self.model['geometry']['regions'])}  ·  Mesh order: {self.model['mesh']['polynomial_order']}"
             ]
-        if hasattr(self, "_model_title"):
+        if hasattr(self, "_model_title") and not self._model_title_editing:
             self._model_title.ui_children = [self.model.get("name", "Untitled axisymmetric model")]
 
     def _make_tree_entry_button(self, section, entry_id, label, icon, callback, selected):

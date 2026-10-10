@@ -368,7 +368,7 @@ class NGSolveGui(App):
                 ui_width="34px",
                 ui_fit="contain",
             ),
-            Div("Netgen / NGSolve", ui_class=cb.brand_wordmark),
+            Div("MM-FEM", ui_class=cb.brand_wordmark),
             ui_class=cb.brand,
         )
         self._workspace_mode_toggle = WorkspaceModeToggle(

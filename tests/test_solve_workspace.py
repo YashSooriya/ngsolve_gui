@@ -49,6 +49,30 @@ def test_workspace_builds_nested_regions_and_recomputes_dimension_parameters(sta
     assert workspace.validation_errors() == []
 
 
+def test_model_title_supports_inline_rename_commit_and_cancel(standalone_components):
+    workspace = SolveWorkspace()
+    title = workspace._model_title
+
+    title._handle("dblclick")
+    editor = workspace._model_title_input
+    assert editor is not None
+    editor._handle("update:model-value", "Quarter magnet")
+    editor._handle("keydown", {"key": "Enter"})
+
+    assert workspace.model["name"] == "Quarter magnet"
+    assert title.ui_children == ["Quarter magnet"]
+    assert not workspace._model_title_editing
+
+    title._handle("dblclick")
+    editor = workspace._model_title_input
+    editor._handle("update:model-value", "Discard this name")
+    editor._handle("keydown", {"key": "Escape"})
+
+    assert workspace.model["name"] == "Quarter magnet"
+    assert title.ui_children == ["Quarter magnet"]
+    assert not workspace._model_title_editing
+
+
 def test_same_edge_can_have_independent_em_and_mechanical_conditions(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
