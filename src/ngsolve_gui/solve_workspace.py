@@ -7,10 +7,13 @@ import json
 import math
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from threading import get_ident
 from pathlib import Path
 
 from ngapp.components import Component, Div, QBtn, QCheckbox, QDialog, QInput, QSelect, QSeparator, QTooltip, QCard, QCardSection, QSplitter
+from ngapp.utils import get_environment
 
 from . import cerbsim_style as cb
 from .axisymmetric_model import evaluate_expression, new_id, new_model, new_studies, validate_model, validate_studies
@@ -698,28 +701,54 @@ class SolveWorkspace(Div):
             self._create_region_from_canvas_drag(drag["tool"], start, end)
 
     @contextmanager
-    def _batch_content_updates(self):
-        """Send related model, inspector, and sketch changes as one UI patch.
+    def _batch_frontend_updates(self):
+        """Flush one interaction's related component changes together.
 
-        A completed sketch gesture updates all three panels. Sending each
-        replacement separately makes the browser show a brief empty state
-        between patches, so hold updates for the workspace content subtree and
-        publish its finished component tree once the edit is complete.
+        Shape creation refreshes the model tree, inspector, and sketch. Sending
+        those slot replacements serially lets the browser paint the temporary
+        empty state between each request, so coalesce repeated component
+        updates and submit the finished patches concurrently.
         """
-        blocked = []
+        frontend = get_environment().frontend
+        send_update = frontend.update_component
+        owner_thread = get_ident()
+        queued = {}
 
-        def block(component):
-            blocked.append((component, component._block_frontend_update))
-            component._block_frontend_update = True
+        def collect(component, data, method, blocking=True):
+            if get_ident() != owner_thread:
+                return send_update(component, data, method, blocking=blocking)
+            key = (id(component), method)
+            if key not in queued:
+                queued[key] = [component, data, method, blocking]
+                return
+            previous = queued[key][1]
+            if previous is None or data is None:
+                queued[key][1] = None
+                return
+            combined = dict(previous)
+            for key, value in data.items():
+                if key in {"props", "slots"} and isinstance(value, dict):
+                    merged = dict(combined.get(key, {}))
+                    merged.update(value)
+                    combined[key] = merged
+                else:
+                    combined[key] = value
+            queued[(id(component), method)][1] = combined
 
-        self._content._recurse(block, True, set())
+        frontend.update_component = collect
         try:
             yield
         finally:
-            for component, was_blocked in blocked:
-                component._block_frontend_update = was_blocked
-            if not self._content._block_frontend_update:
-                self._content.ui_children = list(self._content.ui_children)
+            frontend.update_component = send_update
+            updates = list(queued.values())
+            if updates:
+                with ThreadPoolExecutor(max_workers=min(8, len(updates))) as pool:
+                    futures = [
+                        pool.submit(send_update, component, data, method, blocking=blocking)
+                        for component, data, method, blocking in updates
+                    ]
+                    for future in futures:
+                        future.result()
 
     def _select_edges_in_canvas_box(self, start, end, *, additive=False):
         project, _ = self._canvas_projection()
@@ -969,7 +998,7 @@ class SolveWorkspace(Div):
                 region["material_id"] = "material-air"
             else:
                 region["material_id"] = "material-air"
-            with self._batch_content_updates():
+            with self._batch_frontend_updates():
                 self.model["geometry"]["regions"].append(region)
                 try:
                     self._recompute_parent_links()
