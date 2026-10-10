@@ -392,12 +392,11 @@ class NGSolveGui(App):
 
         ngs_logo = Div(
             QImg(
-                ui_src=self.load_asset("ngsolve-mark.png"),
-                ui_height="34px",
-                ui_width="34px",
+                ui_src=self.load_asset("mm-fem-logo.png"),
+                ui_height="37px",
+                ui_width="138px",
                 ui_fit="contain",
             ),
-            Div("MM-FEM", ui_class=cb.brand_wordmark),
             ui_class=cb.brand,
         )
         self._workspace_mode_toggle = WorkspaceModeToggle(
