@@ -281,9 +281,10 @@ class SolveWorkspace(Div):
         self._model_title_editing = False
         self._model_title_input = None
         self._model_title_draft = self.model.get("name", "Untitled axisymmetric model")
+        self._model_title_tooltip = QTooltip("Double-click to rename this model")
         self._model_title = Div(
             self._model_title_draft,
-            QTooltip("Double-click to rename this model"),
+            self._model_title_tooltip,
             ui_class="solve-model-title",
             ui_style="font-size:13px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:420px; cursor:text; border-radius:3px;",
         )
@@ -483,7 +484,7 @@ class SolveWorkspace(Div):
         self._model_title_input = None
         self._model_title_draft = str(self.model.get("name", "Untitled axisymmetric model"))
         if hasattr(self, "_model_title"):
-            self._model_title.ui_children = [self._model_title_draft]
+            self._model_title.ui_children = [self._model_title_draft, self._model_title_tooltip]
 
     def _tree_selected_entry(self):
         if self.active_section == "geometry" and self.selected_region_id:
@@ -1647,7 +1648,10 @@ class SolveWorkspace(Div):
                 f"Regions: {len(self.model['geometry']['regions'])}  ·  Mesh order: {self.model['mesh']['polynomial_order']}"
             ]
         if hasattr(self, "_model_title") and not self._model_title_editing:
-            self._model_title.ui_children = [self.model.get("name", "Untitled axisymmetric model")]
+            self._model_title.ui_children = [
+                self.model.get("name", "Untitled axisymmetric model"),
+                self._model_title_tooltip,
+            ]
 
     def _make_tree_entry_button(self, section, entry_id, label, icon, callback, selected):
         button = _button(
