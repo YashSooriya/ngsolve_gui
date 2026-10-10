@@ -32,18 +32,18 @@ def _inject_solve_status_styles(js):
     style.id = "mmfem-solve-status-styles"
     style.textContent = """
 @keyframes mmfem-solve-status-flash-a {
-  0%, 100% { background-color: var(--surface); }
-  50% { background-color: var(--accent-subtle); box-shadow: inset 0 0 0 1px var(--accent); }
+  0%, 100% { background-color: var(--surface); box-shadow: inset 0 0 0 0 transparent; }
+  35%, 65% { background-color: var(--accent-subtle); box-shadow: inset 0 0 0 2px var(--accent); }
 }
 @keyframes mmfem-solve-status-flash-b {
-  0%, 100% { background-color: var(--surface); }
-  50% { background-color: var(--accent-subtle); box-shadow: inset 0 0 0 1px var(--accent); }
+  0%, 100% { background-color: var(--surface); box-shadow: inset 0 0 0 0 transparent; }
+  35%, 65% { background-color: var(--accent-subtle); box-shadow: inset 0 0 0 2px var(--accent); }
 }
 .mmfem-solve-status-flash-a {
-  animation: mmfem-solve-status-flash-a 0.48s ease-in-out 3;
+  animation: mmfem-solve-status-flash-a 0.68s ease-in-out 3;
 }
 .mmfem-solve-status-flash-b {
-  animation: mmfem-solve-status-flash-b 0.48s ease-in-out 3;
+  animation: mmfem-solve-status-flash-b 0.68s ease-in-out 3;
 }
 @media (prefers-reduced-motion: reduce) {
   .mmfem-solve-status-flash-a,
