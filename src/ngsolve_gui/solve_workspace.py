@@ -1079,6 +1079,7 @@ class SolveWorkspace(Div):
   let dragBaseTranslateX = 0;
   let dragBaseTranslateY = 0;
   let dragRegionId = null;
+  let dragEdgeId = null;
   let dragMode = null;
   let gestureNumber = 0;
   let suppressCanvasClickUntil = 0;
@@ -1142,6 +1143,9 @@ class SolveWorkspace(Div):
     const targetRegion = event.target && event.target.closest
       ? (event.target.closest('[data-sketch-region-id]') || {}).getAttribute('data-sketch-region-id')
       : null;
+    const targetEdge = event.target && event.target.closest
+      ? (event.target.closest('[data-sketch-edge-id]') || {}).getAttribute('data-sketch-edge-id')
+      : null;
     const fallbackRegion = event.type === 'mousedown'
       && window.__ngsolveSketchRegionForNextMouseDownKnown
       ? window.__ngsolveSketchRegionForNextMouseDown
@@ -1155,6 +1159,7 @@ class SolveWorkspace(Div):
       x: event.clientX,
       y: event.clientY,
       regionId: targetRegion || fallbackRegion || null,
+      edgeId: targetEdge || null,
       regionKnown,
     });
     if (event.type === 'mousedown') {
@@ -1201,6 +1206,7 @@ class SolveWorkspace(Div):
     dragStart = null;
     dragStartScreen = null;
     dragRegionId = null;
+    dragEdgeId = null;
     dragMode = null;
   };
   const snapPoint = (point) => {
@@ -1222,7 +1228,7 @@ class SolveWorkspace(Div):
   ];
   const updatePreview = (svg, point, screenPoint = null) => {
     if (!active || !dragStart || !point) return;
-    if (dragMode === 'region' && dragRegionId) {
+    if ((dragMode === 'region' || dragMode === 'edge') && dragRegionId) {
       const grid = window.__ngsolveSketchSnap;
       const start = grid && grid.enabled ? snapPoint(dragStart) : dragStart;
       const end = grid && grid.enabled ? snapPoint(point) : point;
@@ -1309,16 +1315,26 @@ class SolveWorkspace(Div):
     const region = event.target && event.target.closest
       ? event.target.closest('[data-sketch-region-id]')
       : null;
+    const edge = event.target && event.target.closest
+      ? event.target.closest('[data-sketch-edge-id]')
+      : null;
     dragRegionId = (window.__ngsolveSketchTool || 'select') === 'select' && region
       ? region.getAttribute('data-sketch-region-id')
+      : null;
+    dragEdgeId = (window.__ngsolveSketchTool || 'select') === 'select' && edge
+      ? edge.getAttribute('data-sketch-edge-id')
       : null;
     window.__ngsolveSketchLastRegionId = dragRegionId;
     const tool = window.__ngsolveSketchTool || 'select';
     dragMode = tool !== 'select'
       ? 'draw'
-      : dragRegionId
-        ? 'region'
-        : (event.shiftKey || event.ctrlKey ? 'marquee' : 'pan');
+      : (event.shiftKey || event.ctrlKey)
+        ? 'marquee'
+        : dragEdgeId
+          ? 'edge'
+          : dragRegionId
+            ? 'region'
+            : 'pan';
     window.__ngsolveSketchGestureActive = true;
     if (dragMode === 'pan') svg.style.cursor = 'grabbing';
     if (tool === 'select') {
@@ -1353,9 +1369,11 @@ class SolveWorkspace(Div):
     if (!cancelled && point) updatePreview(svg, point, screenPoint);
     const moved = Boolean(!cancelled && dragStartScreen && screenPoint
       && Math.hypot(screenPoint[0] - dragStartScreen[0], screenPoint[1] - dragStartScreen[1]) >= 4);
+    const hasCompletedPointerGesture = Boolean(!cancelled && dragStartScreen && screenPoint);
     const finishedGesture = gestureNumber;
-    const finishedRegionId = dragMode === 'region' ? dragRegionId : null;
-    const preserveVisual = moved && ['draw', 'pan', 'region'].includes(dragMode);
+    const finishedRegionId = ['region', 'edge'].includes(dragMode) ? dragRegionId : null;
+    const finishedEdgeId = dragEdgeId;
+    const preserveVisual = moved && ['draw', 'pan', 'region', 'edge'].includes(dragMode);
     const shouldForward = active && !targetIsSvg(event, svg) && event.type !== 'pointercancel';
     if (!cancelled && dragStartScreen && screenPoint) {
       const operation = dragMode;
@@ -1365,13 +1383,15 @@ class SolveWorkspace(Div):
         dragStartScreen[0], dragStartScreen[1], screenPoint[0], screenPoint[1],
         dragRegionId || '', Boolean(event.shiftKey || event.ctrlKey), moved,
         visualScale, visualTranslateX, visualTranslateY, viewVersion,
+        finishedEdgeId || '',
       ];
       if (wheelCommitTimer) window.clearTimeout(wheelCommitTimer);
       wheelCommitTimer = 0;
     }
-    if (moved) {
-      // The browser's click follows mouseup. Suppress it after any drag so
-      // the completed gesture cannot select a region beneath its endpoint.
+    if (hasCompletedPointerGesture) {
+      // Selection is resolved from this completed gesture because pointer
+      // capture retargets the browser's following click to the SVG root.
+      // Suppress that click to avoid selecting the region below its endpoint.
       suppressCanvasClickUntil = performance.now() + 1000;
     }
     active = false;
@@ -1595,6 +1615,29 @@ class SolveWorkspace(Div):
         except Exception:
             return value.get("region_id") or value.get("regionId")
 
+    def _read_canvas_edge_id(self, value):
+        """Return the sketch edge hit by a native pointer event, if any."""
+        if not isinstance(value, dict):
+            return None
+        event_type = value.get("type")
+        timestamp = value.get("timeStamp")
+        if event_type not in {None, "mousedown"}:
+            return value.get("edge_id") or value.get("edgeId")
+        try:
+            timestamp_js = "null" if timestamp is None else repr(float(timestamp))
+            edge_id = self.js.eval(
+                "((timestamp) => { "
+                "const events = window.__ngsolveSketchPointerEvents || []; "
+                "const event = (timestamp === null ? null : events.find(item => item.type === 'mousedown' "
+                "&& Math.abs(item.timeStamp - timestamp) < 1)) "
+                "|| [...events].reverse().find(item => item.type === 'mousedown'); "
+                "return event ? event.edgeId || null : null; })"
+                f"({timestamp_js})"
+            )
+            return str(edge_id) if edge_id is not None else None
+        except Exception:
+            return value.get("edge_id") or value.get("edgeId")
+
     def _canvas_event_point(self, event, *, refresh_transform=False):
         value = getattr(event, "value", None)
         if not isinstance(value, dict):
@@ -1630,6 +1673,7 @@ class SolveWorkspace(Div):
         # Resolve the hit target before _canvas_event_point consumes the
         # matching browser pointer record to obtain clientX/clientY.
         region_id = self._read_canvas_region_id(value) if tool == "select" else None
+        edge_id = self._read_canvas_edge_id(value) if tool == "select" else None
         browser_hit_is_known = region_id == ""
         if browser_hit_is_known:
             region_id = None
@@ -1642,10 +1686,12 @@ class SolveWorkspace(Div):
             region_id = self._region_at_canvas_point(point)
         if tool != "select":
             operation = "draw"
-        elif region_id:
-            operation = "region"
         elif value.get("shiftKey") or value.get("ctrlKey"):
             operation = "marquee"
+        elif edge_id:
+            operation = "edge"
+        elif region_id:
+            operation = "region"
         else:
             operation = "pan"
         self._canvas_drag = {
@@ -1654,6 +1700,7 @@ class SolveWorkspace(Div):
             "start": point,
             "current": point,
             "region_id": region_id,
+            "edge_id": edge_id,
             "additive": bool(value.get("shiftKey") or value.get("ctrlKey")),
             "moved": False,
         }
@@ -1701,12 +1748,13 @@ class SolveWorkspace(Div):
                 additive = bool(completed[7])
                 moved = bool(completed[8])
                 view = tuple(float(completed[index]) for index in (9, 10, 11)) + (int(completed[12]),)
+                edge_id = (str(completed[13]) or None) if len(completed) >= 14 else None
             except (TypeError, ValueError, OverflowError):
                 completed = None
             else:
                 self._canvas_drag = None
                 self._screen_to_svg = None
-                if moved and operation == "region" and region_id:
+                if moved and operation in {"region", "edge"} and region_id:
                     self._move_region_from_canvas_drag(region_id, start, end, preserve_canvas=True)
                     # Interpret the pointer coordinates in the view that was
                     # visible during the drag. If a wheel transform was still
@@ -1731,6 +1779,10 @@ class SolveWorkspace(Div):
                             self.render_canvas()
                         else:
                             self._schedule_canvas_interaction_reset()
+                elif edge_id:
+                    self.select_edge(edge_id, additive=additive)
+                elif operation == "region" and region_id:
+                    self.select_region(region_id)
                 elif self._commit_browser_canvas_view(view, render=False):
                     self.render_canvas()
                 return
@@ -1747,7 +1799,7 @@ class SolveWorkspace(Div):
         moved = math.hypot(end[0] - start[0], end[1] - start[1]) >= 4.0
         self._canvas_drag = None
         self._screen_to_svg = None
-        if moved and drag["operation"] == "region" and drag.get("region_id"):
+        if moved and drag["operation"] in {"region", "edge"} and drag.get("region_id"):
             self._move_region_from_canvas_drag(drag["region_id"], start, end)
         elif moved and drag["operation"] == "marquee":
             self._select_edges_in_canvas_box(start, end, additive=drag["additive"])
@@ -1755,6 +1807,10 @@ class SolveWorkspace(Div):
             self._pan_canvas_by_pixels(start, end)
         elif moved and drag["operation"] == "draw":
             self._create_region_from_canvas_drag(drag["tool"], start, end)
+        elif drag.get("edge_id"):
+            self.select_edge(drag["edge_id"], additive=drag["additive"])
+        elif drag["operation"] == "region" and drag.get("region_id"):
+            self.select_region(drag["region_id"])
 
     def _on_canvas_pointer_cancel(self, event=None):
         """Discard an incomplete sketch gesture after a cancelled pointer."""
@@ -3485,6 +3541,7 @@ class SolveWorkspace(Div):
             hit_props = {
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "stroke": "transparent", "stroke_width": "12",
+                "data_sketch_edge_id": edge_id,
                 "data_sketch_region_id": region_id,
                 "style": "cursor:pointer; pointer-events:stroke;",
             }
@@ -3493,7 +3550,8 @@ class SolveWorkspace(Div):
                 visible = _svg("line", **visible_props)
                 hit = _svg("line", **hit_props)
                 hit.on("click", lambda event, eid=edge_id: self.select_edge(
-                    eid, additive=bool((getattr(event, "value", None) or {}).get("shiftKey", False))
+                    eid, additive=bool((getattr(event, "value", None) or {}).get("shiftKey", False)
+                        or (getattr(event, "value", None) or {}).get("ctrlKey", False))
                 ))
                 nodes = (visible, hit)
                 self._canvas_edge_nodes[edge_id] = nodes

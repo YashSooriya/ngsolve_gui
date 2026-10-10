@@ -1028,6 +1028,53 @@ def test_canvas_drag_suppresses_the_click_that_follows_mouseup(standalone_compon
     assert "pointercancel" in scripts[0]
     assert "window.addEventListener('blur'" in scripts[0]
     assert "regionKnown" in scripts[0]
+    assert "edgeId" in scripts[0]
+    assert "data-sketch-edge-id" in scripts[0]
+
+
+def test_stationary_region_pointer_gesture_selects_region_after_pointer_capture(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region_id = workspace.model["geometry"]["regions"][0]["id"]
+    workspace.selected_region_id = None
+    completed = ["region", "select", 120, 180, 120, 180, region_id, False, False, 1, 0, 0, 1, ""]
+    fake_js = SimpleNamespace(eval=lambda _script: completed)
+    monkeypatch.setattr(SolveWorkspace, "js", property(lambda self: fake_js), raising=False)
+
+    workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
+
+    assert workspace.selected_region_id == region_id
+    assert workspace.selected_edge_ids == []
+
+
+def test_stationary_edge_pointer_gesture_selects_edge_after_pointer_capture(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    edge_id = workspace.model["geometry"]["edges"][0]["id"]
+    workspace.selected_region_id = None
+    completed = ["edge", "select", 120, 180, 120, 180, "", False, False, 1, 0, 0, 1, edge_id]
+    fake_js = SimpleNamespace(eval=lambda _script: completed)
+    monkeypatch.setattr(SolveWorkspace, "js", property(lambda self: fake_js), raising=False)
+
+    workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
+
+    assert workspace.selected_edge_ids == [edge_id]
+    assert workspace.selected_region_id is None
+
+
+def test_modified_stationary_edge_pointer_gesture_adds_edge_selection(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    first, second = workspace.model["geometry"]["edges"][:2]
+    workspace.selected_edge_ids = [first["id"]]
+    workspace.selected_edge_id = first["id"]
+    completed = ["marquee", "select", 120, 180, 120, 180, "", True, False, 1, 0, 0, 1, second["id"]]
+    fake_js = SimpleNamespace(eval=lambda _script: completed)
+    monkeypatch.setattr(SolveWorkspace, "js", property(lambda self: fake_js), raising=False)
+
+    workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
+
+    assert workspace.selected_edge_ids == [first["id"], second["id"]]
 
 
 def test_canvas_render_keeps_background_and_layer_components_mounted(standalone_components):
