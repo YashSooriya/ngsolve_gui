@@ -15,6 +15,9 @@ def test_workspace_mode_toggle_updates_selection_and_notifies(monkeypatch):
     assert [button.ui_children[0] for button in toggle.ui_children] == [
         "Solve", "Post Process"
     ]
+    assert all(
+        "font-size:15px" in button.ui_style for button in toggle._buttons.values()
+    )
     assert "background:var(--accent-subtle)" in toggle._buttons["post_process"].ui_style
     assert "background:var(--surface)" in toggle._buttons["solve"].ui_style
 

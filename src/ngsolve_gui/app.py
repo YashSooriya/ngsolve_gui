@@ -160,7 +160,7 @@ class WorkspaceModeToggle(Div):
         style = (
             "display:flex; flex:1; align-items:center; justify-content:center; "
             "height:36px; padding:0 14px; white-space:nowrap; cursor:pointer; "
-            "user-select:none; font-size:13px; transition:background-color 100ms ease, color 100ms ease;"
+            "user-select:none; font-size:15px; transition:background-color 100ms ease, color 100ms ease;"
         )
         if mode == "post_process":
             style += " border-left:1px solid var(--border);"
