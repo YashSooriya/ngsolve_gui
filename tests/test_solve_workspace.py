@@ -768,6 +768,7 @@ def test_nested_region_labels_are_separated_and_stay_in_the_visible_shell(standa
             "name": "Outer domain",
             "parent_id": None,
             "material_id": None,
+            "shape": {"type": "rectangle", "r_min": 0.0, "z_min": -0.01, "width": 0.02, "height": 0.02},
             "vertices": [[0.0, -0.01], [0.02, -0.01], [0.02, 0.01], [0.0, 0.01]],
         },
         {
@@ -775,9 +776,11 @@ def test_nested_region_labels_are_separated_and_stay_in_the_visible_shell(standa
             "name": "Coil",
             "parent_id": "outer",
             "material_id": None,
+            "shape": {"type": "rectangle", "r_min": 0.008, "z_min": -0.003, "width": 0.004, "height": 0.006},
             "vertices": [[0.008, -0.003], [0.012, -0.003], [0.012, 0.003], [0.008, 0.003]],
         },
     ]
+    workspace.selected_region_id = "inner"
 
     workspace.render_canvas()
     labels = {
@@ -798,7 +801,12 @@ def test_nested_region_labels_are_separated_and_stay_in_the_visible_shell(standa
         inner._props["y"] - 10,
         inner._props["y"] + 4,
     )
-    assert outer_box[1] + 4 <= inner_box[0] or inner_box[1] + 4 <= outer_box[0] or outer_box[3] + 4 <= inner_box[2] or inner_box[3] + 4 <= outer_box[2]
+    assert (
+        outer_box[1] + 4 <= inner_box[0]
+        or inner_box[1] + 4 <= outer_box[0]
+        or outer_box[3] + 4 <= inner_box[2]
+        or inner_box[3] + 4 <= outer_box[2]
+    )
 
     project, _ = workspace._canvas_projection()
     child_points = [project(point) for point in workspace.model["geometry"]["regions"][1]["vertices"]]
@@ -808,7 +816,30 @@ def test_nested_region_labels_are_separated_and_stay_in_the_visible_shell(standa
         min(point[1] for point in child_points),
         max(point[1] for point in child_points),
     )
-    assert outer_box[1] <= child_bounds[0] or outer_box[0] >= child_bounds[1] or outer_box[3] <= child_bounds[2] or outer_box[2] >= child_bounds[3]
+    assert (
+        outer_box[1] <= child_bounds[0]
+        or outer_box[0] >= child_bounds[1]
+        or outer_box[3] <= child_bounds[2]
+        or outer_box[2] >= child_bounds[3]
+    )
+
+    def overlaps(first, second):
+        return not (
+            first[1] + 4 <= second[0]
+            or second[1] + 4 <= first[0]
+            or first[3] + 4 <= second[2]
+            or second[3] + 4 <= first[2]
+        )
+
+    dimension_boxes = [
+        box
+        for region in workspace.model["geometry"]["regions"]
+        for component in workspace._region_dimension_components(region)
+        if component._component_name == "text"
+        for box in [workspace._svg_text_box(component)]
+        if box is not None
+    ]
+    assert all(not overlaps(label_box, dimension_box) for label_box in (outer_box, inner_box) for dimension_box in dimension_boxes)
     assert labels["outer"] is workspace._canvas_scene.ui_children[-2]
     assert labels["inner"] is workspace._canvas_scene.ui_children[-1]
 

@@ -1904,6 +1904,10 @@ class SolveWorkspace(Div):
     def _canvas_dimension_components(self):
         """Build the selected region's dimension annotations separately."""
         region = self._selected_region()
+        return self._region_dimension_components(region)
+
+    def _region_dimension_components(self, region):
+        """Build dimensions for a region, whether or not it is selected."""
         if region is None:
             return []
 
@@ -1935,6 +1939,31 @@ class SolveWorkspace(Div):
                 _svg("text", x=(center[0] + radial[0]) / 2, y=center[1] - 7, text_anchor="middle", fill="#263746", font_size="11", font_weight="600", style="pointer-events:none;", children=f"R {radius_mm:.4g} mm"),
             ]
         return []
+
+    @staticmethod
+    def _svg_text_box(component):
+        """Estimate an SVG text component's visible box for label collision checks."""
+        props = component._props
+        try:
+            x, y = float(props["x"]), float(props["y"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        style = str(props.get("style", ""))
+        font_match = re.search(r"font-size:\s*([0-9.]+)px", style)
+        try:
+            font_size = float(props.get("font-size") or (font_match.group(1) if font_match else 12))
+        except (TypeError, ValueError):
+            font_size = 12.0
+        text = str(props.get("textContent", ""))
+        text_width = max(font_size, len(text) * font_size * 0.62)
+        anchor = props.get("text-anchor", "start")
+        if anchor == "middle":
+            left, right = x - text_width / 2, x + text_width / 2
+        elif anchor == "end":
+            left, right = x - text_width, x
+        else:
+            left, right = x, x + text_width
+        return left - 2, right + 2, y - font_size * 0.9 - 2, y + font_size * 0.3 + 2
 
     def _render_canvas_dimensions(self):
         """Update selected dimensions without replacing the full sketch scene."""
@@ -2623,7 +2652,7 @@ class SolveWorkspace(Div):
         return [first + index * step for index in range(count)]
 
     @staticmethod
-    def _region_label_placements(regions, project, plot):
+    def _region_label_placements(regions, project, plot, reserved_boxes=()):
         """Place region names in visible, non-overlapping parts of the sketch."""
         by_id = {region["id"]: region for region in regions}
         polygons = {
@@ -2685,7 +2714,7 @@ class SolveWorkspace(Div):
             )
 
         placements = {}
-        occupied = []
+        occupied = list(reserved_boxes)
         ordered = sorted(
             regions,
             key=lambda region: (
@@ -2843,7 +2872,15 @@ class SolveWorkspace(Div):
         grid_children.append(_svg("text", x=12, y=plot[1] - 8, fill="var(--fg-muted, #697586)", font_size="12", style=grid_text_style, children="z  [m]"))
 
         material_index = {item["id"]: index for index, item in enumerate(self.model["materials"])}
-        label_positions = self._region_label_placements(regions, xy, plot)
+        reserved_boxes = [
+            box
+            for region in regions
+            for component in self._region_dimension_components(region)
+            if component._component_name == "text"
+            for box in [self._svg_text_box(component)]
+            if box is not None
+        ]
+        label_positions = self._region_label_placements(regions, xy, plot, reserved_boxes)
         label_children = []
         label_leaders = []
         for region in regions:
