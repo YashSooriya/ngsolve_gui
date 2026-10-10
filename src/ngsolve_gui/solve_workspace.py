@@ -3251,7 +3251,7 @@ class SolveWorkspace(Div):
         from netgen.occ import Axis, Compound, Face, MakePolygon, OCCGeometry, Pnt, Revolve, Vec, Vertex
         from ngapp.components import WebgpuComponent
         from ngsolve_webgpu import GeometryRenderer
-        from webgpu import CoordinateAxes, NavigationCube
+        from webgpu import CoordinateAxes
 
         regions = self.model.get("geometry", {}).get("regions", [])
         material_names = {
@@ -3321,8 +3321,7 @@ class SolveWorkspace(Div):
             renderer.faces.set_colors(face_colors)
             renderers.append(renderer)
         axes = CoordinateAxes()
-        navigation_cube = NavigationCube()
-        renderers.extend([axes, navigation_cube])
+        renderers.append(axes)
 
         preview = WebgpuComponent(
             ui_style="display:block; flex:1 1 auto; width:100%; height:100%; min-width:0; min-height:0;",

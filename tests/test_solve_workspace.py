@@ -1,8 +1,9 @@
 import copy
 import math
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
-from types import SimpleNamespace
 
 from ngapp import utils
 from ngapp.components import Div
@@ -147,6 +148,52 @@ def test_3d_preview_replaces_viewport_and_restores_editable_sketch(standalone_co
     assert workspace._canvas_host.ui_children == [original_canvas]
     assert workspace._preview_3d_button.ui_label == "Preview in 3D"
     assert all(not control.ui_hidden for control in workspace._sketch_view_controls)
+
+
+def test_3d_preview_keeps_axis_indicator_without_navigation_cube(
+    standalone_components, monkeypatch
+):
+    import ngapp.components
+    import netgen
+
+    axis_indicator = object()
+
+    class Axes:
+        def __new__(cls):
+            return axis_indicator
+
+    class Preview:
+        def __init__(self, **kwargs):
+            self.ui_class = None
+            self.renderers = None
+
+        def on_mounted(self, callback):
+            pass
+
+        def draw(self, renderers):
+            self.renderers = renderers
+            return object()
+
+    occ = ModuleType("netgen.occ")
+    for name in (
+        "Axis", "Compound", "Face", "MakePolygon", "OCCGeometry",
+        "Pnt", "Revolve", "Vec", "Vertex",
+    ):
+        setattr(occ, name, object)
+    ngsolve_webgpu = ModuleType("ngsolve_webgpu")
+    ngsolve_webgpu.GeometryRenderer = object
+    webgpu = ModuleType("webgpu")
+    webgpu.CoordinateAxes = Axes
+    monkeypatch.setattr(netgen, "occ", occ, raising=False)
+    monkeypatch.setitem(sys.modules, "netgen.occ", occ)
+    monkeypatch.setitem(sys.modules, "ngsolve_webgpu", ngsolve_webgpu)
+    monkeypatch.setitem(sys.modules, "webgpu", webgpu)
+    monkeypatch.setattr(ngapp.components, "WebgpuComponent", Preview)
+
+    workspace = SolveWorkspace()
+    preview = workspace._build_3d_preview_component()
+
+    assert preview.renderers == [axis_indicator]
 
 
 def test_3d_preview_failure_keeps_editable_sketch_active(standalone_components):
