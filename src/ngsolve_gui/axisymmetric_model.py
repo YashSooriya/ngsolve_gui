@@ -100,7 +100,7 @@ def migrate_legacy_model(model):
     if not isinstance(model, dict) or model.get("schema_version") != LEGACY_SCHEMA_VERSION:
         return model
     geometry = model.get("geometry", {})
-    if not isinstance(geometry, dict) or "regions" not in geometry or geometry.get("dimension_expression_unit") == "m":
+    if not isinstance(geometry, dict) or geometry.get("dimension_expression_unit") == "m":
         return model
     if geometry.get("dimension_expression_unit", "mm") != "mm":
         return model

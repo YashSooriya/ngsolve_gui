@@ -96,6 +96,20 @@ def test_legacy_millimetre_project_migrates_expressions_to_si_metres():
     assert validate_model(restored) == []
 
 
+def test_legacy_empty_project_is_marked_for_si_geometry():
+    model = new_model()
+    model["geometry"].pop("dimension_expression_unit")
+    model["geometry"].pop("regions")
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("problem.json", json.dumps(model))
+        archive.writestr("studies.json", json.dumps(new_studies()))
+
+    restored, _, _ = unpack_model(archive_bytes.getvalue())
+
+    assert restored["geometry"]["dimension_expression_unit"] == "m"
+
+
 def test_overlapping_domains_and_wrong_parent_are_rejected():
     model = _nested_model()
     model["geometry"]["regions"][1]["vertices"][0][0] = 0.021
