@@ -686,16 +686,20 @@ class SolveWorkspace(Div):
             zmin = min(point[1] for point in points)
             zmax = max(point[1] for point in points)
             pad_r = max(rmax, 0.01) * 0.08
-            pad_z = max(zmax - zmin, 0.01) * 0.08
+            # The meridian model is expected to be centred on z = 0. Keep
+            # that plane at the middle of the default view even when the
+            # current geometry only occupies positive or negative z.
+            z_extent = max(abs(zmin), abs(zmax), 0.01)
+            pad_z = z_extent * 0.08
             rmax += pad_r
-            zmin -= pad_z
-            zmax += pad_z
+            zmin = -(z_extent + pad_z)
+            zmax = z_extent + pad_z
         else:
-            rmin, rmax, zmin, zmax = 0.0, 0.024, -0.002, 0.022
+            rmin, rmax, zmin, zmax = 0.0, 0.024, -0.012, 0.012
         width = max(rmax - rmin, (zmax - zmin) * target_ratio, 1e-12)
         # Keep r = 0 on the left edge of the sketch grid while fitting the
         # region extents into the remaining positive-r area.
-        center = (width / 2, (zmin + zmax) / 2)
+        center = (width / 2, 0.0)
         return center, width
 
     def _current_canvas_world_view(self):

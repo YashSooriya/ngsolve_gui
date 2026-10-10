@@ -377,6 +377,7 @@ def test_dragging_region_rejects_crossing_another_region(standalone_components):
 def test_canvas_drag_on_region_body_moves_region_instead_of_box_selecting_edges(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
+    workspace.zoom_canvas(0.5)
     region = workspace.model["geometry"]["regions"][0]
     before = region["shape"]["r_min"]
     project, _ = workspace._canvas_projection()
@@ -714,9 +715,13 @@ def test_model_tree_groups_sections_and_places_children_under_their_parent(stand
 def test_blank_axisymmetric_view_starts_at_r_zero_with_world_space_ticks(standalone_components):
     workspace = SolveWorkspace()
     project, unproject = workspace._canvas_projection()
+    plot = workspace._canvas_plot_bounds()
+    center = ((plot[0] + plot[2]) / 2, (plot[1] + plot[3]) / 2)
 
     assert project((0.0, 0.0))[0] == pytest.approx(72.0)
     assert unproject((72.0, 320.0))[0] == pytest.approx(0.0)
+    assert unproject(center)[1] == pytest.approx(0.0)
+    assert unproject((center[0], plot[1]))[1] == pytest.approx(-unproject((center[0], plot[3]))[1])
     ticks = workspace._coordinate_ticks(0.0, 0.022)
     assert ticks[0] == pytest.approx(0.0)
     steps = {round(b - a, 10) for a, b in zip(ticks, ticks[1:])}
@@ -724,6 +729,35 @@ def test_blank_axisymmetric_view_starts_at_r_zero_with_world_space_ticks(standal
     svg_text = [item for item in workspace._canvas_grid.ui_children if item._component_name == "text"]
     assert any(item._props.get("textContent") == "Axis of rotation  ·  r = 0" for item in svg_text)
     assert all(not item.ui_children for item in svg_text)
+
+
+def test_default_axisymmetric_fit_centres_z_zero_for_positive_z_geometry(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.model["geometry"]["regions"] = [{
+        "vertices": [[0.0, 0.0], [0.02, 0.0], [0.02, 0.02], [0.0, 0.02]],
+    }]
+
+    project, unproject = workspace._canvas_projection()
+    plot = workspace._canvas_plot_bounds()
+    viewport_midpoint = (plot[1] + plot[3]) / 2
+
+    assert project((0.0, 0.0))[1] == pytest.approx(viewport_midpoint)
+    assert unproject((plot[0], plot[1]))[1] == pytest.approx(-unproject((plot[0], plot[3]))[1])
+    assert project((0.0, 0.02))[1] < viewport_midpoint
+
+
+def test_saved_axisymmetric_view_keeps_its_user_selected_z_centre(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.set_model(
+        workspace.model,
+        layout={
+            "schema_version": 1,
+            "active_section": "geometry",
+            "view": {"center_r": 0.01, "center_z": 0.005, "width": 0.04},
+        },
+    )
+
+    assert workspace._current_canvas_world_view()[0][1] == pytest.approx(0.005)
 
 
 def test_sketch_grid_labels_do_not_intercept_or_select_canvas_drags(standalone_components):
