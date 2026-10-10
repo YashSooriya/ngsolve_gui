@@ -760,6 +760,59 @@ def test_saved_axisymmetric_view_keeps_its_user_selected_z_centre(standalone_com
     assert workspace._current_canvas_world_view()[0][1] == pytest.approx(0.005)
 
 
+def test_nested_region_labels_are_separated_and_stay_in_the_visible_shell(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.model["geometry"]["regions"] = [
+        {
+            "id": "outer",
+            "name": "Outer domain",
+            "parent_id": None,
+            "material_id": None,
+            "vertices": [[0.0, -0.01], [0.02, -0.01], [0.02, 0.01], [0.0, 0.01]],
+        },
+        {
+            "id": "inner",
+            "name": "Coil",
+            "parent_id": "outer",
+            "material_id": None,
+            "vertices": [[0.008, -0.003], [0.012, -0.003], [0.012, 0.003], [0.008, 0.003]],
+        },
+    ]
+
+    workspace.render_canvas()
+    labels = {
+        item._props["data-sketch-region-id"]: item
+        for item in workspace._canvas_scene.ui_children
+        if item._component_name == "text" and "data-sketch-region-id" in item._props
+    }
+    outer, inner = labels["outer"], labels["inner"]
+    outer_box = (
+        outer._props["x"] - len("Outer domain") * 7.4 / 2 - 2,
+        outer._props["x"] + len("Outer domain") * 7.4 / 2 + 2,
+        outer._props["y"] - 10,
+        outer._props["y"] + 4,
+    )
+    inner_box = (
+        inner._props["x"] - len("Coil") * 7.4 / 2 - 2,
+        inner._props["x"] + len("Coil") * 7.4 / 2 + 2,
+        inner._props["y"] - 10,
+        inner._props["y"] + 4,
+    )
+    assert outer_box[1] + 4 <= inner_box[0] or inner_box[1] + 4 <= outer_box[0] or outer_box[3] + 4 <= inner_box[2] or inner_box[3] + 4 <= outer_box[2]
+
+    project, _ = workspace._canvas_projection()
+    child_points = [project(point) for point in workspace.model["geometry"]["regions"][1]["vertices"]]
+    child_bounds = (
+        min(point[0] for point in child_points),
+        max(point[0] for point in child_points),
+        min(point[1] for point in child_points),
+        max(point[1] for point in child_points),
+    )
+    assert outer_box[1] <= child_bounds[0] or outer_box[0] >= child_bounds[1] or outer_box[3] <= child_bounds[2] or outer_box[2] >= child_bounds[3]
+    assert labels["outer"] is workspace._canvas_scene.ui_children[-2]
+    assert labels["inner"] is workspace._canvas_scene.ui_children[-1]
+
+
 def test_sketch_grid_labels_do_not_intercept_or_select_canvas_drags(standalone_components):
     workspace = SolveWorkspace()
     svg_text = [item for item in workspace._canvas_grid.ui_children if item._component_name == "text"]

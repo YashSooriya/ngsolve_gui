@@ -2622,6 +2622,175 @@ class SolveWorkspace(Div):
         count = min(200, max(0, int(math.floor((maximum - first) / step)) + 1))
         return [first + index * step for index in range(count)]
 
+    @staticmethod
+    def _region_label_placements(regions, project, plot):
+        """Place region names in visible, non-overlapping parts of the sketch."""
+        by_id = {region["id"]: region for region in regions}
+        polygons = {
+            region["id"]: [project(point) for point in region.get("vertices", [])]
+            for region in regions
+        }
+        children = {region_id: [] for region_id in by_id}
+        depths = {}
+        for region in regions:
+            region_id = region["id"]
+            parent_id = region.get("parent_id")
+            if parent_id in by_id:
+                children[parent_id].append(region_id)
+            seen = set()
+            depth = 0
+            while parent_id in by_id and parent_id not in seen:
+                seen.add(parent_id)
+                depth += 1
+                parent_id = by_id[parent_id].get("parent_id")
+            depths[region_id] = depth
+
+        def bounds(points):
+            return (
+                min(point[0] for point in points),
+                min(point[1] for point in points),
+                max(point[0] for point in points),
+                max(point[1] for point in points),
+            )
+
+        def label_box(point, name):
+            label_width = max(18.0, len(str(name)) * 7.4)
+            # Keep the same (left, right, top, bottom) ordering as the sketch
+            # hit-test helpers below.
+            return (point[0] - label_width / 2 - 2, point[0] + label_width / 2 + 2, point[1] - 10, point[1] + 4)
+
+        def boxes_overlap(first, second, gap=4.0):
+            return not (
+                first[1] + gap <= second[0]
+                or second[1] + gap <= first[0]
+                or first[3] + gap <= second[2]
+                or second[3] + gap <= first[2]
+            )
+
+        def box_in_polygon(box, polygon):
+            corners = ((box[0], box[2]), (box[1], box[2]), (box[1], box[3]), (box[0], box[3]))
+            return len(polygon) >= 3 and all(_point_in_or_on_polygon(point, polygon) for point in corners)
+
+        def polygon_intersects_box(polygon, box):
+            if len(polygon) < 3:
+                return False
+            corners = ((box[0], box[2]), (box[1], box[2]), (box[1], box[3]), (box[0], box[3]))
+            return (
+                any(_point_in_box(point, box) for point in polygon)
+                or any(_point_in_or_on_polygon(point, polygon) for point in corners)
+                or any(
+                    _segment_intersects_box(polygon[index], polygon[(index + 1) % len(polygon)], box)
+                    for index in range(len(polygon))
+                )
+            )
+
+        placements = {}
+        occupied = []
+        ordered = sorted(
+            regions,
+            key=lambda region: (
+                -depths[region["id"]],
+                abs(_polygon_area(polygons[region["id"]])),
+                str(region.get("name", "")),
+            ),
+        )
+        for region in ordered:
+            region_id = region["id"]
+            polygon = polygons[region_id]
+            if len(polygon) < 3:
+                continue
+            left, top, right, bottom = bounds(polygon)
+            center = (
+                sum(point[0] for point in polygon) / len(polygon),
+                sum(point[1] for point in polygon) / len(polygon),
+            )
+            descendants = []
+            pending = list(children[region_id])
+            seen_descendants = set()
+            while pending:
+                descendant_id = pending.pop()
+                if descendant_id in seen_descendants:
+                    continue
+                seen_descendants.add(descendant_id)
+                descendants.append(polygons[descendant_id])
+                pending.extend(children[descendant_id])
+
+            def region_candidates():
+                nx = min(24, max(2, math.ceil((right - left) / 12)))
+                ny = min(24, max(2, math.ceil((bottom - top) / 12)))
+                candidates = {center}
+                for row in range(ny + 1):
+                    y = top + (bottom - top) * row / ny
+                    for column in range(nx + 1):
+                        x = left + (right - left) * column / nx
+                        candidates.add((x, y))
+                return sorted(
+                    candidates,
+                    key=lambda point: ((point[0] - center[0]) ** 2 + (point[1] - center[1]) ** 2, point[1], point[0]),
+                )
+
+            def acceptable(point, *, avoid_descendants):
+                box = label_box(point, region.get("name", ""))
+                if not (plot[0] <= box[0] and box[1] <= plot[2] and plot[1] <= box[2] and box[3] <= plot[3]):
+                    return None
+                if not box_in_polygon(box, polygon):
+                    return None
+                if avoid_descendants and any(polygon_intersects_box(child, box) for child in descendants):
+                    return None
+                if any(boxes_overlap(box, other) for other in occupied):
+                    return None
+                return box
+
+            chosen = None
+            candidate_grid = None
+            for avoid_descendants in (True, False):
+                center_box = acceptable(center, avoid_descendants=avoid_descendants)
+                if center_box is not None:
+                    chosen = (center, center_box)
+                    break
+                if candidate_grid is None:
+                    candidate_grid = region_candidates()
+                for point in candidate_grid:
+                    if point == center:
+                        continue
+                    box = acceptable(point, avoid_descendants=avoid_descendants)
+                    if box is not None:
+                        chosen = (point, box)
+                        break
+                if chosen is not None:
+                    break
+
+            leader_start = None
+            if chosen is None:
+                # A small region may not have room for its full name. Place a
+                # nearby callout instead of stacking it on another label.
+                nx = min(48, max(2, math.ceil((plot[2] - plot[0]) / 12)))
+                ny = min(36, max(2, math.ceil((plot[3] - plot[1]) / 12)))
+                candidates = [
+                    (plot[0] + (plot[2] - plot[0]) * column / nx,
+                     plot[1] + (plot[3] - plot[1]) * row / ny)
+                    for row in range(ny + 1)
+                    for column in range(nx + 1)
+                ]
+                candidates.sort(
+                    key=lambda point: ((point[0] - center[0]) ** 2 + (point[1] - center[1]) ** 2, point[1], point[0])
+                )
+                for point in candidates:
+                    box = label_box(point, region.get("name", ""))
+                    if not (plot[0] <= box[0] and box[1] <= plot[2] and plot[1] <= box[2] and box[3] <= plot[3]):
+                        continue
+                    if any(boxes_overlap(box, other) for other in occupied):
+                        continue
+                    chosen = (point, box)
+                    leader_start = center
+                    break
+            if chosen is None:
+                continue
+            point, box = chosen
+            placements[region_id] = {"point": point, "leader_start": leader_start}
+            occupied.append(box)
+        return placements
+
     def _canvas_grid_step(self):
         _, world_width, _ = self._current_canvas_world_view()
         plot = self._canvas_plot_bounds()
@@ -2674,6 +2843,9 @@ class SolveWorkspace(Div):
         grid_children.append(_svg("text", x=12, y=plot[1] - 8, fill="var(--fg-muted, #697586)", font_size="12", style=grid_text_style, children="z  [m]"))
 
         material_index = {item["id"]: index for index, item in enumerate(self.model["materials"])}
+        label_positions = self._region_label_placements(regions, xy, plot)
+        label_children = []
+        label_leaders = []
         for region in regions:
             polygon = " ".join(f"{x:.3f},{y:.3f}" for x, y in (xy(point) for point in region["vertices"]))
             color = _MATERIAL_COLORS[material_index.get(region.get("material_id"), 0) % len(_MATERIAL_COLORS)]
@@ -2691,10 +2863,23 @@ class SolveWorkspace(Div):
             )
             shape.on("click", lambda event, rid=region["id"]: self.select_region(rid))
             scene_children.append(shape)
-            center = (sum(p[0] for p in region["vertices"]) / len(region["vertices"]), sum(p[1] for p in region["vertices"]) / len(region["vertices"]))
-            cx, cy = xy(center)
-            label = _svg("text", x=cx, y=cy, fill="#263746", font_size="13", text_anchor="middle", data_sketch_region_id=region["id"], style="pointer-events:none; font-weight:600;", children=region["name"])
-            scene_children.append(label)
+            placement = label_positions.get(region["id"])
+            if placement is None:
+                continue
+            cx, cy = placement["point"]
+            if placement["leader_start"] is not None:
+                lx, ly = placement["leader_start"]
+                label_leaders.append(_svg(
+                    "line", x1=lx, y1=ly, x2=cx, y2=cy,
+                    stroke="#52677b", stroke_width="1", stroke_dasharray="3 3",
+                    style="pointer-events:none;",
+                ))
+            label_children.append(_svg(
+                "text", x=cx, y=cy, fill="#263746", font_size="13", text_anchor="middle",
+                data_sketch_region_id=region["id"],
+                style="pointer-events:none; font-weight:600;",
+                children=region["name"],
+            ))
 
         region_for_edge = {
             edge_id: region["id"]
@@ -2712,6 +2897,9 @@ class SolveWorkspace(Div):
             hit = _svg("line", x1=x1, y1=y1, x2=x2, y2=y2, stroke="transparent", stroke_width="12", data_sketch_region_id=region_id, style="cursor:pointer; pointer-events:stroke;")
             hit.on("click", lambda event, eid=edge["id"]: self.select_edge(eid, additive=bool((getattr(event, "value", None) or {}).get("shiftKey", False))))
             scene_children.extend([visible, hit])
+
+        scene_children.extend(label_leaders)
+        scene_children.extend(label_children)
 
         if not regions:
             scene_children.append(_svg("text", x=width / 2, y=height / 2 - 8, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="16", children="Choose Rectangle or Circle in the toolbar to begin"))
