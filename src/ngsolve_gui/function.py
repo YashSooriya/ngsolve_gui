@@ -8,6 +8,38 @@ import ngsolve as ngs
 import math
 
 
+class _MMFEMColormap(Colormap):
+    """Keep autoscale meaningful for physically small engineering fields.
+
+    ``webgpu.Colormap`` treats every range below 1e-12 as numerical zero.
+    That erases valid SI displacement fields, which can be much smaller than
+    that threshold. Scale only the range passed through its cleanup logic,
+    then put the displayed bounds back in the field's original units.
+    """
+
+    def widen_range(self, minval, maxval, timestamp=None):
+        if not (math.isfinite(minval) and math.isfinite(maxval)) or minval > maxval:
+            return super().widen_range(minval, maxval, timestamp=timestamp)
+
+        if timestamp != getattr(self, "_mmfem_scale_timestamp", object()):
+            magnitude = max(abs(minval), abs(maxval))
+            if 0.0 < magnitude < 1e-12:
+                exponent = min(308, max(0, math.ceil(-math.log10(magnitude))))
+                self._mmfem_autoscale_factor = 10.0 ** exponent
+            else:
+                self._mmfem_autoscale_factor = 1.0
+            self._mmfem_scale_timestamp = timestamp
+
+        factor = self._mmfem_autoscale_factor
+        super().widen_range(minval * factor, maxval * factor, timestamp=timestamp)
+        if factor != 1.0:
+            self.set_min_max(
+                self.minval / factor,
+                self.maxval / factor,
+                set_autoscale=False,
+            )
+
+
 def _fmt_value(v):
     """Fixed-width numeric format for the pick overlay.
 
@@ -1048,7 +1080,9 @@ class FunctionComponent(WebgpuTab):
         discrete = self.colormap_discrete.value
         minval = self.colormap_min.value
         maxval = self.colormap_max.value
-        self.colormap = Colormap(minval=minval, maxval=maxval, colormap=self.colormap_name.value)
+        self.colormap = _MMFEMColormap(
+            minval=minval, maxval=maxval, colormap=self.colormap_name.value
+        )
         self.colormap.autoscale = autoscale
         self.colormap.discrete = discrete
         self.clipping_vectors = None
