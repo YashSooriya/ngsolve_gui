@@ -4,6 +4,7 @@ import ngsolve as ngs
 from netgen.csg import unit_cube
 
 import ngsolve_gui.file_loader as file_loader
+from ngsolve_gui.prop_widgets import _component_display_names
 
 
 def test_gridfunction_pickle_draw_uses_result_view_defaults(monkeypatch):
@@ -54,6 +55,39 @@ def test_axisymmetric_pickle_draw_enables_revolution_from_metadata(monkeypatch):
 
     assert captured["object"] is grid_function
     assert captured["_ngsolve_gui_axisymmetric"] is True
+
+
+def test_axisymmetric_vector_pickle_uses_radial_and_axial_component_names(monkeypatch):
+    from netgen.occ import OCCGeometry, Rectangle
+
+    mesh = ngs.Mesh(OCCGeometry(Rectangle(1, 1).Face(), dim=2).GenerateMesh(maxh=0.8))
+    grid_function = ngs.GridFunction(ngs.VectorH1(mesh, order=1))
+    captured = {}
+    monkeypatch.setattr(file_loader, "_is_axisymmetric_pickle", lambda _path: True)
+    monkeypatch.setattr(
+        file_loader,
+        "DrawImpl",
+        lambda obj, **options: captured.update(object=obj, **options),
+    )
+
+    file_loader._draw_pickle_object(
+        grid_function, "B_DC", field_path="/results/ngsolve_gui/fields/B_DC.pkl"
+    )
+
+    assert captured["object"] is grid_function
+    assert captured["_ngsolve_gui_axisymmetric"] is True
+    assert captured["_ngsolve_gui_component_names"] == ("r", "z")
+
+
+def test_vector_component_selector_uses_axisymmetric_names():
+    class Vector:
+        dim = 2
+
+    class Component:
+        cf = Vector()
+        component_names = ("r", "z")
+
+    assert _component_display_names(Component()) == ("r", "z")
 
 
 def test_pickle_loader_dispatches_through_result_view_defaults(tmp_path):

@@ -89,6 +89,11 @@ class FunctionComponent(WebgpuTab):
         self.name = name
         self.mdata = None
         self.cf = cf
+        component_names = data.get("_ngsolve_gui_component_names")
+        if component_names is not None and len(component_names) == getattr(cf, "dim", 1):
+            self.component_names = tuple(str(name) for name in component_names)
+        else:
+            self.component_names = None
         self.visualization_cf = visualization_cf(cf)
         self.region_or_mesh = data["mesh"]
         self.draw_vol = data.get("draw_vol", True)

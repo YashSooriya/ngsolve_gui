@@ -455,6 +455,11 @@ def _draw_pickle_object(obj, name: str, field_path=None):
     }
     if _is_axisymmetric_pickle(field_path):
         draw_options["_ngsolve_gui_axisymmetric"] = True
+        if obj.dim == 2:
+            # Axisymmetric vector pickles store the meridian components in
+            # (r, z) order. Keep the serialized object a normal NGSolve
+            # GridFunction; this only changes the GUI's selector labels.
+            draw_options["_ngsolve_gui_component_names"] = ("r", "z")
     if mesh.dim == 3 and obj.dim == 3:
         draw_options["_ngsolve_gui_fast_fieldlines"] = True
         draw_options["_ngsolve_gui_fieldline_seed_material"] = seed_material
