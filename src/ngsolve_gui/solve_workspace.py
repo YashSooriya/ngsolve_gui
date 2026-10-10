@@ -2796,14 +2796,27 @@ class SolveWorkspace(Div):
         renderers.extend([axes, navigation_cube])
 
         preview = WebgpuComponent(
-            ui_style="position:absolute; inset:0; display:block; width:100%; height:100%; min-width:0; min-height:0;",
+            ui_style="display:block; flex:1 1 auto; width:100%; height:100%; min-width:0; min-height:0;",
         )
         preview.ui_class = "fit"
+        preview.on_mounted(lambda *_: self._resize_3d_preview(preview))
         scene = preview.draw(renderers)
         if preview_solids:
             scene.options.camera.reset(*scene.bounding_box)
             scene.render()
         return preview
+
+    @staticmethod
+    def _resize_3d_preview(preview):
+        """Resize after the canvas has entered the visible flex viewport."""
+        try:
+            if preview.canvas is not None:
+                preview.canvas.resize()
+            if preview.scene is not None:
+                preview.scene.render()
+        except Exception:
+            # Browser resize/render can race component mount in some frontends.
+            pass
 
     def toggle_3d_preview(self, *args):
         """Toggle between the editable meridian canvas and read-only 3D view."""
