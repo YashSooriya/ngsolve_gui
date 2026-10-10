@@ -957,6 +957,8 @@ class SolveWorkspace(Div):
             return
         if tool != "select":
             point = self._snap_canvas_point(point)
+        elif not region_id:
+            region_id = self._region_at_canvas_point(point)
         self._canvas_drag = {
             "tool": tool,
             "start": point,
@@ -965,6 +967,18 @@ class SolveWorkspace(Div):
             "additive": bool(value.get("shiftKey") or value.get("ctrlKey")),
             "moved": False,
         }
+
+    def _region_at_canvas_point(self, point):
+        """Hit-test a canvas position against regions, preferring the innermost."""
+        _, unproject = self._canvas_projection()
+        world_point = unproject(point)
+        candidates = [
+            (abs(_polygon_area(region.get("vertices", []))), region["id"])
+            for region in self.model["geometry"].get("regions", [])
+            if len(region.get("vertices", [])) >= 3
+            and _point_in_or_on_polygon(world_point, region["vertices"])
+        ]
+        return min(candidates)[1] if candidates else None
 
     def _on_canvas_mouse_move(self, event):
         if self._canvas_drag is None:

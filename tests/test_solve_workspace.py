@@ -379,6 +379,19 @@ def test_canvas_region_target_falls_back_to_latest_native_mousedown(standalone_c
     assert workspace._canvas_drag["region_id"] == "region-square"
 
 
+def test_canvas_region_hit_test_finds_region_when_browser_target_is_missing(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    monkeypatch.setattr(workspace, "_read_canvas_region_id", lambda value: None)
+    project, _ = workspace._canvas_projection()
+    workspace._canvas_event_point = lambda event, refresh_transform=False: project((0.010, 0.010))
+
+    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0}))
+
+    assert workspace._canvas_drag["region_id"] == region["id"]
+
+
 def test_canvas_drag_motion_and_release_do_not_rebuild_the_canvas(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
