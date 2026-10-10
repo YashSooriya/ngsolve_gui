@@ -477,7 +477,7 @@ def test_grid_snap_toggle_snaps_sketch_points_to_grid_intersections(standalone_c
     assert workspace._snap_canvas_point(unsnapped) == unsnapped
 
 
-def test_grid_snap_button_is_right_aligned_in_the_sketch_toolbar(standalone_components):
+def test_grid_snap_button_is_present_with_the_sketch_tools(standalone_components):
     workspace = SolveWorkspace()
     toolbar = workspace._canvas_panel.ui_children[0]
     slots = toolbar.ui_slots["default"]
@@ -488,8 +488,7 @@ def test_grid_snap_button_is_right_aligned_in_the_sketch_toolbar(standalone_comp
     assert workspace._snap_button is snap_button
     assert snap_button.ui_icon == "mdi-magnet"
     assert snap_button.ui_label == "Snap"
-    assert "position:absolute" in snap_button.ui_style
-    assert "right:8px" in snap_button.ui_style
+    assert "flex:0 0 auto" in snap_button.ui_style
     assert snap_index < fit_view_index
 
 
