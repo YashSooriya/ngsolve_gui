@@ -678,6 +678,7 @@ class SolveWorkspace(Div):
   let active = false;
   let dragStart = null;
   let dragRegionId = null;
+  let gestureNumber = 0;
   let suppressCanvasClickUntil = 0;
   const pointerEvents = window.__ngsolveSketchPointerEvents = [];
   const forwardedEvents = new WeakSet();
@@ -803,6 +804,7 @@ class SolveWorkspace(Div):
     if (event.type === 'mousedown') {
       if (!targetIsCanvas || event.button !== 0) return;
       active = true;
+      gestureNumber += 1;
       clearPreview(svg);
       dragStart = sketchPoint(svgPoint(svg, event));
       const region = event.target && event.target.closest
@@ -827,8 +829,19 @@ class SolveWorkspace(Div):
         suppressCanvasClickUntil = performance.now() + 1000;
       }
       const shouldForward = active && !targetIsCanvas;
+      const regionDrag = Boolean(dragRegionId);
+      const finishedGesture = gestureNumber;
       active = false;
-      if (shouldForward) clearPreview(svg);
+      if (shouldForward || !regionDrag) {
+        clearPreview(svg);
+      } else {
+        // The model patch normally replaces the preview immediately after
+        // mouseup. Clear it after a short fallback in case the bridge drops
+        // that event, so the canvas cannot remain visually out of sync.
+        window.setTimeout(() => {
+          if (gestureNumber === finishedGesture) clearPreview(svg);
+        }, 3000);
+      }
       if (shouldForward) {
         const forwarded = new MouseEvent('mouseup', {
           bubbles: true,
@@ -933,13 +946,15 @@ class SolveWorkspace(Div):
         value = getattr(event, "value", None)
         if not isinstance(value, dict) or int(value.get("button", 0) or 0) != 0:
             return
+        tool = self.sketch_tool
+        # Resolve the hit target before _canvas_event_point consumes the
+        # matching browser pointer record to obtain clientX/clientY.
+        region_id = self._read_canvas_region_id(value) if tool == "select" else None
         point = self._canvas_event_point(event, refresh_transform=True)
         if point is None:
             return
-        tool = self.sketch_tool
         if tool != "select":
             point = self._snap_canvas_point(point)
-        region_id = self._read_canvas_region_id(value) if tool == "select" else None
         self._canvas_drag = {
             "tool": tool,
             "start": point,

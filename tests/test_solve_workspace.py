@@ -341,6 +341,30 @@ def test_canvas_mouse_gesture_creates_rectangle_and_maps_screen_coordinates(stan
     assert workspace.sketch_tool == "select"
 
 
+def test_canvas_region_target_is_read_before_pointer_coordinates_are_consumed(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    pointer_events = [{"type": "mousedown", "timeStamp": 42.0, "regionId": "region-square"}]
+    fake_js = SimpleNamespace(
+        eval=lambda script: (
+            pointer_events[0]["regionId"]
+            if pointer_events and "events.find" in script
+            else None
+        )
+    )
+    monkeypatch.setattr(SolveWorkspace, "js", property(lambda self: fake_js), raising=False)
+
+    def consume_pointer(event, refresh_transform=False):
+        pointer_events.clear()
+        return (120.0, 180.0)
+
+    workspace._canvas_event_point = consume_pointer
+    workspace._on_canvas_mouse_down(SimpleNamespace(value={
+        "button": 0, "type": "mousedown", "timeStamp": 42.0,
+    }))
+
+    assert workspace._canvas_drag["region_id"] == "region-square"
+
+
 def test_canvas_drag_motion_and_release_do_not_rebuild_the_canvas(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
