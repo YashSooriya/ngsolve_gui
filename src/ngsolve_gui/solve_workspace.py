@@ -228,7 +228,7 @@ class SolveWorkspace(Div):
         self._canvas_host = Div(
             self._canvas,
             ui_class="relative-position",
-            ui_style="position:relative; display:flex; flex:1 1 auto; flex-direction:column; min-width:0; min-height:0; overflow:hidden;",
+            ui_style="position:relative; display:flex; flex:1 1 0%; height:0; flex-direction:column; min-width:0; min-height:0; overflow:hidden;",
         )
         tree_header = Div(
             Div("MODEL TREE", ui_style="font-size:11px; font-weight:700; letter-spacing:.08em;"),
@@ -315,7 +315,7 @@ class SolveWorkspace(Div):
         self._canvas_panel = Div(
             toolbar,
             self._canvas_host,
-            ui_style="display:flex; flex:1 1 auto; flex-direction:column; min-width:0; min-height:0;",
+            ui_style="display:flex; flex:1 1 auto; flex-direction:column; width:100%; height:100%; min-width:0; min-height:0;",
         )
 
         self._rectangle_dialog = self._make_primitive_dialog("rectangle")
