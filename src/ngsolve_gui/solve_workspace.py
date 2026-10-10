@@ -2850,7 +2850,7 @@ class SolveWorkspace(Div):
         self._preview_3d_tooltip.ui_children = ["Return to the editable meridian sketch."]
         for control in self._sketch_view_controls:
             control.ui_hidden = True
-        self._message("3D preview: drag to rotate, right-drag to pan, and scroll to zoom.")
+        self._message("3D preview: left-drag to rotate, middle-drag or Shift+left-drag to pan, scroll to zoom.")
 
     def _set_region_value(self, region_id, key, value):
         region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
