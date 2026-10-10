@@ -1307,8 +1307,9 @@ def test_blank_axisymmetric_view_starts_at_r_zero_with_world_space_ticks(standal
     plot = workspace._canvas_plot_bounds()
     center = ((plot[0] + plot[2]) / 2, (plot[1] + plot[3]) / 2)
 
-    assert project((0.0, 0.0))[0] == pytest.approx(72.0)
-    assert unproject((72.0, 320.0))[0] == pytest.approx(0.0)
+    assert plot == (0.0, 0.0, 900.0, 640.0)
+    assert project((0.0, 0.0))[0] == pytest.approx(plot[0])
+    assert unproject((plot[0], 320.0))[0] == pytest.approx(0.0)
     assert unproject(center)[1] == pytest.approx(0.0)
     assert unproject((center[0], plot[1]))[1] == pytest.approx(-unproject((center[0], plot[3]))[1])
     ticks = workspace._coordinate_ticks(0.0, 0.022)
@@ -1318,6 +1319,31 @@ def test_blank_axisymmetric_view_starts_at_r_zero_with_world_space_ticks(standal
     svg_text = [item for item in workspace._canvas_grid.ui_children if item._component_name == "text"]
     assert any(item._props.get("textContent") == "Axis of rotation  ·  r = 0" for item in svg_text)
     assert all(not item.ui_children for item in svg_text)
+
+
+def test_sketch_axes_and_grid_fill_the_responsive_viewport(standalone_components):
+    workspace = SolveWorkspace()
+    plot = workspace._canvas_plot_bounds()
+
+    assert workspace._canvas._props["viewBox"] == "0 0 900 640"
+    assert workspace._canvas._props["preserveAspectRatio"] == "xMidYMid meet"
+    assert "width:100%" in workspace._canvas._props["style"]
+    assert "height:100%" in workspace._canvas._props["style"]
+    assert plot == (0.0, 0.0, 900.0, 640.0)
+
+    grid_lines = [
+        item for item in workspace._canvas_grid.ui_children
+        if item._component_name == "line"
+    ]
+    rotation_axis = next(item for item in grid_lines if item._props.get("stroke-dasharray") == "6 4")
+    zero_height_axis = next(
+        item for item in grid_lines
+        if item._props.get("stroke") == "#557187"
+        and item._props.get("stroke-width") == "1.5"
+    )
+    assert (rotation_axis._props["x1"], rotation_axis._props["x2"]) == (plot[0], plot[0])
+    assert (rotation_axis._props["y1"], rotation_axis._props["y2"]) == (plot[1], plot[3])
+    assert (zero_height_axis._props["x1"], zero_height_axis._props["x2"]) == (plot[0], plot[2])
 
 
 def test_default_axisymmetric_fit_centres_z_zero_for_positive_z_geometry(standalone_components):
@@ -1445,9 +1471,9 @@ def test_axisymmetric_view_keeps_axis_visible_for_regions_away_from_axis(standal
 
     project, unproject = workspace._canvas_projection()
 
-    assert project((0.0, 0.0))[0] == pytest.approx(72.0)
-    assert project((0.01, 0.0))[0] > 72.0
-    assert unproject((72.0, 320.0))[0] == pytest.approx(0.0)
+    assert project((0.0, 0.0))[0] == pytest.approx(0.0)
+    assert project((0.01, 0.0))[0] > 0.0
+    assert unproject((0.0, 320.0))[0] == pytest.approx(0.0)
 
 
 def test_grid_zoom_keeps_world_geometry_and_anchor_aligned(standalone_components):

@@ -982,7 +982,10 @@ class SolveWorkspace(Div):
 
     @staticmethod
     def _canvas_plot_bounds():
-        return (72.0, 34.0, 854.0, 566.0)
+        # The sketch, grid, and axes use the complete SVG viewport. Coordinate
+        # labels are drawn just inside its borders instead of reserving a
+        # separate inset plot area.
+        return (0.0, 0.0, 900.0, 640.0)
 
     def _fit_canvas_world_view(self):
         plot = self._canvas_plot_bounds()
@@ -3678,13 +3681,15 @@ class SolveWorkspace(Div):
                 continue
             x = xy((value, 0))[0]
             grid_children.append(_svg("line", x1=x, y1=plot[1], x2=x, y2=plot[3], stroke="var(--border, #d9dfe7)", stroke_width="1"))
-            grid_children.append(_svg("text", x=x, y=plot[3] + 18, fill="var(--fg-muted, #697586)", font_size="10", text_anchor="middle", style=grid_text_style, children=f"{value:.5g}"))
+            label_x = min(max(x, plot[0] + 22), plot[2] - 22)
+            grid_children.append(_svg("text", x=label_x, y=plot[3] - 5, fill="var(--fg-muted, #697586)", font_size="10", text_anchor="middle", style=grid_text_style, children=f"{value:.5g}"))
         for value in axial_ticks:
             if abs(value) <= grid_step * 1e-10:
                 continue
             y = xy((0, value))[1]
             grid_children.append(_svg("line", x1=plot[0], y1=y, x2=plot[2], y2=y, stroke="var(--border, #d9dfe7)", stroke_width="1"))
-            grid_children.append(_svg("text", x=plot[0] - 8, y=y + 4, fill="var(--fg-muted, #697586)", font_size="10", text_anchor="end", style=grid_text_style, children=f"{value:.5g}"))
+            label_y = min(max(y + 4, plot[1] + 12), plot[3] - 3)
+            grid_children.append(_svg("text", x=plot[0] + 6, y=label_y, fill="var(--fg-muted, #697586)", font_size="10", text_anchor="start", style=grid_text_style, children=f"{value:.5g}"))
         if lower_left[0] <= 0 <= upper_right[0]:
             xaxis = xy((0, 0))[0]
             grid_children.append(_svg("line", x1=xaxis, y1=plot[1], x2=xaxis, y2=plot[3], stroke="#557187", stroke_width="2", stroke_dasharray="6 4"))
@@ -3693,8 +3698,8 @@ class SolveWorkspace(Div):
             zaxis = xy((0, 0))[1]
             grid_children.append(_svg("line", x1=plot[0], y1=zaxis, x2=plot[2], y2=zaxis, stroke="#557187", stroke_width="1.5"))
             grid_children.append(_svg("text", x=plot[2] - 4, y=zaxis - 5, fill="#405e75", font_size="10", text_anchor="end", style=grid_text_style, children="z = 0"))
-        grid_children.append(_svg("text", x=plot[2], y=height - 8, fill="var(--fg-muted, #697586)", font_size="12", text_anchor="end", style=grid_text_style, children="r  [m]"))
-        grid_children.append(_svg("text", x=12, y=plot[1] - 8, fill="var(--fg-muted, #697586)", font_size="12", style=grid_text_style, children="z  [m]"))
+        grid_children.append(_svg("text", x=plot[2] - 6, y=height - 8, fill="var(--fg-muted, #697586)", font_size="12", text_anchor="end", style=grid_text_style, children="r  [m]"))
+        grid_children.append(_svg("text", x=plot[0] + 8, y=plot[1] + 15, fill="var(--fg-muted, #697586)", font_size="12", style=grid_text_style, children="z  [m]"))
 
         material_index = {item["id"]: index for index, item in enumerate(self.model["materials"])}
         live_region_ids = set()
