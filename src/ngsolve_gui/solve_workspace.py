@@ -232,7 +232,7 @@ class SolveWorkspace(Div):
             _button(
                 "Select", "mdi-cursor-default-outline",
                 lambda *a: self.set_sketch_tool("select"),
-                tooltip="Click a region or edge to edit it. Drag right-to-left to select crossing edges; Shift adds to the selection.",
+                tooltip="Drag a region to move it. Click an edge to edit it; drag empty space to select edges. Shift adds to the selection.",
                 style="flex:0 0 auto; white-space:nowrap;",
             ),
             _button(
@@ -492,7 +492,7 @@ class SolveWorkspace(Div):
         self._sync_canvas_interaction_settings()
         if announce:
             help_text = {
-                "select": "Click an edge; drag left-to-right for enclosed edges or right-to-left for crossing edges.",
+                "select": "Drag a region to move it; drag empty space to select enclosed or crossed edges.",
                 "rectangle": "Drag between opposite corners to sketch a rectangle; its dimensions remain editable.",
                 "circle": "Drag from the circle centre to its radius; its position and radius remain editable.",
             }
@@ -524,6 +524,8 @@ class SolveWorkspace(Div):
                 "stepPx": self._canvas_grid_step() * pixels_per_world,
             }
             self.js.eval(f"window.__ngsolveSketchSnap = {json.dumps(grid, allow_nan=False)}")
+            move_step = 0.00001 * pixels_per_world  # 0.01 mm in canvas units.
+            self.js.eval(f"window.__ngsolveSketchMoveStep = {move_step!r}")
         except Exception:
             # Tests and non-browser frontends have no JavaScript runtime.
             pass
@@ -675,6 +677,7 @@ class SolveWorkspace(Div):
   window.__ngsolveSketchPointerCaptureInstalled = true;
   let active = false;
   let dragStart = null;
+  let dragRegionId = null;
   let suppressCanvasClickUntil = 0;
   const pointerEvents = window.__ngsolveSketchPointerEvents = [];
   const forwardedEvents = new WeakSet();
@@ -686,6 +689,9 @@ class SolveWorkspace(Div):
       timeStamp: event.timeStamp,
       x: event.clientX,
       y: event.clientY,
+      regionId: event.target && event.target.closest
+        ? (event.target.closest('[data-sketch-region-id]') || {}).getAttribute('data-sketch-region-id')
+        : null,
     });
     if (pointerEvents.length > 256) pointerEvents.splice(0, pointerEvents.length - 256);
   };
@@ -704,7 +710,15 @@ class SolveWorkspace(Div):
       const shape = svg.querySelector('#' + id);
       if (shape) shape.setAttribute('display', 'none');
     }
+    if (dragRegionId) {
+      for (const shape of svg.querySelectorAll('[data-sketch-region-id]')) {
+        if (shape.getAttribute('data-sketch-region-id') === dragRegionId) {
+          shape.removeAttribute('transform');
+        }
+      }
+    }
     dragStart = null;
+    dragRegionId = null;
   };
   const snapPoint = (point) => {
     const grid = window.__ngsolveSketchSnap;
@@ -717,6 +731,22 @@ class SolveWorkspace(Div):
     (window.__ngsolveSketchTool || 'select') === 'select' ? point : snapPoint(point);
   const updatePreview = (svg, point) => {
     if (!dragStart || !point) return;
+    if (dragRegionId) {
+      const grid = window.__ngsolveSketchSnap;
+      const start = grid && grid.enabled ? snapPoint(dragStart) : dragStart;
+      const end = grid && grid.enabled ? snapPoint(point) : point;
+      const step = Math.max(1e-12, Number(window.__ngsolveSketchMoveStep) || 0);
+      const quantize = (value) => Math.sign(value) * Math.round(Math.abs(value) / step) * step;
+      const dx = grid && grid.enabled ? end[0] - start[0] : quantize(end[0] - start[0]);
+      const dy = grid && grid.enabled ? end[1] - start[1] : quantize(end[1] - start[1]);
+      for (const shape of svg.querySelectorAll('[data-sketch-region-id]')) {
+        if (shape.getAttribute('data-sketch-region-id') === dragRegionId) {
+          if (dx === 0 && dy === 0) shape.removeAttribute('transform');
+          else shape.setAttribute('transform', `translate(${dx} ${dy})`);
+        }
+      }
+      return;
+    }
     point = sketchPoint(point);
     const dx = point[0] - dragStart[0];
     const dy = point[1] - dragStart[1];
@@ -775,6 +805,12 @@ class SolveWorkspace(Div):
       active = true;
       clearPreview(svg);
       dragStart = sketchPoint(svgPoint(svg, event));
+      const region = event.target && event.target.closest
+        ? event.target.closest('[data-sketch-region-id]')
+        : null;
+      dragRegionId = (window.__ngsolveSketchTool || 'select') === 'select' && region
+        ? region.getAttribute('data-sketch-region-id')
+        : null;
     } else if (!active) {
       return;
     }
@@ -792,7 +828,7 @@ class SolveWorkspace(Div):
       }
       const shouldForward = active && !targetIsCanvas;
       active = false;
-      clearPreview(svg);
+      if (shouldForward) clearPreview(svg);
       if (shouldForward) {
         const forwarded = new MouseEvent('mouseup', {
           bubbles: true,
@@ -845,6 +881,27 @@ class SolveWorkspace(Div):
         except Exception:
             return None
 
+    def _read_canvas_region_id(self, value):
+        """Return the sketch region hit by a native pointer event, if any."""
+        if not isinstance(value, dict):
+            return None
+        event_type = value.get("type")
+        timestamp = value.get("timeStamp")
+        if event_type != "mousedown" or timestamp is None:
+            return value.get("region_id") or value.get("regionId")
+        try:
+            region_id = self.js.eval(
+                "((timestamp) => { "
+                "const events = window.__ngsolveSketchPointerEvents || []; "
+                "const event = events.find(item => item.type === 'mousedown' "
+                "&& Math.abs(item.timeStamp - timestamp) < 1); "
+                "return event ? event.regionId : null; })"
+                f"({float(timestamp)!r})"
+            )
+            return str(region_id) if region_id else None
+        except Exception:
+            return None
+
     def _canvas_event_point(self, event, *, refresh_transform=False):
         value = getattr(event, "value", None)
         if not isinstance(value, dict):
@@ -882,10 +939,12 @@ class SolveWorkspace(Div):
         tool = self.sketch_tool
         if tool != "select":
             point = self._snap_canvas_point(point)
+        region_id = self._read_canvas_region_id(value) if tool == "select" else None
         self._canvas_drag = {
             "tool": tool,
             "start": point,
             "current": point,
+            "region_id": region_id,
             "additive": bool(value.get("shiftKey") or value.get("ctrlKey")),
             "moved": False,
         }
@@ -918,7 +977,9 @@ class SolveWorkspace(Div):
         moved = math.hypot(end[0] - start[0], end[1] - start[1]) >= 4.0
         self._canvas_drag = None
         self._screen_to_svg = None
-        if moved and drag["tool"] == "select":
+        if moved and drag["tool"] == "select" and drag.get("region_id"):
+            self._move_region_from_canvas_drag(drag["region_id"], start, end)
+        elif moved and drag["tool"] == "select":
             self._select_edges_in_canvas_box(start, end, additive=drag["additive"])
         elif moved and drag["tool"] in {"rectangle", "circle"}:
             self._create_region_from_canvas_drag(drag["tool"], start, end)
@@ -1054,6 +1115,92 @@ class SolveWorkspace(Div):
         self._add_primitive(tool)
         if len(self.model["geometry"]["regions"]) > before:
             self.set_sketch_tool("select", announce=False)
+
+    @staticmethod
+    def _dimension_literal_mm(value_m):
+        """Format a stored metre coordinate as a stable millimetre expression."""
+        return format(value_m * 1000, ".12g")
+
+    def _move_region_from_canvas_drag(self, region_id, start, end):
+        region = next(
+            (item for item in self.model["geometry"]["regions"] if item["id"] == region_id),
+            None,
+        )
+        if region is None:
+            return
+        if self.snap_to_grid:
+            start = self._snap_canvas_point(start)
+            end = self._snap_canvas_point(end)
+        _, unproject = self._canvas_projection()
+        start_world, end_world = unproject(start), unproject(end)
+        dr = _round_sketch_mm((end_world[0] - start_world[0]) * 1000) / 1000
+        dz = _round_sketch_mm((end_world[1] - start_world[1]) * 1000) / 1000
+        if dr == 0 and dz == 0:
+            self.render_canvas()
+            return
+
+        old_shape = copy.deepcopy(region["shape"])
+        old_vertices = copy.deepcopy(region["vertices"])
+        old_parents = {item["id"]: item.get("parent_id") for item in self.model["geometry"]["regions"]}
+        old_edges = copy.deepcopy(self.model["geometry"].get("edges", []))
+        try:
+            shape = region["shape"]
+            expressions = shape.setdefault("dimension_expressions", {})
+            if shape["type"] == "rectangle":
+                shape["r_min"] += dr
+                shape["z_min"] += dz
+                if shape["r_min"] < -1e-12:
+                    raise ValueError("A region cannot be moved left of the r = 0 axis.")
+                shape["r_min"] = max(0.0, shape["r_min"])
+                expressions["r_min"] = self._dimension_literal_mm(shape["r_min"])
+                expressions["z_min"] = self._dimension_literal_mm(shape["z_min"])
+                r0, z0 = shape["r_min"], shape["z_min"]
+                width, height = shape["width"], shape["height"]
+                region["vertices"] = [[r0, z0], [r0 + width, z0], [r0 + width, z0 + height], [r0, z0 + height]]
+            else:
+                shape["r_center"] += dr
+                shape["z_center"] += dz
+                if shape["r_center"] < shape["radius"] - 1e-12:
+                    raise ValueError("The circle must remain at r ≥ 0.")
+                shape["r_center"] = max(shape["radius"], shape["r_center"])
+                expressions["r_center"] = self._dimension_literal_mm(shape["r_center"])
+                expressions["z_center"] = self._dimension_literal_mm(shape["z_center"])
+                radius = shape["radius"]
+                rcenter, zcenter = shape["r_center"], shape["z_center"]
+                segments = int(shape.get("segments", 48))
+                region["vertices"] = [
+                    [rcenter + radius * math.cos(2 * math.pi * index / segments),
+                     zcenter + radius * math.sin(2 * math.pi * index / segments)]
+                    for index in range(segments)
+                ]
+
+            # Moving existing edges before rebuilding preserves their IDs,
+            # names, and electromagnetic/mechanical boundary assignments.
+            edge_ids = set(region.get("edge_ids", []))
+            for edge in self.model["geometry"].get("edges", []):
+                if edge["id"] in edge_ids:
+                    edge["vertices"] = [[point[0] + dr, point[1] + dz] for point in edge["vertices"]]
+            self._recompute_parent_links()
+            self._rebuild_edges()
+            self.selected_region_id = region_id
+            self.selected_edge_id = None
+            self.selected_edge_ids = []
+            self._selected_condition_id = None
+            self.active_section = "geometry"
+            self.layout["active_section"] = self.active_section
+            with self._batch_frontend_updates():
+                self._refresh_model_tree()
+                self._render_inspector()
+                self.render_canvas()
+            self._message(f"Moved {region['name']} by {dr * 1000:g} mm radially and {dz * 1000:g} mm axially.")
+        except (ValueError, TypeError, OverflowError) as error:
+            region["shape"] = old_shape
+            region["vertices"] = old_vertices
+            self.model["geometry"]["edges"] = old_edges
+            for item in self.model["geometry"]["regions"]:
+                item["parent_id"] = old_parents[item["id"]]
+            self._message(str(error), error=True)
+            self.render_canvas()
 
     def _message(self, text, error=False):
         self.message = str(text)
@@ -1205,7 +1352,7 @@ class SolveWorkspace(Div):
                     "type": "rectangle", "r_min": r0, "z_min": z0, "width": width, "height": height,
                     "dimension_expressions": {key: str(vals[key]) for key in ("r_min", "z_min", "width", "height")},
                 }
-                label = "Region"
+                label = "square"
             else:
                 radius = vals["radius"] / 1000
                 rcenter = vals["r_center"] / 1000
@@ -1220,11 +1367,18 @@ class SolveWorkspace(Div):
                     "type": "circle", "r_center": rcenter, "z_center": zcenter, "radius": radius, "segments": 48,
                     "dimension_expressions": {key: str(vals[key]) for key in ("r_center", "z_center", "radius")},
                 }
-                label = "Circular region"
+                label = "circle"
             parent_id = self._find_containing_region(vertices)
             if self._has_unsupported_overlap(vertices, parent_id):
                 raise ValueError("Regions must be nested or disjoint; crossing material boundaries are not supported yet.")
-            index = len(self.model["geometry"]["regions"]) + 1
+            used_indices = []
+            for existing in self.model["geometry"]["regions"]:
+                if existing.get("shape", {}).get("type") != primitive_data["type"]:
+                    continue
+                match = re.fullmatch(rf"{label} (\d+)", existing.get("name", ""))
+                if match:
+                    used_indices.append(int(match.group(1)))
+            index = max(used_indices, default=0) + 1
             region = {
                 "id": new_id("region"),
                 "name": f"{label} {index}",
@@ -2384,23 +2538,29 @@ class SolveWorkspace(Div):
             scene_children.append(shape)
             center = (sum(p[0] for p in region["vertices"]) / len(region["vertices"]), sum(p[1] for p in region["vertices"]) / len(region["vertices"]))
             cx, cy = xy(center)
-            label = _svg("text", x=cx, y=cy, fill="#263746", font_size="13", text_anchor="middle", style="pointer-events:none; font-weight:600;", children=region["name"])
+            label = _svg("text", x=cx, y=cy, fill="#263746", font_size="13", text_anchor="middle", data_sketch_region_id=region["id"], style="pointer-events:none; font-weight:600;", children=region["name"])
             scene_children.append(label)
 
+        region_for_edge = {
+            edge_id: region["id"]
+            for region in regions
+            for edge_id in region.get("edge_ids", [])
+        }
         for edge in self.model["geometry"].get("edges", []):
             start, end = edge["vertices"]
             x1, y1 = xy(start)
             x2, y2 = xy(end)
             selected = edge["id"] in self.selected_edge_ids
             edge_color = "#0877b9" if selected else "#263746"
-            visible = _svg("line", x1=x1, y1=y1, x2=x2, y2=y2, stroke=edge_color, stroke_width="2.2" if selected else "1.6", data_sketch_edge_id=edge["id"], style="pointer-events:none;")
-            hit = _svg("line", x1=x1, y1=y1, x2=x2, y2=y2, stroke="transparent", stroke_width="12", style="cursor:pointer; pointer-events:stroke;")
+            region_id = region_for_edge.get(edge["id"])
+            visible = _svg("line", x1=x1, y1=y1, x2=x2, y2=y2, stroke=edge_color, stroke_width="2.2" if selected else "1.6", data_sketch_edge_id=edge["id"], data_sketch_region_id=region_id, style="pointer-events:none;")
+            hit = _svg("line", x1=x1, y1=y1, x2=x2, y2=y2, stroke="transparent", stroke_width="12", data_sketch_region_id=region_id, style="cursor:pointer; pointer-events:stroke;")
             hit.on("click", lambda event, eid=edge["id"]: self.select_edge(eid, additive=bool((getattr(event, "value", None) or {}).get("shiftKey", False))))
             scene_children.extend([visible, hit])
 
         if not regions:
             scene_children.append(_svg("text", x=width / 2, y=height / 2 - 8, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="16", children="Choose Rectangle or Circle in the toolbar to begin"))
-            scene_children.append(_svg("text", x=width / 2, y=height / 2 + 18, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="12", children="Click a region or edge to edit it; dimensions are entered in mm"))
+            scene_children.append(_svg("text", x=width / 2, y=height / 2 + 18, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="12", children="Drag regions to move them; click regions or edges to edit dimensions in mm"))
         self._canvas_grid.ui_children = grid_children
         self._canvas_scene.ui_children = scene_children
         self._render_canvas_dimensions()

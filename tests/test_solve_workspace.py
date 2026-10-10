@@ -1,3 +1,4 @@
+import copy
 import math
 
 import pytest
@@ -95,6 +96,7 @@ def test_drag_sketches_dimensioned_rectangle_and_circle_regions(standalone_compo
         "rectangle", project((0.0, 0.0)), project((0.020, 0.020))
     )
     rectangle = workspace.model["geometry"]["regions"][0]
+    assert rectangle["name"] == "square 1"
     assert rectangle["shape"]["width"] == pytest.approx(0.020)
     assert rectangle["shape"]["height"] == pytest.approx(0.020)
     assert {item["type"] for item in rectangle["constraints"]} >= {
@@ -106,11 +108,23 @@ def test_drag_sketches_dimensioned_rectangle_and_circle_regions(standalone_compo
         "circle", project((0.010, 0.010)), project((0.012, 0.010))
     )
     circle = workspace.model["geometry"]["regions"][1]
+    assert circle["name"] == "circle 1"
     assert circle["parent_id"] == rectangle["id"]
     assert circle["shape"]["radius"] == pytest.approx(0.002)
     assert {item["type"] for item in circle["constraints"]} >= {
         "radial_position", "axial_position", "radius"
     }
+
+    project, _ = workspace._canvas_projection()
+    workspace._create_region_from_canvas_drag(
+        "rectangle", project((0.030, 0.030)), project((0.040, 0.040))
+    )
+    workspace._create_region_from_canvas_drag(
+        "circle", project((0.055, 0.010)), project((0.057, 0.010))
+    )
+    assert [region["name"] for region in workspace.model["geometry"]["regions"]] == [
+        "square 1", "circle 1", "square 2", "circle 2"
+    ]
 
 
 def test_mouse_drawn_geometry_uses_hundredth_mm_precision(standalone_components):
@@ -160,6 +174,110 @@ def test_manual_region_dimensions_keep_precision_beyond_hundredth_mm(standalone_
 
     assert region["shape"]["width"] == pytest.approx(0.0201234)
     assert region["shape"]["dimension_expressions"]["width"] == "20.1234"
+
+
+def test_dragging_region_moves_shape_by_hundredth_mm_and_preserves_edge_assignments(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    edge = workspace.model["geometry"]["edges"][0]
+    edge["name"] = "Fixed edge"
+    edge["boundary_condition_ids"] = ["support"]
+    edge_ids = list(region["edge_ids"])
+    before = copy.deepcopy(region["shape"])
+    project, _ = workspace._canvas_projection()
+
+    workspace._move_region_from_canvas_drag(
+        region["id"], project((0.004, 0.005)), project((0.0040146, 0.0050246))
+    )
+
+    assert region["shape"]["r_min"] - before["r_min"] == pytest.approx(0.00001)
+    assert region["shape"]["z_min"] - before["z_min"] == pytest.approx(0.00002)
+    assert region["shape"]["width"] == before["width"]
+    assert region["shape"]["height"] == before["height"]
+    assert region["shape"]["dimension_expressions"]["r_min"] == "0.01"
+    assert region["shape"]["dimension_expressions"]["z_min"] == "0.02"
+    assert region["edge_ids"] == edge_ids
+    moved_edge = next(item for item in workspace.model["geometry"]["edges"] if item["id"] == edge["id"])
+    assert moved_edge["name"] == "Fixed edge"
+    assert moved_edge["boundary_condition_ids"] == ["support"]
+
+
+def test_dragging_region_rejects_axis_crossing_and_restores_geometry(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    before_shape = copy.deepcopy(region["shape"])
+    before_vertices = copy.deepcopy(region["vertices"])
+    before_edges = copy.deepcopy(workspace.model["geometry"]["edges"])
+    project, _ = workspace._canvas_projection()
+
+    workspace._move_region_from_canvas_drag(
+        region["id"], project((0.010, 0.0)), project((-0.010, 0.0))
+    )
+
+    assert region["shape"] == before_shape
+    assert region["vertices"] == before_vertices
+    assert workspace.model["geometry"]["edges"] == before_edges
+    assert "r = 0" in workspace.message
+
+
+def test_dragging_circle_moves_its_centre_without_changing_its_radius(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("circle")
+    region = workspace.model["geometry"]["regions"][0]
+    before = copy.deepcopy(region["shape"])
+    project, _ = workspace._canvas_projection()
+
+    workspace._move_region_from_canvas_drag(
+        region["id"], project((0.010, 0.005)), project((0.01002, 0.00497))
+    )
+
+    assert region["shape"]["r_center"] - before["r_center"] == pytest.approx(0.00002)
+    assert region["shape"]["z_center"] - before["z_center"] == pytest.approx(-0.00003)
+    assert region["shape"]["radius"] == before["radius"]
+
+
+def test_dragging_region_rejects_crossing_another_region(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 5.0,
+        ("rectangle", "z_min"): 5.0,
+        ("rectangle", "width"): 5.0,
+        ("rectangle", "height"): 5.0,
+    })
+    workspace._add_primitive("rectangle")
+    child = workspace.model["geometry"]["regions"][1]
+    before_shape = copy.deepcopy(child["shape"])
+    before_vertices = copy.deepcopy(child["vertices"])
+    project, _ = workspace._canvas_projection()
+
+    workspace._move_region_from_canvas_drag(
+        child["id"], project((0.0, 0.0)), project((0.012, 0.0))
+    )
+
+    assert child["shape"] == before_shape
+    assert child["vertices"] == before_vertices
+    assert "crossing or touching" in workspace.message
+
+
+def test_canvas_drag_on_region_body_moves_region_instead_of_box_selecting_edges(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    before = region["shape"]["r_min"]
+    project, _ = workspace._canvas_projection()
+    start, end = project((0.010, 0.010)), project((0.0102, 0.010))
+    points = iter((start, end, end))
+    workspace._canvas_event_point = lambda event, refresh_transform=False: next(points)
+    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0, "region_id": region["id"]}))
+    workspace._on_canvas_mouse_move(SimpleNamespace(value={}))
+    workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
+
+    assert region["shape"]["r_min"] - before == pytest.approx(0.0002)
+    assert workspace.selected_region_id == region["id"]
+    assert workspace.selected_edge_ids == []
 
 
 def test_drag_box_selects_enclosed_or_crossed_edges_and_shift_adds(standalone_components):
@@ -301,7 +419,7 @@ def test_region_click_updates_selection_without_rebuilding_sketch_scene(standalo
     assert tuple(workspace._inspector.ui_children) == inspector_children
     assert tree_button.ui_color == "primary"
     assert not workspace._region_panel.ui_hidden
-    assert workspace._region_name_input.ui_model_value == "Region 1"
+    assert workspace._region_name_input.ui_model_value == "square 1"
     dimension_labels = [
         child._props["textContent"]
         for child in workspace._canvas_dimensions.ui_children
@@ -597,7 +715,7 @@ def test_parameter_removal_is_available_and_blocked_while_referenced(standalone_
 
     assert workspace.model["parameters"] == [parameter]
     assert "Cannot remove 'length_1'" in workspace.message
-    assert "region 'Region 1' width" in workspace.message
+    assert "region 'square 1' width" in workspace.message
 
     workspace._set_region_dimension(region["id"], "width", "20")
     workspace.remove_parameter(parameter["id"])
