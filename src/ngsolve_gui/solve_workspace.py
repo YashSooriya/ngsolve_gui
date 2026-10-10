@@ -4398,6 +4398,86 @@ class SolveWorkspace(Div):
         if study:
             study["frequency_hz"] = [part.strip() for part in str(value).split(",") if part.strip()]
 
+    def _mechanical_components(self):
+        """Return each connected mechanical body and the edges on its boundary."""
+        regions = self.model.get("geometry", {}).get("regions", [])
+        mechanical = {
+            region.get("id"): region
+            for region in regions
+            if isinstance(region, dict) and region.get("id") and region.get("mechanical")
+        }
+        parent = {region_id: region_id for region_id in mechanical}
+
+        def find(region_id):
+            while parent[region_id] != region_id:
+                parent[region_id] = parent[parent[region_id]]
+                region_id = parent[region_id]
+            return region_id
+
+        for region_id, region in mechanical.items():
+            parent_id = region.get("parent_id")
+            if parent_id in mechanical:
+                first, second = find(region_id), find(parent_id)
+                if first != second:
+                    parent[first] = second
+
+        groups = {}
+        for region_id in mechanical:
+            groups.setdefault(find(region_id), set()).add(region_id)
+
+        components = []
+        for region_ids in groups.values():
+            # A nested child's outline is also a boundary of its immediate
+            # parent material. This includes cavity walls when the child is
+            # not itself selected for mechanics.
+            edge_ids = set()
+            for region in regions:
+                if not isinstance(region, dict):
+                    continue
+                if region.get("id") in region_ids or region.get("parent_id") in region_ids:
+                    edge_ids.update(item for item in region.get("edge_ids", []) if isinstance(item, str))
+            components.append((region_ids, edge_ids))
+        return list(mechanical.values()), components
+
+    def _robin_edge_supports_axial_translation(self, edge, condition, parameters):
+        """Check whether a non-negative Robin spring restrains axial motion.
+
+        The axisymmetric displacement has radial and axial components. A free
+        body's remaining rigid mode is axial translation; for an edge with
+        unit tangent (dr, dz), its Robin energy for that mode is proportional
+        to k_normal*dr² + k_tangential*dz².
+        """
+        vertices = edge.get("vertices", [])
+        if len(vertices) != 2:
+            return False, ""
+        try:
+            (r0, z0), (r1, z1) = [tuple(float(value) for value in point) for point in vertices]
+            dr, dz = r1 - r0, z1 - z0
+            length_squared = dr * dr + dz * dz
+            if not math.isfinite(length_squared) or length_squared <= 0:
+                return False, ""
+            # Three-point Gauss locations catch ordinary coordinate-dependent
+            # stiffness profiles while avoiding endpoint-only support claims.
+            samples = (0.1127016653792583, 0.5, 0.8872983346207417)
+            axial_support = False
+            for t in samples:
+                values = dict(parameters)
+                values.update({"r": r0 + t * dr, "z": z0 + t * dz})
+                normal_stiffness = evaluate_expression(condition.get("stiffness_normal", "0"), values)
+                tangential_stiffness = evaluate_expression(condition.get("stiffness_tangential", "0"), values)
+                if normal_stiffness < 0 or tangential_stiffness < 0:
+                    return False, "Robin support stiffnesses must be non-negative."
+                axial_stiffness = (
+                    normal_stiffness * dr * dr + tangential_stiffness * dz * dz
+                ) / length_squared
+                axial_support = axial_support or axial_stiffness > 0
+            if axial_support:
+                return True, ""
+        except (TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError):
+            # Model validation reports malformed expressions separately.
+            return False, ""
+        return False, ""
+
     def validation_errors(self):
         errors = validate_model(self.model)
         if not self.model["geometry"]["regions"]:
@@ -4415,25 +4495,117 @@ class SolveWorkspace(Div):
                 for condition in self.model.get("boundary_conditions", [])
                 if isinstance(condition, dict)
             }
-            has_magnetic_reference = any(
-                condition_types.get(condition_id) == "magnetic_potential_zero"
+            exterior_regions = [
+                region
+                for region in self.model["geometry"].get("regions", [])
+                if isinstance(region, dict) and region.get("parent_id") is None
+            ]
+            edges_by_id = {
+                edge.get("id"): edge
                 for edge in self.model["geometry"].get("edges", [])
-                for condition_id in _edge_condition_ids(edge)
-            )
-            if not has_magnetic_reference:
-                errors.append("Assign magnetic potential = 0 to at least one exterior edge to anchor the electromagnetic solution.")
+                if isinstance(edge, dict) and edge.get("id")
+            }
+            missing_references = []
+            for region in exterior_regions:
+                has_reference = any(
+                    condition_types.get(condition_id) == "magnetic_potential_zero"
+                    for edge_id in region.get("edge_ids", [])
+                    for condition_id in _edge_condition_ids(edges_by_id.get(edge_id, {}))
+                )
+                if not has_reference:
+                    missing_references.append(region.get("name", region.get("id", "unnamed")))
+            if missing_references:
+                names = ", ".join(f"'{name}'" for name in missing_references)
+                errors.append(
+                    "Assign magnetic potential = 0 to an exterior edge of each disconnected "
+                    f"region to anchor the electromagnetic solution. Missing: {names}."
+                )
         if mechanics and not harmonic:
             errors.append("Time-harmonic mechanics currently requires Time-harmonic EM.")
-        mechanical_regions = [region for region in self.model["geometry"]["regions"] if region.get("mechanical")]
+        mechanical_regions, mechanical_components = self._mechanical_components()
         if mechanics and not mechanical_regions:
             errors.append("Choose at least one region to include in mechanics.")
+        if mechanics:
+            parameter_map = {
+                item.get("name"): item
+                for item in self.model.get("parameters", [])
+                if isinstance(item, dict) and item.get("name")
+            }
+            materials = {
+                item.get("id"): item
+                for item in self.model.get("materials", [])
+                if isinstance(item, dict) and item.get("id")
+            }
+            for region in mechanical_regions:
+                material = materials.get(region.get("material_id"))
+                if material is None:
+                    continue
+                try:
+                    youngs_modulus = evaluate_expression(
+                        material.get("properties", {}).get("youngs_modulus", "0"),
+                        parameter_map,
+                    )
+                except (AttributeError, TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError):
+                    continue
+                if youngs_modulus <= 0:
+                    errors.append(
+                        f"Material '{material.get('name', 'unnamed')}' needs positive Young's modulus "
+                        f"for mechanical region '{region.get('name', 'unnamed')}'."
+                    )
         if coupling and not (physics.get("dc_magnetic", {}).get("enabled") and harmonic and mechanics):
             errors.append("Coupling requires DC magnetic, time-harmonic EM, and mechanics.")
-        if mechanics and not any(
-            bool(set(_edge_condition_ids(edge)) & {item.get("id") for item in self.model.get("boundary_conditions", []) if item.get("type") in {"mechanical_fixed", "mechanical_prescribed"}})
-            for edge in self.model["geometry"].get("edges", [])
-        ):
-            errors.append("Assign a fixed or prescribed mechanical boundary condition to at least one edge.")
+        if mechanics and mechanical_regions:
+            condition_by_id = {
+                item.get("id"): item
+                for item in self.model.get("boundary_conditions", [])
+                if isinstance(item, dict) and item.get("id")
+            }
+            parameter_map = {
+                item.get("name"): item
+                for item in self.model.get("parameters", [])
+                if isinstance(item, dict) and item.get("name")
+            }
+            edges_by_id = {
+                edge.get("id"): edge
+                for edge in self.model["geometry"].get("edges", [])
+                if isinstance(edge, dict) and edge.get("id")
+            }
+            for region_ids, edge_ids in mechanical_components:
+                direct_support = False
+                robin_error_reported = set()
+                robin_support = False
+                for edge_id in edge_ids:
+                    edge = edges_by_id.get(edge_id)
+                    if edge is None:
+                        continue
+                    for condition_id in _edge_condition_ids(edge):
+                        condition = condition_by_id.get(condition_id, {})
+                        kind = condition.get("type")
+                        if kind in {"mechanical_fixed", "mechanical_prescribed"}:
+                            direct_support = True
+                        elif kind == "mechanical_robin":
+                            supports, issue = self._robin_edge_supports_axial_translation(
+                                edge, condition, parameter_map
+                            )
+                            robin_support = robin_support or supports
+                            if issue and condition_id not in robin_error_reported:
+                                errors.append(f"Boundary '{condition.get('name', condition_id)}': {issue}")
+                                robin_error_reported.add(condition_id)
+                if not direct_support and not robin_support:
+                    region_names = ", ".join(
+                        region.get("name", region.get("id", "unnamed"))
+                        for region in mechanical_regions
+                        if region.get("id") in region_ids
+                    )
+                    subject = (
+                        f"Mechanical region '{region_names}' needs"
+                        if len(region_ids) == 1
+                        else f"Mechanical regions '{region_names}' need"
+                    )
+                    errors.append(
+                        f"{subject} a fixed or prescribed displacement, or a positive Robin support that "
+                        "restrains axial motion, on their boundary."
+                    )
         parameter_map = {
             item.get("name"): item
             for item in self.model.get("parameters", [])
