@@ -7,6 +7,7 @@ import json
 import math
 import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from ngapp.components import Component, Div, QBtn, QCheckbox, QDialog, QInput, QSelect, QSeparator, QTooltip, QCard, QCardSection, QSplitter
@@ -696,6 +697,30 @@ class SolveWorkspace(Div):
         elif moved and drag["tool"] in {"rectangle", "circle"}:
             self._create_region_from_canvas_drag(drag["tool"], start, end)
 
+    @contextmanager
+    def _batch_content_updates(self):
+        """Send related model, inspector, and sketch changes as one UI patch.
+
+        A completed sketch gesture updates all three panels. Sending each
+        replacement separately makes the browser show a brief empty state
+        between patches, so hold updates for the workspace content subtree and
+        publish its finished component tree once the edit is complete.
+        """
+        blocked = []
+
+        def block(component):
+            blocked.append((component, component._block_frontend_update))
+            component._block_frontend_update = True
+
+        self._content._recurse(block, True, set())
+        try:
+            yield
+        finally:
+            for component, was_blocked in blocked:
+                component._block_frontend_update = was_blocked
+            if not self._content._block_frontend_update:
+                self._content.ui_children = list(self._content.ui_children)
+
     def _select_edges_in_canvas_box(self, start, end, *, additive=False):
         project, _ = self._canvas_projection()
         box = (min(start[0], end[0]), max(start[0], end[0]), min(start[1], end[1]), max(start[1], end[1]))
@@ -944,24 +969,25 @@ class SolveWorkspace(Div):
                 region["material_id"] = "material-air"
             else:
                 region["material_id"] = "material-air"
-            self.model["geometry"]["regions"].append(region)
-            try:
-                self._recompute_parent_links()
-            except ValueError:
-                self.model["geometry"]["regions"].pop()
-                raise
-            self._rebuild_edges()
-            self.selected_region_id = region["id"]
-            self.selected_edge_id = None
-            self.selected_edge_ids = []
-            self._selected_condition_id = None
-            self.active_section = "geometry"
-            self.layout["active_section"] = self.active_section
-            self._close_dialog(kind)
-            self._message(f"Created {region['name']} with {len(region['constraints'])} driving sketch constraints.")
-            self._refresh_model_tree()
-            self._render_inspector()
-            self.render_canvas()
+            with self._batch_content_updates():
+                self.model["geometry"]["regions"].append(region)
+                try:
+                    self._recompute_parent_links()
+                except ValueError:
+                    self.model["geometry"]["regions"].pop()
+                    raise
+                self._rebuild_edges()
+                self.selected_region_id = region["id"]
+                self.selected_edge_id = None
+                self.selected_edge_ids = []
+                self._selected_condition_id = None
+                self.active_section = "geometry"
+                self.layout["active_section"] = self.active_section
+                self._close_dialog(kind)
+                self._message(f"Created {region['name']} with {len(region['constraints'])} driving sketch constraints.")
+                self._refresh_model_tree()
+                self._render_inspector()
+                self.render_canvas()
         except (KeyError, ValueError, OverflowError) as error:
             self._message(str(error), error=True)
 

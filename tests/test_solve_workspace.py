@@ -180,6 +180,23 @@ def test_canvas_drag_motion_and_release_do_not_rebuild_the_canvas(standalone_com
     assert len(workspace.selected_edge_ids) == 4
 
 
+def test_region_creation_publishes_one_complete_workspace_patch(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    updates = []
+    monkeypatch.setattr(
+        utils._environment.frontend,
+        "update_component",
+        lambda component, data, method, **kwargs: updates.append((component, data, method)),
+    )
+
+    workspace._add_primitive("rectangle")
+
+    content_updates = [update for update in updates if update[0] is workspace._content]
+    assert len(content_updates) == 1
+    assert "slots" in content_updates[0][1]
+    assert len(workspace.model["geometry"]["regions"]) == 1
+
+
 def test_region_click_updates_selection_without_rebuilding_sketch_scene(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
