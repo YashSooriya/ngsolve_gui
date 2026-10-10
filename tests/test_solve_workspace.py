@@ -232,17 +232,24 @@ def test_delete_undo_and_redo_shortcut_actions_target_solve_workspace(standalone
 def test_model_title_supports_inline_rename_commit_and_cancel(standalone_components):
     workspace = SolveWorkspace()
     title = workspace._model_title
-    assert title._props["title"] == "Double-click to rename this model"
+    rename_button = workspace._model_title_rename_button
+    assert title._props["title"] == "Model name. Double-click to edit or use Rename."
+    assert rename_button.ui_label == "Rename"
+    assert rename_button.ui_icon == "mdi-pencil-outline"
+    assert rename_button.ui_outline
+    assert "border:1px solid var(--border)" in workspace._model_title_control.ui_style
 
     title._handle("focus")
     assert not workspace._model_title_editing
     assert title.ui_readonly
 
-    title._handle("dblclick")
+    rename_button._handle("click.stop")
     editor = workspace._model_title_input
     assert editor is not None
     assert workspace._model_title_editing
     assert not title.ui_readonly
+    assert rename_button.ui_hidden
+    assert "border:1px solid var(--primary)" in workspace._model_title_control.ui_style
     editor._handle("update:model-value", "Quarter magnet")
     editor._handle("keydown", {"key": "Enter"})
 
@@ -250,6 +257,8 @@ def test_model_title_supports_inline_rename_commit_and_cancel(standalone_compone
     assert title.ui_model_value == "Quarter magnet"
     assert title.ui_readonly
     assert not workspace._model_title_editing
+    assert not rename_button.ui_hidden
+    assert "border:1px solid var(--border)" in workspace._model_title_control.ui_style
 
     title._handle("focus")
     assert not workspace._model_title_editing

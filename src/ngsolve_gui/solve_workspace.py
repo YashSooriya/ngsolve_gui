@@ -545,15 +545,46 @@ class SolveWorkspace(Div):
             ui_dense=True,
             ui_borderless=True,
             ui_hide_bottom_space=True,
-            ui_input_style="font-size:13px; font-weight:600; padding:0; min-width:180px; cursor:text;",
-            ui_style="width:min(420px, 100%); min-height:30px;",
+            ui_input_style="font-size:14px; font-weight:600; padding:0; min-width:0; cursor:pointer;",
+            ui_style="flex:1 1 auto; width:0; min-width:180px; min-height:30px;",
         )
-        self._model_title._props["title"] = "Double-click to rename this model"
+        self._model_title._props["title"] = "Model name. Double-click to edit or use Rename."
         self._model_title.on("dblclick", self._begin_model_rename)
         self._model_title.on_update_model_value(self._update_model_rename_draft)
         self._model_title.on_blur(self._commit_model_rename)
         self._model_title.on("keydown", self._on_model_rename_keydown)
         self._model_title_input = self._model_title
+        self._model_title_rename_button = QBtn(
+            QTooltip("Rename this model"),
+            ui_label="Rename",
+            ui_icon="mdi-pencil-outline",
+            ui_color="primary",
+            ui_outline=True,
+            ui_dense=True,
+            ui_no_caps=True,
+            ui_size="sm",
+        )
+        self._model_title_rename_button.on_click(self._begin_model_rename)
+        self._model_title_control_style = (
+            "display:flex; align-items:center; gap:8px; flex:0 1 520px; "
+            "width:min(520px, 100%); min-width:0; min-height:36px; "
+            "padding:2px 5px 2px 10px; border:1px solid var(--border); "
+            "border-radius:7px; background:var(--surface); "
+            "transition:border-color 120ms ease, box-shadow 120ms ease;"
+        )
+        self._model_title_control_editing_style = (
+            "display:flex; align-items:center; gap:8px; flex:0 1 520px; "
+            "width:min(520px, 100%); min-width:0; min-height:36px; "
+            "padding:2px 5px 2px 10px; border:1px solid var(--primary); "
+            "border-radius:7px; background:var(--surface); "
+            "box-shadow:0 0 0 2px color-mix(in srgb, var(--primary) 16%, transparent);"
+        )
+        self._model_title_control = Div(
+            self._model_title,
+            self._model_title_rename_button,
+            ui_class="mmfem-model-title-control",
+            ui_style=self._model_title_control_style,
+        )
         self._validate_button = _button(
             "Check setup",
             "mdi-check-decagram-outline",
@@ -600,7 +631,7 @@ class SolveWorkspace(Div):
         self._bottom_count.ui_style += " margin-left:12px;"
 
         top = Div(
-            self._model_title,
+            self._model_title_control,
             Div(ui_style="flex:1;"),
             self._validate_button,
             self._mesh_button,
@@ -808,6 +839,8 @@ class SolveWorkspace(Div):
         self._model_title_draft = str(self.model.get("name", "Untitled axisymmetric model"))
         self._model_title.ui_model_value = self._model_title_draft
         self._model_title.ui_readonly = False
+        self._model_title_rename_button.ui_hidden = True
+        self._model_title_control.ui_style = self._model_title_control_editing_style
         if get_environment().type == EnvironmentType.LOCAL_APP:
             self._model_title.ui_focus()
             self._model_title.ui_select()
@@ -844,6 +877,8 @@ class SolveWorkspace(Div):
         if hasattr(self, "_model_title"):
             self._model_title.ui_model_value = self._model_title_draft
             self._model_title.ui_readonly = True
+            self._model_title_rename_button.ui_hidden = False
+            self._model_title_control.ui_style = self._model_title_control_style
 
     def _tree_selected_entry(self):
         if self.active_section == "geometry" and self.selected_region_id:
