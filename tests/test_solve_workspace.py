@@ -255,6 +255,19 @@ def test_canvas_toolbar_wraps_when_the_viewport_is_narrow(standalone_components)
     assert "min-width:0" in toolbar._props["style"]
 
 
+def test_canvas_drag_suppresses_the_click_that_follows_mouseup(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    scripts = []
+    fake_js = SimpleNamespace(eval=scripts.append)
+    monkeypatch.setattr(SolveWorkspace, "js", property(lambda self: fake_js), raising=False)
+
+    workspace._install_canvas_pointer_capture()
+
+    assert "suppressCanvasClickUntil" in scripts[0]
+    assert "event.stopImmediatePropagation()" in scripts[0]
+    assert "document.addEventListener('click', capture, true)" in scripts[0]
+
+
 def test_canvas_render_keeps_background_and_layer_components_mounted(standalone_components):
     workspace = SolveWorkspace()
     root_layers = tuple(workspace._canvas.ui_children)

@@ -486,6 +486,7 @@ class SolveWorkspace(Div):
   window.__ngsolveSketchPointerCaptureInstalled = true;
   let active = false;
   let dragStart = null;
+  let suppressCanvasClickUntil = 0;
   const pointerEvents = window.__ngsolveSketchPointerEvents = [];
   const forwardedEvents = new WeakSet();
   const selector = 'svg.solve-sketch-canvas';
@@ -562,6 +563,14 @@ class SolveWorkspace(Div):
     if (!svg) return;
     const targetIsCanvas = event.target && event.target.closest
       && event.target.closest(selector) === svg;
+    if (event.type === 'click') {
+      if (targetIsCanvas && performance.now() < suppressCanvasClickUntil) {
+        suppressCanvasClickUntil = 0;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+      return;
+    }
     if (event.type === 'mousedown') {
       if (!targetIsCanvas || event.button !== 0) return;
       active = true;
@@ -575,6 +584,13 @@ class SolveWorkspace(Div):
       updatePreview(svg, svgPoint(svg, event));
     }
     if (event.type === 'mouseup') {
+      const releasePoint = svgPoint(svg, event);
+      if (targetIsCanvas && dragStart && releasePoint
+          && Math.hypot(releasePoint[0] - dragStart[0], releasePoint[1] - dragStart[1]) >= 4) {
+        // The browser's click follows mouseup. Ignore that click after a drag,
+        // otherwise a nested shape selects its parent region at the same spot.
+        suppressCanvasClickUntil = performance.now() + 1000;
+      }
       const shouldForward = active && !targetIsCanvas;
       active = false;
       clearPreview(svg);
@@ -596,6 +612,7 @@ class SolveWorkspace(Div):
   document.addEventListener('mousedown', capture, true);
   document.addEventListener('mousemove', capture, true);
   document.addEventListener('mouseup', capture, true);
+  document.addEventListener('click', capture, true);
 })()
 """
         try:
