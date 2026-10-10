@@ -7,7 +7,6 @@ import json
 import math
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from decimal import Decimal, ROUND_HALF_UP
 from threading import Lock, Timer, get_ident
@@ -99,6 +98,18 @@ def _svg(tag, **props):
     return component
 
 
+def _update_svg_props(component, **props):
+    """Patch changed SVG attributes on a mounted component in one update."""
+    changed = {}
+    for key, value in props.items():
+        prop_name = key.replace("_", "-")
+        if component._props.get(prop_name) != value:
+            changed[prop_name] = value
+    if changed:
+        component._props.update(changed)
+        component._update_frontend({"props": changed})
+
+
 def _section_title(title, subtitle=None):
     return Div(
         Div(title, ui_style="font-size:12px; font-weight:700; letter-spacing:.08em; text-transform:uppercase;"),
@@ -139,6 +150,11 @@ class SolveWorkspace(Div):
         self._inspector_view = None
         self._geometry_inspector_ready = False
         self._tree_entry_buttons = {}
+        self._tree_entry_containers = {}
+        self._tree_entry_titles = {}
+        self._tree_entry_lists = {}
+        self._tree_entry_order = {}
+        self._tree_structure_initialized = False
         self._messages_visible = False
         self._status_flash_variant = 0
         self.validation_issues = []
@@ -159,6 +175,15 @@ class SolveWorkspace(Div):
         self._canvas_grid = Component("g")
         self._canvas_scene = Component("g")
         self._canvas_dimensions = Component("g")
+        self._canvas_grid_signature = None
+        self._canvas_scene_component_ids = None
+        self._canvas_region_nodes = {}
+        self._canvas_edge_nodes = {}
+        self._canvas_empty_hint = _svg(
+            "text", x=450, y=338, text_anchor="middle",
+            fill="var(--fg-muted, #697586)", font_size="12",
+            children="Drag blank space to pan; hold Shift while dragging to select edges",
+        )
         self._canvas_preview = Component(
             "g",
             _svg(
@@ -1585,12 +1610,11 @@ class SolveWorkspace(Div):
 
     @contextmanager
     def _batch_frontend_updates(self):
-        """Flush one interaction's related component changes together.
+        """Coalesce duplicate component updates and flush them in order.
 
-        Shape creation refreshes the model tree, inspector, and sketch. Sending
-        those slot replacements serially lets the browser paint the temporary
-        empty state between each request, so coalesce repeated component
-        updates and submit the finished patches concurrently.
+        Browser-backed components share one frontend event loop. Dispatching
+        their patches from a thread pool can race slot updates and briefly
+        unmount visible panels, so keep the final flush on the caller thread.
         """
         frontend = get_environment().frontend
         send_update = frontend.update_component
@@ -1623,35 +1647,8 @@ class SolveWorkspace(Div):
             yield
         finally:
             frontend.update_component = send_update
-            updates = list(queued.values())
-            if updates:
-                canvas_components = {
-                    id(self._canvas_grid),
-                    id(self._canvas_scene),
-                    id(self._canvas_dimensions),
-                }
-                canvas_updates = [item for item in updates if id(item[0]) in canvas_components]
-                panel_updates = [item for item in updates if id(item[0]) not in canvas_components]
-
-                def flush(batch):
-                    if not batch:
-                        return
-                    with ThreadPoolExecutor(max_workers=min(8, len(batch))) as pool:
-                        futures = [
-                            pool.submit(send_update, component, data, method, blocking=blocking)
-                            for component, data, method, blocking in batch
-                        ]
-                        for future in futures:
-                            future.result()
-
-                # Draw the new geometry while the current tree and properties
-                # remain visible. Let that canvas patch settle before replacing
-                # the two side panels, avoiding a frame where all three panes
-                # are empty at once.
-                flush(canvas_updates)
-                if canvas_updates and panel_updates:
-                    time.sleep(0.12)
-                flush(panel_updates)
+            for component, data, method, blocking in queued.values():
+                send_update(component, data, method, blocking=blocking)
 
     def _select_edges_in_canvas_box(self, start, end, *, additive=False):
         project, _ = self._canvas_projection()
@@ -2177,35 +2174,76 @@ class SolveWorkspace(Div):
             button.ui_label = labels[key]
             button.ui_color = "primary" if key == self.active_section else None
             button.ui_flat = key != self.active_section
-        tree_groups = []
-        self._tree_entry_buttons = {}
-        for group_label, section_keys in _TREE_GROUPS:
-            rows = []
-            for key in section_keys:
-                row_children = [self._section_buttons[key]]
-                subsection = self._tree_subsection(key)
-                if subsection:
-                    title, entries = subsection
-                    row_children.append(Div(
-                        Div(title, ui_style="font-size:10px; font-weight:700; letter-spacing:.06em; color:var(--fg-muted); padding:7px 8px 3px 10px;"),
-                        *[
-                            self._make_tree_entry_button(key, entry_id, label, icon, callback, selected)
-                            for entry_id, label, icon, callback, selected in entries
-                        ],
+        if not self._tree_structure_initialized:
+            tree_groups = []
+            for group_label, section_keys in _TREE_GROUPS:
+                rows = []
+                for key in section_keys:
+                    title = Div(
+                        "",
+                        ui_style="font-size:10px; font-weight:700; letter-spacing:.06em; color:var(--fg-muted); padding:7px 8px 3px 10px;",
+                    )
+                    entries = Div(
+                        ui_style="display:flex; flex-direction:column; gap:1px;",
+                    )
+                    self._tree_entry_titles[key] = title
+                    self._tree_entry_lists[key] = entries
+                    self._tree_entry_order[key] = ()
+                    subsection = Div(
+                        title,
+                        entries,
                         ui_style="display:flex; flex-direction:column; gap:1px; margin:0 0 4px 12px; border-left:1px solid var(--border); padding-left:4px;",
+                    )
+                    self._tree_entry_containers[key] = subsection
+                    rows.append(Div(
+                        self._section_buttons[key],
+                        subsection,
+                        ui_style="display:flex; flex-direction:column; gap:1px;",
                     ))
-                rows.append(Div(*row_children, ui_style="display:flex; flex-direction:column; gap:1px;"))
-            tree_groups.append(Div(
-                Div(group_label, ui_style="font-size:10px; font-weight:700; letter-spacing:.09em; color:var(--fg-muted); padding:7px 8px 5px;"),
-                *rows,
-                ui_style="display:flex; flex-direction:column; gap:2px;",
-            ))
-        self._left_items.ui_children = tree_groups
+                tree_groups.append(Div(
+                    Div(group_label, ui_style="font-size:10px; font-weight:700; letter-spacing:.09em; color:var(--fg-muted); padding:7px 8px 5px;"),
+                    *rows,
+                    ui_style="display:flex; flex-direction:column; gap:2px;",
+                ))
+            self._left_items.ui_children = tree_groups
+            self._tree_structure_initialized = True
+
+        for key in self._section_buttons:
+            subsection = self._tree_subsection(key)
+            if not subsection:
+                continue
+            title, entries = subsection
+            title_component = self._tree_entry_titles[key]
+            if title_component.ui_children != [title]:
+                title_component.ui_children = [title]
+
+            old_order = self._tree_entry_order[key]
+            entry_ids = tuple(entry_id for entry_id, *_ in entries)
+            for entry_id in old_order:
+                if entry_id not in entry_ids:
+                    self._tree_entry_buttons.pop(f"{key}:{entry_id}", None)
+
+            entry_buttons = []
+            for entry_id, label, icon, callback, selected in entries:
+                identity = f"{key}:{entry_id}"
+                button = self._tree_entry_buttons.get(identity)
+                if button is None:
+                    button = self._make_tree_entry_button(
+                        key, entry_id, label, icon, callback, selected
+                    )
+                else:
+                    button.ui_label = label
+                    button.ui_icon = icon
+                entry_buttons.append(button)
+            if entry_ids != old_order:
+                self._tree_entry_lists[key].ui_children = entry_buttons
+                self._tree_entry_order[key] = entry_ids
+
         self._update_model_tree_selection()
         if hasattr(self, "_bottom_count"):
-            self._bottom_count.ui_children = [
-                f"Regions: {len(self.model['geometry']['regions'])}  ·  Mesh order: {self.model['mesh']['polynomial_order']}"
-            ]
+            count_text = f"Regions: {len(self.model['geometry']['regions'])}  ·  Mesh order: {self.model['mesh']['polynomial_order']}"
+            if self._bottom_count.ui_children != [count_text]:
+                self._bottom_count.ui_children = [count_text]
         if hasattr(self, "_model_title") and not self._model_title_editing:
             self._model_title.ui_model_value = self.model.get("name", "Untitled axisymmetric model")
 
@@ -3175,6 +3213,10 @@ class SolveWorkspace(Div):
         grid_step = self._canvas_grid_step()
         radial_ticks = self._ticks_for_step(max(0.0, lower_left[0]), max(0.0, upper_right[0]), grid_step)
         axial_ticks = self._ticks_for_step(lower_left[1], upper_right[1], grid_step)
+        grid_signature = (
+            tuple(plot), tuple(lower_left), tuple(upper_right), grid_step,
+            tuple(radial_ticks), tuple(axial_ticks),
+        )
         grid_text_style = "pointer-events:none; user-select:none; -webkit-user-select:none;"
         grid_children = []
         scene_children = []
@@ -3202,46 +3244,89 @@ class SolveWorkspace(Div):
         grid_children.append(_svg("text", x=12, y=plot[1] - 8, fill="var(--fg-muted, #697586)", font_size="12", style=grid_text_style, children="z  [m]"))
 
         material_index = {item["id"]: index for index, item in enumerate(self.model["materials"])}
+        live_region_ids = set()
         for region in regions:
+            region_id = region["id"]
+            live_region_ids.add(region_id)
             polygon = " ".join(f"{x:.3f},{y:.3f}" for x, y in (xy(point) for point in region["vertices"]))
             color = _MATERIAL_COLORS[material_index.get(region.get("material_id"), 0) % len(_MATERIAL_COLORS)]
-            selected = region["id"] == self.selected_region_id
-            shape = _svg(
-                "polygon",
-                points=polygon,
-                fill=color,
-                fill_opacity="0.33" if not selected else "0.48",
-                stroke="#344658" if not selected else "#1b73ae",
-                stroke_width="2.2" if selected else "1.6",
-                data_sketch_region_id=region["id"],
-                tabindex="0",
-                style="cursor:pointer;",
-            )
-            shape.on("click", lambda event, rid=region["id"]: self.select_region(rid))
+            selected = region_id == self.selected_region_id
+            props = {
+                "points": polygon,
+                "fill": color,
+                "fill_opacity": "0.33" if not selected else "0.48",
+                "stroke": "#344658" if not selected else "#1b73ae",
+                "stroke_width": "2.2" if selected else "1.6",
+                "data_sketch_region_id": region_id,
+                "tabindex": "0",
+                "style": "cursor:pointer;",
+            }
+            shape = self._canvas_region_nodes.get(region_id)
+            if shape is None:
+                shape = _svg("polygon", **props)
+                shape.on("click", lambda event, rid=region_id: self.select_region(rid))
+                self._canvas_region_nodes[region_id] = shape
+            else:
+                _update_svg_props(shape, **props)
             scene_children.append(shape)
+        for region_id in self._canvas_region_nodes.keys() - live_region_ids:
+            del self._canvas_region_nodes[region_id]
 
         region_for_edge = {
             edge_id: region["id"]
             for region in regions
             for edge_id in region.get("edge_ids", [])
         }
+        live_edge_ids = set()
         for edge in self.model["geometry"].get("edges", []):
+            edge_id = edge["id"]
+            live_edge_ids.add(edge_id)
             start, end = edge["vertices"]
             x1, y1 = xy(start)
             x2, y2 = xy(end)
-            selected = edge["id"] in self.selected_edge_ids
+            selected = edge_id in self.selected_edge_ids
             edge_color = "#0877b9" if selected else "#263746"
-            region_id = region_for_edge.get(edge["id"])
-            visible = _svg("line", x1=x1, y1=y1, x2=x2, y2=y2, stroke=edge_color, stroke_width="2.2" if selected else "1.6", data_sketch_edge_id=edge["id"], data_sketch_region_id=region_id, style="pointer-events:none;")
-            hit = _svg("line", x1=x1, y1=y1, x2=x2, y2=y2, stroke="transparent", stroke_width="12", data_sketch_region_id=region_id, style="cursor:pointer; pointer-events:stroke;")
-            hit.on("click", lambda event, eid=edge["id"]: self.select_edge(eid, additive=bool((getattr(event, "value", None) or {}).get("shiftKey", False))))
+            region_id = region_for_edge.get(edge_id)
+            visible_props = {
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "stroke": edge_color,
+                "stroke_width": "2.2" if selected else "1.6",
+                "data_sketch_edge_id": edge_id,
+                "data_sketch_region_id": region_id,
+                "style": "pointer-events:none;",
+            }
+            hit_props = {
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "stroke": "transparent", "stroke_width": "12",
+                "data_sketch_region_id": region_id,
+                "style": "cursor:pointer; pointer-events:stroke;",
+            }
+            nodes = self._canvas_edge_nodes.get(edge_id)
+            if nodes is None:
+                visible = _svg("line", **visible_props)
+                hit = _svg("line", **hit_props)
+                hit.on("click", lambda event, eid=edge_id: self.select_edge(
+                    eid, additive=bool((getattr(event, "value", None) or {}).get("shiftKey", False))
+                ))
+                nodes = (visible, hit)
+                self._canvas_edge_nodes[edge_id] = nodes
+            else:
+                visible, hit = nodes
+                _update_svg_props(visible, **visible_props)
+                _update_svg_props(hit, **hit_props)
             scene_children.extend([visible, hit])
+        for edge_id in self._canvas_edge_nodes.keys() - live_edge_ids:
+            del self._canvas_edge_nodes[edge_id]
 
         if not regions:
-            scene_children.append(_svg("text", x=width / 2, y=height / 2 - 8, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="16", children="Choose Rectangle or Circle in the toolbar to begin"))
-            scene_children.append(_svg("text", x=width / 2, y=height / 2 + 18, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="12", children="Drag blank space to pan; hold Shift while dragging to select edges"))
-        self._canvas_grid.ui_children = grid_children
-        self._canvas_scene.ui_children = scene_children
+            scene_children.append(self._canvas_empty_hint)
+        if grid_signature != self._canvas_grid_signature:
+            self._canvas_grid.ui_children = grid_children
+            self._canvas_grid_signature = grid_signature
+        scene_component_ids = tuple(id(component) for component in scene_children)
+        if scene_component_ids != self._canvas_scene_component_ids:
+            self._canvas_scene.ui_children = scene_children
+            self._canvas_scene_component_ids = scene_component_ids
         self._render_canvas_dimensions()
         self._sync_canvas_interaction_settings()
         self._schedule_canvas_interaction_reset()
@@ -3488,19 +3573,20 @@ class SolveWorkspace(Div):
         region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
         if region is None:
             return
-        for child in self.model["geometry"]["regions"]:
-            if child.get("parent_id") == region_id:
-                child["parent_id"] = region.get("parent_id")
-        self.model["geometry"]["regions"] = [item for item in self.model["geometry"]["regions"] if item["id"] != region_id]
-        self.selected_region_id = None
-        self.selected_edge_id = None
-        self.selected_edge_ids = []
-        self._recompute_parent_links()
-        self._rebuild_edges()
-        self._message(f"Deleted {region['name']}.")
-        self._refresh_model_tree()
-        self._render_inspector()
-        self.render_canvas()
+        with self._batch_frontend_updates():
+            for child in self.model["geometry"]["regions"]:
+                if child.get("parent_id") == region_id:
+                    child["parent_id"] = region.get("parent_id")
+            self.model["geometry"]["regions"] = [item for item in self.model["geometry"]["regions"] if item["id"] != region_id]
+            self.selected_region_id = None
+            self.selected_edge_id = None
+            self.selected_edge_ids = []
+            self._recompute_parent_links()
+            self._rebuild_edges()
+            self._message(f"Deleted {region['name']}.")
+            self._refresh_model_tree()
+            self._render_inspector()
+            self.render_canvas()
 
     def add_parameter(self, *args):
         index = len(self.model["parameters"]) + 1

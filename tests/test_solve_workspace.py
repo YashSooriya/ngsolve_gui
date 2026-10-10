@@ -700,7 +700,7 @@ def test_canvas_pointer_cancel_clears_an_incomplete_sketch(standalone_components
     assert workspace._screen_to_svg is None
 
 
-def test_region_creation_updates_canvas_before_side_panels(standalone_components, monkeypatch):
+def test_region_creation_updates_only_changed_canvas_and_tree_subsections(standalone_components, monkeypatch):
     workspace = SolveWorkspace()
     updates = []
     frontend = utils._environment.frontend
@@ -716,21 +716,62 @@ def test_region_creation_updates_canvas_before_side_panels(standalone_components
     updated_components = [update[0] for update in updates]
     assert frontend.update_component is capture
     assert len(updated_components) == len(set(map(id, updated_components)))
+    assert workspace._left_items not in updated_components
     assert all(component in updated_components for component in (
-        workspace._left_items,
+        workspace._tree_entry_lists["geometry"],
+        workspace._tree_entry_lists["sources"],
         workspace._canvas_grid,
         workspace._canvas_scene,
         workspace._canvas_dimensions,
         workspace._region_panel,
         workspace._region_name_input,
     ))
-    positions = {id(component): index for index, component in enumerate(updated_components)}
-    assert max(positions[id(component)] for component in (
-        workspace._canvas_grid,
-        workspace._canvas_scene,
-        workspace._canvas_dimensions,
-    )) < positions[id(workspace._region_panel)]
     assert len(workspace.model["geometry"]["regions"]) == 1
+
+
+def test_region_add_and_remove_keep_tree_grid_and_existing_scene_nodes_mounted(standalone_components):
+    workspace = SolveWorkspace()
+    center, width, _ = workspace._current_canvas_world_view()
+    workspace._view_center = center
+    workspace._view_world_width = width
+
+    tree_groups = tuple(workspace._left_items.ui_children)
+    grid_nodes = tuple(workspace._canvas_grid.ui_children)
+    geometry_entries = workspace._tree_entry_lists["geometry"]
+    sources_entries = workspace._tree_entry_lists["sources"]
+
+    workspace._add_primitive("rectangle")
+    rectangle = workspace.model["geometry"]["regions"][0]
+    rectangle_node = workspace._canvas_region_nodes[rectangle["id"]]
+    rectangle_edges = {
+        edge_id: workspace._canvas_edge_nodes[edge_id]
+        for edge_id in rectangle["edge_ids"]
+    }
+
+    workspace._primitive_values.update({
+        ("circle", "r_center"): 30.0,
+        ("circle", "z_center"): 0.0,
+        ("circle", "radius"): 2.0,
+    })
+    workspace._add_primitive("circle")
+    circle = next(
+        region for region in workspace.model["geometry"]["regions"]
+        if region["shape"]["type"] == "circle"
+    )
+
+    assert tuple(workspace._left_items.ui_children) == tree_groups
+    assert workspace._tree_entry_lists["geometry"] is geometry_entries
+    assert workspace._tree_entry_lists["sources"] is sources_entries
+    assert tuple(workspace._canvas_grid.ui_children) == grid_nodes
+    assert workspace._canvas_region_nodes[rectangle["id"]] is rectangle_node
+    assert all(workspace._canvas_edge_nodes[edge_id] is nodes for edge_id, nodes in rectangle_edges.items())
+
+    workspace.delete_region(circle["id"])
+
+    assert tuple(workspace._left_items.ui_children) == tree_groups
+    assert tuple(workspace._canvas_grid.ui_children) == grid_nodes
+    assert workspace._canvas_region_nodes[rectangle["id"]] is rectangle_node
+    assert all(workspace._canvas_edge_nodes[edge_id] is nodes for edge_id, nodes in rectangle_edges.items())
 
 
 def test_region_click_updates_selection_without_rebuilding_sketch_scene(standalone_components):
@@ -1005,6 +1046,23 @@ def test_region_names_are_not_drawn_inside_sketch_regions(standalone_components)
     )
 
 
+def test_empty_sketch_omits_the_create_region_prompt(standalone_components):
+    workspace = SolveWorkspace()
+    text_nodes = [
+        item for item in workspace._canvas_scene.ui_children
+        if item._component_name == "text"
+    ]
+
+    assert not any(
+        item._props.get("textContent", "").startswith("Choose Rectangle or Circle")
+        for item in text_nodes
+    )
+    assert any(
+        "Drag blank space to pan" in item._props.get("textContent", "")
+        for item in text_nodes
+    )
+
+
 def test_sketch_grid_labels_do_not_intercept_or_select_canvas_drags(standalone_components):
     workspace = SolveWorkspace()
     svg_text = [item for item in workspace._canvas_grid.ui_children if item._component_name == "text"]
@@ -1162,8 +1220,9 @@ def test_added_model_parameter_is_listed_in_tree(standalone_components):
 
     model_group = workspace._left_items.ui_children[0]
     parameter_row = model_group.ui_children[2]
-    parameter_list = parameter_row.ui_children[1]
-    assert any(child.ui_label == "length_1" for child in parameter_list.ui_children[1:])
+    parameter_entries = workspace._tree_entry_lists["parameters"]
+    assert parameter_row.ui_children[1] is workspace._tree_entry_containers["parameters"]
+    assert any(child.ui_label == "length_1" for child in parameter_entries.ui_children)
     assert workspace.selected_parameter_id == workspace.model["parameters"][0]["id"]
 
 
