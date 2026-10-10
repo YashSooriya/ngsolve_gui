@@ -900,16 +900,24 @@ class SolveWorkspace(Div):
       ? (event.target.closest('[data-sketch-region-id]') || {}).getAttribute('data-sketch-region-id')
       : null;
     const fallbackRegion = event.type === 'mousedown'
+      && window.__ngsolveSketchRegionForNextMouseDownKnown
       ? window.__ngsolveSketchRegionForNextMouseDown
       : null;
+    const regionKnown = event.type === 'mousedown'
+      ? Boolean(window.__ngsolveSketchRegionForNextMouseDownKnown)
+      : targetIsSvg(event, currentSvg());
     pointerEvents.push({
       type: event.type,
       timeStamp: event.timeStamp,
       x: event.clientX,
       y: event.clientY,
       regionId: targetRegion || fallbackRegion || null,
+      regionKnown,
     });
-    if (event.type === 'mousedown') window.__ngsolveSketchRegionForNextMouseDown = null;
+    if (event.type === 'mousedown') {
+      window.__ngsolveSketchRegionForNextMouseDown = null;
+      window.__ngsolveSketchRegionForNextMouseDownKnown = false;
+    }
     if (pointerEvents.length > 256) pointerEvents.splice(0, pointerEvents.length - 256);
   };
   const svgPoint = (svg, event) => {
@@ -1034,7 +1042,10 @@ class SolveWorkspace(Div):
         : (event.shiftKey || event.ctrlKey ? 'marquee' : 'pan');
     window.__ngsolveSketchGestureActive = true;
     if (dragMode === 'pan') svg.style.cursor = 'grabbing';
-    if (dragMode === 'region') window.__ngsolveSketchRegionForNextMouseDown = dragRegionId;
+    if (tool === 'select') {
+      window.__ngsolveSketchRegionForNextMouseDown = dragRegionId || '';
+      window.__ngsolveSketchRegionForNextMouseDownKnown = true;
+    }
     remember(event);
     if (activePointerId !== null && svg.setPointerCapture) {
       try { svg.setPointerCapture(activePointerId); } catch (_) { /* capture may already be ending */ }
@@ -1222,10 +1233,10 @@ class SolveWorkspace(Div):
                 "const event = (timestamp === null ? null : events.find(item => item.type === 'mousedown' "
                 "&& Math.abs(item.timeStamp - timestamp) < 1)) "
                 "|| [...events].reverse().find(item => item.type === 'mousedown'); "
-                "return event ? event.regionId : null; })"
+                "return event ? (event.regionKnown ? (event.regionId || '') : null) : null; })"
                 f"({timestamp_js})"
             )
-            return str(region_id) if region_id else None
+            return str(region_id) if region_id is not None else None
         except Exception:
             return value.get("region_id") or value.get("regionId")
 
@@ -1264,12 +1275,15 @@ class SolveWorkspace(Div):
         # Resolve the hit target before _canvas_event_point consumes the
         # matching browser pointer record to obtain clientX/clientY.
         region_id = self._read_canvas_region_id(value) if tool == "select" else None
+        browser_hit_is_known = region_id == ""
+        if browser_hit_is_known:
+            region_id = None
         point = self._canvas_event_point(event, refresh_transform=True)
         if point is None:
             return
         if tool != "select":
             point = self._snap_canvas_point(point)
-        elif not region_id:
+        elif not region_id and not browser_hit_is_known:
             region_id = self._region_at_canvas_point(point)
         if tool != "select":
             operation = "draw"

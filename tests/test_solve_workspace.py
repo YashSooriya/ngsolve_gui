@@ -523,6 +523,22 @@ def test_canvas_region_hit_test_finds_region_when_browser_target_is_missing(stan
     assert workspace._canvas_drag["region_id"] == region["id"]
 
 
+def test_canvas_blank_hit_from_browser_does_not_move_a_nearby_region(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    project, _ = workspace._canvas_projection()
+    center = tuple(sum(point[index] for point in region["vertices"]) / len(region["vertices"]) for index in (0, 1))
+    monkeypatch.setattr(workspace, "_read_canvas_region_id", lambda value: "")
+    monkeypatch.setattr(workspace, "_region_at_canvas_point", lambda point: region["id"])
+    workspace._canvas_event_point = lambda event, refresh_transform=False: project(center)
+
+    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0}))
+
+    assert workspace._canvas_drag["operation"] == "pan"
+    assert workspace._canvas_drag["region_id"] is None
+
+
 def test_canvas_drag_motion_and_release_do_not_rebuild_the_canvas(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
@@ -715,6 +731,7 @@ def test_canvas_drag_suppresses_the_click_that_follows_mouseup(standalone_compon
     assert "setPointerCapture" in scripts[0]
     assert "pointercancel" in scripts[0]
     assert "window.addEventListener('blur'" in scripts[0]
+    assert "regionKnown" in scripts[0]
 
 
 def test_canvas_render_keeps_background_and_layer_components_mounted(standalone_components):
