@@ -6,6 +6,7 @@ import copy
 from functools import wraps
 import json
 import math
+import os
 import re
 import time
 from contextlib import contextmanager
@@ -27,6 +28,11 @@ from ngapp.components import (
     QCardSection,
     QSplitter,
     QResizeObserver,
+    QIcon,
+    QList,
+    QItem,
+    QItemSection,
+    QMenu,
 )
 from ngapp.utils import EnvironmentType, get_environment
 
@@ -65,6 +71,37 @@ _TREE_GROUPS = (
 )
 
 _FREQUENCY_RESULT_SUFFIX = re.compile(r"_\d+_([0-9.eE+-]+)Hz$", re.IGNORECASE)
+_HIDDEN_RUN_HISTORY_FILE = ".mm_fem_hidden_run_history.json"
+
+
+def _run_history_path_key(path):
+    """Return a stable key for a run output path across GUI restarts."""
+    return os.path.normcase(str(Path(path).expanduser().resolve()))
+
+
+def _load_hidden_run_history(root):
+    try:
+        data = json.loads((Path(root) / _HIDDEN_RUN_HISTORY_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return set()
+    paths = data.get("hidden_output_paths", []) if isinstance(data, dict) else []
+    return {
+        _run_history_path_key(path)
+        for path in paths
+        if isinstance(path, str) and path.strip()
+    }
+
+
+def _save_hidden_run_history(root, paths):
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    destination = root / _HIDDEN_RUN_HISTORY_FILE
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps({"schema": 1, "hidden_output_paths": sorted(paths)}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(destination)
 
 
 def _load_saved_run_history(root=None, limit=40):
@@ -76,8 +113,11 @@ def _load_saved_run_history(root=None, limit=40):
     except OSError:
         return []
 
+    hidden_paths = _load_hidden_run_history(root)
     runs = []
     for directory in directories[-max(1, int(limit)):]:
+        if _run_history_path_key(directory) in hidden_paths:
+            continue
         manifest_path = directory / "run_manifest.json"
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -101,6 +141,7 @@ def _load_saved_run_history(root=None, limit=40):
             name = f"{kind}: {directory.name.rsplit('_', 1)[0]}"
             finished = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(directory.stat().st_mtime))
         runs.append({
+            "id": _run_history_path_key(directory),
             "name": name,
             "kind": kind,
             "status": status,
@@ -300,7 +341,8 @@ class SolveWorkspace(Div):
         self.message_is_error = False
         self._log_visible = False
         self._log_messages = ["Axisymmetric model editor ready."]
-        self.runs = _load_saved_run_history()
+        self._run_history_root = Path.home() / "NGSolve_results"
+        self.runs = _load_saved_run_history(self._run_history_root)
         self.mesh_preview_edges = []
         self.mesh_preview_visible = False
         self._mesh_preview_signature = None
@@ -2738,6 +2780,23 @@ class SolveWorkspace(Div):
             style="width:100%; justify-content:flex-start; text-align:left; padding-left:10px; min-height:30px;",
             align="left",
         )
+        if section == "runs":
+            delete_item = QItem(
+                QItemSection(
+                    QIcon(ui_name="mdi-delete", ui_size="xs"),
+                    ui_avatar=True,
+                ),
+                QItemSection("Delete"),
+                ui_clickable=True,
+                ui_dense=True,
+            )
+            delete_item.on_click(
+                lambda e=None, run_id=entry_id: self.delete_run_history_entry(run_id)
+            )
+            button.ui_children = [
+                *button.ui_children,
+                QMenu(QList(delete_item, ui_dense=True), ui_context_menu=True),
+            ]
         self._tree_entry_buttons[f"{section}:{entry_id}"] = button
         return button
 
@@ -2794,11 +2853,39 @@ class SolveWorkspace(Div):
             return f"STUDY · {len(entries)}", entries
         if section == "runs":
             entries = [
-                (item.get("id", item.get("name", "Run")), item.get("name", "Run"), "mdi-file-chart-outline", lambda *a: self.select_section("runs"), False)
+                (item.get("id") or item.get("output_path") or item.get("name", "Run"), item.get("name", "Run"), "mdi-file-chart-outline", lambda *a: self.select_section("runs"), False)
                 for item in reversed(self.runs)
             ]
             return f"RUNS · {len(entries)}", entries
         return None
+
+    def delete_run_history_entry(self, run_id):
+        """Hide one Run History entry without deleting its output files."""
+        run = next(
+            (
+                item for item in self.runs
+                if str(item.get("id") or item.get("output_path") or item.get("name", "Run")) == str(run_id)
+            ),
+            None,
+        )
+        if run is None:
+            return False
+
+        output_path = run.get("output_path")
+        if output_path:
+            hidden_paths = _load_hidden_run_history(self._run_history_root)
+            hidden_paths.add(_run_history_path_key(output_path))
+            try:
+                _save_hidden_run_history(self._run_history_root, hidden_paths)
+            except OSError as error:
+                self._message(f"Could not save the Run History change: {error}", error=True)
+                return False
+
+        self.runs.remove(run)
+        self._refresh_model_tree()
+        if self.active_section == "runs":
+            self._render_inspector()
+        return True
 
     def select_material(self, material_id):
         self.selected_material_id = material_id
@@ -4741,12 +4828,14 @@ class SolveWorkspace(Div):
             self.set_mesh_preview(mesh_preview_edges)
         if run_kind:
             status = "Failed" if error else "Cancelled" if cancelled else "Complete"
+            run_output_path = str(output_path or "")
             self.runs.append({
+                "id": _run_history_path_key(run_output_path) if run_output_path else new_id("run"),
                 "name": run_name or run_kind,
                 "kind": run_kind,
                 "status": status,
                 "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "output_path": str(output_path or ""),
+                "output_path": run_output_path,
             })
             self._refresh_model_tree()
             if self.active_section == "runs":

@@ -353,12 +353,49 @@ def test_saved_run_history_recovers_manifest_and_marks_running_as_interrupted(tm
     runs = _load_saved_run_history(tmp_path)
 
     assert runs == [{
+        "id": str(run_dir.resolve()),
         "name": "Study: Nested model",
         "kind": "Study",
         "status": "Interrupted",
         "finished": "2026-10-10T12:00:00+00:00",
         "output_path": str(run_dir),
     }]
+
+
+def test_run_history_context_menu_hides_entry_and_preserves_output(standalone_components, tmp_path):
+    run_dir = tmp_path / "study_result"
+    run_dir.mkdir()
+    output_file = run_dir / "mesh.vol"
+    output_file.write_text("stored mesh", encoding="utf-8")
+    (run_dir / "run_manifest.json").write_text(json.dumps({
+        "schema": "mm-fem.run",
+        "kind": "study",
+        "status": "complete",
+        "model_name": "Nested model",
+        "created_utc": "2026-10-10T12:00:00+00:00",
+    }), encoding="utf-8")
+
+    workspace = SolveWorkspace()
+    workspace._run_history_root = tmp_path
+    workspace.runs = _load_saved_run_history(tmp_path)
+    workspace._refresh_model_tree()
+    run_id = workspace.runs[0]["id"]
+    tree_entry = workspace._tree_entry_buttons[f"runs:{run_id}"]
+    context_menu = next(child for child in tree_entry.ui_children if child.__class__.__name__ == "QMenu")
+    menu_list = context_menu.ui_children[0]
+    delete_item = menu_list.ui_children[0]
+    assert any(
+        child == "Delete"
+        for section in delete_item.ui_children
+        for child in getattr(section, "ui_children", [])
+    )
+
+    delete_item._handle("click.stop")
+
+    assert workspace.runs == []
+    assert workspace._tree_subsection("runs") == ("RUNS · 0", [])
+    assert output_file.read_text(encoding="utf-8") == "stored mesh"
+    assert _load_saved_run_history(tmp_path) == []
 
 
 def test_run_history_exposes_a_frequency_selector_for_sweep_fields(standalone_components, tmp_path):
