@@ -69,6 +69,31 @@ def test_workspace_mode_switch_changes_workspace_and_keeps_header_visible():
     assert all(not item.ui_hidden for item in header_components)
 
 
+def test_opening_a_run_result_keeps_the_mode_toggle_in_sync(monkeypatch):
+    loaded = []
+    app = SimpleNamespace(
+        _workspace_mode="solve",
+        _post_process_workspace=SimpleNamespace(ui_hidden=True),
+        _solve_workspace=SimpleNamespace(ui_hidden=False),
+        _load_with_status=loaded.append,
+    )
+    toggle = WorkspaceModeToggle(
+        "solve", on_change=lambda mode: NGSolveGui._set_workspace_mode(app, mode)
+    )
+    for button in toggle._buttons.values():
+        monkeypatch.setattr(button, "_update_frontend", lambda _payload: None)
+    app._workspace_mode_toggle = toggle
+    monkeypatch.setattr("ngsolve_gui.app.os.path.isfile", lambda _filename: True)
+
+    NGSolveGui._open_run_result(app, "B_DC.pkl")
+
+    assert toggle.value == "post_process"
+    assert app._workspace_mode == "post_process"
+    assert app._post_process_workspace.ui_hidden is False
+    assert app._solve_workspace.ui_hidden is True
+    assert loaded == ["B_DC.pkl"]
+
+
 def test_workspace_mode_rejects_unknown_mode():
     with pytest.raises(ValueError, match="Unknown workspace mode"):
         WorkspaceModeToggle("solver")

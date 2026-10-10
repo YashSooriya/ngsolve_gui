@@ -818,7 +818,9 @@ class NGSolveGui(App):
         if not os.path.isfile(filename):
             self.solve_workspace._message(f"Result file no longer exists: {filename}", error=True)
             return
-        self._set_workspace_mode("post_process")
+        # Use the toggle as the single source of mode changes so its selected
+        # state stays in sync with the workspace after opening a run result.
+        self._workspace_mode_toggle.select("post_process")
         self._load_with_status(filename)
 
     @staticmethod
