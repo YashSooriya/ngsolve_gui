@@ -483,7 +483,8 @@ def test_grid_snap_button_is_right_aligned_in_the_sketch_toolbar(standalone_comp
     snap_button = toolbar.ui_slots["default"][-1]
 
     assert snap_button.ui_icon == "mdi-magnet"
-    assert "margin-left:auto" in snap_button.ui_style
+    assert "position:absolute" in snap_button.ui_style
+    assert "right:8px" in snap_button.ui_style
 
 
 def test_added_model_parameter_is_listed_in_tree(standalone_components):
