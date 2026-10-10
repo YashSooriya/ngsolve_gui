@@ -56,6 +56,11 @@ def _inject_solve_status_styles(js):
     js.document.head.appendChild(style)
 
 
+def _set_window_title(js):
+    """Give the standalone browser window the product name."""
+    js.document.title = "MM-FEM"
+
+
 class _WorkspaceLogBuffer(io.StringIO):
     """Capture solver output and publish it to the Solve log as it arrives."""
 
@@ -529,6 +534,7 @@ class NGSolveGui(App):
         sync_default_viewport_clear()
         keybinding_styles.inject(self)
         self.call_js(_inject_solve_status_styles)
+        self.call_js(_set_window_title)
         self.on_load(self.__on_load)
 
         # Post Process is the existing/default view. Retain its hidden tree so
