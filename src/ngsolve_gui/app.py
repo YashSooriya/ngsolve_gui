@@ -398,8 +398,8 @@ class NGSolveGui(App):
         ngs_logo = Div(
             QImg(
                 ui_src=self.load_asset("mm-fem-logo.png"),
-                ui_height="37px",
-                ui_width="138px",
+                ui_height="55.5px",
+                ui_width="207px",
                 ui_fit="contain",
             ),
             ui_class=cb.brand,
@@ -426,6 +426,8 @@ class NGSolveGui(App):
             *([self.system_monitor, Div(ui_class=cb.tb_sep)] if self.system_monitor is not None else []),
             view_group,
             ui_class=cb.app_bar,
+            # Keep the enlarged logo fully visible and vertically centered.
+            ui_style="height:60px; min-height:60px;",
         )
         workspace_mode_bar = Div(
             self._workspace_mode_toggle,
