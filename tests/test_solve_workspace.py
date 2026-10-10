@@ -9,6 +9,7 @@ import pytest
 from ngapp import utils
 from ngapp.components import Div
 
+import ngsolve_gui.app as app_module
 from ngsolve_gui.app import NGSolveGui
 from ngsolve_gui.axisymmetric_model import builtin_materials
 from ngsolve_gui.solve_workspace import SolveWorkspace, _load_saved_run_history
@@ -298,6 +299,11 @@ def test_solver_job_can_be_cancelled_and_is_recorded(standalone_components):
     assert not workspace._job_active
     assert workspace._cancel_button.ui_hidden
     assert workspace.runs[-1]["status"] == "Cancelled"
+
+
+def test_solver_timestamp_import_is_not_shadowed_by_component_star_import():
+    assert callable(app_module._datetime.now)
+    assert app_module._timezone.utc is not None
 
 
 def test_saved_run_history_recovers_manifest_and_marks_running_as_interrupted(tmp_path):

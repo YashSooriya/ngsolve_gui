@@ -7,7 +7,7 @@ import io
 import json
 import re
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime as _datetime, timezone as _timezone
 from pathlib import Path
 
 from ngapp.app import App
@@ -747,7 +747,7 @@ class NGSolveGui(App):
         model_name = re.sub(
             r"[^A-Za-z0-9_-]+", "_", model.get("name", "axisymmetric_model")
         ).strip("_") or "axisymmetric_model"
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        stamp = _datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         output_dir = Path.home() / "NGSolve_results" / f"{model_name}_{stamp}"
         model_path = output_dir / f"{model_name}.ngsmodel"
         try:
@@ -764,7 +764,7 @@ class NGSolveGui(App):
                 "schema_version": 1,
                 "status": "running",
                 "kind": "mesh" if mesh_only else "study",
-                "created_utc": datetime.now(timezone.utc).isoformat(),
+                "created_utc": _datetime.now(_timezone.utc).isoformat(),
                 "model_archive": model_path.name,
                 "output_path": str(output_dir),
                 "model_name": model.get("name", "axisymmetric model"),
@@ -845,7 +845,7 @@ class NGSolveGui(App):
                     manifest.update({
                         "status": "cancelled",
                         "run_name": run_name,
-                        "finished_utc": datetime.now(timezone.utc).isoformat(),
+                        "finished_utc": _datetime.now(_timezone.utc).isoformat(),
                     })
                     self._write_run_manifest(output_dir, manifest)
                     workspace.finish_solver_job(
@@ -862,7 +862,7 @@ class NGSolveGui(App):
                         "status": "failed",
                         "run_name": run_name,
                         "error": detail,
-                        "finished_utc": datetime.now(timezone.utc).isoformat(),
+                        "finished_utc": _datetime.now(_timezone.utc).isoformat(),
                     })
                     self._write_run_manifest(output_dir, manifest)
                     raise RuntimeError(detail)
@@ -870,7 +870,7 @@ class NGSolveGui(App):
                 manifest.update({
                     "status": "complete",
                     "run_name": run_name,
-                    "finished_utc": datetime.now(timezone.utc).isoformat(),
+                    "finished_utc": _datetime.now(_timezone.utc).isoformat(),
                     "solver_log": "solver.log",
                 })
                 mesh_preview_path = output_dir / "mesh_preview.json"
@@ -908,7 +908,7 @@ class NGSolveGui(App):
                     "status": "failed",
                     "run_name": run_name,
                     "error": f"{type(error).__name__}: {error}",
-                    "finished_utc": datetime.now(timezone.utc).isoformat(),
+                    "finished_utc": _datetime.now(_timezone.utc).isoformat(),
                     "solver_log": "solver.log",
                 })
                 self._write_run_manifest(output_dir, manifest)
