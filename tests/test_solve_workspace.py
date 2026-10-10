@@ -836,7 +836,42 @@ def test_saved_axisymmetric_view_keeps_its_user_selected_z_centre(standalone_com
     assert workspace._current_canvas_world_view()[0][1] == pytest.approx(0.005)
 
 
-def test_nested_region_labels_are_separated_and_stay_in_the_visible_shell(standalone_components):
+def test_browser_view_transform_commits_once_at_its_final_zoom_and_pan(standalone_components):
+    workspace = SolveWorkspace()
+    plot = workspace._canvas_plot_bounds()
+    center_before, width_before, _ = workspace._current_canvas_world_view()
+    pixel_center = ((plot[0] + plot[2]) / 2, (plot[1] + plot[3]) / 2)
+
+    assert workspace._commit_browser_canvas_view(
+        (2.0, pixel_center[0] * -1.0, pixel_center[1] * -1.0, 1),
+        render=False,
+    )
+    center_after_zoom, width_after_zoom, _ = workspace._current_canvas_world_view()
+    assert center_after_zoom == pytest.approx(center_before)
+    assert width_after_zoom == pytest.approx(width_before / 2)
+    assert not workspace._commit_browser_canvas_view(
+        (2.0, pixel_center[0] * -1.0, pixel_center[1] * -1.0, 1),
+        render=False,
+    )
+
+    assert workspace._commit_browser_canvas_view((1.0, 40.0, -24.0, 2), render=False)
+    center_after_pan, width_after_pan, _ = workspace._current_canvas_world_view()
+    assert width_after_pan == pytest.approx(width_after_zoom)
+    assert center_after_pan[0] < center_after_zoom[0]
+    assert center_after_pan[1] < center_after_zoom[1]
+
+
+def test_sketch_uses_browser_local_motion_and_only_sends_completed_events(standalone_components):
+    workspace = SolveWorkspace()
+    callbacks = workspace._canvas._callbacks
+
+    assert "mouseup" in callbacks
+    assert "wheel" in callbacks
+    assert "mousemove" not in callbacks
+    assert "mousedown" not in callbacks
+
+
+def test_region_names_are_not_drawn_inside_sketch_regions(standalone_components):
     workspace = SolveWorkspace()
     workspace.model["geometry"]["regions"] = [
         {
@@ -856,71 +891,18 @@ def test_nested_region_labels_are_separated_and_stay_in_the_visible_shell(standa
             "vertices": [[0.008, -0.003], [0.012, -0.003], [0.012, 0.003], [0.008, 0.003]],
         },
     ]
-    workspace.selected_region_id = "inner"
 
     workspace.render_canvas()
-    labels = {
-        item._props["data-sketch-region-id"]: item
-        for item in workspace._canvas_scene.ui_children
+    region_text = [
+        item for item in workspace._canvas_scene.ui_children
         if item._component_name == "text" and "data-sketch-region-id" in item._props
-    }
-    outer, inner = labels["outer"], labels["inner"]
-    outer_box = (
-        outer._props["x"] - len("Outer domain") * 7.4 / 2 - 2,
-        outer._props["x"] + len("Outer domain") * 7.4 / 2 + 2,
-        outer._props["y"] - 10,
-        outer._props["y"] + 4,
-    )
-    inner_box = (
-        inner._props["x"] - len("Coil") * 7.4 / 2 - 2,
-        inner._props["x"] + len("Coil") * 7.4 / 2 + 2,
-        inner._props["y"] - 10,
-        inner._props["y"] + 4,
-    )
-    assert (
-        outer_box[1] + 4 <= inner_box[0]
-        or inner_box[1] + 4 <= outer_box[0]
-        or outer_box[3] + 4 <= inner_box[2]
-        or inner_box[3] + 4 <= outer_box[2]
-    )
-
-    project, _ = workspace._canvas_projection()
-    region_center = project((0.01, 0.0))
-    assert math.hypot(outer._props["x"] - region_center[0], outer._props["y"] - region_center[1]) >= 14.0
-    assert math.hypot(inner._props["x"] - region_center[0], inner._props["y"] - region_center[1]) >= 14.0
-    child_points = [project(point) for point in workspace.model["geometry"]["regions"][1]["vertices"]]
-    child_bounds = (
-        min(point[0] for point in child_points),
-        max(point[0] for point in child_points),
-        min(point[1] for point in child_points),
-        max(point[1] for point in child_points),
-    )
-    assert (
-        outer_box[1] <= child_bounds[0]
-        or outer_box[0] >= child_bounds[1]
-        or outer_box[3] <= child_bounds[2]
-        or outer_box[2] >= child_bounds[3]
-    )
-
-    def overlaps(first, second):
-        return not (
-            first[1] + 4 <= second[0]
-            or second[1] + 4 <= first[0]
-            or first[3] + 4 <= second[2]
-            or second[3] + 4 <= first[2]
-        )
-
-    dimension_boxes = [
-        box
-        for region in workspace.model["geometry"]["regions"]
-        for component in workspace._region_dimension_components(region)
-        if component._component_name == "text"
-        for box in [workspace._svg_text_box(component)]
-        if box is not None
     ]
-    assert all(not overlaps(label_box, dimension_box) for label_box in (outer_box, inner_box) for dimension_box in dimension_boxes)
-    assert labels["outer"] is workspace._canvas_scene.ui_children[-2]
-    assert labels["inner"] is workspace._canvas_scene.ui_children[-1]
+
+    assert region_text == []
+    assert not any(
+        item._component_name == "text" and item._props.get("textContent") in {"Outer domain", "Coil"}
+        for item in workspace._canvas_scene.ui_children
+    )
 
 
 def test_sketch_grid_labels_do_not_intercept_or_select_canvas_drags(standalone_components):

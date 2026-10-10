@@ -145,6 +145,7 @@ class SolveWorkspace(Div):
         self.sketch_tool = "select"
         self._canvas_drag = None
         self._screen_to_svg = None
+        self._canvas_view_commit_version = 0
         self._canvas_zoom_timer = None
         self._canvas_zoom_timer_lock = Lock()
         self._canvas_zoom_generation = 0
@@ -208,10 +209,7 @@ class SolveWorkspace(Div):
             "aria-label": "Axisymmetric radial-axial sketch",
         })
         self._canvas.on_mounted(self._install_canvas_pointer_capture)
-        self._canvas.on("mousedown", self._on_canvas_mouse_down)
-        self._canvas.on("mousemove", self._on_canvas_mouse_move)
         self._canvas.on("mouseup", self._on_canvas_mouse_up)
-        self._canvas.on("pointercancel", self._on_canvas_pointer_cancel)
         self._canvas.on("wheel", self._on_canvas_wheel)
         self._inspector = Div(ui_style="display:flex; flex-direction:column; gap:12px; padding:12px; overflow:auto; min-height:0;")
         self._status = Div(ui_style="display:flex; align-items:center; gap:8px; min-width:0; overflow:hidden; white-space:nowrap;")
@@ -807,7 +805,53 @@ class SolveWorkspace(Div):
         self._save_canvas_view_to_layout()
         self.render_canvas()
 
+    def _read_browser_canvas_view(self):
+        """Read the browser's coalesced view transform after a local gesture."""
+        try:
+            values = self.js.eval(
+                "(() => window.__ngsolveSketchViewTransform || null)()"
+            )
+            if values is None or len(values) < 4:
+                return None
+            scale, tx, ty, version = (float(values[index]) for index in range(4))
+            if not all(math.isfinite(value) for value in (scale, tx, ty, version)) or scale <= 0:
+                return None
+            return scale, tx, ty, int(version)
+        except Exception:
+            return None
+
+    def _commit_browser_canvas_view(self, view=None, *, render=True):
+        """Commit a browser-side pan/zoom matrix to the world-space viewport."""
+        view = view or self._read_browser_canvas_view()
+        if view is None:
+            return False
+        scale, tx, ty, version = view
+        if version <= self._canvas_view_commit_version:
+            return False
+        self._canvas_view_commit_version = version
+        if abs(scale - 1.0) < 1e-12 and abs(tx) < 1e-9 and abs(ty) < 1e-9:
+            return False
+        plot = self._canvas_plot_bounds()
+        old_center, old_width, _ = self._current_canvas_world_view()
+        _, unproject = self._canvas_projection()
+        pixel_center = ((plot[0] + plot[2]) / 2, (plot[1] + plot[3]) / 2)
+        center = unproject(((pixel_center[0] - tx) / scale, (pixel_center[1] - ty) / scale))
+        width = old_width / scale
+        if not all(math.isfinite(value) for value in (*center, width)) or width <= 0:
+            return False
+        self._view_center = center
+        self._view_world_width = width
+        self._save_canvas_view_to_layout()
+        if render:
+            self.render_canvas()
+        return True
+
     def _on_canvas_wheel(self, event):
+        """Commit one settled browser-side wheel gesture, never each tick."""
+        if self._commit_browser_canvas_view(render=True):
+            return
+        # Retain the event-driven fallback for frontends without the local SVG
+        # handler and for unit tests that send a native wheel event directly.
         value = getattr(event, "value", None)
         if not isinstance(value, dict):
             return
@@ -840,26 +884,35 @@ class SolveWorkspace(Div):
     def _install_canvas_pointer_capture(self, *_):
         """Keep sketch gestures alive through release and render previews locally.
 
-        Pointer capture makes drawing, marquee selection, region movement, and
-        panning independent of which SVG child is beneath the pointer. The
-        mouse-event cache remains for ngapp's Python callbacks, which do not
-        consistently include client coordinates.
+        Pointer capture makes sketch gestures independent of which SVG child
+        is beneath the pointer. Preview updates stay local; Python receives one
+        compact event after release rather than the full stream of mouse moves.
         """
         script = r"""
 (() => {
   window.__ngsolveSketchTool = '__SKETCH_TOOL__';
-  if (window.__ngsolveSketchPointerCaptureVersion === 2) return;
-  window.__ngsolveSketchPointerCaptureVersion = 2;
+  if (window.__ngsolveSketchPointerCaptureVersion === 3) return;
+  window.__ngsolveSketchPointerCaptureVersion = 3;
   let active = false;
   let activePointerId = null;
   let dragStart = null;
+  let dragStartScreen = null;
+  let dragBaseScale = 1;
+  let dragBaseTranslateX = 0;
+  let dragBaseTranslateY = 0;
   let dragRegionId = null;
   let dragMode = null;
   let gestureNumber = 0;
   let suppressCanvasClickUntil = 0;
+  let previewFrame = 0;
+  let pendingPreview = null;
+  let wheelCommitTimer = 0;
   let visualScale = 1;
   let visualTranslateX = 0;
   let visualTranslateY = 0;
+  let viewVersion = 0;
+  window.__ngsolveSketchViewTransform = [1, 0, 0, viewVersion];
+  window.__ngsolveSketchCompletedGesture = null;
   const pointerEvents = window.__ngsolveSketchPointerEvents = [];
   const forwardedEvents = new WeakSet();
   const selector = 'svg.solve-sketch-canvas';
@@ -878,6 +931,8 @@ class SolveWorkspace(Div):
     visualScale = scale;
     visualTranslateX = tx;
     visualTranslateY = ty;
+    viewVersion += 1;
+    window.__ngsolveSketchViewTransform = [scale, tx, ty, viewVersion];
     const transform = `matrix(${scale} 0 0 ${scale} ${tx} ${ty})`;
     for (const id of groupIds) {
       const group = svg.querySelector('#' + id);
@@ -889,6 +944,7 @@ class SolveWorkspace(Div):
     visualScale = 1;
     visualTranslateX = 0;
     visualTranslateY = 0;
+    window.__ngsolveSketchViewTransform = [1, 0, 0, viewVersion];
     for (const id of groupIds) {
       const group = svg.querySelector('#' + id);
       if (group) group.removeAttribute('transform');
@@ -929,7 +985,7 @@ class SolveWorkspace(Div):
     const mapped = point.matrixTransform(matrix.inverse());
     return [mapped.x, mapped.y];
   };
-  const clearPreview = (svg = currentSvg()) => {
+  const clearPreview = (svg = currentSvg(), resetView = true) => {
     if (!svg) return;
     for (const id of ['solve-sketch-drag-rect', 'solve-sketch-drag-circle']) {
       const shape = svg.querySelector('#' + id);
@@ -943,8 +999,9 @@ class SolveWorkspace(Div):
       }
     }
     window.__ngsolveSketchLastRegionId = null;
-    resetCanvasTransform(svg);
+    if (resetView) resetCanvasTransform(svg);
     dragStart = null;
+    dragStartScreen = null;
     dragRegionId = null;
     dragMode = null;
   };
@@ -957,7 +1014,15 @@ class SolveWorkspace(Div):
   };
   const sketchPoint = (point) =>
     (window.__ngsolveSketchTool || 'select') === 'select' ? point : snapPoint(point);
-  const updatePreview = (svg, point) => {
+  const toScenePoint = (point) => [
+    (point[0] - visualTranslateX) / visualScale,
+    (point[1] - visualTranslateY) / visualScale,
+  ];
+  const toViewPoint = (point) => [
+    visualScale * point[0] + visualTranslateX,
+    visualScale * point[1] + visualTranslateY,
+  ];
+  const updatePreview = (svg, point, screenPoint = null) => {
     if (!active || !dragStart || !point) return;
     if (dragMode === 'region' && dragRegionId) {
       const grid = window.__ngsolveSketchSnap;
@@ -976,7 +1041,14 @@ class SolveWorkspace(Div):
       return;
     }
     if (dragMode === 'pan') {
-      applyCanvasTransform(1, point[0] - dragStart[0], point[1] - dragStart[1], svg);
+      const screenStart = dragStartScreen || toViewPoint(dragStart);
+      const screenEnd = screenPoint || toViewPoint(point);
+      applyCanvasTransform(
+        dragBaseScale,
+        dragBaseTranslateX + screenEnd[0] - screenStart[0],
+        dragBaseTranslateY + screenEnd[1] - screenStart[1],
+        svg,
+      );
       svg.style.cursor = 'grabbing';
       return;
     }
@@ -1021,12 +1093,18 @@ class SolveWorkspace(Div):
   };
   const beginGesture = (event, svg) => {
     if (!targetIsSvg(event, svg) || event.button !== 0 || event.isPrimary === false) return;
-    if (active) clearPreview(svg);
+    if (active) clearPreview(svg, false);
+    window.__ngsolveSketchCompletedGesture = null;
     active = true;
     activePointerId = event.pointerId === undefined ? null : event.pointerId;
     gestureNumber += 1;
-    clearPreview(svg);
-    dragStart = sketchPoint(svgPoint(svg, event));
+    clearPreview(svg, false);
+    const screenStart = svgPoint(svg, event);
+    dragStartScreen = screenStart;
+    dragBaseScale = visualScale;
+    dragBaseTranslateX = visualTranslateX;
+    dragBaseTranslateY = visualTranslateY;
+    dragStart = sketchPoint(toScenePoint(screenStart));
     const region = event.target && event.target.closest
       ? event.target.closest('[data-sketch-region-id]')
       : null;
@@ -1053,19 +1131,42 @@ class SolveWorkspace(Div):
   };
   const moveGesture = (event, svg) => {
     if (!active || (activePointerId !== null && event.pointerId !== activePointerId)) return;
-    remember(event);
-    updatePreview(svg, svgPoint(svg, event));
+    pendingPreview = {event, svg};
+    if (previewFrame) return;
+    previewFrame = requestAnimationFrame(() => {
+      previewFrame = 0;
+      const pending = pendingPreview;
+      pendingPreview = null;
+      if (!active || !pending) return;
+      const screenPoint = svgPoint(pending.svg, pending.event);
+      if (screenPoint) updatePreview(pending.svg, toScenePoint(screenPoint), screenPoint);
+    });
   };
   const finishGesture = (event, svg, cancelled = false) => {
     if (!active || (activePointerId !== null && event.pointerId !== undefined && event.pointerId !== activePointerId)) return;
-    remember(event);
-    const point = svgPoint(svg, event);
-    if (!cancelled && point) updatePreview(svg, point);
-    const moved = Boolean(!cancelled && dragStart && point
-      && Math.hypot(point[0] - dragStart[0], point[1] - dragStart[1]) >= 4);
+    if (previewFrame) cancelAnimationFrame(previewFrame);
+    previewFrame = 0;
+    pendingPreview = null;
+    const screenPoint = svgPoint(svg, event);
+    const point = screenPoint ? toScenePoint(screenPoint) : null;
+    if (!cancelled && point) updatePreview(svg, point, screenPoint);
+    const moved = Boolean(!cancelled && dragStartScreen && screenPoint
+      && Math.hypot(screenPoint[0] - dragStartScreen[0], screenPoint[1] - dragStartScreen[1]) >= 4);
     const finishedGesture = gestureNumber;
     const preserveVisual = moved && ['draw', 'pan', 'region'].includes(dragMode);
     const shouldForward = active && !targetIsSvg(event, svg) && event.type !== 'pointercancel';
+    if (!cancelled && dragStartScreen && screenPoint) {
+      const operation = dragMode;
+      const tool = window.__ngsolveSketchTool || 'select';
+      window.__ngsolveSketchCompletedGesture = [
+        operation, tool,
+        dragStartScreen[0], dragStartScreen[1], screenPoint[0], screenPoint[1],
+        dragRegionId || '', Boolean(event.shiftKey || event.ctrlKey), moved,
+        visualScale, visualTranslateX, visualTranslateY, viewVersion,
+      ];
+      if (wheelCommitTimer) window.clearTimeout(wheelCommitTimer);
+      wheelCommitTimer = 0;
+    }
     if (moved) {
       // The browser's click follows mouseup. Suppress it after any drag so
       // the completed gesture cannot select a region beneath its endpoint.
@@ -1075,9 +1176,12 @@ class SolveWorkspace(Div):
     activePointerId = null;
     window.__ngsolveSketchGestureActive = false;
     if (svg) svg.style.cursor = (window.__ngsolveSketchTool || 'select') === 'select' ? 'default' : 'crosshair';
-    if (!preserveVisual) clearPreview(svg);
+    if (svg) requestAnimationFrame(() => {
+      if (!active) svg.style.cursor = (window.__ngsolveSketchTool || 'select') === 'select' ? 'default' : 'crosshair';
+    });
+    if (!preserveVisual) clearPreview(svg, false);
     else window.setTimeout(() => {
-      if (gestureNumber === finishedGesture) clearPreview(svg);
+      if (gestureNumber === finishedGesture) clearPreview(svg, false);
     }, 2500);
     if (shouldForward) {
       const forwarded = new MouseEvent('mouseup', {
@@ -1098,10 +1202,13 @@ class SolveWorkspace(Div):
     if (!svg) return;
     const wasActive = active;
     const pointerId = activePointerId;
+    if (previewFrame) cancelAnimationFrame(previewFrame);
+    previewFrame = 0;
+    pendingPreview = null;
     active = false;
     activePointerId = null;
     window.__ngsolveSketchGestureActive = false;
-    clearPreview(svg);
+    clearPreview(svg, false);
     svg.style.cursor = (window.__ngsolveSketchTool || 'select') === 'select' ? 'default' : 'crosshair';
     if (wasActive && notifyPython) {
       const cancelled = new PointerEvent('pointercancel', {
@@ -1121,8 +1228,8 @@ class SolveWorkspace(Div):
   const handleWheel = (event, svg) => {
     if (!targetIsSvg(event, svg)) return;
     event.preventDefault();
+    event.stopImmediatePropagation();
     if (active) {
-      event.stopImmediatePropagation();
       return;
     }
     const delta = Number(event.deltaY) || 0;
@@ -1134,6 +1241,16 @@ class SolveWorkspace(Div):
     const tx = point[0] + factor * (visualTranslateX - point[0]);
     const ty = point[1] + factor * (visualTranslateY - point[1]);
     applyCanvasTransform(visualScale * factor, tx, ty, svg);
+    if (wheelCommitTimer) window.clearTimeout(wheelCommitTimer);
+    wheelCommitTimer = window.setTimeout(() => {
+      wheelCommitTimer = 0;
+      if (active) return;
+      const target = currentSvg();
+      if (!target) return;
+      const settled = new WheelEvent('wheel', {bubbles: true, cancelable: true, deltaY: 0});
+      forwardedEvents.add(settled);
+      target.dispatchEvent(settled);
+    }, 140);
   };
   const capture = (event) => {
     if (forwardedEvents.has(event)) return;
@@ -1154,7 +1271,6 @@ class SolveWorkspace(Div):
     }
     if (pointerSupported) {
       if (event.type === 'mousedown' && targetIsCanvas && event.button === 0) remember(event);
-      else if (event.type === 'mousemove' && active) remember(event);
       else if (event.type === 'mouseup' && (targetIsCanvas || active)) remember(event);
       return;
     }
@@ -1330,6 +1446,48 @@ class SolveWorkspace(Div):
             self._canvas_drag["moved"] = moved
 
     def _on_canvas_mouse_up(self, event):
+        try:
+            completed = self.js.eval(
+                "(() => { const gesture = window.__ngsolveSketchCompletedGesture || null; "
+                "window.__ngsolveSketchCompletedGesture = null; return gesture; })()"
+            )
+        except Exception:
+            completed = None
+        if isinstance(completed, (list, tuple)) and len(completed) >= 13:
+            operation, tool = str(completed[0]), str(completed[1])
+            try:
+                start = (float(completed[2]), float(completed[3]))
+                end = (float(completed[4]), float(completed[5]))
+                region_id = str(completed[6]) or None
+                additive = bool(completed[7])
+                moved = bool(completed[8])
+                view = tuple(float(completed[index]) for index in (9, 10, 11)) + (int(completed[12]),)
+            except (TypeError, ValueError, OverflowError):
+                completed = None
+            else:
+                self._canvas_drag = None
+                self._screen_to_svg = None
+                view_changed = self._commit_browser_canvas_view(view, render=False)
+                if moved and operation == "region" and region_id:
+                    self._move_region_from_canvas_drag(region_id, start, end)
+                elif moved and operation == "marquee":
+                    self._select_edges_in_canvas_box(start, end, additive=additive)
+                    if view_changed:
+                        self.render_canvas()
+                elif moved and operation == "pan":
+                    # The pan has already been applied to the local SVG matrix.
+                    self.render_canvas()
+                elif moved and operation == "draw":
+                    region_count = len(self.model["geometry"].get("regions", []))
+                    self._create_region_from_canvas_drag(tool, start, end)
+                    if len(self.model["geometry"].get("regions", [])) == region_count:
+                        if view_changed:
+                            self.render_canvas()
+                        else:
+                            self._schedule_canvas_interaction_reset()
+                elif view_changed:
+                    self.render_canvas()
+                return
         drag = self._canvas_drag
         if drag is None:
             self._screen_to_svg = None
@@ -2174,31 +2332,6 @@ class SolveWorkspace(Div):
             ]
         return []
 
-    @staticmethod
-    def _svg_text_box(component):
-        """Estimate an SVG text component's visible box for label collision checks."""
-        props = component._props
-        try:
-            x, y = float(props["x"]), float(props["y"])
-        except (KeyError, TypeError, ValueError):
-            return None
-        style = str(props.get("style", ""))
-        font_match = re.search(r"font-size:\s*([0-9.]+)px", style)
-        try:
-            font_size = float(props.get("font-size") or (font_match.group(1) if font_match else 12))
-        except (TypeError, ValueError):
-            font_size = 12.0
-        text = str(props.get("textContent", ""))
-        text_width = max(font_size, len(text) * font_size * 0.62)
-        anchor = props.get("text-anchor", "start")
-        if anchor == "middle":
-            left, right = x - text_width / 2, x + text_width / 2
-        elif anchor == "end":
-            left, right = x - text_width, x
-        else:
-            left, right = x, x + text_width
-        return left - 2, right + 2, y - font_size * 0.9 - 2, y + font_size * 0.3 + 2
-
     def _render_canvas_dimensions(self):
         """Update selected dimensions without replacing the full sketch scene."""
         self._canvas_dimensions.ui_children = self._canvas_dimension_components()
@@ -2885,186 +3018,6 @@ class SolveWorkspace(Div):
         count = min(200, max(0, int(math.floor((maximum - first) / step)) + 1))
         return [first + index * step for index in range(count)]
 
-    @staticmethod
-    def _region_label_placements(regions, project, plot, reserved_boxes=()):
-        """Place region names in visible, non-overlapping parts of the sketch."""
-        by_id = {region["id"]: region for region in regions}
-        polygons = {
-            region["id"]: [project(point) for point in region.get("vertices", [])]
-            for region in regions
-        }
-        children = {region_id: [] for region_id in by_id}
-        depths = {}
-        for region in regions:
-            region_id = region["id"]
-            parent_id = region.get("parent_id")
-            if parent_id in by_id:
-                children[parent_id].append(region_id)
-            seen = set()
-            depth = 0
-            while parent_id in by_id and parent_id not in seen:
-                seen.add(parent_id)
-                depth += 1
-                parent_id = by_id[parent_id].get("parent_id")
-            depths[region_id] = depth
-
-        def bounds(points):
-            return (
-                min(point[0] for point in points),
-                min(point[1] for point in points),
-                max(point[0] for point in points),
-                max(point[1] for point in points),
-            )
-
-        def label_box(point, name):
-            label_width = max(18.0, len(str(name)) * 7.4)
-            # Keep the same (left, right, top, bottom) ordering as the sketch
-            # hit-test helpers below.
-            return (point[0] - label_width / 2 - 2, point[0] + label_width / 2 + 2, point[1] - 10, point[1] + 4)
-
-        def boxes_overlap(first, second, gap=4.0):
-            return not (
-                first[1] + gap <= second[0]
-                or second[1] + gap <= first[0]
-                or first[3] + gap <= second[2]
-                or second[3] + gap <= first[2]
-            )
-
-        def box_in_polygon(box, polygon):
-            corners = ((box[0], box[2]), (box[1], box[2]), (box[1], box[3]), (box[0], box[3]))
-            return len(polygon) >= 3 and all(_point_in_or_on_polygon(point, polygon) for point in corners)
-
-        def polygon_intersects_box(polygon, box):
-            if len(polygon) < 3:
-                return False
-            corners = ((box[0], box[2]), (box[1], box[2]), (box[1], box[3]), (box[0], box[3]))
-            return (
-                any(_point_in_box(point, box) for point in polygon)
-                or any(_point_in_or_on_polygon(point, polygon) for point in corners)
-                or any(
-                    _segment_intersects_box(polygon[index], polygon[(index + 1) % len(polygon)], box)
-                    for index in range(len(polygon))
-                )
-            )
-
-        placements = {}
-        occupied = list(reserved_boxes)
-        ordered = sorted(
-            regions,
-            key=lambda region: (
-                -depths[region["id"]],
-                abs(_polygon_area(polygons[region["id"]])),
-                str(region.get("name", "")),
-            ),
-        )
-        for region in ordered:
-            region_id = region["id"]
-            polygon = polygons[region_id]
-            if len(polygon) < 3:
-                continue
-            left, top, right, bottom = bounds(polygon)
-            center = (
-                sum(point[0] for point in polygon) / len(polygon),
-                sum(point[1] for point in polygon) / len(polygon),
-            )
-            preferred = (
-                center[0],
-                top + (bottom - top) * 0.24,
-            )
-            minimum_center_offset = min(36.0, max(14.0, min(right - left, bottom - top) * 0.18))
-            descendants = []
-            pending = list(children[region_id])
-            seen_descendants = set()
-            while pending:
-                descendant_id = pending.pop()
-                if descendant_id in seen_descendants:
-                    continue
-                seen_descendants.add(descendant_id)
-                descendants.append(polygons[descendant_id])
-                pending.extend(children[descendant_id])
-
-            def region_candidates():
-                nx = min(24, max(2, math.ceil((right - left) / 12)))
-                ny = min(24, max(2, math.ceil((bottom - top) / 12)))
-                candidates = {preferred}
-                for row in range(ny + 1):
-                    y = top + (bottom - top) * row / ny
-                    for column in range(nx + 1):
-                        x = left + (right - left) * column / nx
-                        candidates.add((x, y))
-                return sorted(
-                    candidates,
-                    key=lambda point: (
-                        (point[0] - preferred[0]) ** 2 + (point[1] - preferred[1]) ** 2,
-                        point[1],
-                        point[0],
-                    ),
-                )
-
-            def acceptable(point, *, avoid_descendants):
-                if math.hypot(point[0] - center[0], point[1] - center[1]) < minimum_center_offset:
-                    return None
-                box = label_box(point, region.get("name", ""))
-                if not (plot[0] <= box[0] and box[1] <= plot[2] and plot[1] <= box[2] and box[3] <= plot[3]):
-                    return None
-                if not box_in_polygon(box, polygon):
-                    return None
-                if avoid_descendants and any(polygon_intersects_box(child, box) for child in descendants):
-                    return None
-                if any(boxes_overlap(box, other) for other in occupied):
-                    return None
-                return box
-
-            chosen = None
-            candidate_grid = None
-            for avoid_descendants in (True, False):
-                if candidate_grid is None:
-                    candidate_grid = region_candidates()
-                for point in candidate_grid:
-                    box = acceptable(point, avoid_descendants=avoid_descendants)
-                    if box is not None:
-                        chosen = (point, box)
-                        break
-                if chosen is not None:
-                    break
-
-            leader_start = None
-            if chosen is None:
-                # A small region may not have room for its full name. Place a
-                # nearby callout instead of stacking it on another label.
-                nx = min(48, max(2, math.ceil((plot[2] - plot[0]) / 12)))
-                ny = min(36, max(2, math.ceil((plot[3] - plot[1]) / 12)))
-                candidates = [
-                    (plot[0] + (plot[2] - plot[0]) * column / nx,
-                     plot[1] + (plot[3] - plot[1]) * row / ny)
-                    for row in range(ny + 1)
-                    for column in range(nx + 1)
-                ]
-                candidates.sort(
-                    key=lambda point: (
-                        (point[0] - preferred[0]) ** 2 + (point[1] - preferred[1]) ** 2,
-                        point[1],
-                        point[0],
-                    )
-                )
-                for point in candidates:
-                    if math.hypot(point[0] - center[0], point[1] - center[1]) < minimum_center_offset:
-                        continue
-                    box = label_box(point, region.get("name", ""))
-                    if not (plot[0] <= box[0] and box[1] <= plot[2] and plot[1] <= box[2] and box[3] <= plot[3]):
-                        continue
-                    if any(boxes_overlap(box, other) for other in occupied):
-                        continue
-                    chosen = (point, box)
-                    leader_start = center
-                    break
-            if chosen is None:
-                continue
-            point, box = chosen
-            placements[region_id] = {"point": point, "leader_start": leader_start}
-            occupied.append(box)
-        return placements
-
     def _canvas_grid_step(self):
         _, world_width, _ = self._current_canvas_world_view()
         plot = self._canvas_plot_bounds()
@@ -3129,17 +3082,6 @@ class SolveWorkspace(Div):
         grid_children.append(_svg("text", x=12, y=plot[1] - 8, fill="var(--fg-muted, #697586)", font_size="12", style=grid_text_style, children="z  [m]"))
 
         material_index = {item["id"]: index for index, item in enumerate(self.model["materials"])}
-        reserved_boxes = [
-            box
-            for region in regions
-            for component in self._region_dimension_components(region)
-            if component._component_name == "text"
-            for box in [self._svg_text_box(component)]
-            if box is not None
-        ]
-        label_positions = self._region_label_placements(regions, xy, plot, reserved_boxes)
-        label_children = []
-        label_leaders = []
         for region in regions:
             polygon = " ".join(f"{x:.3f},{y:.3f}" for x, y in (xy(point) for point in region["vertices"]))
             color = _MATERIAL_COLORS[material_index.get(region.get("material_id"), 0) % len(_MATERIAL_COLORS)]
@@ -3157,23 +3099,6 @@ class SolveWorkspace(Div):
             )
             shape.on("click", lambda event, rid=region["id"]: self.select_region(rid))
             scene_children.append(shape)
-            placement = label_positions.get(region["id"])
-            if placement is None:
-                continue
-            cx, cy = placement["point"]
-            if placement["leader_start"] is not None:
-                lx, ly = placement["leader_start"]
-                label_leaders.append(_svg(
-                    "line", x1=lx, y1=ly, x2=cx, y2=cy,
-                    stroke="#52677b", stroke_width="1", stroke_dasharray="3 3",
-                    style="pointer-events:none;",
-                ))
-            label_children.append(_svg(
-                "text", x=cx, y=cy, fill="#263746", font_size="13", text_anchor="middle",
-                data_sketch_region_id=region["id"],
-                style="pointer-events:none; font-weight:600;",
-                children=region["name"],
-            ))
 
         region_for_edge = {
             edge_id: region["id"]
@@ -3191,9 +3116,6 @@ class SolveWorkspace(Div):
             hit = _svg("line", x1=x1, y1=y1, x2=x2, y2=y2, stroke="transparent", stroke_width="12", data_sketch_region_id=region_id, style="cursor:pointer; pointer-events:stroke;")
             hit.on("click", lambda event, eid=edge["id"]: self.select_edge(eid, additive=bool((getattr(event, "value", None) or {}).get("shiftKey", False))))
             scene_children.extend([visible, hit])
-
-        scene_children.extend(label_leaders)
-        scene_children.extend(label_children)
 
         if not regions:
             scene_children.append(_svg("text", x=width / 2, y=height / 2 - 8, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="16", children="Choose Rectangle or Circle in the toolbar to begin"))
