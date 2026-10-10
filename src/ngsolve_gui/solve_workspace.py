@@ -17,7 +17,17 @@ from ngapp.components import Component, Div, QBtn, QCheckbox, QDialog, QInput, Q
 from ngapp.utils import EnvironmentType, get_environment
 
 from . import cerbsim_style as cb
-from .axisymmetric_model import builtin_materials, evaluate_expression, new_id, new_model, new_studies, validate_model, validate_studies
+from .axisymmetric_model import (
+    builtin_materials,
+    evaluate_expression,
+    migrate_legacy_model,
+    migrate_legacy_studies,
+    new_id,
+    new_model,
+    new_studies,
+    validate_model,
+    validate_studies,
+)
 
 
 _SECTIONS = [
@@ -70,9 +80,9 @@ def _history_tracked(method):
     return wrapped
 
 
-def _round_sketch_mm(value):
-    """Round a mouse-derived sketch value to hundredths of a millimetre."""
-    return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+def _round_sketch_m(value):
+    """Round mouse-derived geometry to 0.01 mm, represented in metres."""
+    return float(Decimal(str(value)).quantize(Decimal("0.00001"), rounding=ROUND_HALF_UP))
 
 
 def _input(label, value, callback, *, number=False, suffix=None, width=None, hint=None):
@@ -167,7 +177,7 @@ class SolveWorkspace(Div):
         self.selected_region_id = None
         self.selected_edge_id = None
         self.selected_edge_ids = []
-        self.message = "Choose Rectangle or Circle in the viewport toolbar to begin. Dimensions are entered in mm."
+        self.message = "Choose Rectangle or Circle in the viewport toolbar to begin. Enter lengths in SI metres (m)."
         self.message_is_error = False
         self._log_visible = False
         self._log_messages = ["Axisymmetric model editor ready."]
@@ -573,10 +583,12 @@ class SolveWorkspace(Div):
 
     def set_model(self, model, studies=None, layout=None):
         self._cancel_canvas_zoom_render()
+        model = migrate_legacy_model(model)
+        studies = migrate_legacy_studies(studies or new_studies())
         errors = validate_model(model)
         if errors:
             raise ValueError("Invalid model: " + " ".join(errors))
-        studies = copy.deepcopy(studies or new_studies())
+        studies = copy.deepcopy(studies)
         parameter_map = {
             item.get("name"): item
             for item in model.get("parameters", [])
@@ -782,7 +794,7 @@ class SolveWorkspace(Div):
                 "stepPx": self._canvas_grid_step() * pixels_per_world,
             }
             self.js.eval(f"window.__ngsolveSketchSnap = {json.dumps(grid, allow_nan=False)}")
-            move_step = 0.00001 * pixels_per_world  # 0.01 mm in canvas units.
+            move_step = 0.00001 * pixels_per_world  # 0.01 mm, represented as 1e-5 m.
             self.js.eval(f"window.__ngsolveSketchMoveStep = {move_step!r}")
         except Exception:
             # Tests and non-browser frontends have no JavaScript runtime.
@@ -1804,26 +1816,26 @@ class SolveWorkspace(Div):
             start = self._snap_canvas_point(start)
             end = self._snap_canvas_point(end)
         _, unproject = self._canvas_projection()
-        # Mouse placement is intentionally limited to 0.01 mm. The property
-        # editor remains full precision for users who enter dimensions directly.
-        first = tuple(_round_sketch_mm(coordinate * 1000) / 1000 for coordinate in unproject(start))
-        second = tuple(_round_sketch_mm(coordinate * 1000) / 1000 for coordinate in unproject(end))
+        # Mouse placement is intentionally limited to 0.01 mm (1e-5 m). The
+        # property editor remains full precision for direct SI input.
+        first = tuple(_round_sketch_m(coordinate) for coordinate in unproject(start))
+        second = tuple(_round_sketch_m(coordinate) for coordinate in unproject(end))
         before = len(self.model["geometry"]["regions"])
         if tool == "rectangle":
             r_min, r_max = sorted((first[0], second[0]))
             z_min, z_max = sorted((first[1], second[1]))
             values = {
-                "r_min": _round_sketch_mm(r_min * 1000),
-                "z_min": _round_sketch_mm(z_min * 1000),
-                "width": _round_sketch_mm((r_max - r_min) * 1000),
-                "height": _round_sketch_mm((z_max - z_min) * 1000),
+                "r_min": _round_sketch_m(r_min),
+                "z_min": _round_sketch_m(z_min),
+                "width": _round_sketch_m(r_max - r_min),
+                "height": _round_sketch_m(z_max - z_min),
             }
         else:
             radius = math.hypot(second[0] - first[0], second[1] - first[1])
             values = {
-                "r_center": _round_sketch_mm(first[0] * 1000),
-                "z_center": _round_sketch_mm(first[1] * 1000),
-                "radius": _round_sketch_mm(radius * 1000),
+                "r_center": _round_sketch_m(first[0]),
+                "z_center": _round_sketch_m(first[1]),
+                "radius": _round_sketch_m(radius),
             }
         for key, value in values.items():
             self._primitive_values[(tool, key)] = value
@@ -1832,9 +1844,9 @@ class SolveWorkspace(Div):
             self.set_sketch_tool("select", announce=False)
 
     @staticmethod
-    def _dimension_literal_mm(value_m):
-        """Format a stored metre coordinate as a stable millimetre expression."""
-        return format(value_m * 1000, ".12g")
+    def _dimension_literal_m(value_m):
+        """Format a stored metre coordinate as a stable SI expression."""
+        return format(value_m, ".12g")
 
     @_history_tracked
     def _move_region_from_canvas_drag(self, region_id, start, end, *, preserve_canvas=False):
@@ -1849,8 +1861,8 @@ class SolveWorkspace(Div):
             end = self._snap_canvas_point(end)
         _, unproject = self._canvas_projection()
         start_world, end_world = unproject(start), unproject(end)
-        dr = _round_sketch_mm((end_world[0] - start_world[0]) * 1000) / 1000
-        dz = _round_sketch_mm((end_world[1] - start_world[1]) * 1000) / 1000
+        dr = _round_sketch_m(end_world[0] - start_world[0])
+        dz = _round_sketch_m(end_world[1] - start_world[1])
         if dr == 0 and dz == 0:
             if preserve_canvas:
                 self._rollback_canvas_region_move(region_id)
@@ -1872,8 +1884,8 @@ class SolveWorkspace(Div):
                 if shape["r_min"] < -1e-12:
                     raise ValueError("A region cannot be moved left of the r = 0 axis.")
                 shape["r_min"] = max(0.0, shape["r_min"])
-                expressions["r_min"] = self._dimension_literal_mm(shape["r_min"])
-                expressions["z_min"] = self._dimension_literal_mm(shape["z_min"])
+                expressions["r_min"] = self._dimension_literal_m(shape["r_min"])
+                expressions["z_min"] = self._dimension_literal_m(shape["z_min"])
                 r0, z0 = shape["r_min"], shape["z_min"]
                 width, height = shape["width"], shape["height"]
                 region["vertices"] = [[r0, z0], [r0 + width, z0], [r0 + width, z0 + height], [r0, z0 + height]]
@@ -1883,8 +1895,8 @@ class SolveWorkspace(Div):
                 if shape["r_center"] < shape["radius"] - 1e-12:
                     raise ValueError("The circle must remain at r ≥ 0.")
                 shape["r_center"] = max(shape["radius"], shape["r_center"])
-                expressions["r_center"] = self._dimension_literal_mm(shape["r_center"])
-                expressions["z_center"] = self._dimension_literal_mm(shape["z_center"])
+                expressions["r_center"] = self._dimension_literal_m(shape["r_center"])
+                expressions["z_center"] = self._dimension_literal_m(shape["z_center"])
                 radius = shape["radius"]
                 rcenter, zcenter = shape["r_center"], shape["z_center"]
                 segments = int(shape.get("segments", 48))
@@ -1917,7 +1929,7 @@ class SolveWorkspace(Div):
                     self._commit_canvas_region_move(region_id, dr, dz)
                 else:
                     self.render_canvas()
-            self._message(f"Moved {region['name']} by {dr * 1000:g} mm radially and {dz * 1000:g} mm axially.")
+            self._message(f"Moved {region['name']} by {dr:g} m radially and {dz:g} m axially.")
             return True
         except (ValueError, TypeError, OverflowError) as error:
             region["shape"] = old_shape
@@ -2055,16 +2067,16 @@ class SolveWorkspace(Div):
         rectangle = kind == "rectangle"
         fields = (
             [
-                ("r_min", "Inner radius", "0", "mm"),
-                ("z_min", "Bottom", "0", "mm"),
-                ("width", "Radial width", "20", "mm"),
-                ("height", "Axial height", "20", "mm"),
+                ("r_min", "Inner radius", "0", "m"),
+                ("z_min", "Bottom", "0", "m"),
+                ("width", "Radial width", "0.02", "m"),
+                ("height", "Axial height", "0.02", "m"),
             ]
             if rectangle
             else [
-                ("r_center", "Centre radius", "15", "mm"),
-                ("z_center", "Centre height", "10", "mm"),
-                ("radius", "Radius", "5", "mm"),
+                ("r_center", "Centre radius", "0.015", "m"),
+                ("z_center", "Centre height", "0.01", "m"),
+                ("radius", "Radius", "0.005", "m"),
             ]
         )
         self._primitive_values = getattr(self, "_primitive_values", {})
@@ -2115,10 +2127,10 @@ class SolveWorkspace(Div):
             if not all(math.isfinite(value) for value in vals.values()):
                 raise ValueError("Enter a number in each dimension.")
             if kind == "rectangle":
-                r0 = vals["r_min"] / 1000
-                z0 = vals["z_min"] / 1000
-                width = vals["width"] / 1000
-                height = vals["height"] / 1000
+                r0 = vals["r_min"]
+                z0 = vals["z_min"]
+                width = vals["width"]
+                height = vals["height"]
                 if r0 < 0 or width <= 0 or height <= 0:
                     raise ValueError("Radius must be non-negative and both dimensions must be positive.")
                 vertices = [[r0, z0], [r0 + width, z0], [r0 + width, z0 + height], [r0, z0 + height]]
@@ -2128,9 +2140,9 @@ class SolveWorkspace(Div):
                 }
                 label = "square"
             else:
-                radius = vals["radius"] / 1000
-                rcenter = vals["r_center"] / 1000
-                zcenter = vals["z_center"] / 1000
+                radius = vals["radius"]
+                rcenter = vals["r_center"]
+                zcenter = vals["z_center"]
                 if radius <= 0 or rcenter < radius:
                     raise ValueError("Radius must be positive and the circle must stay at r ≥ 0.")
                 vertices = [
@@ -2577,8 +2589,8 @@ class SolveWorkspace(Div):
         shape_data = region.get("shape", {})
         if shape_data.get("type") == "rectangle":
             p0, p1, p2, _ = [xy(point) for point in region["vertices"][:4]]
-            width_mm = float(shape_data.get("width", 0)) * 1000
-            height_mm = float(shape_data.get("height", 0)) * 1000
+            width_m = float(shape_data.get("width", 0))
+            height_m = float(shape_data.get("height", 0))
             dim_style = "stroke:#455f78; stroke-width:1; fill:none; pointer-events:none;"
             text_style = "fill:#263746; font-size:11px; font-weight:600; pointer-events:none;"
             offset = 18
@@ -2586,19 +2598,19 @@ class SolveWorkspace(Div):
                 _svg("line", x1=p0[0], y1=p0[1] + offset, x2=p1[0], y2=p1[1] + offset, style=dim_style),
                 _svg("line", x1=p0[0], y1=p0[1] + 4, x2=p0[0], y2=p0[1] + offset + 3, style=dim_style),
                 _svg("line", x1=p1[0], y1=p1[1] + 4, x2=p1[0], y2=p1[1] + offset + 3, style=dim_style),
-                _svg("text", x=(p0[0] + p1[0]) / 2, y=p0[1] + offset + 14, text_anchor="middle", style=text_style, children=f"W {width_mm:.4g} mm"),
+                _svg("text", x=(p0[0] + p1[0]) / 2, y=p0[1] + offset + 14, text_anchor="middle", style=text_style, children=f"W {width_m:.4g} m"),
                 _svg("line", x1=p1[0] + offset, y1=p1[1], x2=p2[0] + offset, y2=p2[1], style=dim_style),
                 _svg("line", x1=p1[0] + 4, y1=p1[1], x2=p1[0] + offset + 3, y2=p1[1], style=dim_style),
                 _svg("line", x1=p2[0] + 4, y1=p2[1], x2=p2[0] + offset + 3, y2=p2[1], style=dim_style),
-                _svg("text", x=p1[0] + offset + 5, y=(p1[1] + p2[1]) / 2, style=text_style, children=f"H {height_mm:.4g} mm"),
+                _svg("text", x=p1[0] + offset + 5, y=(p1[1] + p2[1]) / 2, style=text_style, children=f"H {height_m:.4g} m"),
             ]
         if shape_data.get("type") == "circle":
             center = xy((shape_data["r_center"], shape_data["z_center"]))
             radial = xy((shape_data["r_center"] + shape_data["radius"], shape_data["z_center"]))
-            radius_mm = float(shape_data.get("radius", 0)) * 1000
+            radius_m = float(shape_data.get("radius", 0))
             return [
                 _svg("line", x1=center[0], y1=center[1], x2=radial[0], y2=radial[1], stroke="#455f78", stroke_width="1", style="pointer-events:none;"),
-                _svg("text", x=(center[0] + radial[0]) / 2, y=center[1] - 7, text_anchor="middle", fill="#263746", font_size="11", font_weight="600", style="pointer-events:none;", children=f"R {radius_mm:.4g} mm"),
+                _svg("text", x=(center[0] + radial[0]) / 2, y=center[1] - 7, text_anchor="middle", fill="#263746", font_size="11", font_weight="600", style="pointer-events:none;", children=f"R {radius_m:.4g} m"),
             ]
         return []
 
@@ -2642,8 +2654,8 @@ class SolveWorkspace(Div):
                     label,
                     "",
                     lambda event, dimension=key: self._set_selected_region_dimension(dimension, event.value),
-                    suffix="mm",
-                    hint="Enter mm. SI parameters in m need ×1000 here.",
+                    suffix="m",
+                    hint="Enter lengths in SI metres.",
                 ))
                 self._region_dimension_groups.setdefault(shape_type, {})[key] = inputs[-1]
             self._region_dimension_groups[shape_type]["group"] = Div(
@@ -2672,7 +2684,7 @@ class SolveWorkspace(Div):
             Div("GEOMETRY", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted);"),
             self._region_name_input,
             Div("Driving dimensions", ui_style="font-size:11px; font-weight:700; letter-spacing:.05em; padding-top:4px;"),
-            Div("Dimensions are shown in mm. The sketch updates while preserving the current rectangle or circle shape.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+            Div("Dimensions are shown in SI metres (m). The sketch updates while preserving the current rectangle or circle shape.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
             *[group["group"] for group in self._region_dimension_groups.values()],
             Div("ASSIGNMENTS", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:6px;"),
             self._region_material_select,
@@ -2780,7 +2792,7 @@ class SolveWorkspace(Div):
             expressions = shape.get("dimension_expressions", {})
             for dimension, widget in self._region_dimension_groups.get(shape_type, {}).items():
                 if dimension in shape:
-                    widget.ui_model_value = expressions.get(dimension, str(1000 * float(shape[dimension])))
+                    widget.ui_model_value = expressions.get(dimension, str(float(shape[dimension])))
             for type_name, group in self._region_dimension_groups.items():
                 group["group"].ui_hidden = type_name != shape_type
             self._region_constraints.ui_children = [
@@ -2952,14 +2964,14 @@ class SolveWorkspace(Div):
             shape = region.get("shape", {})
             if shape.get("type") == "rectangle":
                 expressions = shape.get("dimension_expressions", {})
-                for key, label, display in (("r_min", "Inner radius", "mm"), ("z_min", "Bottom", "mm"), ("width", "Radial width", "mm"), ("height", "Axial height", "mm")):
-                    value = expressions.get(key, str(1000 * float(shape[key])))
-                    shape_fields.append(_input(label, value, lambda event, rid=region["id"], k=key: self._set_region_dimension(rid, k, event.value), suffix=display, hint="Enter mm. SI parameters in m need ×1000 here."))
+                for key, label in (("r_min", "Inner radius"), ("z_min", "Bottom"), ("width", "Radial width"), ("height", "Axial height")):
+                    value = expressions.get(key, str(float(shape[key])))
+                    shape_fields.append(_input(label, value, lambda event, rid=region["id"], k=key: self._set_region_dimension(rid, k, event.value), suffix="m", hint="Enter lengths in SI metres."))
             elif shape.get("type") == "circle":
                 expressions = shape.get("dimension_expressions", {})
                 for key, label in (("r_center", "Centre radius"), ("z_center", "Centre height"), ("radius", "Radius")):
-                    value = expressions.get(key, str(1000 * float(shape[key])))
-                    shape_fields.append(_input(label, value, lambda event, rid=region["id"], k=key: self._set_region_dimension(rid, k, event.value), suffix="mm", hint="Enter mm. SI parameters in m need ×1000 here."))
+                    value = expressions.get(key, str(float(shape[key])))
+                    shape_fields.append(_input(label, value, lambda event, rid=region["id"], k=key: self._set_region_dimension(rid, k, event.value), suffix="m", hint="Enter lengths in SI metres."))
             delete_button = _button("Delete region", "mdi-delete-outline", lambda *a, rid=region["id"]: self.delete_region(rid), color="negative")
             constraints = [Div(f"{constraint['type'].replace('_', ' ').title()}  ·  {'driving' if constraint.get('driving') else 'reference'}", ui_style="font-size:11px; padding:3px 0; color:var(--fg-muted);") for constraint in region.get("constraints", [])]
             parent = next((item["name"] for item in self.model["geometry"]["regions"] if item["id"] == region.get("parent_id")), "Exterior")
@@ -2968,7 +2980,7 @@ class SolveWorkspace(Div):
                 Div("GEOMETRY", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted);"),
                 name,
                 Div("Driving dimensions", ui_style="font-size:11px; font-weight:700; letter-spacing:.05em; padding-top:4px;"),
-                Div("Dimensions are shown in mm. The sketch updates while preserving the current rectangle or circle shape.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+                Div("Dimensions are shown in SI metres (m). The sketch updates while preserving the current rectangle or circle shape.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
                 *shape_fields,
                 Div("ASSIGNMENTS", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:6px;"),
                 material,
@@ -3028,14 +3040,14 @@ class SolveWorkspace(Div):
         children.extend([
             _button("Add parameter", "mdi-plus", self.add_parameter, color="primary"),
             Div(
-                "Expressions are numeric. The unit label documents the value but does not convert it. Geometry dimensions use mm; for example, if coil_radius is stored in m, enter coil_radius*1000 for a radius in mm.",
+                "Enter expression values in SI units. Geometry lengths and length parameters use metres (m); expressions and unit labels do not perform unit conversion.",
                 ui_style="font-size:11px; line-height:1.45; color:var(--fg-muted);",
             ),
         ])
         return children
 
     def _material_properties(self):
-        children = [_section_title("Materials", "Define material values once, then assign them to regions.")]
+        children = [_section_title("Materials", "Enter material properties in SI units, then assign them to regions.")]
         if not self.model["materials"]:
             return children + [
                 Div("Choose Air or Copper from a region's Material list, or add a custom material here.", ui_style="font-size:12px; color:var(--fg-muted); line-height:1.45;"),
@@ -3078,7 +3090,7 @@ class SolveWorkspace(Div):
         return children
 
     def _boundary_properties(self):
-        children = [_section_title("Boundary conditions", "Name a condition once, then assign it to edges in the sketch.")]
+        children = [_section_title("Boundary conditions", "Enter displacements in m, tractions in N/m², and stiffnesses in N/m³.")]
         kinds = [
             ("axis_of_symmetry", "Axis of symmetry"),
             ("magnetic_potential_zero", "Magnetic potential = 0"),
@@ -3167,7 +3179,7 @@ class SolveWorkspace(Div):
         return children
 
     def _sources_properties(self):
-        children = [_section_title("Sources & loads", "Assign current densities and body forces by region.")]
+        children = [_section_title("Sources & loads", "Enter current density in A/m² and body force in N/m³; values use SI units.")]
         regions = self.model["geometry"]["regions"]
         selected_region = next((item for item in regions if item["id"] == self.selected_region_id), None)
         if regions:
@@ -3621,7 +3633,7 @@ class SolveWorkspace(Div):
         try:
             expression = str(value).strip()
             parameters = {item["name"]: item for item in self.model.get("parameters", [])}
-            dimension = evaluate_expression(expression, parameters) / 1000
+            dimension = evaluate_expression(expression, parameters)
             if not math.isfinite(dimension) or dimension <= 0 and key not in {"r_min", "z_min", "r_center", "z_center"}:
                 raise ValueError("Dimensions must be finite and positive.")
             shape = region["shape"]
@@ -3722,7 +3734,7 @@ class SolveWorkspace(Div):
         parameter = {"id": new_id("parameter"), "name": f"length_{index}", "expression": "0.01", "unit": "m"}
         self.model["parameters"].append(parameter)
         self.selected_parameter_id = parameter["id"]
-        self._message("Added a parameter. Its unit label is descriptive; values are not converted automatically.")
+        self._message("Added an SI-valued parameter. Its unit label is descriptive; values are not converted automatically.")
         self._refresh_model_tree()
         self._render_inspector()
 
@@ -3801,7 +3813,7 @@ class SolveWorkspace(Div):
                 shape = region.get("shape", {})
                 expressions = shape.get("dimension_expressions", {})
                 for key, expression in expressions.items():
-                    shape[key] = evaluate_expression(expression, parameters) / 1000
+                    shape[key] = evaluate_expression(expression, parameters)
                 if shape.get("type") == "rectangle":
                     r0, z0, width, height = (float(shape[key]) for key in ("r_min", "z_min", "width", "height"))
                     if r0 < 0 or width <= 0 or height <= 0:

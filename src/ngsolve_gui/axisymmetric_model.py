@@ -20,6 +20,7 @@ import zipfile
 
 SCHEMA = "ngsolve-gui.axisymmetric"
 SCHEMA_VERSION = 1
+LEGACY_SCHEMA_VERSION = 1
 MODEL_FILENAME = "problem.json"
 STUDIES_FILENAME = "studies.json"
 LAYOUT_FILENAME = "layout.json"
@@ -45,7 +46,8 @@ _FUNCTIONS = {
     "max": max,
 }
 _RESERVED_NAMES = set(_FUNCTIONS) | {"r", "z", "pi", "e"}
-_EXPRESSION_UNITS = ("kg/m^3", "A/m^2", "N/m^3", "N/m^2", "S/m", "Pa", "Hz", "mm", "m")
+_EXPRESSION_UNITS = ("kg/m^3", "A/m^2", "N/m^3", "N/m^2", "S/m", "Pa", "Hz", "m")
+_LEGACY_EXPRESSION_UNITS = (*_EXPRESSION_UNITS[:-1], "mm", "m")
 
 
 def builtin_materials() -> list[dict]:
@@ -76,15 +78,98 @@ def builtin_materials() -> list[dict]:
     ])
 
 
-def _normalise_expression(expression):
+def _normalise_expression(expression, units=_EXPRESSION_UNITS):
     text = str(expression).strip()
-    for unit in _EXPRESSION_UNITS:
+    for unit in units:
         if not text.endswith(unit):
             continue
         prefix = text[: -len(unit)]
         if prefix and (prefix[-1].isspace() or prefix[-1].isdigit() or prefix[-1] == ")"):
             return prefix.strip()
     return text
+
+
+def _strip_legacy_mm_suffix(expression):
+    if isinstance(expression, str):
+        return _normalise_expression(expression, ("mm",))
+    return expression
+
+
+def migrate_legacy_model(model):
+    """Upgrade pre-SI geometry expressions while keeping their geometry fixed."""
+    if not isinstance(model, dict) or model.get("schema_version") != LEGACY_SCHEMA_VERSION:
+        return model
+    geometry = model.get("geometry", {})
+    if not isinstance(geometry, dict) or "regions" not in geometry or geometry.get("dimension_expression_unit") == "m":
+        return model
+    if geometry.get("dimension_expression_unit", "mm") != "mm":
+        return model
+    model = copy.deepcopy(model)
+    geometry = model.get("geometry", {})
+    for parameter in model.get("parameters", []) if isinstance(model.get("parameters", []), list) else []:
+        if isinstance(parameter, dict) and "expression" in parameter:
+            parameter["expression"] = _strip_legacy_mm_suffix(parameter["expression"])
+    for material in model.get("materials", []) if isinstance(model.get("materials", []), list) else []:
+        properties = material.get("properties", {}) if isinstance(material, dict) else {}
+        if isinstance(properties, dict):
+            for key, expression in properties.items():
+                properties[key] = _strip_legacy_mm_suffix(expression)
+    for condition in model.get("boundary_conditions", []) if isinstance(model.get("boundary_conditions", []), list) else []:
+        if isinstance(condition, dict):
+            for key in ("displacement_r", "displacement_z", "traction_r", "traction_z", "stiffness_normal", "stiffness_tangential"):
+                if key in condition:
+                    condition[key] = _strip_legacy_mm_suffix(condition[key])
+    for section_name in ("dc_magnetic", "harmonic_electromagnetic"):
+        physics = model.get("physics", {})
+        section = physics.get(section_name, {}) if isinstance(physics, dict) else {}
+        if isinstance(section, dict):
+            for key in ("frequency_hz", "source_current_density", "source_current_density_real", "source_current_density_imaginary"):
+                if key in section:
+                    section[key] = _strip_legacy_mm_suffix(section[key])
+    mesh = model.get("mesh", {})
+    if isinstance(mesh, dict) and "element_size" in mesh:
+        mesh["element_size"] = _strip_legacy_mm_suffix(mesh["element_size"])
+    regions = geometry.get("regions", []) if isinstance(geometry, dict) else []
+    if isinstance(regions, list):
+        for region in regions:
+            if not isinstance(region, dict):
+                continue
+            shape = region.get("shape", {})
+            if not isinstance(shape, dict):
+                continue
+            expressions = shape.get("dimension_expressions", {})
+            if isinstance(expressions, dict):
+                for key, expression in expressions.items():
+                    legacy_expression = _normalise_expression(expression, _LEGACY_EXPRESSION_UNITS)
+                    expressions[key] = f"({legacy_expression}) / 1000"
+            sources = region.get("sources", {})
+            if isinstance(sources, dict):
+                for key in ("dc_current_density", "ac_current_density_real", "ac_current_density_imaginary"):
+                    if key in sources:
+                        sources[key] = _strip_legacy_mm_suffix(sources[key])
+                body = sources.get("mechanical_body_force", {})
+                if isinstance(body, dict):
+                    for key, expression in body.items():
+                        body[key] = _strip_legacy_mm_suffix(expression)
+    geometry["dimension_expression_unit"] = "m"
+    return model
+
+
+def migrate_legacy_studies(studies):
+    if not isinstance(studies, dict):
+        return studies
+    studies = copy.deepcopy(studies)
+    entries = studies.get("studies", [])
+    if isinstance(entries, list):
+        for study in entries:
+            if not isinstance(study, dict):
+                continue
+            points = study.get("frequency_hz")
+            if isinstance(points, list):
+                study["frequency_hz"] = [_strip_legacy_mm_suffix(point) for point in points]
+            elif isinstance(points, str):
+                study["frequency_hz"] = _strip_legacy_mm_suffix(points)
+    return studies
 
 
 def new_id(prefix: str) -> str:
@@ -101,6 +186,7 @@ def new_model(name: str = "Untitled axisymmetric model") -> dict:
         "parameters": [],
         "geometry": {
             "coordinate_system": "r-z",
+            "dimension_expression_unit": "m",
             "regions": [],
             "edges": [],
             "constraints": [],
@@ -305,6 +391,10 @@ def validate_model(model: dict) -> list[str]:
     if not isinstance(geometry, dict):
         errors.append("Geometry section is missing.")
         return errors
+    dimension_unit = geometry.get("dimension_expression_unit", "mm")
+    if dimension_unit not in {"m", "mm"}:
+        errors.append("Geometry dimension expressions must use metres (m).")
+        dimension_unit = "m"
     regions = geometry.get("regions", [])
     if not isinstance(regions, list):
         errors.append("Geometry regions must be a list.")
@@ -407,8 +497,9 @@ def validate_model(model: dict) -> list[str]:
                 errors.append(f"Region '{region.get('name')}' has an expression for unknown dimension '{key}'.")
                 continue
             try:
-                dimension_mm = evaluate_expression(expression, parameter_map)
-                if not math.isclose(float(shape[key]), dimension_mm / 1000, rel_tol=1e-9, abs_tol=1e-12):
+                dimension_value = evaluate_expression(expression, parameter_map)
+                dimension_m = dimension_value / 1000 if dimension_unit == "mm" else dimension_value
+                if not math.isclose(float(shape[key]), dimension_m, rel_tol=1e-9, abs_tol=1e-12):
                     raise ValueError("expression and saved dimension disagree")
             except (TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError) as error:
                 errors.append(f"Region '{region.get('name')}' dimension {key}: {error}.")
@@ -786,10 +877,11 @@ def validate_studies(studies: dict, parameters=None) -> list[str]:
 
 
 def package_model(model: dict, studies: dict | None = None, layout: dict | None = None) -> bytes:
+    model = migrate_legacy_model(model)
     errors = validate_model(model)
     if errors:
         raise ValueError("Cannot save model: " + " ".join(errors))
-    studies = studies or new_studies()
+    studies = migrate_legacy_studies(studies or new_studies())
     parameter_map = {
         item.get("name"): item
         for item in model.get("parameters", [])
@@ -829,8 +921,9 @@ def unpack_model(data: bytes) -> tuple[dict, dict, dict]:
                 raise ValueError(f"Model archive contains an unsafe path: {name}")
             if archive.getinfo(name).file_size > 2_000_000:
                 raise ValueError(f"Model entry is too large: {name}")
-        model = json.loads(archive.read(MODEL_FILENAME))
+        model = migrate_legacy_model(json.loads(archive.read(MODEL_FILENAME)))
         studies = json.loads(archive.read(STUDIES_FILENAME)) if STUDIES_FILENAME in names else new_studies()
+        studies = migrate_legacy_studies(studies)
         layout = json.loads(archive.read(LAYOUT_FILENAME)) if LAYOUT_FILENAME in names else {}
     errors = validate_model(model)
     if errors:

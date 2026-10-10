@@ -9,6 +9,7 @@ from ngapp import utils
 from ngapp.components import Div
 
 from ngsolve_gui.app import NGSolveGui
+from ngsolve_gui.axisymmetric_model import builtin_materials
 from ngsolve_gui.solve_workspace import SolveWorkspace
 
 
@@ -26,10 +27,10 @@ def test_workspace_builds_nested_regions_and_recomputes_dimension_parameters(sta
     workspace._set_region_value(outer["id"], "material_id", "material-air")
 
     workspace._primitive_values.update({
-        ("rectangle", "r_min"): 3.0,
-        ("rectangle", "z_min"): 3.0,
-        ("rectangle", "width"): 4.0,
-        ("rectangle", "height"): 5.0,
+        ("rectangle", "r_min"): 0.003,
+        ("rectangle", "z_min"): 0.003,
+        ("rectangle", "width"): 0.004,
+        ("rectangle", "height"): 0.005,
     })
     workspace._add_primitive("rectangle")
     coil = workspace.model["geometry"]["regions"][1]
@@ -38,7 +39,7 @@ def test_workspace_builds_nested_regions_and_recomputes_dimension_parameters(sta
 
     parameter = {"id": "outer-width", "name": "outer_width", "expression": "0.02", "unit": "m"}
     workspace.model["parameters"].append(parameter)
-    workspace._set_region_dimension(outer["id"], "width", "outer_width*1000")
+    workspace._set_region_dimension(outer["id"], "width", "outer_width")
     workspace.model["boundary_conditions"].append(
         {"id": "boundary-outer", "name": "Outer boundary", "type": "magnetic_potential_zero"}
     )
@@ -50,6 +51,62 @@ def test_workspace_builds_nested_regions_and_recomputes_dimension_parameters(sta
 
     assert outer["shape"]["width"] == 0.02
     assert workspace.validation_errors() == []
+
+
+def test_geometry_and_physics_value_inputs_use_si_units(standalone_components):
+    workspace = SolveWorkspace()
+    assert workspace._primitive_values[("rectangle", "width")] == pytest.approx(0.02)
+    assert workspace._primitive_values[("circle", "radius")] == pytest.approx(0.005)
+    assert all(
+        field._props["suffix"] == "m"
+        for shape in ("rectangle", "circle")
+        for key, field in workspace._region_dimension_groups[shape].items()
+        if key != "group"
+    )
+
+    def components(items):
+        for item in items:
+            yield item
+            yield from components(getattr(item, "ui_children", []))
+
+    workspace._add_primitive("rectangle")
+    sources = workspace._sources_properties()
+    source_units = {
+        item.ui_label: getattr(item, "ui_suffix", None)
+        for item in components(sources)
+        if getattr(item, "ui_label", None)
+    }
+    assert source_units["DC current density"] == "A/m²"
+    assert source_units["Radial body force"] == "N/m³"
+
+    workspace.model["materials"] = builtin_materials()
+    workspace.selected_material_id = "material-copper"
+    material_units = {
+        item.ui_label: getattr(item, "ui_suffix", None)
+        for item in components(workspace._material_properties())
+        if getattr(item, "ui_label", None)
+    }
+    assert material_units["Electrical conductivity"] == "S/m"
+    assert material_units["Young's modulus"] == "Pa"
+    assert material_units["Density"] == "kg/m³"
+
+    workspace.model["boundary_conditions"] = [
+        {"id": "traction", "name": "Traction", "type": "mechanical_traction"}
+    ]
+    workspace.selected_boundary_id = "traction"
+    boundary_units = {
+        item.ui_label: getattr(item, "ui_suffix", None)
+        for item in components(workspace._boundary_properties())
+        if getattr(item, "ui_label", None)
+    }
+    assert boundary_units["Radial traction"] == "N/m²"
+    assert workspace._mesh_properties()[1]._props["suffix"] == "m"
+    study_units = {
+        item.ui_label: getattr(item, "ui_suffix", None)
+        for item in components(workspace._study_properties())
+        if getattr(item, "ui_label", None)
+    }
+    assert study_units["Frequency points (comma separated)"] == "Hz"
 
 
 def test_model_edits_support_undo_redo_and_clear_redo_after_new_edit(standalone_components):
@@ -78,7 +135,7 @@ def test_model_edits_support_undo_redo_and_clear_redo_after_new_edit(standalone_
     assert workspace.model["geometry"]["regions"][0]["id"] == region_id
     assert workspace.selected_region_id == region_id
 
-    workspace._set_region_dimension(region_id, "width", "30")
+    workspace._set_region_dimension(region_id, "width", "0.03")
     region = workspace.model["geometry"]["regions"][0]
     assert region["shape"]["width"] == 0.03
     assert workspace.undo()
@@ -306,10 +363,10 @@ def test_same_edge_can_have_independent_em_and_mechanical_conditions(standalone_
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
     workspace._primitive_values.update({
-        ("rectangle", "r_min"): 3.0,
-        ("rectangle", "z_min"): 3.0,
-        ("rectangle", "width"): 4.0,
-        ("rectangle", "height"): 5.0,
+        ("rectangle", "r_min"): 0.003,
+        ("rectangle", "z_min"): 0.003,
+        ("rectangle", "width"): 0.004,
+        ("rectangle", "height"): 0.005,
     })
     outer = workspace.model["geometry"]["regions"][0]
     workspace._set_region_value(outer["id"], "material_id", "material-air")
@@ -380,7 +437,7 @@ def test_drag_sketches_dimensioned_rectangle_and_circle_regions(standalone_compo
     ]
 
 
-def test_mouse_drawn_geometry_uses_hundredth_mm_precision(standalone_components):
+def test_mouse_drawn_geometry_uses_si_values_with_0_01mm_precision(standalone_components):
     workspace = SolveWorkspace()
     project, _ = workspace._canvas_projection()
     workspace._create_region_from_canvas_drag(
@@ -389,15 +446,15 @@ def test_mouse_drawn_geometry_uses_hundredth_mm_precision(standalone_components)
         project((0.0101234, 0.0078912)),
     )
     rectangle = workspace.model["geometry"]["regions"][0]["shape"]
-    assert rectangle["r_min"] * 1000 == pytest.approx(3.46)
-    assert rectangle["z_min"] * 1000 == pytest.approx(-2.35)
-    assert rectangle["width"] * 1000 == pytest.approx(6.66)
-    assert rectangle["height"] * 1000 == pytest.approx(10.24)
+    assert rectangle["r_min"] == pytest.approx(0.00346)
+    assert rectangle["z_min"] == pytest.approx(-0.00235)
+    assert rectangle["width"] == pytest.approx(0.00666)
+    assert rectangle["height"] == pytest.approx(0.01024)
     assert rectangle["dimension_expressions"] == {
-        "r_min": "3.46",
-        "z_min": "-2.35",
-        "width": "6.66",
-        "height": "10.24",
+        "r_min": "0.00346",
+        "z_min": "-0.00235",
+        "width": "0.00666",
+        "height": "0.01024",
     }
 
     circle_workspace = SolveWorkspace()
@@ -408,13 +465,13 @@ def test_mouse_drawn_geometry_uses_hundredth_mm_precision(standalone_components)
         project((0.0251234, 0.0019879)),
     )
     circle = circle_workspace.model["geometry"]["regions"][0]["shape"]
-    assert circle["r_center"] * 1000 == pytest.approx(20.00)
-    assert circle["z_center"] * 1000 == pytest.approx(-2.35)
-    assert circle["radius"] * 1000 == pytest.approx(6.71)
+    assert circle["r_center"] == pytest.approx(0.02)
+    assert circle["z_center"] == pytest.approx(-0.00235)
+    assert circle["radius"] == pytest.approx(0.00671)
     assert circle["dimension_expressions"] == {
-        "r_center": "20.0",
-        "z_center": "-2.35",
-        "radius": "6.71",
+        "r_center": "0.02",
+        "z_center": "-0.00235",
+        "radius": "0.00671",
     }
 
 
@@ -423,10 +480,10 @@ def test_manual_region_dimensions_keep_precision_beyond_hundredth_mm(standalone_
     workspace._add_primitive("rectangle")
     region = workspace.model["geometry"]["regions"][0]
 
-    workspace._set_region_dimension(region["id"], "width", "20.1234")
+    workspace._set_region_dimension(region["id"], "width", "0.0201234")
 
     assert region["shape"]["width"] == pytest.approx(0.0201234)
-    assert region["shape"]["dimension_expressions"]["width"] == "20.1234"
+    assert region["shape"]["dimension_expressions"]["width"] == "0.0201234"
 
 
 def test_dragging_region_moves_shape_by_hundredth_mm_and_preserves_edge_assignments(standalone_components):
@@ -448,8 +505,8 @@ def test_dragging_region_moves_shape_by_hundredth_mm_and_preserves_edge_assignme
     assert region["shape"]["z_min"] - before["z_min"] == pytest.approx(0.00002)
     assert region["shape"]["width"] == before["width"]
     assert region["shape"]["height"] == before["height"]
-    assert region["shape"]["dimension_expressions"]["r_min"] == "0.01"
-    assert region["shape"]["dimension_expressions"]["z_min"] == "0.02"
+    assert region["shape"]["dimension_expressions"]["r_min"] == "1e-05"
+    assert region["shape"]["dimension_expressions"]["z_min"] == "2e-05"
     assert region["edge_ids"] == edge_ids
     moved_edge = next(item for item in workspace.model["geometry"]["edges"] if item["id"] == edge["id"])
     assert moved_edge["name"] == "Fixed edge"
@@ -516,10 +573,10 @@ def test_dragging_region_rejects_crossing_another_region(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
     workspace._primitive_values.update({
-        ("rectangle", "r_min"): 5.0,
-        ("rectangle", "z_min"): 5.0,
-        ("rectangle", "width"): 5.0,
-        ("rectangle", "height"): 5.0,
+        ("rectangle", "r_min"): 0.005,
+        ("rectangle", "z_min"): 0.005,
+        ("rectangle", "width"): 0.005,
+        ("rectangle", "height"): 0.005,
     })
     workspace._add_primitive("rectangle")
     child = workspace.model["geometry"]["regions"][1]
@@ -812,9 +869,9 @@ def test_region_add_and_remove_keep_tree_grid_and_existing_scene_nodes_mounted(s
     }
 
     workspace._primitive_values.update({
-        ("circle", "r_center"): 30.0,
+        ("circle", "r_center"): 0.03,
         ("circle", "z_center"): 0.0,
-        ("circle", "radius"): 2.0,
+        ("circle", "radius"): 0.002,
     })
     workspace._add_primitive("circle")
     circle = next(
@@ -867,7 +924,7 @@ def test_region_click_updates_selection_without_rebuilding_sketch_scene(standalo
         for child in workspace._canvas_dimensions.ui_children
         if child._props.get("textContent")
     ]
-    assert dimension_labels == ["W 20 mm", "H 20 mm"]
+    assert dimension_labels == ["W 0.02 m", "H 0.02 m"]
 
     edge_id = workspace.model["geometry"]["edges"][0]["id"]
     workspace.select_edge(edge_id)
@@ -1324,7 +1381,7 @@ def test_parameter_removal_is_available_and_blocked_while_referenced(standalone_
     parameter = workspace.model["parameters"][0]
     workspace._add_primitive("rectangle")
     region = workspace.model["geometry"]["regions"][0]
-    workspace._set_region_dimension(region["id"], "width", "length_1*1000")
+    workspace._set_region_dimension(region["id"], "width", "length_1*2")
 
     workspace.remove_parameter(parameter["id"])
 
@@ -1332,7 +1389,7 @@ def test_parameter_removal_is_available_and_blocked_while_referenced(standalone_
     assert "Cannot remove 'length_1'" in workspace.message
     assert "region 'square 1' width" in workspace.message
 
-    workspace._set_region_dimension(region["id"], "width", "20")
+    workspace._set_region_dimension(region["id"], "width", "0.02")
     workspace.remove_parameter(parameter["id"])
     assert workspace.model["parameters"] == []
     assert "Removed parameter 'length_1'" in workspace.message

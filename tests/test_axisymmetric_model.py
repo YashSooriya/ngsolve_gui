@@ -1,4 +1,5 @@
 import io
+import json
 import zipfile
 
 import pytest
@@ -25,14 +26,14 @@ def _nested_model():
             "id": "outer", "name": "Air", "material_id": "material-air", "parent_id": None,
             "vertices": [[0, 0], [0.02, 0], [0.02, 0.02], [0, 0.02]],
             "shape": {"type": "rectangle", "r_min": 0, "z_min": 0, "width": 0.02, "height": 0.02,
-                      "dimension_expressions": {"r_min": "0", "z_min": "0", "width": "20", "height": "20"}},
+                      "dimension_expressions": {"r_min": "0", "z_min": "0", "width": "0.02", "height": "0.02"}},
             "sources": {},
         },
         {
             "id": "coil", "name": "Coil", "material_id": "material-copper", "parent_id": "outer",
             "vertices": [[0.003, 0.003], [0.007, 0.003], [0.007, 0.008], [0.003, 0.008]],
             "shape": {"type": "rectangle", "r_min": 0.003, "z_min": 0.003, "width": 0.004, "height": 0.005,
-                      "dimension_expressions": {"r_min": "3", "z_min": "3", "width": "coil_radius*1000", "height": "5"}},
+                      "dimension_expressions": {"r_min": "0.003", "z_min": "0.003", "width": "coil_radius", "height": "0.005"}},
             "sources": {"dc_current_density": "1e6", "ac_current_density_real": "0", "ac_current_density_imaginary": "0"},
         },
     ]
@@ -68,8 +69,31 @@ def test_parameter_expressions_resolve_safely_and_reject_cycles():
 def test_nested_geometry_and_parameter_driven_dimensions_validate():
     model = _nested_model()
     assert validate_model(model) == []
-    model["geometry"]["regions"][1]["shape"]["dimension_expressions"]["width"] = "coil_radius*2000"
+    model["geometry"]["regions"][1]["shape"]["dimension_expressions"]["width"] = "coil_radius*2"
     assert any("expression and saved dimension disagree" in error for error in validate_model(model))
+
+
+def test_legacy_millimetre_project_migrates_expressions_to_si_metres():
+    model = _nested_model()
+    model["geometry"].pop("dimension_expression_unit")
+    model["geometry"]["regions"][0]["shape"]["dimension_expressions"] = {
+        "r_min": "0", "z_min": "0", "width": "20 mm", "height": "20"
+    }
+    model["geometry"]["regions"][1]["shape"]["dimension_expressions"] = {
+        "r_min": "3", "z_min": "3", "width": "coil_radius*1000", "height": "5"
+    }
+    studies = new_studies()
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("problem.json", json.dumps(model))
+        archive.writestr("studies.json", json.dumps(studies))
+
+    restored, _, _ = unpack_model(archive_bytes.getvalue())
+
+    assert restored["geometry"]["dimension_expression_unit"] == "m"
+    assert restored["geometry"]["regions"][0]["shape"]["dimension_expressions"]["width"] == "(20) / 1000"
+    assert restored["geometry"]["regions"][1]["shape"]["dimension_expressions"]["width"] == "(coil_radius*1000) / 1000"
+    assert validate_model(restored) == []
 
 
 def test_overlapping_domains_and_wrong_parent_are_rejected():
