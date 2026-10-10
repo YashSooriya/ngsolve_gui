@@ -382,7 +382,11 @@ class NGSolveGui(App):
         )
         savebtn = _tbtn("mdi-content-save-outline", "Save Project", self.save_project)
         loadbtn = _tbtn("mdi-folder-open-outline", "Load Project", self.load_project)
-        file_group = Div(upload_file, savebtn, loadbtn, ui_class=cb.tb_group)
+        self._undo_button = _tbtn("mdi-undo", "Undo model change", self._undo_solve_action)
+        self._redo_button = _tbtn("mdi-redo", "Redo model change", self._redo_solve_action)
+        self._undo_button.ui_disable = True
+        self._redo_button.ui_disable = True
+        file_group = Div(upload_file, savebtn, loadbtn, self._undo_button, self._redo_button, ui_class=cb.tb_group)
 
         # Settings + quit (panel toggles removed — sidebars are draggable;
         # theme lives in the settings menu).
@@ -502,6 +506,7 @@ class NGSolveGui(App):
             on_run=lambda: self._run_axisymmetric_solver(mesh_only=False),
             on_mesh=lambda: self._run_axisymmetric_solver(mesh_only=True),
             on_open_file=self._open_run_result,
+            on_history_change=self._refresh_solve_history_controls,
         )
         self._solve_workspace = Div(
             self.solve_workspace,
@@ -546,6 +551,9 @@ class NGSolveGui(App):
         # -- Global keybindings (always active) --
         kb = self.kb
         kb.add("h", kb.toggle_help, "Show keyboard shortcuts", "General")
+        kb.add("delete", self._delete_selected_region_shortcut, "Delete selected region", "Solve")
+        kb.add("ctrl+z", self._undo_solve_action, "Undo model change", "Solve")
+        kb.add("ctrl+y", self._redo_solve_action, "Redo model change", "Solve")
         kb.add("ctrl+b", self._toggle_navigator, "Toggle navigator", "Panels")
         kb.add(
             "ctrl+alt+b", self._toggle_property_panel, "Toggle property panel", "Panels"
@@ -565,6 +573,52 @@ class NGSolveGui(App):
             for f in filename:
                 self._load_with_status(f)
 
+        self._refresh_solve_history_controls()
+
+    def _refresh_solve_history_controls(self):
+        workspace = getattr(self, "solve_workspace", None)
+        solving = getattr(self, "_workspace_mode", "solve") == "solve"
+        if hasattr(self, "_undo_button"):
+            self._undo_button.ui_disable = not (solving and workspace and workspace.can_undo)
+        if hasattr(self, "_redo_button"):
+            self._redo_button.ui_disable = not (solving and workspace and workspace.can_redo)
+
+    def _solve_shortcut_context_active(self):
+        if getattr(self, "_workspace_mode", None) != "solve":
+            return False
+        # Preserve native text editing shortcuts while an input or editable
+        # control has focus. The fallback keeps callbacks usable in standalone
+        # tests where no browser JavaScript context exists.
+        try:
+            focused_editor = self.js.eval(
+                "(() => { const e = document.activeElement; return !!e && "
+                "(e.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(e.tagName)); })()"
+            )
+            if focused_editor:
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _undo_solve_action(self, *args):
+        if self._solve_shortcut_context_active():
+            return self.solve_workspace.undo()
+        return False
+
+    def _redo_solve_action(self, *args):
+        if self._solve_shortcut_context_active():
+            return self.solve_workspace.redo()
+        return False
+
+    def _delete_selected_region_shortcut(self, *args):
+        if not self._solve_shortcut_context_active():
+            return False
+        region_id = self.solve_workspace.selected_region_id
+        if region_id:
+            self.solve_workspace.delete_region(region_id)
+            return True
+        return False
+
     def _set_workspace_mode(self, mode):
         if mode not in WorkspaceModeToggle._MODES:
             raise ValueError(f"Unknown workspace mode: {mode}")
@@ -573,6 +627,9 @@ class NGSolveGui(App):
         self._workspace_mode = mode
         self._post_process_workspace.ui_hidden = solving
         self._solve_workspace.ui_hidden = not solving
+        refresh_history_controls = getattr(self, "_refresh_solve_history_controls", None)
+        if refresh_history_controls:
+            refresh_history_controls()
 
     def save_project(self):
         """Save a declarative axisymmetric project in Solve, or the GUI state otherwise."""

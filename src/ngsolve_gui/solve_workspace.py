@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from functools import wraps
 import json
 import math
 import re
@@ -39,6 +40,34 @@ _TREE_GROUPS = (
 )
 
 _MATERIAL_COLORS = ["#6886ac", "#d58651", "#69a77b", "#ae8bb7", "#d1b44f", "#4cabb0"]
+
+
+def _history_tracked(method):
+    """Record one model snapshot around a top-level user edit."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        depth = getattr(self, "_history_transaction_depth", 0)
+        if depth:
+            self._history_transaction_depth = depth + 1
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                self._history_transaction_depth -= 1
+
+        before = self._capture_history_state()
+        self._history_transaction_depth = 1
+        failed = False
+        try:
+            return method(self, *args, **kwargs)
+        except Exception:
+            failed = True
+            raise
+        finally:
+            self._history_transaction_depth = 0
+            if not failed:
+                self._finish_history_transaction(before)
+
+    return wrapped
 
 
 def _round_sketch_mm(value):
@@ -121,7 +150,7 @@ def _section_title(title, subtitle=None):
 class SolveWorkspace(Div):
     """Editable axisymmetric r-z model with a selectable sketch viewport."""
 
-    def __init__(self, on_log=None, on_run=None, on_mesh=None, on_open_file=None):
+    def __init__(self, on_log=None, on_run=None, on_mesh=None, on_open_file=None, on_history_change=None):
         self.model = new_model()
         self.studies = new_studies()
         self.layout = {"schema_version": 1, "active_section": "geometry", "camera": "fit"}
@@ -129,6 +158,11 @@ class SolveWorkspace(Div):
         self.on_run = on_run
         self.on_mesh = on_mesh
         self.on_open_file = on_open_file
+        self.on_history_change = on_history_change
+        self._undo_history = []
+        self._redo_history = []
+        self._history_transaction_depth = 0
+        self._history_limit = 100
         self.active_section = "geometry"
         self.selected_region_id = None
         self.selected_edge_id = None
@@ -463,6 +497,85 @@ class SolveWorkspace(Div):
     def dirty(self):
         return True
 
+    @property
+    def can_undo(self):
+        return bool(self._undo_history)
+
+    @property
+    def can_redo(self):
+        return bool(self._redo_history)
+
+    def _capture_history_state(self):
+        return {
+            "model": copy.deepcopy(self.model),
+            "studies": copy.deepcopy(self.studies),
+            "selection": {
+                "region_id": self.selected_region_id,
+                "edge_id": self.selected_edge_id,
+                "edge_ids": list(self.selected_edge_ids),
+                "parameter_id": self.selected_parameter_id,
+                "material_id": self.selected_material_id,
+                "boundary_id": self.selected_boundary_id,
+                "active_section": self.active_section,
+            },
+        }
+
+    def _finish_history_transaction(self, before):
+        if before["model"] == self.model and before["studies"] == self.studies:
+            return
+        self._undo_history.append(before)
+        del self._undo_history[:-self._history_limit]
+        self._redo_history.clear()
+        self._notify_history_changed()
+
+    def _notify_history_changed(self):
+        if self.on_history_change:
+            self.on_history_change()
+
+    def _restore_history_state(self, state):
+        self._preserve_canvas_view()
+        self.model = copy.deepcopy(state["model"])
+        self.studies = copy.deepcopy(state["studies"])
+        selection = state["selection"]
+        region_ids = {item["id"] for item in self.model["geometry"].get("regions", [])}
+        edge_ids = {item["id"] for item in self.model["geometry"].get("edges", [])}
+        self.selected_region_id = selection["region_id"] if selection["region_id"] in region_ids else None
+        self.selected_edge_id = selection["edge_id"] if selection["edge_id"] in edge_ids else None
+        self.selected_edge_ids = [item for item in selection["edge_ids"] if item in edge_ids]
+        self.selected_parameter_id = selection["parameter_id"]
+        self.selected_material_id = selection["material_id"]
+        self.selected_boundary_id = selection["boundary_id"]
+        self._selected_condition_id = self.selected_boundary_id if selection["active_section"] == "boundaries" else None
+        if selection["active_section"] in {key for key, _, _ in _SECTIONS}:
+            self.active_section = selection["active_section"]
+            self.layout["active_section"] = self.active_section
+        self._recompute_parent_links()
+        with self._batch_frontend_updates():
+            self._refresh_model_tree()
+            self._render_inspector()
+            self.render_canvas()
+
+    def undo(self):
+        if not self.can_undo:
+            return False
+        self._redo_history.append(self._capture_history_state())
+        state = self._undo_history.pop()
+        self._restore_history_state(state)
+        self._message("Undid the last model change.")
+        self._notify_history_changed()
+        return True
+
+    def redo(self):
+        if not self.can_redo:
+            return False
+        self._undo_history.append(self._capture_history_state())
+        del self._undo_history[:-self._history_limit]
+        state = self._redo_history.pop()
+        self._restore_history_state(state)
+        self._message("Redid the model change.")
+        self._notify_history_changed()
+        return True
+
     def set_model(self, model, studies=None, layout=None):
         self._cancel_canvas_zoom_render()
         errors = validate_model(model)
@@ -480,6 +593,9 @@ class SolveWorkspace(Div):
         self._cancel_model_rename()
         self.model = copy.deepcopy(model)
         self.studies = studies
+        self._undo_history.clear()
+        self._redo_history.clear()
+        self._notify_history_changed()
         self.layout = copy.deepcopy(layout or {"schema_version": 1, "active_section": "geometry", "camera": "fit"})
         self._load_canvas_view_from_layout()
         self.runs = []
@@ -540,6 +656,7 @@ class SolveWorkspace(Div):
         elif key == "escape":
             self._cancel_model_rename()
 
+    @_history_tracked
     def _commit_model_rename(self, event=None):
         if not self._model_title_editing:
             return
@@ -1724,6 +1841,7 @@ class SolveWorkspace(Div):
         """Format a stored metre coordinate as a stable millimetre expression."""
         return format(value_m * 1000, ".12g")
 
+    @_history_tracked
     def _move_region_from_canvas_drag(self, region_id, start, end, *, preserve_canvas=False):
         region = next(
             (item for item in self.model["geometry"]["regions"] if item["id"] == region_id),
@@ -1995,6 +2113,7 @@ class SolveWorkspace(Div):
     def open_circle_dialog(self, *args):
         self._circle_dialog.ui_model_value = True
 
+    @_history_tracked
     def _add_primitive(self, kind):
         try:
             vals = {key: value for (primitive, key), value in self._primitive_values.items() if primitive == kind}
@@ -3478,6 +3597,7 @@ class SolveWorkspace(Div):
             control.ui_hidden = True
         self._message("3D preview: left-drag to rotate, middle-drag or Shift+left-drag to pan, scroll to zoom.")
 
+    @_history_tracked
     def _set_region_value(self, region_id, key, value):
         region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
         if region is None:
@@ -3496,6 +3616,7 @@ class SolveWorkspace(Div):
             self._render_inspector()
         self.render_canvas()
 
+    @_history_tracked
     def _set_region_dimension(self, region_id, key, value):
         region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
         if region is None:
@@ -3537,6 +3658,7 @@ class SolveWorkspace(Div):
             self._message(str(error), error=True)
         self.render_canvas()
 
+    @_history_tracked
     def _set_edge_name(self, edge_id, value):
         edge = next((item for item in self.model["geometry"]["edges"] if item["id"] == edge_id), None)
         if edge:
@@ -3545,6 +3667,7 @@ class SolveWorkspace(Div):
     def _set_edge_condition(self, edge_id, physics, value):
         self._set_edge_conditions([edge_id], physics, value)
 
+    @_history_tracked
     def _set_edge_conditions(self, edge_ids, physics, value):
         selected = set(edge_ids)
         edges = [edge for edge in self.model["geometry"]["edges"] if edge["id"] in selected]
@@ -3579,6 +3702,7 @@ class SolveWorkspace(Div):
         self._render_inspector()
         self.render_canvas()
 
+    @_history_tracked
     def delete_region(self, region_id):
         region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
         if region is None:
@@ -3599,6 +3723,7 @@ class SolveWorkspace(Div):
             self._render_inspector()
             self.render_canvas()
 
+    @_history_tracked
     def add_parameter(self, *args):
         index = len(self.model["parameters"]) + 1
         parameter = {"id": new_id("parameter"), "name": f"length_{index}", "expression": "0.01", "unit": "m"}
@@ -3608,6 +3733,7 @@ class SolveWorkspace(Div):
         self._refresh_model_tree()
         self._render_inspector()
 
+    @_history_tracked
     def remove_parameter(self, parameter_id):
         parameter = next((item for item in self.model["parameters"] if item["id"] == parameter_id), None)
         if parameter is None:
@@ -3667,6 +3793,7 @@ class SolveWorkspace(Div):
         check("target mesh size", self.model.get("mesh", {}).get("element_size"))
         return list(dict.fromkeys(references))
 
+    @_history_tracked
     def _set_parameter(self, parameter_id, key, value):
         parameter = next((item for item in self.model["parameters"] if item["id"] == parameter_id), None)
         if parameter:
@@ -3707,6 +3834,7 @@ class SolveWorkspace(Div):
             self._render_inspector()
             self._message(f"Geometry was not updated: {error}", error=True)
 
+    @_history_tracked
     def add_material(self, *args):
         index = len(self.model["materials"]) + 1
         material = builtin_materials()[0]
@@ -3717,6 +3845,7 @@ class SolveWorkspace(Div):
         self._refresh_model_tree()
         self._render_inspector()
 
+    @_history_tracked
     def remove_material(self, material_id):
         if any(region.get("material_id") == material_id for region in self.model["geometry"]["regions"]):
             self._message("This material is assigned to a region. Reassign the region before deleting it.", error=True)
@@ -3727,17 +3856,20 @@ class SolveWorkspace(Div):
         self._refresh_model_tree()
         self._render_inspector()
 
+    @_history_tracked
     def _set_material_name(self, material_id, value):
         material = next((item for item in self.model["materials"] if item["id"] == material_id), None)
         if material:
             material["name"] = str(value).strip()
             self._refresh_model_tree()
 
+    @_history_tracked
     def _set_material_property(self, material_id, key, value):
         material = next((item for item in self.model["materials"] if item["id"] == material_id), None)
         if material:
             material.setdefault("properties", {})[key] = str(value).strip()
 
+    @_history_tracked
     def add_boundary(self, *args):
         index = len(self.model.get("boundary_conditions", [])) + 1
         condition = {"id": new_id("boundary"), "name": f"Boundary {index}", "type": "natural"}
@@ -3750,6 +3882,7 @@ class SolveWorkspace(Div):
         self._render_inspector()
         self._sync_canvas_selection()
 
+    @_history_tracked
     def remove_boundary(self, boundary_id):
         if any(boundary_id in _edge_condition_ids(edge) for edge in self.model["geometry"].get("edges", [])):
             self._message("This condition is assigned to an edge. Reassign the edge before deleting it.", error=True)
@@ -3763,6 +3896,7 @@ class SolveWorkspace(Div):
         self._render_inspector()
         self._sync_canvas_selection()
 
+    @_history_tracked
     def _set_boundary_value(self, boundary_id, key, value):
         condition = next((item for item in self.model.get("boundary_conditions", []) if item["id"] == boundary_id), None)
         if condition:
@@ -3772,31 +3906,38 @@ class SolveWorkspace(Div):
                 self._render_inspector()
                 self._sync_canvas_selection()
 
+    @_history_tracked
     def _set_region_source(self, region_id, key, value):
         region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
         if region:
             region.setdefault("sources", {})[key] = str(value).strip()
 
+    @_history_tracked
     def _set_region_body_force(self, region_id, component, value):
         region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
         if region:
             region.setdefault("sources", {}).setdefault("mechanical_body_force", {"r": "0", "z": "0"})[component] = str(value).strip()
 
+    @_history_tracked
     def _set_physics(self, physics, key, value):
         self.model["physics"].setdefault(physics, {})[key] = value
 
+    @_history_tracked
     def _set_mesh(self, key, value):
         self.model["mesh"][key] = value
         self._refresh_model_tree()
 
+    @_history_tracked
     def _set_solver(self, key, value):
         self.model["solver"][key] = value
 
+    @_history_tracked
     def _set_study(self, study_id, key, value):
         study = next((item for item in self.studies["studies"] if item["id"] == study_id), None)
         if study:
             study[key] = str(value).strip()
 
+    @_history_tracked
     def _set_study_frequencies(self, study_id, value):
         study = next((item for item in self.studies["studies"] if item["id"] == study_id), None)
         if study:

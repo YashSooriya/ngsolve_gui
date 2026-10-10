@@ -8,6 +8,7 @@ import pytest
 from ngapp import utils
 from ngapp.components import Div
 
+from ngsolve_gui.app import NGSolveGui
 from ngsolve_gui.solve_workspace import SolveWorkspace
 
 
@@ -49,6 +50,67 @@ def test_workspace_builds_nested_regions_and_recomputes_dimension_parameters(sta
 
     assert outer["shape"]["width"] == 0.02
     assert workspace.validation_errors() == []
+
+
+def test_model_edits_support_undo_redo_and_clear_redo_after_new_edit(standalone_components):
+    history_notifications = []
+    workspace = SolveWorkspace(on_history_change=lambda: history_notifications.append(True))
+
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    region_id = region["id"]
+    assert workspace.can_undo
+    assert not workspace.can_redo
+
+    assert workspace.undo()
+    assert workspace.model["geometry"]["regions"] == []
+    assert not workspace.can_undo
+    assert workspace.can_redo
+
+    assert workspace.redo()
+    assert workspace.model["geometry"]["regions"][0]["id"] == region_id
+    assert workspace.can_undo
+    assert not workspace.can_redo
+
+    workspace.delete_region(region_id)
+    assert workspace.model["geometry"]["regions"] == []
+    assert workspace.undo()
+    assert workspace.model["geometry"]["regions"][0]["id"] == region_id
+    assert workspace.selected_region_id == region_id
+
+    workspace._set_region_dimension(region_id, "width", "30")
+    region = workspace.model["geometry"]["regions"][0]
+    assert region["shape"]["width"] == 0.03
+    assert workspace.undo()
+    assert workspace.model["geometry"]["regions"][0]["shape"]["width"] == 0.02
+    assert workspace.redo()
+    assert workspace.model["geometry"]["regions"][0]["shape"]["width"] == 0.03
+
+    workspace.delete_region(region_id)
+    assert workspace.model["geometry"]["regions"] == []
+    assert workspace.undo()
+    assert workspace.can_redo
+    workspace._set_region_value(region_id, "name", "Outer shell")
+    assert workspace.model["geometry"]["regions"][0]["name"] == "Outer shell"
+    assert not workspace.can_redo
+    assert len(history_notifications) >= 10
+
+
+def test_delete_undo_and_redo_shortcut_actions_target_solve_workspace(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    app = SimpleNamespace(
+        _workspace_mode="solve",
+        solve_workspace=workspace,
+        _solve_shortcut_context_active=lambda: True,
+    )
+
+    assert NGSolveGui._delete_selected_region_shortcut(app)
+    assert workspace.model["geometry"]["regions"] == []
+    assert NGSolveGui._undo_solve_action(app)
+    assert len(workspace.model["geometry"]["regions"]) == 1
+    assert NGSolveGui._redo_solve_action(app)
+    assert workspace.model["geometry"]["regions"] == []
 
 
 def test_model_title_supports_inline_rename_commit_and_cancel(standalone_components):
