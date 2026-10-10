@@ -19,6 +19,7 @@ def test_workspace_builds_nested_regions_and_recomputes_dimension_parameters(sta
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
     outer = workspace.model["geometry"]["regions"][0]
+    workspace._set_region_value(outer["id"], "material_id", "material-air")
 
     workspace._primitive_values.update({
         ("rectangle", "r_min"): 3.0,
@@ -28,11 +29,20 @@ def test_workspace_builds_nested_regions_and_recomputes_dimension_parameters(sta
     })
     workspace._add_primitive("rectangle")
     coil = workspace.model["geometry"]["regions"][1]
+    workspace._set_region_value(coil["id"], "material_id", "material-copper")
     assert coil["parent_id"] == outer["id"]
 
     parameter = {"id": "outer-width", "name": "outer_width", "expression": "0.02", "unit": "m"}
     workspace.model["parameters"].append(parameter)
     workspace._set_region_dimension(outer["id"], "width", "outer_width*1000")
+    workspace.model["boundary_conditions"].append(
+        {"id": "boundary-outer", "name": "Outer boundary", "type": "magnetic_potential_zero"}
+    )
+    exterior_edge = next(
+        edge for edge in workspace.model["geometry"]["edges"]
+        if not all(abs(float(point[0])) <= 1e-12 for point in edge["vertices"])
+    )
+    workspace._set_edge_condition(exterior_edge["id"], "electromagnetic", "boundary-outer")
 
     assert outer["shape"]["width"] == 0.02
     assert workspace.validation_errors() == []
@@ -47,28 +57,33 @@ def test_same_edge_can_have_independent_em_and_mechanical_conditions(standalone_
         ("rectangle", "width"): 4.0,
         ("rectangle", "height"): 5.0,
     })
+    outer = workspace.model["geometry"]["regions"][0]
+    workspace._set_region_value(outer["id"], "material_id", "material-air")
     workspace._add_primitive("rectangle")
     coil = workspace.model["geometry"]["regions"][1]
-    coil["material_id"] = "material-copper"
+    workspace._set_region_value(coil["id"], "material_id", "material-copper")
+    workspace.model["boundary_conditions"].extend([
+        {"id": "boundary-outer", "name": "Outer boundary", "type": "magnetic_potential_zero"},
+        {"id": "boundary-fixed", "name": "Fixed support", "type": "mechanical_fixed"},
+    ])
     coil["mechanical"] = True
     workspace.model["physics"]["mechanics"]["enabled"] = True
 
     outer_edge = next(
         edge for edge in workspace.model["geometry"]["edges"]
-        if "boundary-outer" in edge["boundary_condition_ids"]
+        if not all(abs(float(point[0])) <= 1e-12 for point in edge["vertices"])
     )
+    workspace._set_edge_condition(outer_edge["id"], "electromagnetic", "boundary-outer")
     workspace._set_edge_condition(outer_edge["id"], "mechanical", "boundary-fixed")
 
-    assert set(outer_edge["boundary_condition_ids"]) == {"boundary-outer", "boundary-fixed"}
+    updated_edge = next(edge for edge in workspace.model["geometry"]["edges"] if edge["id"] == outer_edge["id"])
+    assert set(updated_edge["boundary_condition_ids"]) == {"boundary-outer", "boundary-fixed"}
     assert workspace.validation_errors() == []
 
 
 def test_electromagnetic_run_requires_an_exterior_reference_boundary(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
-    for edge in list(workspace.model["geometry"]["edges"]):
-        if "boundary-outer" in edge["boundary_condition_ids"]:
-            workspace._set_edge_condition(edge["id"], "electromagnetic", None)
 
     assert any("anchor the electromagnetic solution" in error for error in workspace.validation_errors())
 
@@ -355,6 +370,8 @@ def test_canvas_render_keeps_background_and_layer_components_mounted(standalone_
 
 def test_model_tree_groups_sections_and_places_children_under_their_parent(standalone_components):
     workspace = SolveWorkspace()
+    assert workspace.model["materials"] == []
+    assert workspace.model["boundary_conditions"] == []
 
     assert [button.ui_label for button in workspace._section_buttons.values()] == [
         "Geometry",
@@ -376,6 +393,11 @@ def test_model_tree_groups_sections_and_places_children_under_their_parent(stand
     assert geometry_children.ui_children[0].ui_children[0] == "REGIONS · 0"
     assert analysis_group.ui_children[1].ui_children[0] is workspace._section_buttons["mesh"]
     assert results_group.ui_children[1].ui_children[0] is workspace._section_buttons["runs"]
+    assert workspace._tree_subsection("materials") == ("MATERIALS · 0", [])
+    assert workspace._tree_subsection("boundaries") == ("CONDITIONS · 0", [])
+    assert [option["label"] for option in workspace._material_options()] == [
+        "Unassigned", "Air", "Copper"
+    ]
     assert workspace._tree_splitter.ui_slot_before == [workspace._tree]
     assert workspace._tree_splitter.ui_slot_after == [workspace._properties_splitter]
     assert workspace._properties_splitter.ui_slot_before == [workspace._canvas_panel]
@@ -503,6 +525,40 @@ def test_added_model_parameter_is_listed_in_tree(standalone_components):
     parameter_list = parameter_row.ui_children[1]
     assert any(child.ui_label == "length_1" for child in parameter_list.ui_children[1:])
     assert workspace.selected_parameter_id == workspace.model["parameters"][0]["id"]
+
+
+def test_model_tree_counts_only_project_materials_and_assigned_boundary_conditions(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    edges = workspace.model["geometry"]["edges"]
+    assert all(edge["boundary_condition_ids"] == [] for edge in edges)
+
+    workspace._set_region_value(region["id"], "material_id", "material-air")
+    assert workspace._tree_subsection("materials")[1][0][1] == "Air · 1 region"
+    workspace._set_region_value(region["id"], "material_id", "material-copper")
+    materials = {entry[1] for entry in workspace._tree_subsection("materials")[1]}
+    assert materials == {"Air · 0 regions", "Copper · 1 region"}
+
+    condition = {"id": "boundary-fixed", "name": "Fixed support", "type": "mechanical_fixed"}
+    workspace.model["boundary_conditions"].append(condition)
+    workspace._refresh_model_tree()
+    assert workspace._tree_subsection("boundaries")[1][0][1] == "Fixed support · 0 edges"
+    workspace._set_edge_condition(edges[1]["id"], "mechanical", condition["id"])
+    assert workspace._tree_subsection("boundaries")[1][0][1] == "Fixed support · 1 edge"
+
+
+def test_unused_builtin_material_can_be_removed_from_the_model(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    workspace._set_region_value(region["id"], "material_id", "material-air")
+    workspace._set_region_value(region["id"], "material_id", None)
+
+    workspace.remove_material("material-air")
+
+    assert workspace.model["materials"] == []
+    assert workspace._tree_subsection("materials") == ("MATERIALS · 0", [])
 
 
 def test_parameter_removal_is_available_and_blocked_while_referenced(standalone_components):

@@ -8,6 +8,7 @@ than ``eval`` so opening a model file cannot execute Python code.
 from __future__ import annotations
 
 import ast
+import copy
 import io
 import json
 import math
@@ -47,6 +48,34 @@ _RESERVED_NAMES = set(_FUNCTIONS) | {"r", "z", "pi", "e"}
 _EXPRESSION_UNITS = ("kg/m^3", "A/m^2", "N/m^3", "N/m^2", "S/m", "Pa", "Hz", "mm", "m")
 
 
+def builtin_materials() -> list[dict]:
+    """Return the built-in material choices without adding them to a model."""
+    return copy.deepcopy([
+        {
+            "id": "material-air",
+            "name": "Air",
+            "properties": {
+                "relative_permeability": "1",
+                "electrical_conductivity": "0",
+                "youngs_modulus": "0",
+                "poissons_ratio": "0.3",
+                "density": "0",
+            },
+        },
+        {
+            "id": "material-copper",
+            "name": "Copper",
+            "properties": {
+                "relative_permeability": "1",
+                "electrical_conductivity": "5.8e7",
+                "youngs_modulus": "110e9",
+                "poissons_ratio": "0.34",
+                "density": "8960",
+            },
+        },
+    ])
+
+
 def _normalise_expression(expression):
     text = str(expression).strip()
     for unit in _EXPRESSION_UNITS:
@@ -63,7 +92,7 @@ def new_id(prefix: str) -> str:
 
 
 def new_model(name: str = "Untitled axisymmetric model") -> dict:
-    """Return a valid blank r-z model with useful material and physics defaults."""
+    """Return a blank r-z model with no material or boundary assignments."""
     return {
         "schema": SCHEMA,
         "schema_version": SCHEMA_VERSION,
@@ -76,56 +105,8 @@ def new_model(name: str = "Untitled axisymmetric model") -> dict:
             "edges": [],
             "constraints": [],
         },
-        "materials": [
-            {
-                "id": "material-air",
-                "name": "Air",
-                "properties": {
-                    "relative_permeability": "1",
-                    "electrical_conductivity": "0",
-                    "youngs_modulus": "0",
-                    "poissons_ratio": "0.3",
-                    "density": "0",
-                },
-            },
-            {
-                "id": "material-copper",
-                "name": "Copper",
-                "properties": {
-                    "relative_permeability": "1",
-                    "electrical_conductivity": "5.8e7",
-                    "youngs_modulus": "110e9",
-                    "poissons_ratio": "0.34",
-                    "density": "8960",
-                },
-            },
-        ],
-        "boundary_conditions": [
-            {"id": "boundary-axis", "name": "Axis", "type": "axis_of_symmetry"},
-            {"id": "boundary-outer", "name": "Outer boundary", "type": "magnetic_potential_zero"},
-            {"id": "boundary-fixed", "name": "Fixed support", "type": "mechanical_fixed"},
-            {
-                "id": "boundary-prescribed",
-                "name": "Prescribed displacement",
-                "type": "mechanical_prescribed",
-                "displacement_r": "0",
-                "displacement_z": "0",
-            },
-            {
-                "id": "boundary-traction",
-                "name": "Vector traction",
-                "type": "mechanical_traction",
-                "traction_r": "0",
-                "traction_z": "0",
-            },
-            {
-                "id": "boundary-robin",
-                "name": "Robin support",
-                "type": "mechanical_robin",
-                "stiffness_normal": "0",
-                "stiffness_tangential": "0",
-            },
-        ],
+        "materials": [],
+        "boundary_conditions": [],
         "physics": {
             "dc_magnetic": {"enabled": True},
             "harmonic_electromagnetic": {

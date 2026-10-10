@@ -17,7 +17,7 @@ from ngapp.components import Component, Div, QBtn, QCheckbox, QDialog, QInput, Q
 from ngapp.utils import get_environment
 
 from . import cerbsim_style as cb
-from .axisymmetric_model import evaluate_expression, new_id, new_model, new_studies, validate_model, validate_studies
+from .axisymmetric_model import builtin_materials, evaluate_expression, new_id, new_model, new_studies, validate_model, validate_studies
 
 
 _SECTIONS = [
@@ -1230,7 +1230,7 @@ class SolveWorkspace(Div):
                 "name": f"{label} {index}",
                 "shape": primitive_data,
                 "vertices": vertices,
-                "material_id": "material-air",
+                "material_id": None,
                 "parent_id": parent_id,
                 "mechanical": False,
                 "sources": {
@@ -1242,10 +1242,6 @@ class SolveWorkspace(Div):
                 "edge_ids": [],
                 "constraints": self._primitive_constraints(kind),
             }
-            if parent_id is None:
-                region["material_id"] = "material-air"
-            else:
-                region["material_id"] = "material-air"
             with self._batch_frontend_updates():
                 self.model["geometry"]["regions"].append(region)
                 try:
@@ -1348,7 +1344,7 @@ class SolveWorkspace(Div):
                         "id": new_id("edge"),
                         "vertices": [list(start), list(end)],
                         "name": f"Edge {len(edges) + 1}",
-                        "boundary_condition_ids": [] if region.get("parent_id") else (["boundary-axis"] if abs(start[0]) < 1e-12 and abs(end[0]) < 1e-12 else ["boundary-outer"]),
+                        "boundary_condition_ids": [],
                     }
                 else:
                     edge = copy.deepcopy(edge)
@@ -1430,16 +1426,30 @@ class SolveWorkspace(Div):
             ]
             return f"PARAMETERS · {len(entries)}", entries
         if section == "materials":
-            entries = [
-                (item["id"], item["name"], "mdi-cube-outline", lambda *a, mid=item["id"]: self.select_material(mid), item["id"] == self.selected_material_id)
-                for item in self.model.get("materials", [])
-            ]
+            entries = []
+            for item in self.model.get("materials", []):
+                assigned = sum(region.get("material_id") == item["id"] for region in self.model["geometry"]["regions"])
+                noun = "region" if assigned == 1 else "regions"
+                entries.append((
+                    item["id"],
+                    f"{item['name']} · {assigned} {noun}",
+                    "mdi-cube-outline",
+                    lambda *a, mid=item["id"]: self.select_material(mid),
+                    item["id"] == self.selected_material_id,
+                ))
             return f"MATERIALS · {len(entries)}", entries
         if section == "boundaries":
-            entries = [
-                (item["id"], item["name"], "mdi-vector-link", lambda *a, bid=item["id"]: self.select_boundary(bid), item["id"] == self.selected_boundary_id)
-                for item in self.model.get("boundary_conditions", [])
-            ]
+            entries = []
+            for item in self.model.get("boundary_conditions", []):
+                assigned = sum(item["id"] in _edge_condition_ids(edge) for edge in self.model["geometry"].get("edges", []))
+                noun = "edge" if assigned == 1 else "edges"
+                entries.append((
+                    item["id"],
+                    f"{item['name']} · {assigned} {noun}",
+                    "mdi-vector-link",
+                    lambda *a, bid=item["id"]: self.select_boundary(bid),
+                    item["id"] == self.selected_boundary_id,
+                ))
             return f"CONDITIONS · {len(entries)}", entries
         if section == "sources":
             entries = [
@@ -1653,7 +1663,7 @@ class SolveWorkspace(Div):
 
         self._region_material_select = QSelect(
             ui_label="Material",
-            ui_options=[{"label": item["name"], "value": item["id"]} for item in self.model.get("materials", [])],
+            ui_options=self._material_options(),
             ui_option_label="label",
             ui_option_value="value",
             ui_model_value=None,
@@ -1730,6 +1740,18 @@ class SolveWorkspace(Div):
             if kinds(item)
         ]
 
+    def _material_options(self):
+        """Built-ins are choices; model materials are the project-specific set."""
+        options = [{"label": "Unassigned", "value": None}]
+        seen = set()
+        for material in [*self.model.get("materials", []), *builtin_materials()]:
+            material_id = material.get("id")
+            if material_id in seen:
+                continue
+            seen.add(material_id)
+            options.append({"label": material.get("name", "Material"), "value": material_id})
+        return options
+
     def _set_selected_region_value(self, key, value):
         region = self._selected_region()
         if region is not None:
@@ -1761,10 +1783,7 @@ class SolveWorkspace(Div):
             parent = next((item["name"] for item in self.model["geometry"]["regions"] if item["id"] == region.get("parent_id")), "Exterior")
             self._region_subtitle.ui_children = [f"{shape_type.title() if shape_type else 'Region'} · parent: {parent}"]
             self._region_name_input.ui_model_value = region.get("name", "")
-            self._region_material_select.ui_options = [
-                {"label": item["name"], "value": item["id"]}
-                for item in self.model.get("materials", [])
-            ]
+            self._region_material_select.ui_options = self._material_options()
             self._region_material_select.ui_model_value = region.get("material_id")
             self._region_mechanical_checkbox.ui_model_value = bool(region.get("mechanical", False))
             expressions = shape.get("dimension_expressions", {})
@@ -2027,7 +2046,10 @@ class SolveWorkspace(Div):
     def _material_properties(self):
         children = [_section_title("Materials", "Define material values once, then assign them to regions.")]
         if not self.model["materials"]:
-            return children + [Div("Add a material to assign it to a region.", ui_style="font-size:12px; color:var(--fg-muted);")]
+            return children + [
+                Div("Choose Air or Copper from a region's Material list, or add a custom material here.", ui_style="font-size:12px; color:var(--fg-muted); line-height:1.45;"),
+                _button("Add material", "mdi-plus", self.add_material),
+            ]
         valid_ids = {item["id"] for item in self.model["materials"]}
         if self.selected_material_id not in valid_ids:
             self.selected_material_id = self.model["materials"][0]["id"]
@@ -2061,8 +2083,7 @@ class SolveWorkspace(Div):
             _input("Density", properties.get("density", ""), lambda event, mid=material["id"]: self._set_material_property(mid, "density", event.value), suffix="kg/m³"),
             _button("Add material", "mdi-plus", self.add_material),
         ])
-        if material["id"] not in {"material-air", "material-copper"}:
-            children.append(_button("Remove material", "mdi-delete-outline", lambda *a, mid=material["id"]: self.remove_material(mid)))
+        children.append(_button("Remove material", "mdi-delete-outline", lambda *a, mid=material["id"]: self.remove_material(mid)))
         return children
 
     def _boundary_properties(self):
@@ -2080,7 +2101,10 @@ class SolveWorkspace(Div):
         valid_ids = {item["id"] for item in conditions}
         if self.selected_boundary_id not in valid_ids:
             self.selected_boundary_id = conditions[0]["id"] if conditions else None
-        children.append(Div("Condition definitions · assigned edges", ui_style="font-size:10px; font-weight:700; color:var(--fg-muted); padding:3px 6px;"))
+        if conditions:
+            children.append(Div("Condition definitions · assigned edges", ui_style="font-size:10px; font-weight:700; color:var(--fg-muted); padding:3px 6px;"))
+        else:
+            children.append(Div("No boundary conditions yet. Add a condition, then assign it to one or more sketch edges.", ui_style="font-size:12px; color:var(--fg-muted); line-height:1.45;"))
         for condition in conditions:
             assigned = sum(condition["id"] in _edge_condition_ids(edge) for edge in self.model["geometry"].get("edges", []))
             children.append(_button(
@@ -2126,8 +2150,7 @@ class SolveWorkspace(Div):
                     _input("Tangential stiffness", condition.get("stiffness_tangential", "0"), lambda event, bid=condition["id"]: self._set_boundary_value(bid, "stiffness_tangential", event.value), suffix="N/m³"),
                 ])
             children.append(Div("Highlighted orange edges use this condition. Select edges in Geometry to assign or change their conditions.", ui_style="font-size:11px; line-height:1.45; color:var(--fg-muted);"))
-            if condition["id"] not in {"boundary-axis", "boundary-outer"}:
-                children.append(_button("Remove condition", "mdi-delete-outline", lambda *a, bid=condition["id"]: self.remove_boundary(bid)))
+            children.append(_button("Remove condition", "mdi-delete-outline", lambda *a, bid=condition["id"]: self.remove_boundary(bid)))
         children.append(_button("Add boundary condition", "mdi-plus", self.add_boundary))
         return children
 
@@ -2381,8 +2404,18 @@ class SolveWorkspace(Div):
         region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
         if region is None:
             return
+        if key == "material_id" and value:
+            material = next((item for item in self.model["materials"] if item["id"] == value), None)
+            if material is None:
+                material = next((item for item in builtin_materials() if item["id"] == value), None)
+                if material is None:
+                    self._message("Choose a material from the available list.", error=True)
+                    return
+                self.model["materials"].append(material)
         region[key] = str(value).strip() if key == "name" else value
         self._refresh_model_tree()
+        if key == "material_id":
+            self._render_inspector()
         self.render_canvas()
 
     def _set_region_dimension(self, region_id, key, value):
@@ -2463,6 +2496,7 @@ class SolveWorkspace(Div):
                 condition_ids.append(value)
             edge["boundary_condition_ids"] = condition_ids
         self._rebuild_edges()
+        self._refresh_model_tree()
         self._render_inspector()
         self.render_canvas()
 
@@ -2594,7 +2628,7 @@ class SolveWorkspace(Div):
 
     def add_material(self, *args):
         index = len(self.model["materials"]) + 1
-        material = copy.deepcopy(self.model["materials"][0])
+        material = builtin_materials()[0]
         material.update({"id": new_id("material"), "name": f"Material {index}"})
         self.model["materials"].append(material)
         self.selected_material_id = material["id"]

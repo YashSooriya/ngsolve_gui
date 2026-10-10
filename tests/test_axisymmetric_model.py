@@ -4,6 +4,7 @@ import zipfile
 import pytest
 
 from ngsolve_gui.axisymmetric_model import (
+    builtin_materials,
     evaluate_expression,
     new_model,
     new_studies,
@@ -15,6 +16,7 @@ from ngsolve_gui.axisymmetric_model import (
 
 def _nested_model():
     model = new_model()
+    model["materials"] = builtin_materials()
     model["parameters"] = [
         {"id": "parameter-radius", "name": "coil_radius", "expression": "0.004", "unit": "m"}
     ]
@@ -84,7 +86,7 @@ def test_overlapping_domains_and_wrong_parent_are_rejected():
 def test_malformed_parent_and_boundary_values_are_reported_without_crashing():
     model = _nested_model()
     model["geometry"]["regions"][1]["parent_id"] = {"invalid": "id"}
-    model["boundary_conditions"][1]["type"] = ["invalid"]
+    model["boundary_conditions"].append({"id": "broken", "name": "Broken", "type": ["invalid"]})
 
     errors = validate_model(model)
 
