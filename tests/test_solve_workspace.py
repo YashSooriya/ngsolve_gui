@@ -5,6 +5,7 @@ import pytest
 from types import SimpleNamespace
 
 from ngapp import utils
+from ngapp.components import Div
 
 from ngsolve_gui.solve_workspace import SolveWorkspace
 
@@ -123,6 +124,41 @@ def test_study_opens_solver_log_and_close_button_minimises_it(standalone_compone
     workspace.run_study_action()
     assert run_observations == [True]
     assert not workspace._log_visible
+
+
+def test_3d_preview_replaces_viewport_and_restores_editable_sketch(standalone_components):
+    workspace = SolveWorkspace()
+    preview = Div()
+    workspace._build_3d_preview_component = lambda: preview
+    original_canvas = workspace._canvas
+
+    workspace.toggle_3d_preview()
+
+    assert workspace._preview_3d_active
+    assert workspace._preview_3d_component is preview
+    assert workspace._canvas_host.ui_children == [preview]
+    assert workspace._preview_3d_button.ui_label == "Preview in 3D"
+    assert all(control.ui_hidden for control in workspace._sketch_view_controls)
+
+    workspace.toggle_3d_preview()
+
+    assert not workspace._preview_3d_active
+    assert workspace._preview_3d_component is None
+    assert workspace._canvas_host.ui_children == [original_canvas]
+    assert workspace._preview_3d_button.ui_label == "Preview in 3D"
+    assert all(not control.ui_hidden for control in workspace._sketch_view_controls)
+
+
+def test_3d_preview_failure_keeps_editable_sketch_active(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._build_3d_preview_component = lambda: (_ for _ in ()).throw(ValueError("invalid profile"))
+
+    workspace.toggle_3d_preview()
+
+    assert not workspace._preview_3d_active
+    assert workspace._canvas_host.ui_children == [workspace._canvas]
+    assert workspace._preview_3d_button.ui_label == "Preview in 3D"
+    assert "invalid profile" in workspace.message
 
 
 def test_same_edge_can_have_independent_em_and_mechanical_conditions(standalone_components):

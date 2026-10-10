@@ -145,6 +145,8 @@ class SolveWorkspace(Div):
         self.sketch_tool = "select"
         self._canvas_drag = None
         self._screen_to_svg = None
+        self._preview_3d_active = False
+        self._preview_3d_component = None
 
         self._canvas_background = _svg(
             "rect", x=0, y=0, width=900, height=640,
@@ -248,48 +250,67 @@ class SolveWorkspace(Div):
             ui_style="display:flex; flex-direction:column; min-width:0; min-height:0; overflow:hidden; background:var(--surface);",
         )
 
+        select_button = _button(
+            "Select", "mdi-cursor-default-outline",
+            lambda *a: self.set_sketch_tool("select"),
+            tooltip="Drag a region to move it. Click an edge to edit it; drag empty space to select edges. Shift adds to the selection.",
+            style="flex:0 0 auto; white-space:nowrap;",
+        )
+        rectangle_button = _button(
+            "Rectangle", "mdi-rectangle-outline",
+            lambda *a: self.set_sketch_tool("rectangle"),
+            tooltip="Draw a rectangle by dragging between opposite corners.",
+            style="flex:0 0 auto; white-space:nowrap;",
+        )
+        circle_button = _button(
+            "Circle", "mdi-circle-outline",
+            lambda *a: self.set_sketch_tool("circle"),
+            tooltip="Draw a circle by dragging from its centre to its radius.",
+            style="flex:0 0 auto; white-space:nowrap;",
+        )
+        snap_button = _button("Snap", "mdi-magnet", self.toggle_snap_to_grid, tooltip="Snap sketch points to grid intersections", style="flex:0 0 auto; white-space:nowrap;")
+        sketch_toolbar_separator = QSeparator(ui_vertical=True)
+        fit_view_button = _button(
+            "Fit view", "mdi-fit-to-screen-outline",
+            self.fit_canvas_view,
+            tooltip="Fit the sketch to the viewport.",
+            style="flex:0 0 auto; white-space:nowrap;",
+        )
+        zoom_out_button = _button("Zoom out", "mdi-minus", lambda *a: self.zoom_canvas(1.2), tooltip="Zoom out one step", style="flex:0 0 auto;")
+        zoom_in_button = _button("Zoom in", "mdi-plus", lambda *a: self.zoom_canvas(1 / 1.2), tooltip="Zoom in one step", style="flex:0 0 auto;")
+        self._preview_3d_button = _button(
+            "Preview in 3D", "mdi-cube-scan", self.toggle_3d_preview,
+            tooltip="Preview the axisymmetric regions revolved into 3D.",
+            style="flex:0 0 auto; white-space:nowrap;",
+        )
+        self._preview_3d_tooltip = self._preview_3d_button.ui_slots["default"][0]
+        model_button = _button("Model", "mdi-file-tree-outline", self._toggle_tree_panel, tooltip="Show or hide the model tree", style="flex:0 0 auto;")
+        properties_button = _button("Properties", "mdi-tune-variant", self._toggle_properties_panel, tooltip="Show or hide properties", style="flex:0 0 auto;")
         toolbar = Div(
-            _button(
-                "Select", "mdi-cursor-default-outline",
-                lambda *a: self.set_sketch_tool("select"),
-                tooltip="Drag a region to move it. Click an edge to edit it; drag empty space to select edges. Shift adds to the selection.",
-                style="flex:0 0 auto; white-space:nowrap;",
-            ),
-            _button(
-                "Rectangle", "mdi-rectangle-outline",
-                lambda *a: self.set_sketch_tool("rectangle"),
-                tooltip="Draw a rectangle by dragging between opposite corners.",
-                style="flex:0 0 auto; white-space:nowrap;",
-            ),
-            _button(
-                "Circle", "mdi-circle-outline",
-                lambda *a: self.set_sketch_tool("circle"),
-                tooltip="Draw a circle by dragging from its centre to its radius.",
-                style="flex:0 0 auto; white-space:nowrap;",
-            ),
-            _button("Snap", "mdi-magnet", self.toggle_snap_to_grid, tooltip="Snap sketch points to grid intersections", style="flex:0 0 auto; white-space:nowrap;"),
-            QSeparator(ui_vertical=True),
-            _button(
-                "Fit view", "mdi-fit-to-screen-outline",
-                self.fit_canvas_view,
-                tooltip="Fit the sketch to the viewport.",
-                style="flex:0 0 auto; white-space:nowrap;",
-            ),
-            _button("Zoom out", "mdi-minus", lambda *a: self.zoom_canvas(1.2), tooltip="Zoom out one step", style="flex:0 0 auto;"),
-            _button("Zoom in", "mdi-plus", lambda *a: self.zoom_canvas(1 / 1.2), tooltip="Zoom in one step", style="flex:0 0 auto;"),
-            _button("Model", "mdi-file-tree-outline", self._toggle_tree_panel, tooltip="Show or hide the model tree", style="flex:0 0 auto;"),
-            _button("Properties", "mdi-tune-variant", self._toggle_properties_panel, tooltip="Show or hide properties", style="flex:0 0 auto;"),
+            select_button,
+            rectangle_button,
+            circle_button,
+            snap_button,
+            sketch_toolbar_separator,
+            fit_view_button,
+            zoom_out_button,
+            zoom_in_button,
+            self._preview_3d_button,
+            model_button,
+            properties_button,
             ui_style="display:flex; flex-wrap:wrap; align-items:center; gap:4px; flex:none; min-width:0; min-height:42px; padding:4px 8px; border-bottom:1px solid var(--border); background:var(--surface);",
         )
         self._tool_buttons = {
-            "select": toolbar.ui_slots["default"][0],
-            "rectangle": toolbar.ui_slots["default"][1],
-            "circle": toolbar.ui_slots["default"][2],
+            "select": select_button,
+            "rectangle": rectangle_button,
+            "circle": circle_button,
         }
-        self._snap_button = next(
-            button for button in toolbar.ui_slots["default"]
-            if getattr(button, "ui_icon", None) == "mdi-magnet"
-        )
+        self._snap_button = snap_button
+        self._sketch_view_controls = [
+            select_button, rectangle_button, circle_button, snap_button,
+            sketch_toolbar_separator, fit_view_button, zoom_out_button,
+            zoom_in_button,
+        ]
         self._canvas_panel = Div(
             toolbar,
             self._canvas_host,
@@ -2694,6 +2715,102 @@ class SolveWorkspace(Div):
         self._canvas_scene.ui_children = scene_children
         self._render_canvas_dimensions()
         self._sync_canvas_interaction_settings()
+
+    def _build_3d_preview_component(self):
+        """Revolve the current meridian regions and show them without editing tools."""
+        from netgen.occ import Axis, Compound, Face, MakePolygon, OCCGeometry, Pnt, Revolve, Vec, Vertex
+        from ngapp.components import WebgpuComponent
+        from ngsolve_webgpu import GeometryRenderer
+        from webgpu import CoordinateAxes, NavigationCube
+
+        regions = self.model.get("geometry", {}).get("regions", [])
+        material_names = {
+            material.get("id"): material.get("name", "")
+            for material in self.model.get("materials", [])
+        }
+        revolved = {}
+        for region in regions:
+            vertices = region.get("vertices", [])
+            if len(vertices) < 3:
+                raise ValueError(f"Region '{region.get('name', 'unnamed')}' needs at least three vertices.")
+            profile_vertices = [
+                Vertex(Pnt(float(radius), 0.0, float(axial)))
+                for radius, axial in vertices
+            ]
+            profile_vertices.append(profile_vertices[0])
+            profile = Face(MakePolygon(profile_vertices))
+            revolved[region["id"]] = Revolve(
+                profile,
+                Axis(Pnt(0.0, 0.0, 0.0), Vec(0.0, 0.0, 1.0)),
+                360.0,
+            )
+
+        # A nested 2D region denotes a separate material domain. Cut its
+        # immediate children from the parent before combining the solids so
+        # that both the outer boundary and the inner domain can be seen.
+        preview_solids = []
+        for region in regions:
+            solid = revolved[region["id"]]
+            for child in regions:
+                if child.get("parent_id") == region["id"]:
+                    solid = solid - revolved[child["id"]]
+            solid = solid.mat(material_names.get(region.get("material_id")) or region.get("name", "Region"))
+            preview_solids.append(solid)
+
+        renderers = []
+        if preview_solids:
+            geometry = OCCGeometry(Compound(preview_solids))
+            renderer = GeometryRenderer(geometry)
+            renderer.faces.active = True
+            renderer.edges.active = True
+            renderers.append(renderer)
+        axes = CoordinateAxes()
+        navigation_cube = NavigationCube()
+        renderers.extend([axes, navigation_cube])
+
+        preview = WebgpuComponent(
+            ui_style="display:block; flex:1 1 auto; width:100%; height:100%; min-width:0; min-height:0;",
+        )
+        preview.ui_class = "fit"
+        scene = preview.draw(renderers)
+        if preview_solids:
+            scene.options.camera.reset(*scene.bounding_box)
+            scene.render()
+        return preview
+
+    def toggle_3d_preview(self, *args):
+        """Toggle between the editable meridian canvas and read-only 3D view."""
+        if self._preview_3d_active:
+            self._preview_3d_active = False
+            self._canvas_host.ui_children = [self._canvas]
+            self._preview_3d_component = None
+            self._preview_3d_button.ui_label = "Preview in 3D"
+            self._preview_3d_button.ui_icon = "mdi-cube-scan"
+            self._preview_3d_button.ui_color = None
+            self._preview_3d_button.ui_flat = True
+            self._preview_3d_tooltip.ui_children = ["Preview the axisymmetric regions revolved into 3D."]
+            for control in self._sketch_view_controls:
+                control.ui_hidden = False
+            self.render_canvas()
+            self._message("Returned to the editable meridian sketch.")
+            return
+
+        try:
+            preview = self._build_3d_preview_component()
+        except Exception as error:
+            self._message(f"Could not create the 3D preview: {error}", error=True)
+            return
+
+        self._preview_3d_component = preview
+        self._canvas_host.ui_children = [preview]
+        self._preview_3d_active = True
+        self._preview_3d_button.ui_icon = "mdi-cube-outline"
+        self._preview_3d_button.ui_color = "primary"
+        self._preview_3d_button.ui_flat = False
+        self._preview_3d_tooltip.ui_children = ["Return to the editable meridian sketch."]
+        for control in self._sketch_view_controls:
+            control.ui_hidden = True
+        self._message("3D preview: drag to rotate, right-drag to pan, and scroll to zoom.")
 
     def _set_region_value(self, region_id, key, value):
         region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
