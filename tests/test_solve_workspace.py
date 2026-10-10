@@ -180,7 +180,7 @@ def test_canvas_drag_motion_and_release_do_not_rebuild_the_canvas(standalone_com
     assert len(workspace.selected_edge_ids) == 4
 
 
-def test_region_creation_coalesces_component_updates(standalone_components, monkeypatch):
+def test_region_creation_updates_canvas_before_side_panels(standalone_components, monkeypatch):
     workspace = SolveWorkspace()
     updates = []
     frontend = utils._environment.frontend
@@ -203,6 +203,12 @@ def test_region_creation_coalesces_component_updates(standalone_components, monk
         workspace._canvas_scene,
         workspace._canvas_dimensions,
     ))
+    positions = {id(component): index for index, component in enumerate(updated_components)}
+    assert max(positions[id(component)] for component in (
+        workspace._canvas_grid,
+        workspace._canvas_scene,
+        workspace._canvas_dimensions,
+    )) < positions[id(workspace._inspector)]
     assert len(workspace.model["geometry"]["regions"]) == 1
 
 

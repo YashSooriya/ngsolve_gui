@@ -742,13 +742,33 @@ class SolveWorkspace(Div):
             frontend.update_component = send_update
             updates = list(queued.values())
             if updates:
-                with ThreadPoolExecutor(max_workers=min(8, len(updates))) as pool:
-                    futures = [
-                        pool.submit(send_update, component, data, method, blocking=blocking)
-                        for component, data, method, blocking in updates
-                    ]
-                    for future in futures:
-                        future.result()
+                canvas_components = {
+                    id(self._canvas_grid),
+                    id(self._canvas_scene),
+                    id(self._canvas_dimensions),
+                }
+                canvas_updates = [item for item in updates if id(item[0]) in canvas_components]
+                panel_updates = [item for item in updates if id(item[0]) not in canvas_components]
+
+                def flush(batch):
+                    if not batch:
+                        return
+                    with ThreadPoolExecutor(max_workers=min(8, len(batch))) as pool:
+                        futures = [
+                            pool.submit(send_update, component, data, method, blocking=blocking)
+                            for component, data, method, blocking in batch
+                        ]
+                        for future in futures:
+                            future.result()
+
+                # Draw the new geometry while the current tree and properties
+                # remain visible. Let that canvas patch settle before replacing
+                # the two side panels, avoiding a frame where all three panes
+                # are empty at once.
+                flush(canvas_updates)
+                if canvas_updates and panel_updates:
+                    time.sleep(0.12)
+                flush(panel_updates)
 
     def _select_edges_in_canvas_box(self, start, end, *, additive=False):
         project, _ = self._canvas_projection()
