@@ -111,7 +111,7 @@ def test_geometry_and_physics_value_inputs_use_si_units(standalone_components):
     assert study_units["Frequency points (comma separated)"] == "Hz"
 
 
-def test_generated_mesh_preview_is_visible_and_invalidated_by_edits(standalone_components):
+def test_generated_mesh_preview_is_invalidated_only_by_mesh_relevant_edits(standalone_components):
     workspace = SolveWorkspace()
     workspace.set_mesh_preview([
         ((0.0, 0.0), (1.0, 0.0)),
@@ -124,9 +124,33 @@ def test_generated_mesh_preview_is_visible_and_invalidated_by_edits(standalone_c
     assert workspace._canvas_mesh_path in workspace._canvas_scene.ui_children
 
     workspace.add_parameter()
+    workspace._set_solver("relative_tolerance", "1e-5")
+    workspace._set_study_frequencies("study-static", "250, 500")
+
+    assert workspace.mesh_preview_edges
+    assert workspace.mesh_preview_visible
+
+    workspace._set_mesh("element_size", "0.005")
 
     assert workspace.mesh_preview_edges == []
     assert not workspace.mesh_preview_visible
+    assert workspace._mesh_preview_button.ui_disable
+
+    workspace.set_mesh_preview([((0.0, 0.0), (1.0, 0.0))])
+    workspace._add_primitive("rectangle")
+    assert workspace.mesh_preview_edges == []
+
+
+def test_mesh_preview_invalidates_when_a_mesh_parameter_changes(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.add_parameter()
+    parameter = workspace.model["parameters"][0]
+    workspace._set_mesh("element_size", parameter["name"])
+    workspace.set_mesh_preview([((0.0, 0.0), (1.0, 0.0))])
+
+    workspace._set_parameter(parameter["id"], "expression", "0.005")
+
+    assert workspace.mesh_preview_edges == []
     assert workspace._mesh_preview_button.ui_disable
 
 
@@ -1620,6 +1644,38 @@ def test_setup_validation_checks_actual_study_frequency_list(standalone_componen
 
     assert any("Study frequency" in error for error in workspace.validation_errors())
     assert workspace._validation_issue_section("Study frequency must be positive") == "studies"
+
+
+def test_setup_issue_navigation_selects_the_named_model_item(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    workspace.model["materials"] = builtin_materials()
+    copper = next(item for item in workspace.model["materials"] if item["name"] == "Copper")
+    condition = {"id": "condition-fixed", "name": "Fixed support", "type": "mechanical_fixed"}
+    workspace.model["boundary_conditions"] = [condition]
+    edge = workspace.model["geometry"]["edges"][0]
+    edge["name"] = "left edge"
+
+    workspace._navigate_to_validation_issue("Material 'Copper' electrical_conductivity must be positive")
+    assert workspace.active_section == "materials"
+    assert workspace.selected_material_id == copper["id"]
+
+    workspace._navigate_to_validation_issue("Boundary 'Fixed support' has an invalid value")
+    assert workspace.active_section == "boundaries"
+    assert workspace.selected_boundary_id == condition["id"]
+
+    workspace._navigate_to_validation_issue("Geometry edge 'left edge' duplicates another edge")
+    assert workspace.active_section == "geometry"
+    assert workspace.selected_edge_id == edge["id"]
+
+    workspace._navigate_to_validation_issue("Region 'square 1' dc_current_density has an incompatible unit")
+    assert workspace.active_section == "sources"
+    assert workspace.selected_region_id == region["id"]
+
+    workspace._navigate_to_validation_issue("Region 'square 1' has invalid geometry")
+    assert workspace.active_section == "geometry"
+    assert workspace.selected_region_id == region["id"]
 
 
 def test_canvas_event_reads_pointer_cache_when_ngapp_omits_coordinates(standalone_components):

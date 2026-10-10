@@ -131,6 +131,63 @@ def _round_sketch_m(value):
     return float(Decimal(str(value)).quantize(Decimal("0.00001"), rounding=ROUND_HALF_UP))
 
 
+def _mesh_signature(model):
+    """Describe only model inputs that can change the generated mesh."""
+    geometry = model.get("geometry", {}) if isinstance(model, dict) else {}
+    regions = []
+    for region in geometry.get("regions", []) if isinstance(geometry, dict) else []:
+        if not isinstance(region, dict):
+            regions.append(repr(region))
+            continue
+        shape = region.get("shape", {})
+        if not isinstance(shape, dict):
+            shape = {}
+        shape_type = shape.get("type")
+        dimension_keys = {
+            "rectangle": ("r_min", "z_min", "width", "height"),
+            "circle": ("r_center", "z_center", "radius"),
+        }.get(shape_type, ())
+        regions.append({
+            "id": region.get("id"),
+            "parent_id": region.get("parent_id"),
+            "vertices": region.get("vertices", []),
+            "shape": {
+                "type": shape_type,
+                **{key: shape.get(key) for key in dimension_keys},
+            },
+        })
+
+    mesh = model.get("mesh", {}) if isinstance(model, dict) else {}
+    if not isinstance(mesh, dict):
+        mesh = {}
+    parameters = {
+        item.get("name"): item
+        for item in model.get("parameters", [])
+        if isinstance(item, dict) and item.get("name")
+    } if isinstance(model, dict) else {}
+    try:
+        element_size = evaluate_expression(mesh.get("element_size", "0.01"), parameters)
+    except (AttributeError, TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError):
+        # While a mesh field is invalid or being edited, treat its raw input as
+        # part of the signature so a preview cannot appear to match it.
+        element_size = {
+            "expression": repr(mesh.get("element_size", "0.01")),
+            "parameters": sorted(
+                (str(name), repr(item.get("expression")))
+                for name, item in parameters.items()
+            ),
+        }
+    payload = {
+        "regions": regions,
+        "element_size": element_size,
+        "polynomial_order": mesh.get("polynomial_order", 3),
+    }
+    try:
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError):
+        return repr(payload)
+
+
 def _input(label, value, callback, *, number=False, suffix=None, width=None, hint=None):
     widget = QInput(
         ui_label=label,
@@ -232,6 +289,7 @@ class SolveWorkspace(Div):
         self.runs = _load_saved_run_history()
         self.mesh_preview_edges = []
         self.mesh_preview_visible = False
+        self._mesh_preview_signature = None
         self.selected_material_id = None
         self.selected_boundary_id = None
         self.selected_parameter_id = None
@@ -600,7 +658,11 @@ class SolveWorkspace(Div):
     def _finish_history_transaction(self, before):
         if before["model"] == self.model and before["studies"] == self.studies:
             return
-        self._clear_mesh_preview()
+        if (
+            self._mesh_preview_signature is not None
+            and _mesh_signature(self.model) != self._mesh_preview_signature
+        ):
+            self._clear_mesh_preview()
         self._undo_history.append(before)
         del self._undo_history[:-self._history_limit]
         self._redo_history.clear()
@@ -612,9 +674,14 @@ class SolveWorkspace(Div):
 
     def _restore_history_state(self, state):
         self._preserve_canvas_view()
-        self._clear_mesh_preview()
+        mesh_preview_signature = self._mesh_preview_signature
         self.model = copy.deepcopy(state["model"])
         self.studies = copy.deepcopy(state["studies"])
+        if (
+            mesh_preview_signature is not None
+            and _mesh_signature(self.model) != mesh_preview_signature
+        ):
+            self._clear_mesh_preview()
         selection = state["selection"]
         region_ids = {item["id"] for item in self.model["geometry"].get("regions", [])}
         edge_ids = {item["id"] for item in self.model["geometry"].get("edges", [])}
@@ -2133,11 +2200,10 @@ class SolveWorkspace(Div):
             return
         rows = []
         for issue in errors:
-            section = self._validation_issue_section(issue)
             rows.append(_button(
                 issue,
                 "mdi-alert-circle-outline",
-                lambda *a, selected=section: self.select_section(selected),
+                lambda *a, selected_issue=issue: self._navigate_to_validation_issue(selected_issue),
                 style="width:100%; justify-content:flex-start; text-align:left; white-space:normal;",
                 align="left",
             ))
@@ -2145,9 +2211,58 @@ class SolveWorkspace(Div):
         self._messages_visible = True
         self._messages_panel.ui_hidden = False
 
+    def _navigate_to_validation_issue(self, issue):
+        """Open the relevant inspector item when a setup message is clicked."""
+        text = str(issue)
+        section = self._validation_issue_section(text)
+        matchers = (
+            ("parameter", r"Parameter '([^']+)'"),
+            ("materials", r"Material '([^']+)'"),
+            ("boundaries", r"Boundary '([^']+)'"),
+            ("boundaries", r"(?:Geometry )?Edge '([^']+)'"),
+            ("region", r"Region '([^']+)'"),
+        )
+        target_kind = None
+        target_name = None
+        for kind, pattern in matchers:
+            found = re.search(pattern, text, re.IGNORECASE)
+            if found:
+                target_kind, target_name = kind, found.group(1)
+                break
+
+        if target_name is not None:
+            if target_kind == "parameter":
+                matches = [item for item in self.model.get("parameters", []) if item.get("name") == target_name]
+                if len(matches) == 1:
+                    self.select_parameter(matches[0]["id"])
+                    return
+            elif target_kind == "materials":
+                matches = [item for item in self.model.get("materials", []) if item.get("name") == target_name]
+                if len(matches) == 1:
+                    self.select_material(matches[0]["id"])
+                    return
+            elif target_kind == "boundaries":
+                matches = [item for item in self.model.get("boundary_conditions", []) if item.get("name") == target_name]
+                if len(matches) == 1:
+                    self.select_boundary(matches[0]["id"])
+                    return
+                edge_matches = [item for item in self.model.get("geometry", {}).get("edges", []) if item.get("name") == target_name or item.get("id") == target_name]
+                if len(edge_matches) == 1:
+                    self.select_edge(edge_matches[0]["id"])
+                    return
+            elif target_kind == "region":
+                matches = [item for item in self.model.get("geometry", {}).get("regions", []) if item.get("name") == target_name or item.get("id") == target_name]
+                if len(matches) == 1:
+                    if section == "sources":
+                        self.select_source_region(matches[0]["id"])
+                    else:
+                        self.select_region(matches[0]["id"])
+                    return
+        self.select_section(section)
+
     @staticmethod
     def _validation_issue_section(issue):
-        text = issue.lower()
+        text = issue.lower().replace("_", " ")
         if "parameter" in text:
             return "parameters"
         if "material" in text:
@@ -4249,6 +4364,7 @@ class SolveWorkspace(Div):
         had_preview = bool(self.mesh_preview_edges) or self.mesh_preview_visible
         self.mesh_preview_edges = []
         self.mesh_preview_visible = False
+        self._mesh_preview_signature = None
         button = getattr(self, "_mesh_preview_button", None)
         if button is not None:
             button.ui_label = "Mesh preview"
@@ -4266,6 +4382,7 @@ class SolveWorkspace(Div):
             if len(start) >= 2 and len(end) >= 2
         ]
         self.mesh_preview_visible = bool(self.mesh_preview_edges)
+        self._mesh_preview_signature = _mesh_signature(self.model) if self.mesh_preview_edges else None
         self._mesh_preview_button.ui_disable = not self.mesh_preview_edges
         self._mesh_preview_button.ui_label = "Hide mesh" if self.mesh_preview_visible else "Mesh preview"
         self._mesh_preview_button.ui_color = "primary" if self.mesh_preview_visible else None
