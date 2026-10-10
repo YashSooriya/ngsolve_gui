@@ -720,27 +720,28 @@ def test_region_creation_updates_only_changed_canvas_and_tree_subsections(standa
     assert all(component in updated_components for component in (
         workspace._tree_entry_lists["geometry"],
         workspace._tree_entry_lists["sources"],
-        workspace._canvas_grid,
         workspace._canvas_scene,
         workspace._canvas_dimensions,
         workspace._region_panel,
         workspace._region_name_input,
     ))
+    assert workspace._canvas_grid not in updated_components
     assert len(workspace.model["geometry"]["regions"]) == 1
 
 
 def test_region_add_and_remove_keep_tree_grid_and_existing_scene_nodes_mounted(standalone_components):
     workspace = SolveWorkspace()
     center, width, _ = workspace._current_canvas_world_view()
-    workspace._view_center = center
-    workspace._view_world_width = width
-
     tree_groups = tuple(workspace._left_items.ui_children)
     grid_nodes = tuple(workspace._canvas_grid.ui_children)
+    grid_signature = workspace._canvas_grid_signature
     geometry_entries = workspace._tree_entry_lists["geometry"]
     sources_entries = workspace._tree_entry_lists["sources"]
 
     workspace._add_primitive("rectangle")
+    assert workspace._view_center == center
+    assert workspace._view_world_width == width
+    assert workspace._canvas_grid_signature == grid_signature
     rectangle = workspace.model["geometry"]["regions"][0]
     rectangle_node = workspace._canvas_region_nodes[rectangle["id"]]
     rectangle_edges = {
@@ -763,6 +764,7 @@ def test_region_add_and_remove_keep_tree_grid_and_existing_scene_nodes_mounted(s
     assert workspace._tree_entry_lists["geometry"] is geometry_entries
     assert workspace._tree_entry_lists["sources"] is sources_entries
     assert tuple(workspace._canvas_grid.ui_children) == grid_nodes
+    assert workspace._canvas_grid_signature == grid_signature
     assert workspace._canvas_region_nodes[rectangle["id"]] is rectangle_node
     assert all(workspace._canvas_edge_nodes[edge_id] is nodes for edge_id, nodes in rectangle_edges.items())
 
@@ -770,6 +772,7 @@ def test_region_add_and_remove_keep_tree_grid_and_existing_scene_nodes_mounted(s
 
     assert tuple(workspace._left_items.ui_children) == tree_groups
     assert tuple(workspace._canvas_grid.ui_children) == grid_nodes
+    assert workspace._canvas_grid_signature == grid_signature
     assert workspace._canvas_region_nodes[rectangle["id"]] is rectangle_node
     assert all(workspace._canvas_edge_nodes[edge_id] is nodes for edge_id, nodes in rectangle_edges.items())
 

@@ -754,6 +754,13 @@ class SolveWorkspace(Div):
             center, width = self._view_center, self._view_world_width
         return center, width, width / target_ratio
 
+    def _preserve_canvas_view(self):
+        """Keep geometry edits from changing the camera and rebuilding the grid."""
+        if self._view_center is not None and self._view_world_width is not None:
+            return
+        self._view_center, self._view_world_width, _ = self._current_canvas_world_view()
+        self._save_canvas_view_to_layout()
+
     def zoom_canvas(self, factor, anchor=None, *, render=True):
         """Zoom in-place, preserving the world coordinate beneath the anchor."""
         try:
@@ -1738,6 +1745,7 @@ class SolveWorkspace(Div):
                 self.render_canvas()
             return False
 
+        self._preserve_canvas_view()
         old_shape = copy.deepcopy(region["shape"])
         old_vertices = copy.deepcopy(region["vertices"])
         old_parents = {item["id"]: item.get("parent_id") for item in self.model["geometry"]["regions"]}
@@ -2048,6 +2056,7 @@ class SolveWorkspace(Div):
                 "edge_ids": [],
                 "constraints": self._primitive_constraints(kind),
             }
+            self._preserve_canvas_view()
             with self._batch_frontend_updates():
                 self.model["geometry"]["regions"].append(region)
                 try:
@@ -3491,6 +3500,7 @@ class SolveWorkspace(Div):
         region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
         if region is None:
             return
+        self._preserve_canvas_view()
         old_shape = copy.deepcopy(region["shape"])
         old_vertices = copy.deepcopy(region["vertices"])
         old_parents = {item["id"]: item.get("parent_id") for item in self.model["geometry"]["regions"]}
@@ -3573,6 +3583,7 @@ class SolveWorkspace(Div):
         region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
         if region is None:
             return
+        self._preserve_canvas_view()
         with self._batch_frontend_updates():
             for child in self.model["geometry"]["regions"]:
                 if child.get("parent_id") == region_id:
