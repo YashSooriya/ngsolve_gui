@@ -98,6 +98,55 @@ def test_drag_sketches_dimensioned_rectangle_and_circle_regions(standalone_compo
     }
 
 
+def test_mouse_drawn_geometry_uses_hundredth_mm_precision(standalone_components):
+    workspace = SolveWorkspace()
+    project, _ = workspace._canvas_projection()
+    workspace._create_region_from_canvas_drag(
+        "rectangle",
+        project((0.0034567, -0.0023467)),
+        project((0.0101234, 0.0078912)),
+    )
+    rectangle = workspace.model["geometry"]["regions"][0]["shape"]
+    assert rectangle["r_min"] * 1000 == pytest.approx(3.46)
+    assert rectangle["z_min"] * 1000 == pytest.approx(-2.35)
+    assert rectangle["width"] * 1000 == pytest.approx(6.66)
+    assert rectangle["height"] * 1000 == pytest.approx(10.24)
+    assert rectangle["dimension_expressions"] == {
+        "r_min": "3.46",
+        "z_min": "-2.35",
+        "width": "6.66",
+        "height": "10.24",
+    }
+
+    circle_workspace = SolveWorkspace()
+    project, _ = circle_workspace._canvas_projection()
+    circle_workspace._create_region_from_canvas_drag(
+        "circle",
+        project((0.0200034567, -0.0023467)),
+        project((0.0251234, 0.0019879)),
+    )
+    circle = circle_workspace.model["geometry"]["regions"][0]["shape"]
+    assert circle["r_center"] * 1000 == pytest.approx(20.00)
+    assert circle["z_center"] * 1000 == pytest.approx(-2.35)
+    assert circle["radius"] * 1000 == pytest.approx(6.71)
+    assert circle["dimension_expressions"] == {
+        "r_center": "20.0",
+        "z_center": "-2.35",
+        "radius": "6.71",
+    }
+
+
+def test_manual_region_dimensions_keep_precision_beyond_hundredth_mm(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+
+    workspace._set_region_dimension(region["id"], "width", "20.1234")
+
+    assert region["shape"]["width"] == pytest.approx(0.0201234)
+    assert region["shape"]["dimension_expressions"]["width"] == "20.1234"
+
+
 def test_drag_box_selects_enclosed_or_crossed_edges_and_shift_adds(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")

@@ -9,6 +9,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from decimal import Decimal, ROUND_HALF_UP
 from threading import get_ident
 from pathlib import Path
 
@@ -39,6 +40,11 @@ _TREE_GROUPS = (
 )
 
 _MATERIAL_COLORS = ["#6886ac", "#d58651", "#69a77b", "#ae8bb7", "#d1b44f", "#4cabb0"]
+
+
+def _round_sketch_mm(value):
+    """Round a mouse-derived sketch value to hundredths of a millimetre."""
+    return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def _input(label, value, callback, *, number=False, suffix=None, width=None, hint=None):
@@ -1020,24 +1026,26 @@ class SolveWorkspace(Div):
             start = self._snap_canvas_point(start)
             end = self._snap_canvas_point(end)
         _, unproject = self._canvas_projection()
-        first = unproject(start)
-        second = unproject(end)
+        # Mouse placement is intentionally limited to 0.01 mm. The property
+        # editor remains full precision for users who enter dimensions directly.
+        first = tuple(_round_sketch_mm(coordinate * 1000) / 1000 for coordinate in unproject(start))
+        second = tuple(_round_sketch_mm(coordinate * 1000) / 1000 for coordinate in unproject(end))
         before = len(self.model["geometry"]["regions"])
         if tool == "rectangle":
             r_min, r_max = sorted((first[0], second[0]))
             z_min, z_max = sorted((first[1], second[1]))
             values = {
-                "r_min": r_min * 1000,
-                "z_min": z_min * 1000,
-                "width": (r_max - r_min) * 1000,
-                "height": (z_max - z_min) * 1000,
+                "r_min": _round_sketch_mm(r_min * 1000),
+                "z_min": _round_sketch_mm(z_min * 1000),
+                "width": _round_sketch_mm((r_max - r_min) * 1000),
+                "height": _round_sketch_mm((z_max - z_min) * 1000),
             }
         else:
             radius = math.hypot(second[0] - first[0], second[1] - first[1])
             values = {
-                "r_center": first[0] * 1000,
-                "z_center": first[1] * 1000,
-                "radius": radius * 1000,
+                "r_center": _round_sketch_mm(first[0] * 1000),
+                "z_center": _round_sketch_mm(first[1] * 1000),
+                "radius": _round_sketch_mm(radius * 1000),
             }
         for key, value in values.items():
             self._primitive_values[(tool, key)] = value
