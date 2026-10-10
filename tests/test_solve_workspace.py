@@ -317,6 +317,30 @@ def test_region_click_updates_selection_without_rebuilding_sketch_scene(standalo
     assert not workspace._edge_panel.ui_hidden
 
 
+def test_selecting_geometry_restores_its_inspector_after_another_section(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region_id = workspace.model["geometry"]["regions"][0]["id"]
+    edge_id = workspace.model["geometry"]["edges"][0]["id"]
+
+    workspace.select_section("materials")
+    assert workspace._inspector_view == "materials"
+
+    workspace.select_region(region_id)
+
+    assert workspace._inspector_view == "geometry"
+    assert tuple(workspace._inspector.ui_children) == tuple(workspace._geometry_inspector_children)
+    assert not workspace._region_panel.ui_hidden
+    assert {option["label"] for option in workspace._region_material_select.ui_options} >= {"Air", "Copper"}
+
+    workspace.select_section("materials")
+    workspace.select_edge(edge_id)
+
+    assert workspace._inspector_view == "geometry"
+    assert workspace._region_panel.ui_hidden
+    assert not workspace._edge_panel.ui_hidden
+
+
 def test_region_properties_explain_the_current_sketch_constraint_scope(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")

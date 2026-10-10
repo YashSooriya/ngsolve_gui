@@ -1516,7 +1516,10 @@ class SolveWorkspace(Div):
         self.active_section = "geometry"
         self.layout["active_section"] = self.active_section
         self._update_model_tree_selection()
-        self._update_geometry_inspector()
+        if self._inspector_view != "geometry":
+            self._render_inspector()
+        else:
+            self._update_geometry_inspector()
         self._sync_canvas_selection()
         self._render_canvas_dimensions()
 
@@ -1536,7 +1539,10 @@ class SolveWorkspace(Div):
         self.active_section = "geometry"
         self.layout["active_section"] = self.active_section
         self._update_model_tree_selection()
-        self._update_geometry_inspector()
+        if self._inspector_view != "geometry":
+            self._render_inspector()
+        else:
+            self._update_geometry_inspector()
         self._sync_canvas_selection()
         self._render_canvas_dimensions()
 
