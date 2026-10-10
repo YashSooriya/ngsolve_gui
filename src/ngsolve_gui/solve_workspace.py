@@ -227,7 +227,8 @@ class SolveWorkspace(Div):
         self._messages_panel = Div(ui_hidden=True, ui_style="max-height:180px; flex:none; overflow:auto; border-top:1px solid var(--border); background:var(--surface); padding:8px 14px;")
         self._canvas_host = Div(
             self._canvas,
-            ui_style="display:flex; flex:1 1 auto; flex-direction:column; min-width:0; min-height:0; overflow:hidden;",
+            ui_class="relative-position",
+            ui_style="position:relative; display:flex; flex:1 1 auto; flex-direction:column; min-width:0; min-height:0; overflow:hidden;",
         )
         tree_header = Div(
             Div("MODEL TREE", ui_style="font-size:11px; font-weight:700; letter-spacing:.08em;"),
@@ -2795,7 +2796,7 @@ class SolveWorkspace(Div):
         renderers.extend([axes, navigation_cube])
 
         preview = WebgpuComponent(
-            ui_style="display:block; flex:1 1 auto; width:100%; height:100%; min-width:0; min-height:0;",
+            ui_style="position:absolute; inset:0; display:block; width:100%; height:100%; min-width:0; min-height:0;",
         )
         preview.ui_class = "fit"
         scene = preview.draw(renderers)
