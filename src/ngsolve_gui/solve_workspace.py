@@ -13,7 +13,21 @@ from decimal import Decimal, ROUND_HALF_UP
 from threading import Lock, Timer, get_ident
 from pathlib import Path
 
-from ngapp.components import Component, Div, QBtn, QCheckbox, QDialog, QInput, QSelect, QSeparator, QTooltip, QCard, QCardSection, QSplitter
+from ngapp.components import (
+    Component,
+    Div,
+    QBtn,
+    QCheckbox,
+    QDialog,
+    QInput,
+    QSelect,
+    QSeparator,
+    QTooltip,
+    QCard,
+    QCardSection,
+    QSplitter,
+    QResizeObserver,
+)
 from ngapp.utils import EnvironmentType, get_environment
 
 from . import cerbsim_style as cb
@@ -299,6 +313,8 @@ class SolveWorkspace(Div):
         self.snap_to_grid = False
         self._view_center = None
         self._view_world_width = None
+        self._canvas_width = 900
+        self._canvas_height = 640
         self._inspector_view = None
         self._geometry_inspector_ready = False
         self._tree_entry_buttons = {}
@@ -321,7 +337,7 @@ class SolveWorkspace(Div):
         self._preview_3d_component = None
 
         self._canvas_background = _svg(
-            "rect", x=0, y=0, width=900, height=640,
+            "rect", x=0, y=0, width=self._canvas_width, height=self._canvas_height,
             fill="var(--canvas-bg, #f4f6f8)",
         )
         self._canvas_grid = Component("g")
@@ -416,8 +432,11 @@ class SolveWorkspace(Div):
             ui_style="display:flex; flex-direction:column; flex:0 0 170px; min-height:0; overflow:hidden; border-top:1px solid var(--border); background:var(--surface);",
         )
         self._messages_panel = Div(ui_hidden=True, ui_style="max-height:180px; flex:none; overflow:auto; border-top:1px solid var(--border); background:var(--surface); padding:8px 14px;")
+        self._canvas_resize_observer = QResizeObserver(ui_debounce=80)
+        self._canvas_resize_observer.on_resize(self._on_canvas_resize)
         self._canvas_host = Div(
             self._canvas,
+            self._canvas_resize_observer,
             ui_class="relative-position",
             ui_style="position:relative; display:flex; flex:1 1 0%; height:0; flex-direction:column; min-width:0; min-height:0; overflow:hidden;",
         )
@@ -980,12 +999,29 @@ class SolveWorkspace(Div):
         self._save_canvas_view_to_layout()
         self.render_canvas()
 
-    @staticmethod
-    def _canvas_plot_bounds():
+    def _canvas_plot_bounds(self):
         # The sketch, grid, and axes use the complete SVG viewport. Coordinate
         # labels are drawn just inside its borders instead of reserving a
         # separate inset plot area.
-        return (0.0, 0.0, 900.0, 640.0)
+        return (0.0, 0.0, float(self._canvas_width), float(self._canvas_height))
+
+    def _on_canvas_resize(self, event):
+        """Reproject the sketch after the available viewport size changes."""
+        value = getattr(event, "value", None)
+        if not isinstance(value, dict):
+            return
+        try:
+            width = int(round(float(value["width"])))
+            height = int(round(float(value["height"])))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return
+        if width < 100 or height < 100:
+            return
+        if (width, height) == (self._canvas_width, self._canvas_height):
+            return
+        self._canvas_width = width
+        self._canvas_height = height
+        self.render_canvas()
 
     def _fit_canvas_world_view(self):
         plot = self._canvas_plot_bounds()
@@ -3660,7 +3696,9 @@ class SolveWorkspace(Div):
             pass
 
     def render_canvas(self):
-        width, height = 900, 640
+        width, height = self._canvas_width, self._canvas_height
+        _update_svg_props(self._canvas, **{"viewBox": f"0 0 {width} {height}"})
+        _update_svg_props(self._canvas_background, width=width, height=height)
         plot = self._canvas_plot_bounds()
         xy, unproject = self._canvas_projection()
         regions = self.model["geometry"]["regions"]
@@ -3930,7 +3968,7 @@ class SolveWorkspace(Div):
         """Toggle between the editable meridian canvas and read-only 3D view."""
         if self._preview_3d_active:
             self._preview_3d_active = False
-            self._canvas_host.ui_children = [self._canvas]
+            self._canvas_host.ui_children = [self._canvas, self._canvas_resize_observer]
             self._preview_3d_component = None
             self._preview_3d_button.ui_label = "Preview in 3D"
             self._preview_3d_button.ui_icon = "mdi-cube-scan"
@@ -3950,7 +3988,7 @@ class SolveWorkspace(Div):
             return
 
         self._preview_3d_component = preview
-        self._canvas_host.ui_children = [preview]
+        self._canvas_host.ui_children = [preview, self._canvas_resize_observer]
         self._preview_3d_active = True
         self._preview_3d_button.ui_label = "Exit 3D Preview"
         self._preview_3d_button.ui_icon = "mdi-cube-outline"

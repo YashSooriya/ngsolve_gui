@@ -389,7 +389,7 @@ def test_3d_preview_replaces_viewport_and_restores_editable_sketch(standalone_co
 
     assert workspace._preview_3d_active
     assert workspace._preview_3d_component is preview
-    assert workspace._canvas_host.ui_children == [preview]
+    assert workspace._canvas_host.ui_children == [preview, workspace._canvas_resize_observer]
     assert workspace._preview_3d_button.ui_label == "Exit 3D Preview"
     assert all(control.ui_hidden for control in workspace._sketch_view_controls)
 
@@ -397,7 +397,7 @@ def test_3d_preview_replaces_viewport_and_restores_editable_sketch(standalone_co
 
     assert not workspace._preview_3d_active
     assert workspace._preview_3d_component is None
-    assert workspace._canvas_host.ui_children == [original_canvas]
+    assert workspace._canvas_host.ui_children == [original_canvas, workspace._canvas_resize_observer]
     assert workspace._preview_3d_button.ui_label == "Preview in 3D"
     assert all(not control.ui_hidden for control in workspace._sketch_view_controls)
 
@@ -532,7 +532,7 @@ def test_3d_preview_failure_keeps_editable_sketch_active(standalone_components):
     workspace.toggle_3d_preview()
 
     assert not workspace._preview_3d_active
-    assert workspace._canvas_host.ui_children == [workspace._canvas]
+    assert workspace._canvas_host.ui_children == [workspace._canvas, workspace._canvas_resize_observer]
     assert workspace._preview_3d_button.ui_label == "Preview in 3D"
     assert "invalid profile" in workspace.message
 
@@ -1344,6 +1344,23 @@ def test_sketch_axes_and_grid_fill_the_responsive_viewport(standalone_components
     assert (rotation_axis._props["x1"], rotation_axis._props["x2"]) == (plot[0], plot[0])
     assert (rotation_axis._props["y1"], rotation_axis._props["y2"]) == (plot[1], plot[3])
     assert (zero_height_axis._props["x1"], zero_height_axis._props["x2"]) == (plot[0], plot[2])
+
+
+def test_sketch_reprojects_to_resized_viewport_without_distorting_geometry(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._on_canvas_resize(SimpleNamespace(value={"width": 1200.4, "height": 600.2}))
+
+    assert workspace._canvas_width == 1200
+    assert workspace._canvas_height == 600
+    assert workspace._canvas._props["viewBox"] == "0 0 1200 600"
+    assert workspace._canvas_background._props["width"] == 1200
+    assert workspace._canvas_background._props["height"] == 600
+    assert workspace._canvas_plot_bounds() == (0.0, 0.0, 1200.0, 600.0)
+
+    project, _ = workspace._canvas_projection()
+    radial_scale = (project((0.01, 0.0))[0] - project((0.0, 0.0))[0]) / 0.01
+    axial_scale = (project((0.0, 0.01))[1] - project((0.0, 0.0))[1]) / 0.01
+    assert radial_scale == pytest.approx(-axial_scale)
 
 
 def test_default_axisymmetric_fit_centres_z_zero_for_positive_z_geometry(standalone_components):
