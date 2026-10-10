@@ -891,8 +891,8 @@ class SolveWorkspace(Div):
         script = r"""
 (() => {
   window.__ngsolveSketchTool = '__SKETCH_TOOL__';
-  if (window.__ngsolveSketchPointerCaptureVersion === 3) return;
-  window.__ngsolveSketchPointerCaptureVersion = 3;
+  if (window.__ngsolveSketchPointerCaptureVersion === 4) return;
+  window.__ngsolveSketchPointerCaptureVersion = 4;
   let active = false;
   let activePointerId = null;
   let dragStart = null;
@@ -911,6 +911,7 @@ class SolveWorkspace(Div):
   let visualTranslateX = 0;
   let visualTranslateY = 0;
   let viewVersion = 0;
+  const committedRegionOffsets = new Map();
   window.__ngsolveSketchViewTransform = [1, 0, 0, viewVersion];
   window.__ngsolveSketchCompletedGesture = null;
   const pointerEvents = window.__ngsolveSketchPointerEvents = [];
@@ -949,6 +950,14 @@ class SolveWorkspace(Div):
       const group = svg.querySelector('#' + id);
       if (group) group.removeAttribute('transform');
     }
+    for (const regionId of committedRegionOffsets.keys()) {
+      for (const shape of svg.querySelectorAll('[data-sketch-region-id]')) {
+        if (shape.getAttribute('data-sketch-region-id') === regionId) {
+          shape.removeAttribute('transform');
+        }
+      }
+    }
+    committedRegionOffsets.clear();
   };
   const remember = (event) => {
     window.__ngsolveSketchPointer = [event.clientX, event.clientY];
@@ -985,18 +994,29 @@ class SolveWorkspace(Div):
     const mapped = point.matrixTransform(matrix.inverse());
     return [mapped.x, mapped.y];
   };
-  const clearPreview = (svg = currentSvg(), resetView = true) => {
+  const setRegionOffset = (svg, regionId, offset) => {
+    if (!svg || !regionId) return;
+    for (const shape of svg.querySelectorAll('[data-sketch-region-id]')) {
+      if (shape.getAttribute('data-sketch-region-id') !== regionId) continue;
+      if (offset && (offset[0] !== 0 || offset[1] !== 0)) {
+        shape.setAttribute('transform', `translate(${offset[0]} ${offset[1]})`);
+      } else {
+        shape.removeAttribute('transform');
+      }
+    }
+  };
+  const clearPreview = (svg = currentSvg(), resetView = true, preserveCommitted = false) => {
     if (!svg) return;
     for (const id of ['solve-sketch-drag-rect', 'solve-sketch-drag-circle']) {
       const shape = svg.querySelector('#' + id);
       if (shape) shape.setAttribute('display', 'none');
     }
     if (dragRegionId) {
-      for (const shape of svg.querySelectorAll('[data-sketch-region-id]')) {
-        if (shape.getAttribute('data-sketch-region-id') === dragRegionId) {
-          shape.removeAttribute('transform');
-        }
-      }
+      setRegionOffset(
+        svg,
+        dragRegionId,
+        preserveCommitted ? committedRegionOffsets.get(dragRegionId) || null : null,
+      );
     }
     window.__ngsolveSketchLastRegionId = null;
     if (resetView) resetCanvasTransform(svg);
@@ -1032,10 +1052,13 @@ class SolveWorkspace(Div):
       const quantize = (value) => Math.sign(value) * Math.round(Math.abs(value) / step) * step;
       const dx = grid && grid.enabled ? end[0] - start[0] : quantize(end[0] - start[0]);
       const dy = grid && grid.enabled ? end[1] - start[1] : quantize(end[1] - start[1]);
+      const baseOffset = committedRegionOffsets.get(dragRegionId) || [0, 0];
       for (const shape of svg.querySelectorAll('[data-sketch-region-id]')) {
         if (shape.getAttribute('data-sketch-region-id') === dragRegionId) {
-          if (dx === 0 && dy === 0) shape.removeAttribute('transform');
-          else shape.setAttribute('transform', `translate(${dx} ${dy})`);
+          const totalX = baseOffset[0] + dx;
+          const totalY = baseOffset[1] + dy;
+          if (totalX === 0 && totalY === 0) shape.removeAttribute('transform');
+          else shape.setAttribute('transform', `translate(${totalX} ${totalY})`);
         }
       }
       return;
@@ -1093,12 +1116,12 @@ class SolveWorkspace(Div):
   };
   const beginGesture = (event, svg) => {
     if (!targetIsSvg(event, svg) || event.button !== 0 || event.isPrimary === false) return;
-    if (active) clearPreview(svg, false);
+    if (active) clearPreview(svg, false, true);
     window.__ngsolveSketchCompletedGesture = null;
     active = true;
     activePointerId = event.pointerId === undefined ? null : event.pointerId;
     gestureNumber += 1;
-    clearPreview(svg, false);
+    clearPreview(svg, false, true);
     const screenStart = svgPoint(svg, event);
     dragStartScreen = screenStart;
     dragBaseScale = visualScale;
@@ -1153,6 +1176,7 @@ class SolveWorkspace(Div):
     const moved = Boolean(!cancelled && dragStartScreen && screenPoint
       && Math.hypot(screenPoint[0] - dragStartScreen[0], screenPoint[1] - dragStartScreen[1]) >= 4);
     const finishedGesture = gestureNumber;
+    const finishedRegionId = dragMode === 'region' ? dragRegionId : null;
     const preserveVisual = moved && ['draw', 'pan', 'region'].includes(dragMode);
     const shouldForward = active && !targetIsSvg(event, svg) && event.type !== 'pointercancel';
     if (!cancelled && dragStartScreen && screenPoint) {
@@ -1181,7 +1205,11 @@ class SolveWorkspace(Div):
     });
     if (!preserveVisual) clearPreview(svg, false);
     else window.setTimeout(() => {
-      if (gestureNumber === finishedGesture) clearPreview(svg, false);
+      if (gestureNumber === finishedGesture) {
+        clearPreview(svg, false, Boolean(
+          finishedRegionId && committedRegionOffsets.has(finishedRegionId)
+        ));
+      }
     }, 2500);
     if (shouldForward) {
       const forwarded = new MouseEvent('mouseup', {
@@ -1208,7 +1236,7 @@ class SolveWorkspace(Div):
     active = false;
     activePointerId = null;
     window.__ngsolveSketchGestureActive = false;
-    clearPreview(svg, false);
+    clearPreview(svg, false, true);
     svg.style.cursor = (window.__ngsolveSketchTool || 'select') === 'select' ? 'default' : 'crosshair';
     if (wasActive && notifyPython) {
       const cancelled = new PointerEvent('pointercancel', {
@@ -1221,6 +1249,39 @@ class SolveWorkspace(Div):
     }
   };
   window.__ngsolveCancelSketchGesture = () => cancelGesture(true);
+  window.__ngsolveCommitSketchRegionMove = (regionId, dx, dy) => {
+    if (!regionId || !Number.isFinite(dx) || !Number.isFinite(dy)) return;
+    const previous = committedRegionOffsets.get(regionId) || [0, 0];
+    const offset = [previous[0] + dx, previous[1] + dy];
+    committedRegionOffsets.set(regionId, offset);
+    const svg = currentSvg();
+    setRegionOffset(svg, regionId, offset);
+    const dimensions = svg && svg.querySelector('#solve-sketch-dimensions');
+    const selected = window.__ngsolveSketchSelectedRegionId;
+    if (dimensions && selected === regionId) {
+      if (offset[0] || offset[1]) dimensions.setAttribute('transform', `translate(${offset[0]} ${offset[1]})`);
+      else dimensions.removeAttribute('transform');
+    }
+  };
+  window.__ngsolveSyncSketchDimensionOffset = (regionId) => {
+    const svg = currentSvg();
+    const dimensions = svg && svg.querySelector('#solve-sketch-dimensions');
+    if (!dimensions) return;
+    window.__ngsolveSketchSelectedRegionId = regionId || null;
+    const offset = regionId ? committedRegionOffsets.get(regionId) : null;
+    if (offset && (offset[0] || offset[1])) dimensions.setAttribute('transform', `translate(${offset[0]} ${offset[1]})`);
+    else dimensions.removeAttribute('transform');
+  };
+  window.__ngsolveRollbackSketchRegionMove = (regionId) => {
+    const svg = currentSvg();
+    setRegionOffset(svg, regionId, committedRegionOffsets.get(regionId) || null);
+    const dimensions = svg && svg.querySelector('#solve-sketch-dimensions');
+    if (dimensions && window.__ngsolveSketchSelectedRegionId === regionId) {
+      const offset = committedRegionOffsets.get(regionId);
+      if (offset && (offset[0] || offset[1])) dimensions.setAttribute('transform', `translate(${offset[0]} ${offset[1]})`);
+      else dimensions.removeAttribute('transform');
+    }
+  };
   window.__ngsolveResetSketchPreview = () => {
     if (active) return;
     clearPreview(currentSvg());
@@ -1467,17 +1528,24 @@ class SolveWorkspace(Div):
             else:
                 self._canvas_drag = None
                 self._screen_to_svg = None
-                view_changed = self._commit_browser_canvas_view(view, render=False)
                 if moved and operation == "region" and region_id:
-                    self._move_region_from_canvas_drag(region_id, start, end)
+                    self._move_region_from_canvas_drag(region_id, start, end, preserve_canvas=True)
+                    # Interpret the pointer coordinates in the view that was
+                    # visible during the drag. If a wheel transform was still
+                    # pending, commit it after the region move and redraw once.
+                    if self._commit_browser_canvas_view(view, render=False):
+                        self.render_canvas()
                 elif moved and operation == "marquee":
+                    view_changed = self._commit_browser_canvas_view(view, render=False)
                     self._select_edges_in_canvas_box(start, end, additive=additive)
                     if view_changed:
                         self.render_canvas()
                 elif moved and operation == "pan":
+                    self._commit_browser_canvas_view(view, render=False)
                     # The pan has already been applied to the local SVG matrix.
                     self.render_canvas()
                 elif moved and operation == "draw":
+                    view_changed = self._commit_browser_canvas_view(view, render=False)
                     region_count = len(self.model["geometry"].get("regions", []))
                     self._create_region_from_canvas_drag(tool, start, end)
                     if len(self.model["geometry"].get("regions", [])) == region_count:
@@ -1485,7 +1553,7 @@ class SolveWorkspace(Div):
                             self.render_canvas()
                         else:
                             self._schedule_canvas_interaction_reset()
-                elif view_changed:
+                elif self._commit_browser_canvas_view(view, render=False):
                     self.render_canvas()
                 return
         drag = self._canvas_drag
@@ -1652,7 +1720,7 @@ class SolveWorkspace(Div):
         """Format a stored metre coordinate as a stable millimetre expression."""
         return format(value_m * 1000, ".12g")
 
-    def _move_region_from_canvas_drag(self, region_id, start, end):
+    def _move_region_from_canvas_drag(self, region_id, start, end, *, preserve_canvas=False):
         region = next(
             (item for item in self.model["geometry"]["regions"] if item["id"] == region_id),
             None,
@@ -1667,8 +1735,11 @@ class SolveWorkspace(Div):
         dr = _round_sketch_mm((end_world[0] - start_world[0]) * 1000) / 1000
         dz = _round_sketch_mm((end_world[1] - start_world[1]) * 1000) / 1000
         if dr == 0 and dz == 0:
-            self.render_canvas()
-            return
+            if preserve_canvas:
+                self._rollback_canvas_region_move(region_id)
+            else:
+                self.render_canvas()
+            return False
 
         old_shape = copy.deepcopy(region["shape"])
         old_vertices = copy.deepcopy(region["vertices"])
@@ -1722,8 +1793,14 @@ class SolveWorkspace(Div):
             with self._batch_frontend_updates():
                 self._refresh_model_tree()
                 self._render_inspector()
-                self.render_canvas()
+                if preserve_canvas:
+                    self._sync_canvas_selection()
+                    self._render_canvas_dimensions()
+                    self._commit_canvas_region_move(region_id, dr, dz)
+                else:
+                    self.render_canvas()
             self._message(f"Moved {region['name']} by {dr * 1000:g} mm radially and {dz * 1000:g} mm axially.")
+            return True
         except (ValueError, TypeError, OverflowError) as error:
             region["shape"] = old_shape
             region["vertices"] = old_vertices
@@ -1731,7 +1808,39 @@ class SolveWorkspace(Div):
             for item in self.model["geometry"]["regions"]:
                 item["parent_id"] = old_parents[item["id"]]
             self._message(str(error), error=True)
-            self.render_canvas()
+            if preserve_canvas:
+                self._rollback_canvas_region_move(region_id)
+            else:
+                self.render_canvas()
+            return False
+
+    def _commit_canvas_region_move(self, region_id, dr, dz):
+        """Keep the live SVG scene mounted and commit its region preview offset."""
+        project, _ = self._canvas_projection()
+        origin = project((0.0, 0.0))
+        moved = project((dr, dz))
+        dx, dy = moved[0] - origin[0], moved[1] - origin[1]
+        try:
+            self.js.eval(
+                "(() => { const commit = window.__ngsolveCommitSketchRegionMove; "
+                f"if (commit) commit({json.dumps(region_id)}, {dx!r}, {dy!r}); "
+                "})()"
+            )
+        except Exception:
+            # Standalone tests and non-browser frontends have no JS runtime.
+            pass
+
+    def _rollback_canvas_region_move(self, region_id):
+        """Restore the committed SVG offset when a proposed move is rejected."""
+        try:
+            self.js.eval(
+                "(() => { const rollback = window.__ngsolveRollbackSketchRegionMove; "
+                f"if (rollback) rollback({json.dumps(region_id)}); "
+                "})()"
+            )
+        except Exception:
+            # Standalone tests and non-browser frontends have no JS runtime.
+            pass
 
     def _message(self, text, error=False):
         self.message = str(text)
@@ -2334,7 +2443,18 @@ class SolveWorkspace(Div):
 
     def _render_canvas_dimensions(self):
         """Update selected dimensions without replacing the full sketch scene."""
-        self._canvas_dimensions.ui_children = self._canvas_dimension_components()
+        region = self._selected_region()
+        self._canvas_dimensions.ui_children = self._region_dimension_components(region)
+        region_id = region.get("id") if region else None
+        try:
+            self.js.eval(
+                "(() => { const sync = window.__ngsolveSyncSketchDimensionOffset; "
+                f"if (sync) sync({json.dumps(region_id)}); "
+                "})()"
+            )
+        except Exception:
+            # Standalone tests and non-browser frontends have no JS runtime.
+            pass
 
     def _build_geometry_inspector(self):
         self._geometry_empty_panel = Div(

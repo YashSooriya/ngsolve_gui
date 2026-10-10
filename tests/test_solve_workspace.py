@@ -315,6 +315,27 @@ def test_dragging_region_moves_shape_by_hundredth_mm_and_preserves_edge_assignme
     assert moved_edge["boundary_condition_ids"] == ["support"]
 
 
+def test_browser_region_move_keeps_canvas_mounted(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    before = region["shape"]["r_min"]
+    project, _ = workspace._canvas_projection()
+    rendered = []
+    monkeypatch.setattr(workspace, "render_canvas", lambda: rendered.append(True))
+    monkeypatch.setattr(workspace, "_refresh_model_tree", lambda: None)
+    monkeypatch.setattr(workspace, "_render_inspector", lambda: None)
+
+    moved = workspace._move_region_from_canvas_drag(
+        region["id"], project((0.004, 0.005)), project((0.0040146, 0.0050246)),
+        preserve_canvas=True,
+    )
+
+    assert moved is True
+    assert region["shape"]["r_min"] - before == pytest.approx(0.00001)
+    assert rendered == []
+
+
 def test_dragging_region_rejects_axis_crossing_and_restores_geometry(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
