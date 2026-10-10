@@ -290,7 +290,6 @@ class SolveWorkspace(Div):
             ui_style="width:min(420px, 100%); min-height:30px;",
         )
         self._model_title._props["title"] = "Double-click to rename this model"
-        self._model_title.on_focus(self._begin_model_rename)
         self._model_title.on("dblclick", self._begin_model_rename)
         self._model_title.on_update_model_value(self._update_model_rename_draft)
         self._model_title.on_blur(self._commit_model_rename)
