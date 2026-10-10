@@ -480,12 +480,16 @@ def test_grid_snap_toggle_snaps_sketch_points_to_grid_intersections(standalone_c
 def test_grid_snap_button_is_right_aligned_in_the_sketch_toolbar(standalone_components):
     workspace = SolveWorkspace()
     toolbar = workspace._canvas_panel.ui_children[0]
-    snap_button = toolbar.ui_slots["default"][-1]
+    slots = toolbar.ui_slots["default"]
+    snap_index = next(index for index, item in enumerate(slots) if getattr(item, "ui_icon", None) == "mdi-magnet")
+    fit_view_index = next(index for index, item in enumerate(slots) if getattr(item, "ui_label", None) == "Fit view")
+    snap_button = slots[snap_index]
 
     assert snap_button.ui_icon == "mdi-magnet"
     assert snap_button.ui_label == "Snap"
     assert "position:absolute" in snap_button.ui_style
     assert "right:8px" in snap_button.ui_style
+    assert snap_index < fit_view_index
 
 
 def test_added_model_parameter_is_listed_in_tree(standalone_components):
