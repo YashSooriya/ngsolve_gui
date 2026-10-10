@@ -809,6 +809,9 @@ def test_nested_region_labels_are_separated_and_stay_in_the_visible_shell(standa
     )
 
     project, _ = workspace._canvas_projection()
+    region_center = project((0.01, 0.0))
+    assert math.hypot(outer._props["x"] - region_center[0], outer._props["y"] - region_center[1]) >= 14.0
+    assert math.hypot(inner._props["x"] - region_center[0], inner._props["y"] - region_center[1]) >= 14.0
     child_points = [project(point) for point in workspace.model["geometry"]["regions"][1]["vertices"]]
     child_bounds = (
         min(point[0] for point in child_points),

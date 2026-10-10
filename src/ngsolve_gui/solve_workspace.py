@@ -2733,6 +2733,11 @@ class SolveWorkspace(Div):
                 sum(point[0] for point in polygon) / len(polygon),
                 sum(point[1] for point in polygon) / len(polygon),
             )
+            preferred = (
+                center[0],
+                top + (bottom - top) * 0.24,
+            )
+            minimum_center_offset = min(36.0, max(14.0, min(right - left, bottom - top) * 0.18))
             descendants = []
             pending = list(children[region_id])
             seen_descendants = set()
@@ -2747,7 +2752,7 @@ class SolveWorkspace(Div):
             def region_candidates():
                 nx = min(24, max(2, math.ceil((right - left) / 12)))
                 ny = min(24, max(2, math.ceil((bottom - top) / 12)))
-                candidates = {center}
+                candidates = {preferred}
                 for row in range(ny + 1):
                     y = top + (bottom - top) * row / ny
                     for column in range(nx + 1):
@@ -2755,10 +2760,16 @@ class SolveWorkspace(Div):
                         candidates.add((x, y))
                 return sorted(
                     candidates,
-                    key=lambda point: ((point[0] - center[0]) ** 2 + (point[1] - center[1]) ** 2, point[1], point[0]),
+                    key=lambda point: (
+                        (point[0] - preferred[0]) ** 2 + (point[1] - preferred[1]) ** 2,
+                        point[1],
+                        point[0],
+                    ),
                 )
 
             def acceptable(point, *, avoid_descendants):
+                if math.hypot(point[0] - center[0], point[1] - center[1]) < minimum_center_offset:
+                    return None
                 box = label_box(point, region.get("name", ""))
                 if not (plot[0] <= box[0] and box[1] <= plot[2] and plot[1] <= box[2] and box[3] <= plot[3]):
                     return None
@@ -2773,15 +2784,9 @@ class SolveWorkspace(Div):
             chosen = None
             candidate_grid = None
             for avoid_descendants in (True, False):
-                center_box = acceptable(center, avoid_descendants=avoid_descendants)
-                if center_box is not None:
-                    chosen = (center, center_box)
-                    break
                 if candidate_grid is None:
                     candidate_grid = region_candidates()
                 for point in candidate_grid:
-                    if point == center:
-                        continue
                     box = acceptable(point, avoid_descendants=avoid_descendants)
                     if box is not None:
                         chosen = (point, box)
@@ -2802,9 +2807,15 @@ class SolveWorkspace(Div):
                     for column in range(nx + 1)
                 ]
                 candidates.sort(
-                    key=lambda point: ((point[0] - center[0]) ** 2 + (point[1] - center[1]) ** 2, point[1], point[0])
+                    key=lambda point: (
+                        (point[0] - preferred[0]) ** 2 + (point[1] - preferred[1]) ** 2,
+                        point[1],
+                        point[0],
+                    )
                 )
                 for point in candidates:
+                    if math.hypot(point[0] - center[0], point[1] - center[1]) < minimum_center_offset:
+                        continue
                     box = label_box(point, region.get("name", ""))
                     if not (plot[0] <= box[0] and box[1] <= plot[2] and plot[1] <= box[2] and box[3] <= plot[3]):
                         continue
