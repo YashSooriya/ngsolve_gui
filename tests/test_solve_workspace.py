@@ -1111,21 +1111,14 @@ def test_region_names_are_not_drawn_inside_sketch_regions(standalone_components)
     )
 
 
-def test_empty_sketch_omits_the_create_region_prompt(standalone_components):
+def test_empty_sketch_has_no_centered_viewport_instruction(standalone_components):
     workspace = SolveWorkspace()
     text_nodes = [
         item for item in workspace._canvas_scene.ui_children
         if item._component_name == "text"
     ]
 
-    assert not any(
-        item._props.get("textContent", "").startswith("Choose Rectangle or Circle")
-        for item in text_nodes
-    )
-    assert any(
-        "Drag blank space to pan" in item._props.get("textContent", "")
-        for item in text_nodes
-    )
+    assert text_nodes == []
 
 
 def test_sketch_grid_labels_do_not_intercept_or_select_canvas_drags(standalone_components):

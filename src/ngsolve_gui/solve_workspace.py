@@ -213,11 +213,6 @@ class SolveWorkspace(Div):
         self._canvas_scene_component_ids = None
         self._canvas_region_nodes = {}
         self._canvas_edge_nodes = {}
-        self._canvas_empty_hint = _svg(
-            "text", x=450, y=338, text_anchor="middle",
-            fill="var(--fg-muted, #697586)", font_size="12",
-            children="Drag blank space to pan; hold Shift while dragging to select edges",
-        )
         self._canvas_preview = Component(
             "g",
             _svg(
@@ -3446,8 +3441,6 @@ class SolveWorkspace(Div):
         for edge_id in self._canvas_edge_nodes.keys() - live_edge_ids:
             del self._canvas_edge_nodes[edge_id]
 
-        if not regions:
-            scene_children.append(self._canvas_empty_hint)
         if grid_signature != self._canvas_grid_signature:
             self._canvas_grid.ui_children = grid_children
             self._canvas_grid_signature = grid_signature
