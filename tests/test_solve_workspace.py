@@ -1,4 +1,5 @@
 import copy
+import json
 import math
 import sys
 from types import ModuleType, SimpleNamespace
@@ -10,7 +11,7 @@ from ngapp.components import Div
 
 from ngsolve_gui.app import NGSolveGui
 from ngsolve_gui.axisymmetric_model import builtin_materials
-from ngsolve_gui.solve_workspace import SolveWorkspace
+from ngsolve_gui.solve_workspace import SolveWorkspace, _load_saved_run_history
 
 
 @pytest.fixture
@@ -277,6 +278,75 @@ def test_study_opens_solver_log_and_close_button_minimises_it(standalone_compone
     workspace.run_study_action()
     assert run_observations == [True]
     assert not workspace._log_visible
+
+
+def test_solver_job_can_be_cancelled_and_is_recorded(standalone_components):
+    cancelled = []
+    workspace = SolveWorkspace(on_run=lambda: None, on_cancel=lambda: cancelled.append(True))
+    workspace.validation_errors = lambda: []
+    workspace.run_study_action()
+
+    assert workspace._job_active
+    assert not workspace._cancel_button.ui_hidden
+    workspace._cancel_solver_job()
+    assert cancelled == [True]
+    assert workspace._cancel_button.ui_label == "Stopping…"
+
+    workspace.finish_solver_job(
+        "Study cancelled", cancelled=True, run_kind="Study", run_name="Study: test"
+    )
+    assert not workspace._job_active
+    assert workspace._cancel_button.ui_hidden
+    assert workspace.runs[-1]["status"] == "Cancelled"
+
+
+def test_saved_run_history_recovers_manifest_and_marks_running_as_interrupted(tmp_path):
+    run_dir = tmp_path / "nested_model"
+    run_dir.mkdir()
+    (run_dir / "run_manifest.json").write_text(json.dumps({
+        "schema": "mm-fem.run",
+        "kind": "study",
+        "status": "running",
+        "model_name": "Nested model",
+        "created_utc": "2026-10-10T12:00:00+00:00",
+    }), encoding="utf-8")
+
+    runs = _load_saved_run_history(tmp_path)
+
+    assert runs == [{
+        "name": "Study: Nested model",
+        "kind": "Study",
+        "status": "Interrupted",
+        "finished": "2026-10-10T12:00:00+00:00",
+        "output_path": str(run_dir),
+    }]
+
+
+def test_run_history_exposes_a_frequency_selector_for_sweep_fields(standalone_components, tmp_path):
+    fields_dir = tmp_path / "run" / "ngsolve_gui" / "fields"
+    fields_dir.mkdir(parents=True)
+    for name in ("B_DC.pkl", "B_AC_001_250Hz.pkl", "B_AC_002_500Hz.pkl"):
+        (fields_dir / name).touch()
+    run = {
+        "name": "Study: frequency sweep",
+        "kind": "Study",
+        "status": "Complete",
+        "finished": "now",
+        "output_path": str(fields_dir.parents[1]),
+    }
+    workspace = SolveWorkspace(on_open_file=lambda path: None)
+    workspace.runs = [run]
+
+    properties = workspace._run_properties()
+    frequency_select = next(
+        item for item in properties
+        if getattr(item, "ui_label", None) == "Frequency"
+    )
+    assert [option["value"] for option in frequency_select.ui_options] == ["250", "500"]
+    assert run["selected_frequency_hz"] == "250"
+
+    workspace._set_run_frequency(run, "500")
+    assert run["selected_frequency_hz"] == "500"
 
 
 def test_3d_preview_replaces_viewport_and_restores_editable_sketch(standalone_components):

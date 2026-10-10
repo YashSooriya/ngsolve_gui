@@ -50,6 +50,51 @@ _TREE_GROUPS = (
     ("RESULTS", ("runs",)),
 )
 
+_FREQUENCY_RESULT_SUFFIX = re.compile(r"_\d+_([0-9.eE+-]+)Hz$", re.IGNORECASE)
+
+
+def _load_saved_run_history(root=None, limit=40):
+    """Recover prior GUI runs from their manifests or legacy output folders."""
+    root = Path(root) if root is not None else Path.home() / "NGSolve_results"
+    try:
+        directories = [path for path in root.iterdir() if path.is_dir()]
+        directories.sort(key=lambda path: path.stat().st_mtime)
+    except OSError:
+        return []
+
+    runs = []
+    for directory in directories[-max(1, int(limit)):]:
+        manifest_path = directory / "run_manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            manifest = None
+        if isinstance(manifest, dict) and manifest.get("schema") == "mm-fem.run":
+            kind = str(manifest.get("kind", "study")).title()
+            status = str(manifest.get("status", "complete")).title()
+            if status == "Running":
+                status = "Interrupted"
+            name = str(manifest.get("run_name") or f"{kind}: {manifest.get('model_name', directory.name)}")
+            finished = str(manifest.get("finished_utc") or manifest.get("created_utc") or "")
+        else:
+            has_project = any(directory.glob("*.ngsmodel"))
+            fields = list((directory / "ngsolve_gui" / "fields").glob("*.pkl")) if (directory / "ngsolve_gui" / "fields").is_dir() else []
+            has_mesh = (directory / "mesh.vol").is_file() or (directory / "mesh_preview.json").is_file()
+            if not (has_project or fields or has_mesh):
+                continue
+            kind = "Study" if fields else "Mesh"
+            status = "Complete" if fields or has_mesh else "Interrupted"
+            name = f"{kind}: {directory.name.rsplit('_', 1)[0]}"
+            finished = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(directory.stat().st_mtime))
+        runs.append({
+            "name": name,
+            "kind": kind,
+            "status": status,
+            "finished": finished,
+            "output_path": str(directory),
+        })
+    return runs
+
 _MATERIAL_COLORS = ["#6886ac", "#d58651", "#69a77b", "#ae8bb7", "#d1b44f", "#4cabb0"]
 
 
@@ -161,7 +206,7 @@ def _section_title(title, subtitle=None):
 class SolveWorkspace(Div):
     """Editable axisymmetric r-z model with a selectable sketch viewport."""
 
-    def __init__(self, on_log=None, on_run=None, on_mesh=None, on_open_file=None, on_history_change=None):
+    def __init__(self, on_log=None, on_run=None, on_mesh=None, on_open_file=None, on_history_change=None, on_cancel=None):
         self.model = new_model()
         self.studies = new_studies()
         self.layout = {"schema_version": 1, "active_section": "geometry", "camera": "fit"}
@@ -170,6 +215,8 @@ class SolveWorkspace(Div):
         self.on_mesh = on_mesh
         self.on_open_file = on_open_file
         self.on_history_change = on_history_change
+        self.on_cancel = on_cancel
+        self._job_active = False
         self._undo_history = []
         self._redo_history = []
         self._history_transaction_depth = 0
@@ -182,7 +229,7 @@ class SolveWorkspace(Div):
         self.message_is_error = False
         self._log_visible = False
         self._log_messages = ["Axisymmetric model editor ready."]
-        self.runs = []
+        self.runs = _load_saved_run_history()
         self.mesh_preview_edges = []
         self.mesh_preview_visible = False
         self.selected_material_id = None
@@ -448,6 +495,11 @@ class SolveWorkspace(Div):
             color="primary",
             tooltip="Check the full setup, then run the selected study.",
         )
+        self._cancel_button = _button(
+            "Cancel run", "mdi-stop-circle-outline", self._cancel_solver_job,
+            color="negative", tooltip="Stop the active mesh or solver job.",
+        )
+        self._cancel_button.ui_hidden = True
 
         self._status_text = Div(self.message, ui_style="overflow:hidden; text-overflow:ellipsis; font-size:11px;")
         self._messages_button = QBtn(QTooltip("Show setup issues and validation results"), ui_icon="mdi-message-alert-outline", ui_label="Messages", ui_flat=True, ui_dense=True, ui_no_caps=True)
@@ -475,6 +527,7 @@ class SolveWorkspace(Div):
             self._validate_button,
             self._mesh_button,
             self._run_button,
+            self._cancel_button,
             ui_style="display:flex; align-items:center; gap:8px; flex:none; min-height:40px; padding:4px 12px; border-bottom:1px solid var(--border); background:var(--surface);",
         )
         self._content = Div(
@@ -627,7 +680,6 @@ class SolveWorkspace(Div):
         self._notify_history_changed()
         self.layout = copy.deepcopy(layout or {"schema_version": 1, "active_section": "geometry", "camera": "fit"})
         self._load_canvas_view_from_layout()
-        self.runs = []
         self.selected_material_id = None
         self.selected_boundary_id = None
         self.selected_parameter_id = None
@@ -2936,11 +2988,16 @@ class SolveWorkspace(Div):
             children.append(Div("No mesh or solver runs yet.", ui_style="font-size:12px; color:var(--fg-muted);"))
             return children
         for run in reversed(self.runs):
-            status_color = "var(--negative)" if run["status"] == "Failed" else "var(--positive)"
+            status = run.get("status", "Complete")
+            status_color = (
+                "var(--negative)" if status == "Failed"
+                else "var(--warning)" if status in {"Cancelled", "Interrupted"}
+                else "var(--positive)"
+            )
             children.append(Div(
                 Div(
                     Div(run["name"], ui_style="font-weight:600; font-size:12px; overflow-wrap:anywhere;"),
-                    Div(run["status"], ui_style=f"color:{status_color}; font-size:11px; font-weight:600;"),
+                    Div(status, ui_style=f"color:{status_color}; font-size:11px; font-weight:600;"),
                     ui_style="display:flex; justify-content:space-between; gap:8px;",
                 ),
                 Div(run["finished"], ui_style="font-size:10px; color:var(--fg-muted); margin-top:4px;"),
@@ -2952,7 +3009,46 @@ class SolveWorkspace(Div):
                 field_files = sorted(fields_dir.glob("*.pkl")) if fields_dir.is_dir() else []
             except OSError:
                 field_files = []
+            frequency_by_file = {}
             for field_file in field_files:
+                match = _FREQUENCY_RESULT_SUFFIX.search(field_file.stem)
+                if match:
+                    frequency_by_file[field_file] = match.group(1)
+            frequencies = sorted(
+                set(frequency_by_file.values()),
+                key=lambda value: (float(value), value),
+            )
+            selected_frequency = str(
+                run.get("selected_frequency_hz")
+                or (frequencies[0] if frequencies else "")
+            )
+            if frequencies:
+                run["selected_frequency_hz"] = selected_frequency
+            if len(frequencies) > 1:
+                frequency_select = QSelect(
+                    ui_label="Frequency",
+                    ui_options=[
+                        {"label": f"{frequency} Hz", "value": frequency}
+                        for frequency in frequencies
+                    ],
+                    ui_option_label="label",
+                    ui_option_value="value",
+                    ui_model_value=selected_frequency,
+                    ui_emit_value=True,
+                    ui_map_options=True,
+                    ui_dense=True,
+                    ui_filled=True,
+                )
+                frequency_select.on_update_model_value(
+                    lambda event, selected_run=run: self._set_run_frequency(
+                        selected_run, event.value
+                    )
+                )
+                children.append(frequency_select)
+            for field_file in field_files:
+                frequency = frequency_by_file.get(field_file)
+                if frequency and len(frequencies) > 1 and frequency != selected_frequency:
+                    continue
                 if self.on_open_file:
                     children.append(Div(
                         Div(field_file.name, ui_style="font-size:11px; overflow-wrap:anywhere; flex:1;"),
@@ -2960,6 +3056,11 @@ class SolveWorkspace(Div):
                         ui_style="display:flex; align-items:center; gap:6px; padding:3px 6px 3px 12px;",
                     ))
         return children
+
+    def _set_run_frequency(self, run, frequency):
+        run["selected_frequency_hz"] = str(frequency)
+        if self.active_section == "runs":
+            self._render_inspector()
 
     def _geometry_properties(self):
         region = self._selected_region()
@@ -4124,8 +4225,13 @@ class SolveWorkspace(Div):
             self._message(f"Mesh setup found {len(errors)} issue{'s' if len(errors) != 1 else ''}.", error=True)
             return
         if self.on_mesh:
+            if not self.begin_solver_job("Mesh"):
+                return
             self._mesh_button.ui_loading = True
-            self.on_mesh()
+            try:
+                self.on_mesh()
+            except Exception as error:
+                self.finish_solver_job(f"Could not start mesh generation: {error}", error=True)
         else:
             self._message("Mesh generation is unavailable in this environment.", error=True)
 
@@ -4173,23 +4279,59 @@ class SolveWorkspace(Div):
             self._message(f"Study setup found {len(errors)} issue{'s' if len(errors) != 1 else ''}.", error=True)
             return
         if self.on_run:
+            if not self.begin_solver_job("Study"):
+                return
             self._run_button.ui_loading = True
-            self.show_log()
-            self.on_run()
+            try:
+                self.on_run()
+            except Exception as error:
+                self.finish_solver_job(f"Could not start the study: {error}", error=True)
         else:
             self._message("The solver is unavailable in this environment.", error=True)
 
-    def finish_solver_job(self, message, error=False, *, run_kind=None, output_path=None, run_name=None, mesh_preview_edges=None):
+    def begin_solver_job(self, kind):
+        """Mark the mesh/study job active and expose cancellation controls."""
+        if self._job_active:
+            self._message("A mesh or solver job is already running.", error=True)
+            return False
+        self._job_active = True
+        self._active_job_kind = str(kind)
+        self._cancel_button.ui_hidden = False
+        self._cancel_button.ui_disable = False
+        self._cancel_button.ui_label = "Cancel run"
+        self.show_log()
+        return True
+
+    def _cancel_solver_job(self, *args):
+        if not self._job_active or not self.on_cancel:
+            return
+        self.mark_solver_cancel_requested()
+        self.on_cancel()
+
+    def mark_solver_cancel_requested(self):
+        if not self._job_active:
+            return
+        self._cancel_button.ui_label = "Stopping…"
+        self._cancel_button.ui_disable = True
+        self._message("Stopping the active solver job…")
+
+    def finish_solver_job(self, message, error=False, *, cancelled=False, run_kind=None, output_path=None, run_name=None, mesh_preview_edges=None):
         self._mesh_button.ui_loading = False
         self._run_button.ui_loading = False
+        self._job_active = False
+        self._active_job_kind = None
+        self._cancel_button.ui_hidden = True
+        self._cancel_button.ui_disable = False
+        self._cancel_button.ui_label = "Cancel run"
         self._message(message, error=error)
         if not error and mesh_preview_edges is not None:
             self.set_mesh_preview(mesh_preview_edges)
         if run_kind:
+            status = "Failed" if error else "Cancelled" if cancelled else "Complete"
             self.runs.append({
                 "name": run_name or run_kind,
                 "kind": run_kind,
-                "status": "Failed" if error else "Complete",
+                "status": status,
                 "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "output_path": str(output_path or ""),
             })

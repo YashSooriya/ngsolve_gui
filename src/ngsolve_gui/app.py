@@ -3,10 +3,11 @@ import sys
 import threading
 import time
 import copy
-import contextlib
 import io
+import json
 import re
-import importlib.util
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ngapp.app import App
@@ -388,6 +389,11 @@ class NGSolveGui(App):
         self._local_path = local_path
         self.script_args = list(script_args or [])
         self.app_data = AppData()
+        self._solver_job_lock = threading.RLock()
+        self._solver_process = None
+        self._solver_job_active = False
+        self._solver_cancel_requested = False
+        self._solver_run_context = None
 
         # -- Toolbar buttons (compact flat icon buttons, muted like the designer) --
         def _tbtn(icon, tip, handler=None):
@@ -528,6 +534,7 @@ class NGSolveGui(App):
         self.solve_workspace = SolveWorkspace(
             on_run=lambda: self._run_axisymmetric_solver(mesh_only=False),
             on_mesh=lambda: self._run_axisymmetric_solver(mesh_only=True),
+            on_cancel=self._cancel_axisymmetric_solver,
             on_open_file=self._open_run_result,
             on_history_change=self._refresh_solve_history_controls,
         )
@@ -722,66 +729,156 @@ class NGSolveGui(App):
             self.solve_workspace._message(f"Load failed: {error}", error=True)
 
     def _run_axisymmetric_solver(self, *, mesh_only=False):
-        """Run a saved model on the machine hosting this GUI, off the UI thread."""
+        """Run a saved model in a cancellable child process on this computer."""
         workspace = self.solve_workspace
+        run_kind = "Mesh" if mesh_only else "Study"
+        run_name = f"{run_kind}: {workspace.model.get('name', 'axisymmetric model')}"
+        with self._solver_job_lock:
+            if self._solver_job_active:
+                workspace._message("A mesh or solver job is already running.", error=True)
+                return
+            self._solver_job_active = True
+            self._solver_cancel_requested = False
+            self._solver_process = None
+
         model = copy.deepcopy(workspace.model)
         studies = copy.deepcopy(workspace.studies)
         layout = copy.deepcopy(workspace.layout)
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        model_name = re.sub(r"[^A-Za-z0-9_-]+", "_", model.get("name", "axisymmetric_model")).strip("_") or "axisymmetric_model"
+        model_name = re.sub(
+            r"[^A-Za-z0-9_-]+", "_", model.get("name", "axisymmetric_model")
+        ).strip("_") or "axisymmetric_model"
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         output_dir = Path.home() / "NGSolve_results" / f"{model_name}_{stamp}"
-        output_dir.mkdir(parents=True, exist_ok=True)
         model_path = output_dir / f"{model_name}.ngsmodel"
-
         try:
-            from .axisymmetric_model import evaluate_expression
-
-            h_global = evaluate_expression(model.get("mesh", {}).get("element_size", "0.01"), {
-                item["name"]: item["expression"] for item in model.get("parameters", [])
-            })
-            if h_global <= 0:
-                raise ValueError("Target element size must be positive")
+            solver_root = self._find_solver_root()
+            runner = solver_root / "scripts" / "run_gui_model.py"
+            if not runner.is_file():
+                raise FileNotFoundError(
+                    f"The solver checkout is missing its GUI runner: {runner}"
+                )
+            output_dir.mkdir(parents=True, exist_ok=False)
             model_path.write_bytes(package_model(model, studies, layout))
+            manifest = {
+                "schema": "mm-fem.run",
+                "schema_version": 1,
+                "status": "running",
+                "kind": "mesh" if mesh_only else "study",
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+                "model_archive": model_path.name,
+                "output_path": str(output_dir),
+                "model_name": model.get("name", "axisymmetric model"),
+                "physics": copy.deepcopy(model.get("physics", {})),
+                "mesh_settings": copy.deepcopy(model.get("mesh", {})),
+                "solver_settings": copy.deepcopy(model.get("solver", {})),
+                "studies": copy.deepcopy(studies.get("studies", [])),
+            }
+            self._write_run_manifest(output_dir, manifest)
         except Exception as error:
-            workspace.finish_solver_job(f"Could not prepare solver input: {error}", error=True)
+            with self._solver_job_lock:
+                self._solver_job_active = False
+            workspace.finish_solver_job(
+                f"Could not prepare solver input: {error}",
+                error=True,
+                run_kind=run_kind,
+                run_name=run_name,
+                output_path=output_dir,
+            )
             return
 
-        workspace._message(("Generating mesh" if mesh_only else "Running study") + f" in {output_dir}")
+        workspace._message(
+            ("Generating mesh" if mesh_only else "Running study")
+            + f" in {output_dir}"
+        )
 
         def run_job():
             log_buffer = _WorkspaceLogBuffer(workspace)
+            log_path = output_dir / "solver.log"
+            process = None
             try:
-                solver_root = self._find_solver_root()
-                solver_entry = solver_root / "main.py"
-                if not solver_entry.is_file():
-                    raise FileNotFoundError(
-                        "Could not find the coupled_solver checkout containing main.py. "
-                        "Open NGSolve GUI from the coupled_solver directory."
+                command = [
+                    sys.executable,
+                    str(runner),
+                    "--model",
+                    str(model_path),
+                    "--output-dir",
+                    str(output_dir),
+                    "--kind",
+                    "mesh" if mesh_only else "study",
+                ]
+                popen_options = {
+                    "cwd": str(solver_root),
+                    "stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.STDOUT,
+                    "text": True,
+                    "encoding": "utf-8",
+                    "errors": "replace",
+                    "bufsize": 1,
+                }
+                if os.name == "nt":
+                    popen_options["creationflags"] = getattr(
+                        subprocess, "CREATE_NO_WINDOW", 0
                     )
-                root_text = str(solver_root)
-                src_text = str(solver_root / "src")
-                for entry in (root_text, src_text):
-                    if entry not in sys.path:
-                        sys.path.insert(0, entry)
-                spec = importlib.util.spec_from_file_location("_ngsolve_gui_solver_main", solver_entry)
-                if spec is None or spec.loader is None:
-                    raise ImportError(f"Could not load solver entry point: {solver_entry}")
-                solver_module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(solver_module)
-                with contextlib.redirect_stdout(log_buffer), contextlib.redirect_stderr(log_buffer):
-                    result = solver_module.main(
-                        h_global=h_global,
-                        p=int(model.get("mesh", {}).get("polynomial_order", 3)),
-                        problem_name=str(model_path),
-                        h_local=h_global,
-                        dt=1e-3,
-                        output_path=str(output_dir),
-                        mesh_only=mesh_only,
-                    )
-                mesh_edges = _axisymmetric_mesh_edges(result["mesh"])
+                else:
+                    popen_options["start_new_session"] = True
+                process = subprocess.Popen(command, **popen_options)
+                with self._solver_job_lock:
+                    self._solver_process = process
+                    cancel_now = self._solver_cancel_requested
+                if cancel_now:
+                    process.terminate()
+
+                with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
+                    assert process.stdout is not None
+                    for line in process.stdout:
+                        log_file.write(line)
+                        log_file.flush()
+                        log_buffer.write(line)
+                return_code = process.wait()
                 log_buffer.flush()
-                run_kind = "Mesh" if mesh_only else "Study"
-                run_name = f"{run_kind}: {model.get('name', 'axisymmetric model')}"
+                with self._solver_job_lock:
+                    cancelled = self._solver_cancel_requested and return_code != 0
+
+                manifest = self._read_run_manifest(output_dir)
+                if cancelled:
+                    manifest.update({
+                        "status": "cancelled",
+                        "run_name": run_name,
+                        "finished_utc": datetime.now(timezone.utc).isoformat(),
+                    })
+                    self._write_run_manifest(output_dir, manifest)
+                    workspace.finish_solver_job(
+                        f"{run_kind} cancelled. Partial files are in {output_dir}",
+                        cancelled=True,
+                        run_kind=run_kind,
+                        run_name=run_name,
+                        output_path=output_dir,
+                    )
+                    return
+                if return_code != 0:
+                    detail = manifest.get("error") or "See solver.log for details."
+                    manifest.update({
+                        "status": "failed",
+                        "run_name": run_name,
+                        "error": detail,
+                        "finished_utc": datetime.now(timezone.utc).isoformat(),
+                    })
+                    self._write_run_manifest(output_dir, manifest)
+                    raise RuntimeError(detail)
+
+                manifest.update({
+                    "status": "complete",
+                    "run_name": run_name,
+                    "finished_utc": datetime.now(timezone.utc).isoformat(),
+                    "solver_log": "solver.log",
+                })
+                mesh_preview_path = output_dir / "mesh_preview.json"
+                mesh_edges = []
+                if mesh_preview_path.is_file():
+                    mesh_payload = json.loads(mesh_preview_path.read_text(encoding="utf-8"))
+                    mesh_edges = mesh_payload.get("edges", [])
+                self._write_run_manifest(output_dir, manifest)
                 if mesh_only:
                     workspace.finish_solver_job(
                         f"Mesh generated successfully ({len(mesh_edges):,} unique edges): {output_dir}",
@@ -799,19 +896,81 @@ class NGSolveGui(App):
                         output_path=output_dir,
                         mesh_preview_edges=mesh_edges,
                     )
-                    self._notify(f"Study complete. Results saved to {output_dir}", type="positive", timeout=7000)
+                    self._notify(
+                        f"Study complete. Results saved to {output_dir}",
+                        type="positive",
+                        timeout=7000,
+                    )
             except Exception as error:
                 log_buffer.flush()
+                manifest = self._read_run_manifest(output_dir)
+                manifest.update({
+                    "status": "failed",
+                    "run_name": run_name,
+                    "error": f"{type(error).__name__}: {error}",
+                    "finished_utc": datetime.now(timezone.utc).isoformat(),
+                    "solver_log": "solver.log",
+                })
+                self._write_run_manifest(output_dir, manifest)
                 workspace.finish_solver_job(
                     f"Solver failed: {error}",
                     error=True,
-                    run_kind="Mesh" if mesh_only else "Study",
-                    run_name=f"{'Mesh' if mesh_only else 'Study'}: {model.get('name', 'axisymmetric model')}",
+                    run_kind=run_kind,
+                    run_name=run_name,
                     output_path=output_dir,
                 )
-                self._notify(f"Solver failed: {error}", type="negative", timeout=9000)
+                self._notify(
+                    f"Solver failed: {error}", type="negative", timeout=9000
+                )
+            finally:
+                if process is not None and process.stdout is not None:
+                    process.stdout.close()
+                with self._solver_job_lock:
+                    self._solver_process = None
+                    self._solver_run_context = None
+                    self._solver_job_active = False
+                    self._solver_cancel_requested = False
 
-        threading.Thread(target=run_job, name="NGSolveAxisymmetricStudy", daemon=True).start()
+        self._solver_run_context = {
+            "kind": run_kind,
+            "output_dir": output_dir,
+            "run_name": run_name,
+        }
+        threading.Thread(
+            target=run_job,
+            name="NGSolveAxisymmetricChildJob",
+            daemon=True,
+        ).start()
+
+    def _cancel_axisymmetric_solver(self, *args):
+        """Stop the active solver child process without blocking the UI."""
+        with self._solver_job_lock:
+            if not self._solver_job_active:
+                return
+            self._solver_cancel_requested = True
+            process = self._solver_process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        self.solve_workspace.mark_solver_cancel_requested()
+
+    @staticmethod
+    def _read_run_manifest(output_dir):
+        manifest_path = Path(output_dir) / "run_manifest.json"
+        try:
+            value = json.loads(manifest_path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    @staticmethod
+    def _write_run_manifest(output_dir, manifest):
+        manifest_path = Path(output_dir) / "run_manifest.json"
+        temporary = manifest_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        temporary.replace(manifest_path)
 
     def _open_run_result(self, filename):
         """Open a generated field in the existing Post Process workspace."""
