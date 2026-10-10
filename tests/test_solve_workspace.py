@@ -201,6 +201,28 @@ def test_region_click_updates_selection_without_rebuilding_sketch_scene(standalo
     assert dimension_labels == ["W 20 mm", "H 20 mm"]
 
 
+def test_region_properties_explain_the_current_sketch_constraint_scope(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    workspace.selected_region_id = workspace.model["geometry"]["regions"][0]["id"]
+
+    note = (
+        "These are built-in relationships for the rectangle and circle tools. "
+        "This version does not solve general user-defined sketch constraints."
+    )
+    properties = workspace._geometry_properties()
+
+    assert any(getattr(component, "ui_children", None) == [note] for component in properties)
+
+
+def test_canvas_toolbar_wraps_when_the_viewport_is_narrow(standalone_components):
+    workspace = SolveWorkspace()
+    toolbar = workspace._canvas_panel.ui_children[0]
+
+    assert "flex-wrap:wrap" in toolbar._props["style"]
+    assert "min-width:0" in toolbar._props["style"]
+
+
 def test_canvas_render_keeps_background_and_layer_components_mounted(standalone_components):
     workspace = SolveWorkspace()
     root_layers = tuple(workspace._canvas.ui_children)
