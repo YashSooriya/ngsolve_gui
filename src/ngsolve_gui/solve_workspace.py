@@ -290,8 +290,7 @@ class SolveWorkspace(Div):
             ui_style="width:min(420px, 100%); min-height:30px;",
         )
         self._model_title._props["title"] = "Double-click to rename this model"
-        self._last_model_title_click_time = 0.0
-        self._model_title.on("click", self._on_model_title_click)
+        self._model_title.on_focus(self._begin_model_rename)
         self._model_title.on("dblclick", self._begin_model_rename)
         self._model_title.on_update_model_value(self._update_model_rename_draft)
         self._model_title.on_blur(self._commit_model_rename)
@@ -451,17 +450,6 @@ class SolveWorkspace(Div):
         if get_environment().type == EnvironmentType.LOCAL_APP:
             self._model_title.ui_focus()
             self._model_title.ui_select()
-
-    def _on_model_title_click(self, event=None):
-        """Detect a double-click from click events if the renderer omits dblclick."""
-        if self._model_title_editing:
-            return
-        now = time.monotonic()
-        if 0 < now - self._last_model_title_click_time <= 0.5:
-            self._last_model_title_click_time = 0.0
-            self._begin_model_rename(event)
-        else:
-            self._last_model_title_click_time = now
 
     def _update_model_rename_draft(self, event):
         self._model_title_draft = str(getattr(event, "value", "") or "")
