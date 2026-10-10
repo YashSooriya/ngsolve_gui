@@ -62,7 +62,8 @@ def test_model_title_supports_inline_rename_commit_and_cancel(standalone_compone
     editor._handle("keydown", {"key": "Enter"})
 
     assert workspace.model["name"] == "Quarter magnet"
-    assert title.ui_children == ["Quarter magnet"]
+    assert title.ui_model_value == "Quarter magnet"
+    assert title.ui_readonly
     assert not workspace._model_title_editing
 
     title._handle("dblclick")
@@ -71,7 +72,8 @@ def test_model_title_supports_inline_rename_commit_and_cancel(standalone_compone
     editor._handle("keydown", {"key": "Escape"})
 
     assert workspace.model["name"] == "Quarter magnet"
-    assert title.ui_children == ["Quarter magnet"]
+    assert title.ui_model_value == "Quarter magnet"
+    assert title.ui_readonly
     assert not workspace._model_title_editing
 
 
