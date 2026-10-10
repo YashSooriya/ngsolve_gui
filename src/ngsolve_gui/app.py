@@ -91,6 +91,29 @@ class _WorkspaceLogBuffer(io.StringIO):
             self.workspace.append_solver_output([pending])
 
 
+def _axisymmetric_mesh_edges(mesh):
+    """Convert a 2D NGSolve mesh into unique world-coordinate edge segments."""
+    from ngsolve import VOL
+
+    edges = {}
+    for element in mesh.Elements(VOL):
+        vertices = tuple(element.vertices)
+        if len(vertices) < 3:
+            continue
+        for index, start in enumerate(vertices):
+            end = vertices[(index + 1) % len(vertices)]
+            key = tuple(sorted((start.nr, end.nr)))
+            if key in edges:
+                continue
+            start_point = mesh[start].point
+            end_point = mesh[end].point
+            edges[key] = (
+                (float(start_point[0]), float(start_point[1])),
+                (float(end_point[0]), float(end_point[1])),
+            )
+    return list(edges.values())
+
+
 class StackHost(Div):
     """Hosts several panels, keeping them mounted and showing only one.
 
@@ -755,15 +778,17 @@ class NGSolveGui(App):
                         output_path=str(output_dir),
                         mesh_only=mesh_only,
                     )
+                mesh_edges = _axisymmetric_mesh_edges(result["mesh"])
                 log_buffer.flush()
                 run_kind = "Mesh" if mesh_only else "Study"
                 run_name = f"{run_kind}: {model.get('name', 'axisymmetric model')}"
                 if mesh_only:
                     workspace.finish_solver_job(
-                        f"Mesh generated successfully: {output_dir}",
+                        f"Mesh generated successfully ({len(mesh_edges):,} unique edges): {output_dir}",
                         run_kind=run_kind,
                         run_name=run_name,
                         output_path=output_dir,
+                        mesh_preview_edges=mesh_edges,
                     )
                 else:
                     fields_dir = output_dir / "ngsolve_gui" / "fields"
@@ -772,6 +797,7 @@ class NGSolveGui(App):
                         run_kind=run_kind,
                         run_name=run_name,
                         output_path=output_dir,
+                        mesh_preview_edges=mesh_edges,
                     )
                     self._notify(f"Study complete. Results saved to {output_dir}", type="positive", timeout=7000)
             except Exception as error:

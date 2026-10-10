@@ -109,6 +109,39 @@ def test_geometry_and_physics_value_inputs_use_si_units(standalone_components):
     assert study_units["Frequency points (comma separated)"] == "Hz"
 
 
+def test_generated_mesh_preview_is_visible_and_invalidated_by_edits(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.set_mesh_preview([
+        ((0.0, 0.0), (1.0, 0.0)),
+        ((1.0, 0.0), (0.0, 1.0)),
+    ])
+
+    assert workspace.mesh_preview_visible
+    assert not workspace._mesh_preview_button.ui_disable
+    assert workspace._mesh_preview_button.ui_label == "Hide mesh"
+    assert workspace._canvas_mesh_path in workspace._canvas_scene.ui_children
+
+    workspace.add_parameter()
+
+    assert workspace.mesh_preview_edges == []
+    assert not workspace.mesh_preview_visible
+    assert workspace._mesh_preview_button.ui_disable
+
+
+def test_ngsolve_mesh_edges_are_deduplicated_for_preview():
+    from netgen.geom2d import unit_square
+    from ngsolve import Mesh, VOL
+    from ngsolve_gui.app import _axisymmetric_mesh_edges
+
+    mesh = Mesh(unit_square.GenerateMesh(maxh=0.5))
+    preview_edges = _axisymmetric_mesh_edges(mesh)
+    element_edge_count = sum(len(element.vertices) for element in mesh.Elements(VOL))
+
+    assert preview_edges
+    assert len(preview_edges) < element_edge_count
+    assert all(len(start) == len(end) == 2 for start, end in preview_edges)
+
+
 def test_model_edits_support_undo_redo_and_clear_redo_after_new_edit(standalone_components):
     history_notifications = []
     workspace = SolveWorkspace(on_history_change=lambda: history_notifications.append(True))
@@ -1339,6 +1372,26 @@ def test_added_model_parameter_is_listed_in_tree(standalone_components):
     assert parameter_row.ui_children[1] is workspace._tree_entry_containers["parameters"]
     assert any(child.ui_label == "length_1" for child in parameter_entries.ui_children)
     assert workspace.selected_parameter_id == workspace.model["parameters"][0]["id"]
+
+
+def test_parameter_dimension_is_selected_from_physical_units(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.add_parameter()
+    parameter = workspace.model["parameters"][0]
+    entries = workspace._parameter_properties()
+    widgets = []
+
+    def collect(items):
+        for item in items:
+            widgets.append(item)
+            collect(getattr(item, "ui_children", []))
+
+    collect(entries)
+    dimension = next(item for item in widgets if getattr(item, "ui_label", None) == "Dimension")
+
+    assert dimension.ui_model_value == "m"
+    assert {option["value"] for option in dimension.ui_options} >= {"m", "A/m^2", "Pa", "Hz"}
+    assert parameter["unit"] == "m"
 
 
 def test_model_tree_counts_only_project_materials_and_assigned_boundary_conditions(standalone_components):

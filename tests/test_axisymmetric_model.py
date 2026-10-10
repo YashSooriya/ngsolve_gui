@@ -73,6 +73,41 @@ def test_nested_geometry_and_parameter_driven_dimensions_validate():
     assert any("expression and saved dimension disagree" in error for error in validate_model(model))
 
 
+def test_parameter_dimensions_reject_values_used_in_incompatible_fields():
+    model = _nested_model()
+    model["parameters"].append({
+        "id": "parameter-current",
+        "name": "coil_current_density",
+        "expression": "2e6",
+        "unit": "A/m^2",
+    })
+    coil = model["geometry"]["regions"][1]
+    coil["sources"]["dc_current_density"] = "coil_current_density"
+    coil["shape"]["dimension_expressions"]["width"] = "sqrt(coil_radius**2)"
+    assert validate_model(model) == []
+
+    coil["sources"]["dc_current_density"] = "coil_radius"
+    errors = validate_model(model)
+    assert any("dc_current_density: has unit m; expected A/m^2" in error for error in errors)
+
+
+def test_parameter_declaration_and_explicit_si_suffixes_are_checked():
+    model = _nested_model()
+    model["parameters"].append({
+        "id": "parameter-frequency",
+        "name": "bad_frequency",
+        "expression": "2*coil_radius",
+        "unit": "Hz",
+    })
+    errors = validate_model(model)
+    assert any("expression has unit m but parameter is declared as Hz" in error for error in errors)
+
+    model = _nested_model()
+    model["mesh"]["element_size"] = "0.01 A/m^2"
+    errors = validate_model(model)
+    assert any("Mesh element size: has unit A/m^2; expected m" in error for error in errors)
+
+
 def test_legacy_millimetre_project_migrates_expressions_to_si_metres():
     model = _nested_model()
     model["geometry"].pop("dimension_expression_unit")

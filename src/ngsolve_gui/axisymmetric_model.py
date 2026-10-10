@@ -17,6 +17,8 @@ import re
 import uuid
 import zipfile
 
+from .units import parameter_dimensions as infer_parameter_dimensions, require_expression_unit
+
 
 SCHEMA = "ngsolve-gui.axisymmetric"
 SCHEMA_VERSION = 1
@@ -352,6 +354,22 @@ def validate_model(model: dict) -> list[str]:
             evaluate_expression(name, parameter_map)
         except (AttributeError, TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError) as error:
             errors.append(f"Parameter '{name}': {error}")
+    try:
+        parameter_dims = infer_parameter_dimensions(parameters)
+    except (AttributeError, TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError) as error:
+        errors.append(f"Parameter units: {error}.")
+        parameter_dims = {}
+
+    def check_unit(label, expression, expected_unit, *, allow_coordinates=False):
+        try:
+            require_expression_unit(
+                expression,
+                expected_unit,
+                parameter_dims,
+                allow_coordinates=allow_coordinates,
+            )
+        except (AttributeError, TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError) as error:
+            errors.append(f"{label}: {error}.")
 
     materials_list = model.get("materials", [])
     if not isinstance(materials_list, list):
@@ -376,6 +394,18 @@ def validate_model(model: dict) -> list[str]:
         for key in ("relative_permeability", "electrical_conductivity", "youngs_modulus", "poissons_ratio", "density"):
             if key not in properties:
                 continue
+            expected_units = {
+                "relative_permeability": "dimensionless",
+                "electrical_conductivity": "S/m",
+                "youngs_modulus": "Pa",
+                "poissons_ratio": "dimensionless",
+                "density": "kg/m^3",
+            }
+            check_unit(
+                f"Material '{material.get('name', material_id)}' {key}",
+                properties[key],
+                expected_units[key],
+            )
             try:
                 value = evaluate_expression(properties[key], parameter_map)
                 if key == "relative_permeability" and value <= 0:
@@ -497,6 +527,7 @@ def validate_model(model: dict) -> list[str]:
                 errors.append(f"Region '{region.get('name')}' has an expression for unknown dimension '{key}'.")
                 continue
             try:
+                check_unit(f"Region '{region.get('name')}' dimension {key}", expression, "m")
                 dimension_value = evaluate_expression(expression, parameter_map)
                 dimension_m = dimension_value / 1000 if dimension_unit == "mm" else dimension_value
                 if not math.isclose(float(shape[key]), dimension_m, rel_tol=1e-9, abs_tol=1e-12):
@@ -534,6 +565,20 @@ def validate_model(model: dict) -> list[str]:
             "mechanical_robin": ("stiffness_normal", "stiffness_tangential"),
         }.get(kind, ())
         for key in expression_keys:
+            required_unit = {
+                "displacement_r": "m",
+                "displacement_z": "m",
+                "traction_r": "N/m^2",
+                "traction_z": "N/m^2",
+                "stiffness_normal": "N/m^3",
+                "stiffness_tangential": "N/m^3",
+            }[key]
+            check_unit(
+                f"Boundary '{condition.get('name', condition_id)}' {key}",
+                condition.get(key, "0"),
+                required_unit,
+                allow_coordinates=True,
+            )
             try:
                 _validate_expression(condition.get(key, "0"), set(parameter_map), allow_coordinates=True)
             except (TypeError, ValueError, SyntaxError) as error:
@@ -628,6 +673,12 @@ def validate_model(model: dict) -> list[str]:
             errors.append(f"Region '{region.get('name', region.get('id'))}' sources must be an object.")
             continue
         for key in ("dc_current_density", "ac_current_density_real", "ac_current_density_imaginary"):
+            check_unit(
+                f"Region '{region.get('name', region.get('id'))}' {key}",
+                source.get(key, "0"),
+                "A/m^2",
+                allow_coordinates=True,
+            )
             try:
                 _validate_expression(source.get(key, "0"), set(parameter_map), allow_coordinates=True)
             except (TypeError, ValueError, SyntaxError) as error:
@@ -637,6 +688,12 @@ def validate_model(model: dict) -> list[str]:
             errors.append(f"Region '{region.get('name', region.get('id'))}' body force must be an object.")
         else:
             for key in ("r", "z"):
+                check_unit(
+                    f"Region '{region.get('name', region.get('id'))}' body force {key}",
+                    body.get(key, "0"),
+                    "N/m^3",
+                    allow_coordinates=True,
+                )
                 try:
                     _validate_expression(body.get(key, "0"), set(parameter_map), allow_coordinates=True)
                 except (TypeError, ValueError, SyntaxError) as error:
@@ -653,6 +710,7 @@ def validate_model(model: dict) -> list[str]:
             errors.append(f"Physics setting '{key}' must contain an enabled boolean.")
     harmonic = physics.get("harmonic_electromagnetic", {})
     if isinstance(harmonic, dict):
+        check_unit("Default frequency", harmonic.get("frequency_hz", "500"), "Hz")
         try:
             frequency = evaluate_expression(harmonic.get("frequency_hz", "500"), parameter_map)
             if frequency <= 0:
@@ -665,6 +723,7 @@ def validate_model(model: dict) -> list[str]:
         errors.append("Mesh settings must be an object.")
         mesh = {}
     try:
+        check_unit("Mesh element size", mesh.get("element_size", "0.01"), "m")
         if int(mesh.get("polynomial_order", 3)) not in range(1, 7):
             raise ValueError("polynomial order must be between 1 and 6")
         if float(evaluate_expression(mesh.get("element_size", "0.01"), parameter_map)) <= 0:
@@ -706,6 +765,7 @@ def validate_model(model: dict) -> list[str]:
                 continue
             for point in points:
                 try:
+                    check_unit(f"Study '{study.get('name', '')}' frequency", point, "Hz")
                     if evaluate_expression(point, parameter_map) <= 0:
                         raise ValueError("frequency must be positive")
                 except (TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError) as error:
@@ -867,8 +927,14 @@ def validate_studies(studies: dict, parameters=None) -> list[str]:
         errors.append("Enter at least one positive frequency for the study.")
         return errors
     parameters = parameters or {}
+    parameter_entries = list(parameters.values()) if isinstance(parameters, dict) else parameters
+    try:
+        parameter_dims = infer_parameter_dimensions(parameter_entries)
+    except (AttributeError, TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError):
+        parameter_dims = {}
     for point in points:
         try:
+            require_expression_unit(point, "Hz", parameter_dims)
             if evaluate_expression(point, parameters) <= 0:
                 raise ValueError("frequency must be positive")
         except (TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError) as error:

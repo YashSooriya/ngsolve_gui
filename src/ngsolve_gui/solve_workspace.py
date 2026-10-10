@@ -28,6 +28,7 @@ from .axisymmetric_model import (
     validate_model,
     validate_studies,
 )
+from .units import UNIT_OPTIONS
 
 
 _SECTIONS = [
@@ -182,6 +183,8 @@ class SolveWorkspace(Div):
         self._log_visible = False
         self._log_messages = ["Axisymmetric model editor ready."]
         self.runs = []
+        self.mesh_preview_edges = []
+        self.mesh_preview_visible = False
         self.selected_material_id = None
         self.selected_boundary_id = None
         self.selected_parameter_id = None
@@ -218,6 +221,15 @@ class SolveWorkspace(Div):
         )
         self._canvas_grid = Component("g")
         self._canvas_scene = Component("g")
+        self._canvas_mesh_path = _svg(
+            "path",
+            fill="none",
+            stroke="#203c57",
+            stroke_width="0.9",
+            stroke_opacity="0.82",
+            vector_effect="non-scaling-stroke",
+            style="pointer-events:none;",
+        )
         self._canvas_dimensions = Component("g")
         self._canvas_grid_signature = None
         self._canvas_scene_component_ids = None
@@ -352,6 +364,12 @@ class SolveWorkspace(Div):
         )
         zoom_out_button = _button("Zoom out", "mdi-minus", lambda *a: self.zoom_canvas(1.2), tooltip="Zoom out one step", style="flex:0 0 auto;")
         zoom_in_button = _button("Zoom in", "mdi-plus", lambda *a: self.zoom_canvas(1 / 1.2), tooltip="Zoom in one step", style="flex:0 0 auto;")
+        self._mesh_preview_button = _button(
+            "Mesh preview", "mdi-vector-polygon", self.toggle_mesh_preview,
+            disable=True,
+            tooltip="Generate a mesh before previewing it.",
+            style="flex:0 0 auto; white-space:nowrap;",
+        )
         self._preview_3d_button = _button(
             "Preview in 3D", "mdi-cube-scan", self.toggle_3d_preview,
             tooltip="Preview the axisymmetric regions revolved into 3D.",
@@ -369,6 +387,7 @@ class SolveWorkspace(Div):
             fit_view_button,
             zoom_out_button,
             zoom_in_button,
+            self._mesh_preview_button,
             self._preview_3d_button,
             model_button,
             properties_button,
@@ -383,7 +402,7 @@ class SolveWorkspace(Div):
         self._sketch_view_controls = [
             select_button, rectangle_button, circle_button, snap_button,
             sketch_toolbar_separator, fit_view_button, zoom_out_button,
-            zoom_in_button,
+            zoom_in_button, self._mesh_preview_button,
         ]
         self._canvas_panel = Div(
             toolbar,
@@ -528,6 +547,7 @@ class SolveWorkspace(Div):
     def _finish_history_transaction(self, before):
         if before["model"] == self.model and before["studies"] == self.studies:
             return
+        self._clear_mesh_preview()
         self._undo_history.append(before)
         del self._undo_history[:-self._history_limit]
         self._redo_history.clear()
@@ -539,6 +559,7 @@ class SolveWorkspace(Div):
 
     def _restore_history_state(self, state):
         self._preserve_canvas_view()
+        self._clear_mesh_preview()
         self.model = copy.deepcopy(state["model"])
         self.studies = copy.deepcopy(state["studies"])
         selection = state["selection"]
@@ -583,6 +604,7 @@ class SolveWorkspace(Div):
 
     def set_model(self, model, studies=None, layout=None):
         self._cancel_canvas_zoom_render()
+        self._clear_mesh_preview()
         model = migrate_legacy_model(model)
         studies = migrate_legacy_studies(studies or new_studies())
         errors = validate_model(model)
@@ -3012,10 +3034,24 @@ class SolveWorkspace(Div):
                 value = "Invalid"
                 evaluated_color = "var(--negative);"
             selected = parameter["id"] == self.selected_parameter_id
+            unit_select = QSelect(
+                ui_label="Dimension",
+                ui_options=list(UNIT_OPTIONS),
+                ui_option_label="label",
+                ui_option_value="value",
+                ui_model_value=parameter.get("unit", "m"),
+                ui_emit_value=True,
+                ui_map_options=True,
+                ui_dense=True,
+                ui_filled=True,
+            )
+            unit_select.on_update_model_value(
+                lambda event, pid=parameter["id"]: self._set_parameter(pid, "unit", event.value)
+            )
             children.append(Div(
                 Div(
                     _input("Name", parameter["name"], lambda event, pid=parameter["id"]: self._set_parameter(pid, "name", event.value)),
-                    _input("Unit label", parameter.get("unit", ""), lambda event, pid=parameter["id"]: self._set_parameter(pid, "unit", event.value)),
+                    unit_select,
                     ui_style="display:grid; grid-template-columns:minmax(0,1fr) minmax(70px,.45fr); gap:7px;",
                 ),
                 _input("Expression", parameter["expression"], lambda event, pid=parameter["id"]: self._set_parameter(pid, "expression", event.value)),
@@ -3040,7 +3076,7 @@ class SolveWorkspace(Div):
         children.extend([
             _button("Add parameter", "mdi-plus", self.add_parameter, color="primary"),
             Div(
-                "Enter expression values in SI units. Geometry lengths and length parameters use metres (m); expressions and unit labels do not perform unit conversion.",
+                "Choose the parameter's physical dimension. Compatible expressions can reuse it; Check setup rejects using it in a field with a different SI unit. Bare numbers are interpreted in the destination field's unit.",
                 ui_style="font-size:11px; line-height:1.45; color:var(--fg-muted);",
             ),
         ])
@@ -3407,6 +3443,22 @@ class SolveWorkspace(Div):
         for region_id in self._canvas_region_nodes.keys() - live_region_ids:
             del self._canvas_region_nodes[region_id]
 
+        if self.mesh_preview_visible and self.mesh_preview_edges:
+            mesh_path = " ".join(
+                f"M{x1:.2f},{y1:.2f} L{x2:.2f},{y2:.2f}"
+                for start, end in self.mesh_preview_edges
+                for x1, y1 in (xy(start),)
+                for x2, y2 in (xy(end),)
+            )
+            _update_svg_props(
+                self._canvas_mesh_path,
+                d=mesh_path,
+                display="inline",
+            )
+            scene_children.append(self._canvas_mesh_path)
+        else:
+            _update_svg_props(self._canvas_mesh_path, d="", display="none")
+
         region_for_edge = {
             edge_id: region["id"]
             for region in regions
@@ -3734,7 +3786,7 @@ class SolveWorkspace(Div):
         parameter = {"id": new_id("parameter"), "name": f"length_{index}", "expression": "0.01", "unit": "m"}
         self.model["parameters"].append(parameter)
         self.selected_parameter_id = parameter["id"]
-        self._message("Added an SI-valued parameter. Its unit label is descriptive; values are not converted automatically.")
+        self._message("Added a parameter with the dimension Length (m). Choose a different dimension if needed.")
         self._refresh_model_tree()
         self._render_inspector()
 
@@ -4019,6 +4071,43 @@ class SolveWorkspace(Div):
         else:
             self._message("Mesh generation is unavailable in this environment.", error=True)
 
+    def toggle_mesh_preview(self, *args):
+        if not self.mesh_preview_edges:
+            self._message("Generate a mesh before opening the mesh preview.", error=True)
+            return
+        self.mesh_preview_visible = not self.mesh_preview_visible
+        self._mesh_preview_button.ui_label = "Hide mesh" if self.mesh_preview_visible else "Show mesh"
+        self._mesh_preview_button.ui_color = "primary" if self.mesh_preview_visible else None
+        self._mesh_preview_button.ui_flat = not self.mesh_preview_visible
+        self.render_canvas()
+
+    def _clear_mesh_preview(self):
+        had_preview = bool(self.mesh_preview_edges) or self.mesh_preview_visible
+        self.mesh_preview_edges = []
+        self.mesh_preview_visible = False
+        button = getattr(self, "_mesh_preview_button", None)
+        if button is not None:
+            button.ui_label = "Mesh preview"
+            button.ui_color = None
+            button.ui_flat = True
+            button.ui_disable = True
+        if had_preview and hasattr(self, "_canvas_scene"):
+            self.render_canvas()
+
+    def set_mesh_preview(self, edges):
+        """Show mesh segments returned by a completed solver mesh build."""
+        self.mesh_preview_edges = [
+            ((float(start[0]), float(start[1])), (float(end[0]), float(end[1])))
+            for start, end in edges
+            if len(start) >= 2 and len(end) >= 2
+        ]
+        self.mesh_preview_visible = bool(self.mesh_preview_edges)
+        self._mesh_preview_button.ui_disable = not self.mesh_preview_edges
+        self._mesh_preview_button.ui_label = "Hide mesh" if self.mesh_preview_visible else "Mesh preview"
+        self._mesh_preview_button.ui_color = "primary" if self.mesh_preview_visible else None
+        self._mesh_preview_button.ui_flat = not self.mesh_preview_visible
+        self.render_canvas()
+
     def run_study_action(self, *args):
         errors = self.validation_errors()
         if errors:
@@ -4032,10 +4121,12 @@ class SolveWorkspace(Div):
         else:
             self._message("The solver is unavailable in this environment.", error=True)
 
-    def finish_solver_job(self, message, error=False, *, run_kind=None, output_path=None, run_name=None):
+    def finish_solver_job(self, message, error=False, *, run_kind=None, output_path=None, run_name=None, mesh_preview_edges=None):
         self._mesh_button.ui_loading = False
         self._run_button.ui_loading = False
         self._message(message, error=error)
+        if not error and mesh_preview_edges is not None:
+            self.set_mesh_preview(mesh_preview_edges)
         if run_kind:
             self.runs.append({
                 "name": run_name or run_kind,
