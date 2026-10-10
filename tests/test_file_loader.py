@@ -4,7 +4,7 @@ import ngsolve as ngs
 from netgen.csg import unit_cube
 
 import ngsolve_gui.file_loader as file_loader
-from ngsolve_gui.prop_widgets import _component_display_names
+from ngsolve_gui.prop_widgets import ColorbarLegend, _component_display_names
 
 
 def test_gridfunction_pickle_draw_uses_result_view_defaults(monkeypatch):
@@ -88,6 +88,21 @@ def test_vector_component_selector_uses_axisymmetric_names():
         component_names = ("r", "z")
 
     assert _component_display_names(Component()) == ("r", "z")
+
+    class SelectorBuilder:
+        def _set_component(self, value):
+            self.selected_component = value
+
+    builder = SelectorBuilder()
+    selector = ColorbarLegend._build_component_selector(builder, Component())
+    buttons = selector.ui_children[0]._btns
+    assert [buttons[key].ui_children[0] for key in ("norm", "0", "1")] == [
+        "|u|",
+        "r",
+        "z",
+    ]
+    selector.ui_children[0]._on_change("1")
+    assert builder.selected_component == "1"
 
 
 def test_pickle_loader_dispatches_through_result_view_defaults(tmp_path):
