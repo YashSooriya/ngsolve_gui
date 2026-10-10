@@ -7,7 +7,7 @@ from ngsolve_gui.app import NGSolveGui, WorkspaceModeToggle
 
 def test_workspace_mode_toggle_updates_selection_and_notifies(monkeypatch):
     selected = []
-    toggle = WorkspaceModeToggle(on_change=selected.append)
+    toggle = WorkspaceModeToggle("post_process", on_change=selected.append)
     for button in toggle._buttons.values():
         monkeypatch.setattr(button, "_update_frontend", lambda payload: None)
 
@@ -22,6 +22,14 @@ def test_workspace_mode_toggle_updates_selection_and_notifies(monkeypatch):
 
     assert toggle.value == "solve"
     assert selected == ["solve"]
+    assert "background:var(--accent-subtle)" in toggle._buttons["solve"].ui_style
+    assert "background:var(--surface)" in toggle._buttons["post_process"].ui_style
+
+
+def test_workspace_mode_toggle_defaults_to_solve():
+    toggle = WorkspaceModeToggle()
+
+    assert toggle.value == "solve"
     assert "background:var(--accent-subtle)" in toggle._buttons["solve"].ui_style
     assert "background:var(--surface)" in toggle._buttons["post_process"].ui_style
 

@@ -134,7 +134,7 @@ class WorkspaceModeToggle(Div):
 
     _MODES = ("solve", "post_process")
 
-    def __init__(self, value="post_process", on_change=None):
+    def __init__(self, value="solve", on_change=None):
         if value not in self._MODES:
             raise ValueError(f"Unknown workspace mode: {value}")
         self._value = value
@@ -405,7 +405,7 @@ class NGSolveGui(App):
             ui_class=cb.brand,
         )
         self._workspace_mode_toggle = WorkspaceModeToggle(
-            "post_process", self._set_workspace_mode
+            "solve", self._set_workspace_mode
         )
 
         self.system_monitor = SystemMonitor() if system_monitor_available() else None
@@ -496,6 +496,7 @@ class NGSolveGui(App):
                 "display:flex; flex-direction:column; flex:1 1 auto; "
                 "min-height:0; width:100%;"
             ),
+            ui_hidden=True,
         )
         self.solve_workspace = SolveWorkspace(
             on_run=lambda: self._run_axisymmetric_solver(mesh_only=False),
@@ -505,7 +506,6 @@ class NGSolveGui(App):
         self._solve_workspace = Div(
             self.solve_workspace,
             ui_style="flex:1 1 auto; min-height:0; width:100%;",
-            ui_hidden=True,
         )
 
         # Timer / profiling diagnostics dialog (opened from the settings menu).
@@ -539,9 +539,9 @@ class NGSolveGui(App):
         self.call_js(_set_window_title)
         self.on_load(self.__on_load)
 
-        # Post Process is the existing/default view. Retain its hidden tree so
-        # the viewport and loaded data survive a mode switch to Solve.
-        self._workspace_mode = "post_process"
+        # Start in Solve while retaining the mounted Post Process workspace so
+        # its viewport and loaded data survive mode switches.
+        self._workspace_mode = "solve"
 
         # -- Global keybindings (always active) --
         kb = self.kb
