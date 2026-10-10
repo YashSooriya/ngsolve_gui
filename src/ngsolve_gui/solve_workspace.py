@@ -287,6 +287,8 @@ class SolveWorkspace(Div):
             ui_style="font-size:13px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:420px; cursor:text; border-radius:3px;",
         )
         self._model_title._props["title"] = "Double-click to rename this model"
+        self._last_model_title_click_time = 0.0
+        self._model_title.on("click", self._on_model_title_click)
         self._model_title.on("dblclick", self._begin_model_rename)
         self._validate_button = _button(
             "Check setup",
@@ -452,6 +454,17 @@ class SolveWorkspace(Div):
         editor.on_mounted(lambda: (editor.ui_focus(), editor.ui_select()))
         self._model_title_input = editor
         self._model_title.ui_children = [editor]
+
+    def _on_model_title_click(self, event=None):
+        """Detect a double-click from click events if the renderer omits dblclick."""
+        if self._model_title_editing:
+            return
+        now = time.monotonic()
+        if 0 < now - self._last_model_title_click_time <= 0.5:
+            self._last_model_title_click_time = 0.0
+            self._begin_model_rename(event)
+        else:
+            self._last_model_title_click_time = now
 
     def _update_model_rename_draft(self, event):
         self._model_title_draft = str(getattr(event, "value", "") or "")

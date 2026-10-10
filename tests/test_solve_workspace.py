@@ -54,7 +54,8 @@ def test_model_title_supports_inline_rename_commit_and_cancel(standalone_compone
     title = workspace._model_title
     assert title._props["title"] == "Double-click to rename this model"
 
-    title._handle("dblclick")
+    title._handle("click")
+    title._handle("click")
     editor = workspace._model_title_input
     assert editor is not None
     editor._handle("update:model-value", "Quarter magnet")
