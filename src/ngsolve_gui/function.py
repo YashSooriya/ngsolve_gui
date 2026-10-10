@@ -134,6 +134,30 @@ class FunctionComponent(WebgpuTab):
         ):
             self.deformation = self._resolve_deformation(True)
 
+        self.axisymmetric_revolution_available = bool(
+            data.get("_ngsolve_gui_axisymmetric", False)
+            and self.mesh.dim == 2
+            and isinstance(cf, ngs.GridFunction)
+        )
+        self.axisymmetric_revolved = Observable(False, "axisymmetric_revolved")
+        self._axisymmetric_revolution_mesh = None
+        self._axisymmetric_revolution_field = None
+        self._axisymmetric_original_state = None
+        self._axisymmetric_camera_state = None
+        if self.axisymmetric_revolution_available:
+            from .sections.axisymmetric_revolution import AxisymmetricRevolutionSection
+
+            sections = list(type(self).property_sections)
+            sections.insert(1, AxisymmetricRevolutionSection)
+            self.property_sections = sections
+            self._axisymmetric_original_state = {
+                "mesh": self.mesh,
+                "region_or_mesh": self.region_or_mesh,
+                "cf": self.cf,
+                "visualization_cf": self.visualization_cf,
+                "deformation": self.deformation,
+            }
+
         cv = data.get("clipping_vectors", False)
         sv = data.get("surface_vectors", False)
         fl = data.get("field_lines", False)
@@ -312,6 +336,8 @@ class FunctionComponent(WebgpuTab):
         self.numbers_one_based.on_change(self._apply_numbers_one_based)
         self.hidden_regions.on_change(self._apply_region_change)
         self.boundary_overrides.on_change(self._apply_region_change)
+        if self.axisymmetric_revolution_available:
+            self.axisymmetric_revolved.on_change(self._apply_axisymmetric_revolved)
 
     # -- GPU side-effect handlers -------------------------------------------
 
@@ -587,6 +613,83 @@ class FunctionComponent(WebgpuTab):
             r.zero_based = not val
             r.set_needs_update()
         self.wgpu.scene.render()
+
+    def _apply_axisymmetric_revolved(self, enabled, _old):
+        if not self.axisymmetric_revolution_available:
+            return
+
+        if enabled:
+            if self._axisymmetric_revolution_mesh is None:
+                from .axisymmetric_revolution import revolve_gridfunction
+
+                try:
+                    (
+                        self._axisymmetric_revolution_mesh,
+                        self._axisymmetric_revolution_field,
+                    ) = revolve_gridfunction(self._axisymmetric_original_state["cf"])
+                except Exception as error:
+                    print(f"Could not create axisymmetric 3D view: {error}")
+                    self.axisymmetric_revolved.value = False
+                    return
+
+            camera = self.camera
+            self._axisymmetric_camera_state = {
+                "shared": bool(self.camera_shared.value),
+                "transform": camera.transform.copy(),
+                "orthographic": camera.orthographic,
+            }
+            if self.camera_shared.value:
+                self.camera_shared.value = False
+
+            self.mesh = self._axisymmetric_revolution_mesh
+            self.region_or_mesh = self._axisymmetric_revolution_mesh
+            self.cf = self._axisymmetric_revolution_field
+            self.visualization_cf = visualization_cf(self.cf)
+            self.deformation = None
+        else:
+            original = self._axisymmetric_original_state
+            self.mesh = original["mesh"]
+            self.region_or_mesh = original["region_or_mesh"]
+            self.cf = original["cf"]
+            self.visualization_cf = original["visualization_cf"]
+            self.deformation = original["deformation"]
+
+        self.region_state = None
+        self.region_visibility = None
+        self._full_range = None
+        self._mesh_data = None
+        self.mdata = None
+        self._facet_supported = bool(self.draw_vol) and self.mesh.dim in (2, 3)
+        self.draw()
+        self._rebuild_dimension_controls()
+
+        if enabled:
+            self.reset_camera()
+        elif self._axisymmetric_camera_state is not None:
+            camera_state = self._axisymmetric_camera_state
+            if camera_state["shared"]:
+                self.camera_shared.value = True
+            else:
+                camera = self.camera
+                camera.transform = camera_state["transform"]
+                camera.orthographic = camera_state["orthographic"]
+                self.scene.render()
+            self._axisymmetric_camera_state = None
+
+    def _rebuild_dimension_controls(self):
+        """Rebuild viewport controls whose availability depends on mesh dimension."""
+        self._tool_dock = self._build_tool_dock()
+        self._clip_toolbar = self._build_clip_toolbar()
+        overlays = [self.wgpu, self._tool_dock, self.pick_overlay]
+        if self._clip_toolbar is not None:
+            overlays.insert(2, self._clip_toolbar)
+        if self._legend is not None:
+            overlays.append(self._legend)
+        if self._probe_panel is not None:
+            overlays.extend((self._probe_preview, self._probe_panel))
+        self.ui_children = overlays
+        self._sync_clip_ui(self.clipping_enabled.value, None)
+        self._sync_camera_link_ui(self.camera_shared.value, None)
 
     def _sync_region_state(self):
         self.region_state.hidden = set(self.hidden_regions.value)
@@ -1032,7 +1135,7 @@ class FunctionComponent(WebgpuTab):
     def draw(self):
         # Per-tab region visibility: shared alpha buffer (like clipping /
         # colormap), fed from the saved hidden-regions state.
-        if not hasattr(self, "region_state"):
+        if getattr(self, "region_state", None) is None:
             self.region_state = RegionState(self.mesh)
             self.region_visibility = RegionVisibility()
             self._full_range = None

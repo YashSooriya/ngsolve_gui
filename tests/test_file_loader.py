@@ -30,6 +30,30 @@ def test_gridfunction_pickle_draw_uses_result_view_defaults(monkeypatch):
     assert captured["fieldlines_thickness"] == 0.0001
     assert captured["_ngsolve_gui_fast_fieldlines"] is True
     assert captured["_ngsolve_gui_fieldline_seed_material"] is None
+    assert "_ngsolve_gui_axisymmetric" not in captured
+
+
+def test_axisymmetric_pickle_draw_enables_revolution_from_metadata(monkeypatch):
+    from netgen.occ import Rectangle
+    from netgen.occ import OCCGeometry
+
+    mesh = ngs.Mesh(OCCGeometry(Rectangle(1, 1).Face(), dim=2).GenerateMesh(maxh=0.8))
+    grid_function = ngs.GridFunction(ngs.H1(mesh, order=1))
+    captured = {}
+
+    monkeypatch.setattr(file_loader, "_is_axisymmetric_pickle", lambda _path: True)
+    monkeypatch.setattr(
+        file_loader,
+        "DrawImpl",
+        lambda obj, **options: captured.update(object=obj, **options),
+    )
+
+    file_loader._draw_pickle_object(
+        grid_function, "axisymmetric field", field_path="/results/fields/field.pkl"
+    )
+
+    assert captured["object"] is grid_function
+    assert captured["_ngsolve_gui_axisymmetric"] is True
 
 
 def test_pickle_loader_dispatches_through_result_view_defaults(tmp_path):
@@ -38,7 +62,10 @@ def test_pickle_loader_dispatches_through_result_view_defaults(tmp_path):
     )
 
     assert compile_name == "<ngsolve_gui:pickle>"
-    assert "_draw_pickle_object(obj, 'result')" in source
+    assert (
+        f"_draw_pickle_object(obj, 'result', field_path={str(tmp_path / 'result.pkl')!r})"
+        in source
+    )
 
 
 def test_draw_preserves_gridfunction_for_function_component(monkeypatch):
@@ -76,3 +103,20 @@ def test_pickle_loader_escapes_windows_paths():
 
     compile(source, compile_name, "exec")
     assert repr(filename) in source
+
+
+def test_axisymmetric_pickle_detection_requires_matching_solver_metadata(tmp_path):
+    gui_dir = tmp_path / "run" / "ngsolve_gui"
+    fields_dir = gui_dir / "fields"
+    fields_dir.mkdir(parents=True)
+    field_path = fields_dir / "B_DC.pkl"
+    field_path.write_bytes(b"field")
+    (gui_dir / "metadata.json").write_text(
+        '{"problem_domain":"axisymmetric","field_files":[{"file":"fields/B_DC.pkl"}]}',
+        encoding="utf-8",
+    )
+    unrelated = fields_dir / "not_a_solver_field.pkl"
+    unrelated.write_bytes(b"field")
+
+    assert file_loader._is_axisymmetric_pickle(field_path)
+    assert not file_loader._is_axisymmetric_pickle(unrelated)

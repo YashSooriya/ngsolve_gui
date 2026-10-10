@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import threading
@@ -55,7 +56,7 @@ if isinstance(obj, netgen.occ.TopoDS_Shape):
     obj = netgen.occ.OCCGeometry(obj)
 print("Loaded object of type", type(obj))
 from ngsolve_gui.file_loader import _draw_pickle_object
-_draw_pickle_object(obj, '{name}')""", "<ngsolve_gui:pickle>"
+_draw_pickle_object(obj, '{name}', field_path={filename_literal})""", "<ngsolve_gui:pickle>"
 
     if ext == ".py":
         import tokenize
@@ -386,7 +387,40 @@ def DrawImpl(
     return _appdata.add_tab(name or default_name, comp, data, _appdata)
 
 
-def _draw_pickle_object(obj, name: str):
+def _is_axisymmetric_pickle(filename) -> bool:
+    """Check adjacent solver metadata rather than guessing from a 2D mesh."""
+    if not filename:
+        return False
+    source_path = Path(filename).resolve()
+    for directory in (source_path.parent, *source_path.parents):
+        metadata_path = directory / "metadata.json"
+        if not metadata_path.is_file():
+            continue
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if metadata.get("problem_domain") != "axisymmetric":
+            continue
+
+        referenced_files = [
+            item.get("file")
+            for item in metadata.get("field_files", [])
+            if isinstance(item, dict) and item.get("file")
+        ]
+        if metadata.get("default_solution_file"):
+            referenced_files.append(metadata["default_solution_file"])
+        for relative_path in referenced_files:
+            try:
+                expected = (metadata_path.parent / relative_path).resolve()
+                if os.path.normcase(str(expected)) == os.path.normcase(str(source_path)):
+                    return True
+            except (OSError, TypeError, ValueError):
+                continue
+    return False
+
+
+def _draw_pickle_object(obj, name: str, field_path=None):
     """Draw a pickled NGSolve field with clean, fast result-view defaults."""
     if not isinstance(obj, ngs.GridFunction):
         return DrawImpl(obj, name=name)
@@ -419,6 +453,8 @@ def _draw_pickle_object(obj, name: str):
         "fieldlines_num_lines": 20,
         "fieldlines_thickness": 0.0001,
     }
+    if _is_axisymmetric_pickle(field_path):
+        draw_options["_ngsolve_gui_axisymmetric"] = True
     if mesh.dim == 3 and obj.dim == 3:
         draw_options["_ngsolve_gui_fast_fieldlines"] = True
         draw_options["_ngsolve_gui_fieldline_seed_material"] = seed_material
