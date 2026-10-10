@@ -258,7 +258,7 @@ class SolveWorkspace(Div):
             _button("Zoom in", "mdi-plus", lambda *a: self.zoom_canvas(1 / 1.2), tooltip="Zoom in one step", style="flex:0 0 auto;"),
             _button("Model", "mdi-file-tree-outline", self._toggle_tree_panel, tooltip="Show or hide the model tree", style="flex:0 0 auto;"),
             _button("Properties", "mdi-tune-variant", self._toggle_properties_panel, tooltip="Show or hide properties", style="flex:0 0 auto;"),
-            _button("", "mdi-magnet", self.toggle_snap_to_grid, tooltip="Snap sketch points to grid intersections", style="position:absolute; right:8px; top:4px; z-index:1;"),
+            _button("Snap", "mdi-magnet", self.toggle_snap_to_grid, tooltip="Snap sketch points to grid intersections", style="position:absolute; right:8px; top:4px; z-index:1;"),
             ui_style="display:flex; position:relative; flex-wrap:wrap; align-items:center; gap:4px; flex:none; min-width:0; min-height:42px; padding:4px 8px; border-bottom:1px solid var(--border); background:var(--surface);",
         )
         self._tool_buttons = {
