@@ -900,20 +900,22 @@ class SolveWorkspace(Div):
             return None
         event_type = value.get("type")
         timestamp = value.get("timeStamp")
-        if event_type != "mousedown" or timestamp is None:
+        if event_type not in {None, "mousedown"}:
             return value.get("region_id") or value.get("regionId")
         try:
+            timestamp_js = "null" if timestamp is None else repr(float(timestamp))
             region_id = self.js.eval(
                 "((timestamp) => { "
                 "const events = window.__ngsolveSketchPointerEvents || []; "
-                "const event = events.find(item => item.type === 'mousedown' "
-                "&& Math.abs(item.timeStamp - timestamp) < 1); "
+                "const event = (timestamp === null ? null : events.find(item => item.type === 'mousedown' "
+                "&& Math.abs(item.timeStamp - timestamp) < 1)) "
+                "|| [...events].reverse().find(item => item.type === 'mousedown'); "
                 "return event ? event.regionId : null; })"
-                f"({float(timestamp)!r})"
+                f"({timestamp_js})"
             )
             return str(region_id) if region_id else None
         except Exception:
-            return None
+            return value.get("region_id") or value.get("regionId")
 
     def _canvas_event_point(self, event, *, refresh_transform=False):
         value = getattr(event, "value", None)

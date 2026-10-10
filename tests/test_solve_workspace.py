@@ -365,6 +365,20 @@ def test_canvas_region_target_is_read_before_pointer_coordinates_are_consumed(st
     assert workspace._canvas_drag["region_id"] == "region-square"
 
 
+def test_canvas_region_target_falls_back_to_latest_native_mousedown(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    pointer_events = [{"type": "mousedown", "timeStamp": 42.0, "regionId": "region-square"}]
+    fake_js = SimpleNamespace(
+        eval=lambda script: pointer_events[-1]["regionId"] if pointer_events else None
+    )
+    monkeypatch.setattr(SolveWorkspace, "js", property(lambda self: fake_js), raising=False)
+    workspace._canvas_event_point = lambda event, refresh_transform=False: (120.0, 180.0)
+
+    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0}))
+
+    assert workspace._canvas_drag["region_id"] == "region-square"
+
+
 def test_canvas_drag_motion_and_release_do_not_rebuild_the_canvas(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
