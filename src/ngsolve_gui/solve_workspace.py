@@ -3294,7 +3294,11 @@ class SolveWorkspace(Div):
             geometry = OCCGeometry(Compound(preview_solids))
             renderer = GeometryRenderer(geometry)
             renderer.faces.active = True
-            renderer.edges.active = True
+            # OCC visualization tessellates curved faces into many small
+            # edges. Drawing every one of them makes revolved circles look
+            # like wire cages, especially at the small dimensions used here.
+            # The shaded faces retain the shape silhouette without these seams.
+            renderer.edges.active = False
 
             # Parent domains enclose their child materials. Keep those faces
             # translucent so the inner regions are visible from outside.

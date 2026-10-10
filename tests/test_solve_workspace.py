@@ -150,13 +150,30 @@ def test_3d_preview_replaces_viewport_and_restores_editable_sketch(standalone_co
     assert all(not control.ui_hidden for control in workspace._sketch_view_controls)
 
 
-def test_3d_preview_keeps_axis_indicator_without_navigation_cube(
+def test_3d_preview_shows_shaded_solid_and_axis_without_edges_or_navigation_cube(
     standalone_components, monkeypatch
 ):
     import ngapp.components
     import netgen
 
     axis_indicator = object()
+    geometry_renderer = None
+
+    class Solid:
+        faces = []
+
+        def mat(self, _name):
+            return self
+
+    class Renderer:
+        def __init__(self, _geometry):
+            self.faces = SimpleNamespace(active=None, set_colors=lambda _colors: None)
+            self.edges = SimpleNamespace(active=None)
+
+    def make_geometry_renderer(geometry):
+        nonlocal geometry_renderer
+        geometry_renderer = Renderer(geometry)
+        return geometry_renderer
 
     class Axes:
         def __new__(cls):
@@ -172,16 +189,24 @@ def test_3d_preview_keeps_axis_indicator_without_navigation_cube(
 
         def draw(self, renderers):
             self.renderers = renderers
-            return object()
+            return SimpleNamespace(
+                options=SimpleNamespace(camera=SimpleNamespace(reset=lambda *_args: None)),
+                bounding_box=(),
+                render=lambda: None,
+            )
 
     occ = ModuleType("netgen.occ")
-    for name in (
-        "Axis", "Compound", "Face", "MakePolygon", "OCCGeometry",
-        "Pnt", "Revolve", "Vec", "Vertex",
-    ):
-        setattr(occ, name, object)
+    occ.Axis = lambda *_args: object()
+    occ.Compound = lambda _solids: object()
+    occ.Face = lambda _polygon: object()
+    occ.MakePolygon = lambda _vertices: object()
+    occ.OCCGeometry = lambda _compound: SimpleNamespace(faces=[])
+    occ.Pnt = lambda *_args: object()
+    occ.Revolve = lambda *_args: Solid()
+    occ.Vec = lambda *_args: object()
+    occ.Vertex = lambda _point: object()
     ngsolve_webgpu = ModuleType("ngsolve_webgpu")
-    ngsolve_webgpu.GeometryRenderer = object
+    ngsolve_webgpu.GeometryRenderer = make_geometry_renderer
     webgpu = ModuleType("webgpu")
     webgpu.CoordinateAxes = Axes
     monkeypatch.setattr(netgen, "occ", occ, raising=False)
@@ -191,9 +216,16 @@ def test_3d_preview_keeps_axis_indicator_without_navigation_cube(
     monkeypatch.setattr(ngapp.components, "WebgpuComponent", Preview)
 
     workspace = SolveWorkspace()
+    workspace.model["geometry"]["regions"] = [{
+        "id": "circle-1",
+        "name": "circle 1",
+        "vertices": [[0.02, 0.0], [0.023, 0.0], [0.023, 0.003], [0.02, 0.003]],
+    }]
     preview = workspace._build_3d_preview_component()
 
-    assert preview.renderers == [axis_indicator]
+    assert geometry_renderer.faces.active is True
+    assert geometry_renderer.edges.active is False
+    assert preview.renderers == [geometry_renderer, axis_indicator]
 
 
 def test_3d_preview_failure_keeps_editable_sketch_active(standalone_components):
