@@ -10,7 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from decimal import Decimal, ROUND_HALF_UP
-from threading import get_ident
+from threading import Lock, Timer, get_ident
 from pathlib import Path
 
 from ngapp.components import Component, Div, QBtn, QCheckbox, QDialog, QInput, QSelect, QSeparator, QTooltip, QCard, QCardSection, QSplitter
@@ -145,6 +145,9 @@ class SolveWorkspace(Div):
         self.sketch_tool = "select"
         self._canvas_drag = None
         self._screen_to_svg = None
+        self._canvas_zoom_timer = None
+        self._canvas_zoom_timer_lock = Lock()
+        self._canvas_zoom_generation = 0
         self._preview_3d_active = False
         self._preview_3d_component = None
 
@@ -170,6 +173,13 @@ class SolveWorkspace(Div):
                 style="pointer-events:none;",
             ),
         )
+        for component, element_id in (
+            (self._canvas_grid, "solve-sketch-grid"),
+            (self._canvas_scene, "solve-sketch-scene"),
+            (self._canvas_dimensions, "solve-sketch-dimensions"),
+            (self._canvas_preview, "solve-sketch-preview"),
+        ):
+            component._props["id"] = element_id
 
         self._section_buttons = {}
         for key, label, icon in _SECTIONS:
@@ -189,7 +199,7 @@ class SolveWorkspace(Div):
             self._canvas_dimensions,
             self._canvas_preview,
             ui_class="solve-sketch-canvas",
-            ui_style="display:block; width:100%; height:100%; min-height:0; background:var(--canvas-bg, #f4f6f8); cursor:default; user-select:none; -webkit-user-select:none;",
+            ui_style="display:block; width:100%; height:100%; min-height:0; background:var(--canvas-bg, #f4f6f8); cursor:default; user-select:none; -webkit-user-select:none; touch-action:none; overscroll-behavior:contain;",
         )
         self._canvas._props.update({
             "viewBox": "0 0 900 640",
@@ -201,6 +211,7 @@ class SolveWorkspace(Div):
         self._canvas.on("mousedown", self._on_canvas_mouse_down)
         self._canvas.on("mousemove", self._on_canvas_mouse_move)
         self._canvas.on("mouseup", self._on_canvas_mouse_up)
+        self._canvas.on("pointercancel", self._on_canvas_pointer_cancel)
         self._canvas.on("wheel", self._on_canvas_wheel)
         self._inspector = Div(ui_style="display:flex; flex-direction:column; gap:12px; padding:12px; overflow:auto; min-height:0;")
         self._status = Div(ui_style="display:flex; align-items:center; gap:8px; min-width:0; overflow:hidden; white-space:nowrap;")
@@ -254,7 +265,7 @@ class SolveWorkspace(Div):
         select_button = _button(
             "Select", "mdi-cursor-default-outline",
             lambda *a: self.set_sketch_tool("select"),
-            tooltip="Drag a region to move it. Click an edge to edit it; drag empty space to select edges. Shift adds to the selection.",
+            tooltip="Drag a region to move it; drag empty space to pan. Hold Shift and drag to select edges.",
             style="flex:0 0 auto; white-space:nowrap;",
         )
         rectangle_button = _button(
@@ -430,6 +441,7 @@ class SolveWorkspace(Div):
         return True
 
     def set_model(self, model, studies=None, layout=None):
+        self._cancel_canvas_zoom_render()
         errors = validate_model(model)
         if errors:
             raise ValueError("Invalid model: " + " ".join(errors))
@@ -582,21 +594,28 @@ class SolveWorkspace(Div):
         if tool not in {"select", "rectangle", "circle"}:
             return
         self.sketch_tool = tool
+        self._canvas_drag = None
+        self._screen_to_svg = None
         try:
-            self.js.eval(f"window.__ngsolveSketchTool = '{tool}'")
+            self.js.eval(
+                "if (window.__ngsolveCancelSketchGesture) window.__ngsolveCancelSketchGesture(); "
+                f"window.__ngsolveSketchTool = '{tool}'"
+            )
         except Exception:
             # Standalone tests and non-browser frontends have no JS runtime.
             pass
         self._canvas.ui_style = (
             "display:block; width:100%; height:100%; min-height:0; "
-            "background:var(--canvas-bg, #f4f6f8); cursor:"
+            "background:var(--canvas-bg, #f4f6f8); touch-action:none; "
+            "overscroll-behavior:contain; cursor:"
             + ("crosshair;" if tool != "select" else "default;")
+            + " user-select:none; -webkit-user-select:none;"
         )
         self._refresh_sketch_tool_buttons()
         self._sync_canvas_interaction_settings()
         if announce:
             help_text = {
-                "select": "Drag a region to move it; drag empty space to select enclosed or crossed edges.",
+                "select": "Drag a region to move it; drag empty space to pan. Hold Shift and drag to select edges.",
                 "rectangle": "Drag between opposite corners to sketch a rectangle; its dimensions remain editable.",
                 "circle": "Drag from the circle centre to its radius; its position and radius remain editable.",
             }
@@ -666,6 +685,7 @@ class SolveWorkspace(Div):
         }
 
     def fit_canvas_view(self, *args):
+        self._cancel_canvas_zoom_render()
         self._view_center = None
         self._view_world_width = None
         self._save_canvas_view_to_layout()
@@ -711,7 +731,7 @@ class SolveWorkspace(Div):
             center, width = self._view_center, self._view_world_width
         return center, width, width / target_ratio
 
-    def zoom_canvas(self, factor, anchor=None):
+    def zoom_canvas(self, factor, anchor=None, *, render=True):
         """Zoom in-place, preserving the world coordinate beneath the anchor."""
         try:
             factor = float(factor)
@@ -739,6 +759,52 @@ class SolveWorkspace(Div):
         self._view_center = center
         self._view_world_width = new_width
         self._save_canvas_view_to_layout()
+        if render:
+            self._cancel_canvas_zoom_render()
+            self.render_canvas()
+
+    def _schedule_canvas_zoom_render(self):
+        """Rebuild grid labels once wheel input settles, not once per tick."""
+        with self._canvas_zoom_timer_lock:
+            self._canvas_zoom_generation += 1
+            generation = self._canvas_zoom_generation
+            if self._canvas_zoom_timer is not None:
+                self._canvas_zoom_timer.cancel()
+            timer = Timer(0.12, self._flush_canvas_zoom_render, args=(generation,))
+            timer.daemon = True
+            self._canvas_zoom_timer = timer
+            timer.start()
+
+    def _cancel_canvas_zoom_render(self):
+        with self._canvas_zoom_timer_lock:
+            self._canvas_zoom_generation += 1
+            if self._canvas_zoom_timer is not None:
+                self._canvas_zoom_timer.cancel()
+                self._canvas_zoom_timer = None
+
+    def _flush_canvas_zoom_render(self, generation):
+        with self._canvas_zoom_timer_lock:
+            if generation != self._canvas_zoom_generation:
+                return
+            self._canvas_zoom_timer = None
+        self.render_canvas()
+
+    def _pan_canvas_by_pixels(self, start, end):
+        """Pan the meridian view by a drag measured in SVG canvas units."""
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        if math.hypot(dx, dy) < 1e-9:
+            return
+        plot = self._canvas_plot_bounds()
+        center, width, _ = self._current_canvas_world_view()
+        pixels_per_world = (plot[2] - plot[0]) / width
+        if not math.isfinite(pixels_per_world) or pixels_per_world <= 0:
+            return
+        self._view_center = (
+            center[0] - dx / pixels_per_world,
+            center[1] + dy / pixels_per_world,
+        )
+        self._view_world_width = width
+        self._save_canvas_view_to_layout()
         self.render_canvas()
 
     def _on_canvas_wheel(self, event):
@@ -754,7 +820,8 @@ class SolveWorkspace(Div):
         delta = min(300.0, max(-300.0, delta))
         anchor = self._canvas_event_point(event, refresh_transform=True)
         factor = math.exp(delta * 0.0015)
-        self.zoom_canvas(factor, anchor)
+        self.zoom_canvas(factor, anchor, render=False)
+        self._schedule_canvas_zoom_render()
 
     def _read_screen_to_svg_transform(self):
         """Read the current SVG screen matrix once when a pointer gesture starts."""
@@ -771,37 +838,78 @@ class SolveWorkspace(Div):
             return None
 
     def _install_canvas_pointer_capture(self, *_):
-        """Keep absolute pointer coordinates from the browser's native events.
+        """Keep sketch gestures alive through release and render previews locally.
 
-        ngapp's generic mouse-event bridge forwards buttons and modifiers but
-        omits clientX/clientY.  The sketch callbacks still arrive in Python,
-        so retain the latest screen coordinates in the page for those handlers
-        to read when a gesture starts, moves, or ends.
+        Pointer capture makes drawing, marquee selection, region movement, and
+        panning independent of which SVG child is beneath the pointer. The
+        mouse-event cache remains for ngapp's Python callbacks, which do not
+        consistently include client coordinates.
         """
         script = r"""
 (() => {
   window.__ngsolveSketchTool = '__SKETCH_TOOL__';
-  if (window.__ngsolveSketchPointerCaptureInstalled) return;
-  window.__ngsolveSketchPointerCaptureInstalled = true;
+  if (window.__ngsolveSketchPointerCaptureVersion === 2) return;
+  window.__ngsolveSketchPointerCaptureVersion = 2;
   let active = false;
+  let activePointerId = null;
   let dragStart = null;
   let dragRegionId = null;
+  let dragMode = null;
   let gestureNumber = 0;
   let suppressCanvasClickUntil = 0;
+  let visualScale = 1;
+  let visualTranslateX = 0;
+  let visualTranslateY = 0;
   const pointerEvents = window.__ngsolveSketchPointerEvents = [];
   const forwardedEvents = new WeakSet();
   const selector = 'svg.solve-sketch-canvas';
+  const groupIds = [
+    'solve-sketch-grid', 'solve-sketch-scene',
+    'solve-sketch-dimensions', 'solve-sketch-preview',
+  ];
+  const pointerSupported = typeof window.PointerEvent === 'function';
+  const currentSvg = () => document.querySelector(selector);
+  const targetIsSvg = (event, svg) => Boolean(
+    svg && event.target && event.target.closest
+      && event.target.closest(selector) === svg
+  );
+  const applyCanvasTransform = (scale, tx, ty, svg = currentSvg()) => {
+    if (!svg) return;
+    visualScale = scale;
+    visualTranslateX = tx;
+    visualTranslateY = ty;
+    const transform = `matrix(${scale} 0 0 ${scale} ${tx} ${ty})`;
+    for (const id of groupIds) {
+      const group = svg.querySelector('#' + id);
+      if (group) group.setAttribute('transform', transform);
+    }
+  };
+  const resetCanvasTransform = (svg = currentSvg()) => {
+    if (!svg) return;
+    visualScale = 1;
+    visualTranslateX = 0;
+    visualTranslateY = 0;
+    for (const id of groupIds) {
+      const group = svg.querySelector('#' + id);
+      if (group) group.removeAttribute('transform');
+    }
+  };
   const remember = (event) => {
     window.__ngsolveSketchPointer = [event.clientX, event.clientY];
+    const targetRegion = event.target && event.target.closest
+      ? (event.target.closest('[data-sketch-region-id]') || {}).getAttribute('data-sketch-region-id')
+      : null;
+    const fallbackRegion = event.type === 'mousedown'
+      ? window.__ngsolveSketchRegionForNextMouseDown
+      : null;
     pointerEvents.push({
       type: event.type,
       timeStamp: event.timeStamp,
       x: event.clientX,
       y: event.clientY,
-      regionId: event.target && event.target.closest
-        ? (event.target.closest('[data-sketch-region-id]') || {}).getAttribute('data-sketch-region-id')
-        : null,
+      regionId: targetRegion || fallbackRegion || null,
     });
+    if (event.type === 'mousedown') window.__ngsolveSketchRegionForNextMouseDown = null;
     if (pointerEvents.length > 256) pointerEvents.splice(0, pointerEvents.length - 256);
   };
   const svgPoint = (svg, event) => {
@@ -813,7 +921,7 @@ class SolveWorkspace(Div):
     const mapped = point.matrixTransform(matrix.inverse());
     return [mapped.x, mapped.y];
   };
-  const clearPreview = (svg) => {
+  const clearPreview = (svg = currentSvg()) => {
     if (!svg) return;
     for (const id of ['solve-sketch-drag-rect', 'solve-sketch-drag-circle']) {
       const shape = svg.querySelector('#' + id);
@@ -826,8 +934,11 @@ class SolveWorkspace(Div):
         }
       }
     }
+    window.__ngsolveSketchLastRegionId = null;
+    resetCanvasTransform(svg);
     dragStart = null;
     dragRegionId = null;
+    dragMode = null;
   };
   const snapPoint = (point) => {
     const grid = window.__ngsolveSketchSnap;
@@ -839,8 +950,8 @@ class SolveWorkspace(Div):
   const sketchPoint = (point) =>
     (window.__ngsolveSketchTool || 'select') === 'select' ? point : snapPoint(point);
   const updatePreview = (svg, point) => {
-    if (!dragStart || !point) return;
-    if (dragRegionId) {
+    if (!active || !dragStart || !point) return;
+    if (dragMode === 'region' && dragRegionId) {
       const grid = window.__ngsolveSketchSnap;
       const start = grid && grid.enabled ? snapPoint(dragStart) : dragStart;
       const end = grid && grid.enabled ? snapPoint(point) : point;
@@ -856,11 +967,16 @@ class SolveWorkspace(Div):
       }
       return;
     }
-    point = sketchPoint(point);
+    if (dragMode === 'pan') {
+      applyCanvasTransform(1, point[0] - dragStart[0], point[1] - dragStart[1], svg);
+      svg.style.cursor = 'grabbing';
+      return;
+    }
+    if (dragMode !== 'marquee') point = sketchPoint(point);
     const dx = point[0] - dragStart[0];
     const dy = point[1] - dragStart[1];
     const tool = window.__ngsolveSketchTool || 'select';
-    const isSelection = tool === 'select';
+    const isSelection = dragMode === 'marquee';
     const rect = svg.querySelector('#solve-sketch-drag-rect');
     const circle = svg.querySelector('#solve-sketch-drag-circle');
     if (Math.hypot(dx, dy) < 4) {
@@ -895,12 +1011,128 @@ class SolveWorkspace(Div):
     rect.setAttribute('stroke', stroke);
     rect.setAttribute('stroke-width', isSelection ? '1.5' : '2');
   };
+  const beginGesture = (event, svg) => {
+    if (!targetIsSvg(event, svg) || event.button !== 0 || event.isPrimary === false) return;
+    if (active) clearPreview(svg);
+    active = true;
+    activePointerId = event.pointerId === undefined ? null : event.pointerId;
+    gestureNumber += 1;
+    clearPreview(svg);
+    dragStart = sketchPoint(svgPoint(svg, event));
+    const region = event.target && event.target.closest
+      ? event.target.closest('[data-sketch-region-id]')
+      : null;
+    dragRegionId = (window.__ngsolveSketchTool || 'select') === 'select' && region
+      ? region.getAttribute('data-sketch-region-id')
+      : null;
+    window.__ngsolveSketchLastRegionId = dragRegionId;
+    const tool = window.__ngsolveSketchTool || 'select';
+    dragMode = tool !== 'select'
+      ? 'draw'
+      : dragRegionId
+        ? 'region'
+        : (event.shiftKey || event.ctrlKey ? 'marquee' : 'pan');
+    window.__ngsolveSketchGestureActive = true;
+    if (dragMode === 'pan') svg.style.cursor = 'grabbing';
+    if (dragMode === 'region') window.__ngsolveSketchRegionForNextMouseDown = dragRegionId;
+    remember(event);
+    if (activePointerId !== null && svg.setPointerCapture) {
+      try { svg.setPointerCapture(activePointerId); } catch (_) { /* capture may already be ending */ }
+    }
+  };
+  const moveGesture = (event, svg) => {
+    if (!active || (activePointerId !== null && event.pointerId !== activePointerId)) return;
+    remember(event);
+    updatePreview(svg, svgPoint(svg, event));
+  };
+  const finishGesture = (event, svg, cancelled = false) => {
+    if (!active || (activePointerId !== null && event.pointerId !== undefined && event.pointerId !== activePointerId)) return;
+    remember(event);
+    const point = svgPoint(svg, event);
+    if (!cancelled && point) updatePreview(svg, point);
+    const moved = Boolean(!cancelled && dragStart && point
+      && Math.hypot(point[0] - dragStart[0], point[1] - dragStart[1]) >= 4);
+    const finishedGesture = gestureNumber;
+    const preserveVisual = moved && ['draw', 'pan', 'region'].includes(dragMode);
+    const shouldForward = active && !targetIsSvg(event, svg) && event.type !== 'pointercancel';
+    if (moved) {
+      // The browser's click follows mouseup. Suppress it after any drag so
+      // the completed gesture cannot select a region beneath its endpoint.
+      suppressCanvasClickUntil = performance.now() + 1000;
+    }
+    active = false;
+    activePointerId = null;
+    window.__ngsolveSketchGestureActive = false;
+    if (svg) svg.style.cursor = (window.__ngsolveSketchTool || 'select') === 'select' ? 'default' : 'crosshair';
+    if (!preserveVisual) clearPreview(svg);
+    else window.setTimeout(() => {
+      if (gestureNumber === finishedGesture) clearPreview(svg);
+    }, 2500);
+    if (shouldForward) {
+      const forwarded = new MouseEvent('mouseup', {
+        bubbles: true,
+        button: event.button,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        shiftKey: event.shiftKey,
+        ctrlKey: event.ctrlKey,
+      });
+      forwardedEvents.add(forwarded);
+      remember(forwarded);
+      svg.dispatchEvent(forwarded);
+    }
+  };
+  const cancelGesture = (notifyPython = false) => {
+    const svg = currentSvg();
+    if (!svg) return;
+    const wasActive = active;
+    const pointerId = activePointerId;
+    active = false;
+    activePointerId = null;
+    window.__ngsolveSketchGestureActive = false;
+    clearPreview(svg);
+    svg.style.cursor = (window.__ngsolveSketchTool || 'select') === 'select' ? 'default' : 'crosshair';
+    if (wasActive && notifyPython) {
+      const cancelled = new PointerEvent('pointercancel', {
+        bubbles: true, pointerId: pointerId === null ? 1 : pointerId,
+        pointerType: 'mouse', button: 0,
+        clientX: (window.__ngsolveSketchPointer || [0, 0])[0],
+        clientY: (window.__ngsolveSketchPointer || [0, 0])[1],
+      });
+      svg.dispatchEvent(cancelled);
+    }
+  };
+  window.__ngsolveCancelSketchGesture = () => cancelGesture(true);
+  window.__ngsolveResetSketchPreview = () => {
+    if (active) return;
+    clearPreview(currentSvg());
+  };
+  const handleWheel = (event, svg) => {
+    if (!targetIsSvg(event, svg)) return;
+    event.preventDefault();
+    if (active) {
+      event.stopImmediatePropagation();
+      return;
+    }
+    const delta = Number(event.deltaY) || 0;
+    if (!Number.isFinite(delta) || delta === 0) return;
+    const point = svgPoint(svg, event);
+    if (!point) return;
+    const clampedDelta = Math.max(-300, Math.min(300, delta));
+    const factor = Math.exp(-clampedDelta * 0.0015);
+    const tx = point[0] + factor * (visualTranslateX - point[0]);
+    const ty = point[1] + factor * (visualTranslateY - point[1]);
+    applyCanvasTransform(visualScale * factor, tx, ty, svg);
+  };
   const capture = (event) => {
     if (forwardedEvents.has(event)) return;
-    const svg = document.querySelector(selector);
+    const svg = currentSvg();
     if (!svg) return;
-    const targetIsCanvas = event.target && event.target.closest
-      && event.target.closest(selector) === svg;
+    const targetIsCanvas = targetIsSvg(event, svg);
+    if (event.type === 'wheel') {
+      handleWheel(event, svg);
+      return;
+    }
     if (event.type === 'click') {
       if (targetIsCanvas && performance.now() < suppressCanvasClickUntil) {
         suppressCanvasClickUntil = 0;
@@ -909,66 +1141,38 @@ class SolveWorkspace(Div):
       }
       return;
     }
-    if (event.type === 'mousedown') {
-      if (!targetIsCanvas || event.button !== 0) return;
-      active = true;
-      gestureNumber += 1;
-      clearPreview(svg);
-      dragStart = sketchPoint(svgPoint(svg, event));
-      const region = event.target && event.target.closest
-        ? event.target.closest('[data-sketch-region-id]')
-        : null;
-      dragRegionId = (window.__ngsolveSketchTool || 'select') === 'select' && region
-        ? region.getAttribute('data-sketch-region-id')
-        : null;
-    } else if (!active) {
+    if (pointerSupported) {
+      if (event.type === 'mousedown' && targetIsCanvas && event.button === 0) remember(event);
+      else if (event.type === 'mousemove' && active) remember(event);
+      else if (event.type === 'mouseup' && (targetIsCanvas || active)) remember(event);
       return;
     }
-    remember(event);
-    if (event.type === 'mousemove') {
-      updatePreview(svg, svgPoint(svg, event));
+    if (event.type === 'mousedown') {
+      beginGesture(event, svg);
+      return;
     }
-    if (event.type === 'mouseup') {
-      const releasePoint = sketchPoint(svgPoint(svg, event));
-      if (targetIsCanvas && dragStart && releasePoint
-          && Math.hypot(releasePoint[0] - dragStart[0], releasePoint[1] - dragStart[1]) >= 4) {
-        // The browser's click follows mouseup. Ignore that click after a drag,
-        // otherwise a nested shape selects its parent region at the same spot.
-        suppressCanvasClickUntil = performance.now() + 1000;
-      }
-      const shouldForward = active && !targetIsCanvas;
-      const regionDrag = Boolean(dragRegionId);
-      const finishedGesture = gestureNumber;
-      active = false;
-      if (shouldForward || !regionDrag) {
-        clearPreview(svg);
-      } else {
-        // The model patch normally replaces the preview immediately after
-        // mouseup. Clear it after a short fallback in case the bridge drops
-        // that event, so the canvas cannot remain visually out of sync.
-        window.setTimeout(() => {
-          if (gestureNumber === finishedGesture) clearPreview(svg);
-        }, 3000);
-      }
-      if (shouldForward) {
-        const forwarded = new MouseEvent('mouseup', {
-          bubbles: true,
-          button: event.button,
-          clientX: event.clientX,
-          clientY: event.clientY,
-          shiftKey: event.shiftKey,
-          ctrlKey: event.ctrlKey,
-        });
-        forwardedEvents.add(forwarded);
-        remember(forwarded);
-        svg.dispatchEvent(forwarded);
-      }
-    }
+    if (!active) return;
+    if (event.type === 'mousemove') moveGesture(event, svg);
+    if (event.type === 'mouseup') finishGesture(event, svg);
   };
+  if (pointerSupported) {
+    document.addEventListener('pointerdown', event => beginGesture(event, currentSvg()), true);
+    document.addEventListener('pointermove', event => moveGesture(event, currentSvg()), true);
+    document.addEventListener('pointerup', event => finishGesture(event, currentSvg()), true);
+    document.addEventListener('pointercancel', event => finishGesture(event, currentSvg(), true), true);
+    document.addEventListener('lostpointercapture', event => {
+      if (active && event.pointerId === activePointerId) cancelGesture(true);
+    }, true);
+  }
+  window.addEventListener('blur', () => cancelGesture(true));
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) cancelGesture(true);
+  });
   document.addEventListener('mousedown', capture, true);
   document.addEventListener('mousemove', capture, true);
   document.addEventListener('mouseup', capture, true);
   document.addEventListener('click', capture, true);
+  document.addEventListener('wheel', capture, {capture:true, passive:false});
 })()
 """
         try:
@@ -1067,8 +1271,17 @@ class SolveWorkspace(Div):
             point = self._snap_canvas_point(point)
         elif not region_id:
             region_id = self._region_at_canvas_point(point)
+        if tool != "select":
+            operation = "draw"
+        elif region_id:
+            operation = "region"
+        elif value.get("shiftKey") or value.get("ctrlKey"):
+            operation = "marquee"
+        else:
+            operation = "pan"
         self._canvas_drag = {
             "tool": tool,
+            "operation": operation,
             "start": point,
             "current": point,
             "region_id": region_id,
@@ -1116,12 +1329,19 @@ class SolveWorkspace(Div):
         moved = math.hypot(end[0] - start[0], end[1] - start[1]) >= 4.0
         self._canvas_drag = None
         self._screen_to_svg = None
-        if moved and drag["tool"] == "select" and drag.get("region_id"):
+        if moved and drag["operation"] == "region" and drag.get("region_id"):
             self._move_region_from_canvas_drag(drag["region_id"], start, end)
-        elif moved and drag["tool"] == "select":
+        elif moved and drag["operation"] == "marquee":
             self._select_edges_in_canvas_box(start, end, additive=drag["additive"])
-        elif moved and drag["tool"] in {"rectangle", "circle"}:
+        elif moved and drag["operation"] == "pan":
+            self._pan_canvas_by_pixels(start, end)
+        elif moved and drag["operation"] == "draw":
             self._create_region_from_canvas_drag(drag["tool"], start, end)
+
+    def _on_canvas_pointer_cancel(self, event=None):
+        """Discard an incomplete sketch gesture after a cancelled pointer."""
+        self._canvas_drag = None
+        self._screen_to_svg = None
 
     @contextmanager
     def _batch_frontend_updates(self):
@@ -2846,6 +3066,18 @@ class SolveWorkspace(Div):
         axial = round(axial / step) * step
         return project((radial, axial))
 
+    def _schedule_canvas_interaction_reset(self):
+        """Clear temporary SVG transforms after the committed scene is patched."""
+        try:
+            self.js.eval(
+                "(() => { const reset = window.__ngsolveResetSketchPreview; "
+                "if (!reset) return; "
+                "requestAnimationFrame(() => requestAnimationFrame(reset)); })()"
+            )
+        except Exception:
+            # Standalone tests and non-browser frontends do not expose JS.
+            pass
+
     def render_canvas(self):
         width, height = 900, 640
         plot = self._canvas_plot_bounds()
@@ -2951,11 +3183,12 @@ class SolveWorkspace(Div):
 
         if not regions:
             scene_children.append(_svg("text", x=width / 2, y=height / 2 - 8, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="16", children="Choose Rectangle or Circle in the toolbar to begin"))
-            scene_children.append(_svg("text", x=width / 2, y=height / 2 + 18, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="12", children="Drag regions to move them; click regions or edges to edit dimensions in mm"))
+            scene_children.append(_svg("text", x=width / 2, y=height / 2 + 18, text_anchor="middle", fill="var(--fg-muted, #697586)", font_size="12", children="Drag blank space to pan; hold Shift while dragging to select edges"))
         self._canvas_grid.ui_children = grid_children
         self._canvas_scene.ui_children = scene_children
         self._render_canvas_dimensions()
         self._sync_canvas_interaction_settings()
+        self._schedule_canvas_interaction_reset()
 
     def _build_3d_preview_component(self):
         """Revolve the current meridian regions and show them without editing tools."""

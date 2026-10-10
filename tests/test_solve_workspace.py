@@ -454,6 +454,24 @@ def test_canvas_mouse_gesture_creates_rectangle_and_maps_screen_coordinates(stan
     assert workspace.sketch_tool == "select"
 
 
+def test_canvas_mouse_gesture_creates_circle_and_restores_select_tool(standalone_components):
+    workspace = SolveWorkspace()
+    project, _ = workspace._canvas_projection()
+    start, end = project((0.010, 0.004)), project((0.013, 0.008))
+    points = iter((start, (start[0] + 9, start[1] + 8), end))
+    workspace._canvas_event_point = lambda event, refresh_transform=False: next(points)
+    workspace.set_sketch_tool("circle", announce=False)
+
+    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0}))
+    workspace._on_canvas_mouse_move(SimpleNamespace(value={}))
+    workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
+
+    circle = workspace.model["geometry"]["regions"][0]
+    assert circle["shape"]["type"] == "circle"
+    assert circle["shape"]["radius"] == pytest.approx(math.hypot(0.003, 0.004))
+    assert workspace.sketch_tool == "select"
+
+
 def test_canvas_region_target_is_read_before_pointer_coordinates_are_consumed(standalone_components, monkeypatch):
     workspace = SolveWorkspace()
     pointer_events = [{"type": "mousedown", "timeStamp": 42.0, "regionId": "region-square"}]
@@ -519,13 +537,51 @@ def test_canvas_drag_motion_and_release_do_not_rebuild_the_canvas(standalone_com
     renders = []
     workspace.render_canvas = lambda: renders.append("render")
 
-    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0}))
+    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0, "shiftKey": True}))
+    assert workspace._canvas_drag["operation"] == "marquee"
     workspace._on_canvas_mouse_move(SimpleNamespace(value={}))
     assert renders == []
 
     workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
     assert renders == []
     assert len(workspace.selected_edge_ids) == 4
+
+
+def test_empty_canvas_drag_pans_and_shift_drag_retains_marquee_selection(standalone_components):
+    workspace = SolveWorkspace()
+    center_before, width_before, _ = workspace._current_canvas_world_view()
+    start, end = (100.0, 120.0), (138.0, 146.0)
+    points = iter((start, end, end))
+    workspace._canvas_event_point = lambda event, refresh_transform=False: next(points)
+
+    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0}))
+    assert workspace._canvas_drag["operation"] == "pan"
+    workspace._on_canvas_mouse_move(SimpleNamespace(value={}))
+    workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
+
+    center_after, width_after, _ = workspace._current_canvas_world_view()
+    pixels_per_world = (workspace._canvas_plot_bounds()[2] - workspace._canvas_plot_bounds()[0]) / width_before
+    assert center_after[0] == pytest.approx(center_before[0] - 38.0 / pixels_per_world)
+    assert center_after[1] == pytest.approx(center_before[1] + 26.0 / pixels_per_world)
+    assert width_after == pytest.approx(width_before)
+
+    points = iter(((160.0, 180.0), (190.0, 210.0)))
+    workspace._canvas_event_point = lambda event, refresh_transform=False: next(points)
+    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0, "shiftKey": True}))
+    assert workspace._canvas_drag["operation"] == "marquee"
+    workspace._on_canvas_pointer_cancel()
+    assert workspace._canvas_drag is None
+
+
+def test_canvas_pointer_cancel_clears_an_incomplete_sketch(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._canvas_drag = {"tool": "rectangle", "start": (1, 2), "current": (4, 5)}
+    workspace._screen_to_svg = (1, 0, 0, 1, 0, 0)
+
+    workspace._on_canvas_pointer_cancel()
+
+    assert workspace._canvas_drag is None
+    assert workspace._screen_to_svg is None
 
 
 def test_region_creation_updates_canvas_before_side_panels(standalone_components, monkeypatch):
@@ -656,6 +712,9 @@ def test_canvas_drag_suppresses_the_click_that_follows_mouseup(standalone_compon
     assert "suppressCanvasClickUntil" in scripts[0]
     assert "event.stopImmediatePropagation()" in scripts[0]
     assert "document.addEventListener('click', capture, true)" in scripts[0]
+    assert "setPointerCapture" in scripts[0]
+    assert "pointercancel" in scripts[0]
+    assert "window.addEventListener('blur'" in scripts[0]
 
 
 def test_canvas_render_keeps_background_and_layer_components_mounted(standalone_components):
@@ -895,11 +954,56 @@ def test_canvas_wheel_zooms_at_the_current_pointer(standalone_components):
     calls = []
     anchor = (740.0, 200.0)
     workspace._canvas_event_point = lambda event, refresh_transform=False: anchor
-    workspace.zoom_canvas = lambda factor, point=None: calls.append((factor, point))
+    workspace.zoom_canvas = lambda factor, point=None, render=True: calls.append((factor, point, render))
+    workspace._schedule_canvas_zoom_render = lambda: calls.append("schedule")
 
     workspace._on_canvas_wheel(SimpleNamespace(value={"deltaY": 120.0}))
 
-    assert calls == [(pytest.approx(math.exp(0.18)), anchor)]
+    assert calls == [(pytest.approx(math.exp(0.18)), anchor, False), "schedule"]
+
+
+def test_wheel_zoom_coalesces_canvas_renders_until_input_settles(standalone_components, monkeypatch):
+    import ngsolve_gui.solve_workspace as solve_workspace_module
+
+    timers = []
+
+    class FakeTimer:
+        def __init__(self, interval, callback, args=()):
+            self.interval = interval
+            self.callback = callback
+            self.args = args
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+        def fire(self):
+            self.callback(*self.args)
+
+    monkeypatch.setattr(solve_workspace_module, "Timer", FakeTimer)
+    workspace = SolveWorkspace()
+    anchor = (740.0, 200.0)
+    workspace._canvas_event_point = lambda event, refresh_transform=False: anchor
+    renders = []
+    workspace.render_canvas = lambda: renders.append("render")
+    initial_width = workspace._current_canvas_world_view()[1]
+
+    workspace._on_canvas_wheel(SimpleNamespace(value={"deltaY": 120.0}))
+    first_timer = timers[-1]
+    workspace._on_canvas_wheel(SimpleNamespace(value={"deltaY": -60.0}))
+    second_timer = timers[-1]
+
+    assert first_timer.cancelled
+    assert renders == []
+    assert workspace._current_canvas_world_view()[1] == pytest.approx(
+        initial_width * math.exp(0.09)
+    )
+    second_timer.fire()
+    assert renders == ["render"]
 
 
 def test_grid_zoom_out_expands_without_a_fixed_view_boundary(standalone_components):
