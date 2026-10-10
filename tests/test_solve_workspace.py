@@ -485,6 +485,7 @@ def test_grid_snap_button_is_right_aligned_in_the_sketch_toolbar(standalone_comp
     fit_view_index = next(index for index, item in enumerate(slots) if getattr(item, "ui_label", None) == "Fit view")
     snap_button = slots[snap_index]
 
+    assert workspace._snap_button is snap_button
     assert snap_button.ui_icon == "mdi-magnet"
     assert snap_button.ui_label == "Snap"
     assert "position:absolute" in snap_button.ui_style

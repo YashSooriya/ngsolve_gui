@@ -266,7 +266,10 @@ class SolveWorkspace(Div):
             "rectangle": toolbar.ui_slots["default"][1],
             "circle": toolbar.ui_slots["default"][2],
         }
-        self._snap_button = toolbar.ui_slots["default"][-1]
+        self._snap_button = next(
+            button for button in toolbar.ui_slots["default"]
+            if getattr(button, "ui_icon", None) == "mdi-magnet"
+        )
         self._canvas_panel = Div(
             toolbar,
             self._canvas_host,
