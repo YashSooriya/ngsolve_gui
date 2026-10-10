@@ -3792,7 +3792,10 @@ class SolveWorkspace(Div):
 
     def _build_3d_preview_component(self):
         """Revolve the current meridian regions and show them without editing tools."""
-        from netgen.occ import Axis, Compound, Face, MakePolygon, OCCGeometry, Pnt, Revolve, Vec, Vertex
+        from netgen.occ import (
+            Axis, Circle, Compound, Dir, Face, MakePolygon, OCCGeometry, Pnt,
+            Revolve, Vec, Vertex, Wire,
+        )
         from ngapp.components import WebgpuComponent
         from ngsolve_webgpu import GeometryRenderer
         from webgpu import CoordinateAxes
@@ -3807,12 +3810,28 @@ class SolveWorkspace(Div):
             vertices = region.get("vertices", [])
             if len(vertices) < 3:
                 raise ValueError(f"Region '{region.get('name', 'unnamed')}' needs at least three vertices.")
-            profile_vertices = [
-                Vertex(Pnt(float(radius), 0.0, float(axial)))
-                for radius, axial in vertices
-            ]
-            profile_vertices.append(profile_vertices[0])
-            profile = Face(MakePolygon(profile_vertices))
+            shape = region.get("shape", {})
+            if shape.get("type") == "circle":
+                # The editable sketch stores circles as a 48-sided polygon for
+                # the solver. Revolving that polygon creates dozens of tiny
+                # OCC edges, which render as distracting rings on the torus.
+                # Use an exact circular profile in the read-only preview.
+                profile = Face(Wire(Circle(
+                    Pnt(
+                        float(shape["r_center"]),
+                        0.0,
+                        float(shape["z_center"]),
+                    ),
+                    Dir(0.0, 1.0, 0.0),
+                    float(shape["radius"]),
+                )))
+            else:
+                profile_vertices = [
+                    Vertex(Pnt(float(radius), 0.0, float(axial)))
+                    for radius, axial in vertices
+                ]
+                profile_vertices.append(profile_vertices[0])
+                profile = Face(MakePolygon(profile_vertices))
             revolved[region["id"]] = Revolve(
                 profile,
                 Axis(Pnt(0.0, 0.0, 0.0), Vec(0.0, 0.0, 1.0)),
@@ -3838,30 +3857,28 @@ class SolveWorkspace(Div):
             geometry = OCCGeometry(Compound(preview_solids))
             renderer = GeometryRenderer(geometry)
             renderer.faces.active = True
-            # OCC visualization tessellates curved faces into many small
-            # edges. Drawing every one of them makes revolved circles look
-            # like wire cages, especially at the small dimensions used here.
-            # The shaded faces retain the shape silhouette without these seams.
-            renderer.edges.active = False
+            # Show the geometric boundaries while keeping circle profiles
+            # analytic above, so a torus has a small number of clean OCC edges
+            # instead of a wire cage made from the sketch polygon.
+            renderer.edges.active = True
 
-            # Parent domains enclose their child materials. Keep those faces
-            # translucent so the inner regions are visible from outside.
+            # Nested parent domains were boolean-cut by their child regions
+            # above, so every material can be shown as an opaque solid.
             material_index = {
                 material.get("id"): index
                 for index, material in enumerate(self.model.get("materials", []))
             }
-            parent_ids = {region.get("parent_id") for region in regions}
             face_color_by_hash = {}
             for region, solid in zip(regions, preview_solids):
                 palette = _MATERIAL_COLORS[
                     material_index.get(region.get("material_id"), 0) % len(_MATERIAL_COLORS)
                 ]
                 rgb = tuple(int(palette[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
-                alpha = 0.20 if region["id"] in parent_ids else 0.92
+                alpha = 1.0
                 for face in solid.faces:
                     face_color_by_hash[hash(face)] = (*rgb, alpha)
             faces = list(geometry.faces)
-            face_colors = np.tile(np.array([0.42, 0.55, 0.68, 0.20], dtype=np.float32), len(faces))
+            face_colors = np.tile(np.array([0.42, 0.55, 0.68, 1.0], dtype=np.float32), len(faces))
             for face_index, face in enumerate(faces):
                 color = face_color_by_hash.get(hash(face))
                 if color is not None:
@@ -3920,6 +3937,7 @@ class SolveWorkspace(Div):
         self._preview_3d_component = preview
         self._canvas_host.ui_children = [preview]
         self._preview_3d_active = True
+        self._preview_3d_button.ui_label = "Exit 3D Preview"
         self._preview_3d_button.ui_icon = "mdi-cube-outline"
         self._preview_3d_button.ui_color = "primary"
         self._preview_3d_button.ui_flat = False

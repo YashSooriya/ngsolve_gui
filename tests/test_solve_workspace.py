@@ -390,7 +390,7 @@ def test_3d_preview_replaces_viewport_and_restores_editable_sketch(standalone_co
     assert workspace._preview_3d_active
     assert workspace._preview_3d_component is preview
     assert workspace._canvas_host.ui_children == [preview]
-    assert workspace._preview_3d_button.ui_label == "Preview in 3D"
+    assert workspace._preview_3d_button.ui_label == "Exit 3D Preview"
     assert all(control.ui_hidden for control in workspace._sketch_view_controls)
 
     workspace.toggle_3d_preview()
@@ -402,7 +402,7 @@ def test_3d_preview_replaces_viewport_and_restores_editable_sketch(standalone_co
     assert all(not control.ui_hidden for control in workspace._sketch_view_controls)
 
 
-def test_3d_preview_shows_shaded_solid_and_axis_without_edges_or_navigation_cube(
+def test_3d_preview_shows_opaque_solid_with_edges_and_axis_without_navigation_cube(
     standalone_components, monkeypatch
 ):
     import ngapp.components
@@ -410,22 +410,38 @@ def test_3d_preview_shows_shaded_solid_and_axis_without_edges_or_navigation_cube
 
     axis_indicator = object()
     geometry_renderer = None
+    face_colors = None
+    circle_profiles = []
 
     class Solid:
-        faces = []
+        def __init__(self, profile):
+            self.faces = [profile]
+
+        def __sub__(self, _child):
+            return self
 
         def mat(self, _name):
             return self
 
     class Renderer:
         def __init__(self, _geometry):
-            self.faces = SimpleNamespace(active=None, set_colors=lambda _colors: None)
+            self.faces = SimpleNamespace(active=None, set_colors=self.set_face_colors)
             self.edges = SimpleNamespace(active=None)
+
+        @staticmethod
+        def set_face_colors(colors):
+            nonlocal face_colors
+            face_colors = colors.copy()
 
     def make_geometry_renderer(geometry):
         nonlocal geometry_renderer
         geometry_renderer = Renderer(geometry)
         return geometry_renderer
+
+    def make_circle(center, normal, radius):
+        profile = object()
+        circle_profiles.append((center, normal, radius, profile))
+        return profile
 
     class Axes:
         def __new__(cls):
@@ -449,14 +465,20 @@ def test_3d_preview_shows_shaded_solid_and_axis_without_edges_or_navigation_cube
 
     occ = ModuleType("netgen.occ")
     occ.Axis = lambda *_args: object()
-    occ.Compound = lambda _solids: object()
-    occ.Face = lambda _polygon: object()
+    occ.Circle = make_circle
+    occ.Compound = lambda solids: list(solids)
+    occ.Dir = lambda *args: args
+    occ.Face = lambda profile: profile
     occ.MakePolygon = lambda _vertices: object()
-    occ.OCCGeometry = lambda _compound: SimpleNamespace(faces=[])
-    occ.Pnt = lambda *_args: object()
-    occ.Revolve = lambda *_args: Solid()
+    occ.OCCGeometry = lambda compound: SimpleNamespace(
+        faces=[face for solid in compound for face in solid.faces],
+        shape=SimpleNamespace(solids=compound),
+    )
+    occ.Pnt = lambda *args: args
+    occ.Revolve = lambda profile, *_args: Solid(profile)
     occ.Vec = lambda *_args: object()
     occ.Vertex = lambda _point: object()
+    occ.Wire = lambda profile: profile
     ngsolve_webgpu = ModuleType("ngsolve_webgpu")
     ngsolve_webgpu.GeometryRenderer = make_geometry_renderer
     webgpu = ModuleType("webgpu")
@@ -468,15 +490,38 @@ def test_3d_preview_shows_shaded_solid_and_axis_without_edges_or_navigation_cube
     monkeypatch.setattr(ngapp.components, "WebgpuComponent", Preview)
 
     workspace = SolveWorkspace()
-    workspace.model["geometry"]["regions"] = [{
-        "id": "circle-1",
-        "name": "circle 1",
-        "vertices": [[0.02, 0.0], [0.023, 0.0], [0.023, 0.003], [0.02, 0.003]],
-    }]
+    workspace.model["geometry"]["regions"] = [
+        {
+            "id": "circle-outer",
+            "name": "circle 1",
+            "shape": {
+                "type": "circle", "r_center": 0.02, "z_center": 0.0, "radius": 0.01,
+            },
+            "vertices": [[0.01, 0.0], [0.03, 0.0], [0.02, 0.01]],
+        },
+        {
+            "id": "circle-inner",
+            "name": "circle 2",
+            "shape": {
+                "type": "circle", "r_center": 0.02, "z_center": 0.0, "radius": 0.002,
+            },
+            "vertices": [[0.018, 0.0], [0.022, 0.0], [0.02, 0.002]],
+            "parent_id": "circle-outer",
+        },
+    ]
     preview = workspace._build_3d_preview_component()
 
     assert geometry_renderer.faces.active is True
-    assert geometry_renderer.edges.active is False
+    assert geometry_renderer.edges.active is True
+    assert [center for center, _normal, _radius, _profile in circle_profiles] == [
+        (0.02, 0.0, 0.0), (0.02, 0.0, 0.0),
+    ]
+    assert [normal for _center, normal, _radius, _profile in circle_profiles] == [
+        (0.0, 1.0, 0.0), (0.0, 1.0, 0.0),
+    ]
+    assert [radius for _center, _normal, radius, _profile in circle_profiles] == pytest.approx([0.01, 0.002])
+    assert face_colors is not None
+    assert face_colors[3::4].tolist() == [1.0, 1.0]
     assert preview.renderers == [geometry_renderer, axis_indicator]
 
 
