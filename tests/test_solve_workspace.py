@@ -1934,7 +1934,10 @@ def test_region_properties_explain_the_current_sketch_constraint_scope(standalon
 
 def test_canvas_toolbar_wraps_when_the_viewport_is_narrow(standalone_components):
     workspace = SolveWorkspace()
-    toolbar = workspace._canvas_panel.ui_children[0]
+    toolbar = workspace._sketch_toolbar
+
+    assert workspace.ui_children.index(toolbar) < workspace.ui_children.index(workspace._content)
+    assert workspace._canvas_panel.ui_children == [workspace._canvas_host]
 
     assert "flex-wrap:wrap" in toolbar._props["style"]
     assert "min-width:0" in toolbar._props["style"]
@@ -2449,7 +2452,7 @@ def test_grid_snap_toggle_snaps_sketch_points_to_grid_intersections(standalone_c
 
 def test_grid_snap_button_is_present_with_the_sketch_tools(standalone_components):
     workspace = SolveWorkspace()
-    toolbar = workspace._canvas_panel.ui_children[0]
+    toolbar = workspace._sketch_toolbar
     slots = toolbar.ui_slots["default"]
     snap_index = next(index for index, item in enumerate(slots) if getattr(item, "ui_icon", None) == "mdi-magnet")
     fit_view_index = next(index for index, item in enumerate(slots) if getattr(item, "ui_label", None) == "Fit view")

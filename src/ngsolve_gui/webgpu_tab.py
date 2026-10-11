@@ -272,13 +272,18 @@ class WebgpuTab(PropertyPanelMixin, Div):
             excluded.add(id(self._clip_toolbar))
         return [item for item in overlays if id(item) not in excluded]
 
-    def _page_layout_children(self):
-        """Build the labeled toolbar rows followed by the flexible viewport."""
+    def _page_toolbar_children(self):
+        """Return controls for the app row above navigator and properties."""
+        if not self._page_toolbar_enabled:
+            return []
         rows = [self._tool_dock]
         if self._clip_toolbar is not None:
             rows.append(self._clip_toolbar)
-        rows.append(self._viewport)
         return rows
+
+    def _page_layout_children(self):
+        """Keep the viewport in the center pane; toolbars are app-level rows."""
+        return [self._viewport]
 
     def _sync_viewport_layout(self, overlays):
         """Refresh overlays without allowing them to replace the page toolbar."""
@@ -791,7 +796,7 @@ class WebgpuTab(PropertyPanelMixin, Div):
                 ui_no_caps=True,
                 ui_class=str(cb.vp_tool),
                 ui_style=(
-                    "width:auto; min-width:0; height:32px; padding:0 9px; "
+                    "width:auto; min-width:max-content; flex:0 0 auto; height:34px; padding:0 10px; "
                     "white-space:nowrap;"
                 ),
             )
@@ -878,10 +883,11 @@ class WebgpuTab(PropertyPanelMixin, Div):
                 ui_class=str(cb.vp_dock),
                 ui_style=(
                     "position:relative; top:auto; left:auto; transform:none; z-index:auto; "
-                    "display:flex; flex:0 0 auto; align-items:center; gap:5px; "
-                    "width:100%; min-height:42px; box-sizing:border-box; overflow-x:auto; "
+                    "display:flex; flex:0 0 auto; flex-wrap:wrap; align-items:center; "
+                    "justify-content:flex-start; gap:8px; width:100%; min-height:46px; "
+                    "box-sizing:border-box; overflow:visible; "
                     "border-radius:0; border-width:0 0 1px; box-shadow:none; "
-                    "backdrop-filter:none; background:var(--panel-header); padding:4px 10px;"
+                    "backdrop-filter:none; background:var(--panel-header); padding:5px 12px;"
                 ),
             )
         return Div(*tools, ui_class=str(cb.vp_dock))
@@ -902,7 +908,7 @@ class WebgpuTab(PropertyPanelMixin, Div):
                 ui_no_caps=True,
                 ui_class=str(cb.vp_tool),
                 ui_style=(
-                    "width:auto; min-width:0; height:32px; padding:0 9px; "
+                    "width:auto; min-width:max-content; flex:0 0 auto; height:34px; padding:0 10px; "
                     "white-space:nowrap;"
                 ),
             )
@@ -944,7 +950,7 @@ class WebgpuTab(PropertyPanelMixin, Div):
                 ui_no_caps=True,
                 ui_class=str(cb.vp_tool),
                 ui_style=(
-                    "width:auto; min-width:0; height:32px; padding:0 9px; "
+                    "width:auto; min-width:max-content; flex:0 0 auto; height:34px; padding:0 10px; "
                     "white-space:nowrap;"
                 ),
             )
@@ -983,7 +989,7 @@ class WebgpuTab(PropertyPanelMixin, Div):
                 ui_no_caps=True,
                 ui_class=str(cb.vp_tool),
                 ui_style=(
-                    "width:auto; min-width:0; height:32px; padding:0 7px; "
+                    "width:auto; min-width:max-content; flex:0 0 auto; height:34px; padding:0 8px; "
                     "white-space:nowrap;"
                 ),
             )

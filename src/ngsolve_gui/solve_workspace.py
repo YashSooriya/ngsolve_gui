@@ -599,7 +599,7 @@ class SolveWorkspace(Div):
             zoom_in_button,
             self._mesh_preview_button,
             self._preview_3d_button,
-            ui_style="display:flex; flex-wrap:wrap; align-items:center; gap:4px; flex:none; min-width:0; min-height:42px; padding:4px 8px; border-bottom:1px solid var(--border); background:var(--surface);",
+            ui_style="display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-start; gap:8px; flex:none; width:100%; min-width:0; min-height:46px; padding:5px 12px; border-bottom:1px solid var(--border); background:var(--surface);",
         )
         self._sketch_toolbar = toolbar
         self._tool_buttons = {
@@ -685,7 +685,6 @@ class SolveWorkspace(Div):
             ui_class="mmfem-3d-preview-dialog",
         )
         self._canvas_panel = Div(
-            toolbar,
             self._canvas_host,
             ui_style="display:flex; flex:1 1 auto; flex-direction:column; width:100%; height:100%; min-width:0; min-height:0;",
         )
@@ -865,6 +864,7 @@ class SolveWorkspace(Div):
         ]
         super().__init__(
             top,
+            toolbar,
             self._content,
             self._messages_panel,
             self._log_panel,

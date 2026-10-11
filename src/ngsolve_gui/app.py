@@ -638,6 +638,13 @@ class NGSolveGui(App):
         self.property_host = StackHost(ui_class=panel_full)
         self.property_host.show(None, empty_property_panel)
         self.tab_panel = Panel(self.app_data)
+        self._post_process_toolbar = Div(
+            ui_hidden=True,
+            ui_style=(
+                "display:flex; flex-direction:column; flex:none; width:100%; "
+                "min-width:0; background:var(--panel-header);"
+            ),
+        )
         self.controls = ControlBar()
         self.footer = StatusFooter()
 
@@ -683,7 +690,7 @@ class NGSolveGui(App):
 
         page = self._outer_splitter
         self._post_process_workspace = Div(
-            page, self.controls, self.footer,
+            self._post_process_toolbar, page, self.controls, self.footer,
             ui_style=(
                 "display:flex; flex-direction:column; flex:1 1 auto; "
                 "min-height:0; width:100%;"
@@ -1458,12 +1465,20 @@ class NGSolveGui(App):
     def _activate(self, tabname):
         """Point property panel, footer and keybindings at the active tab."""
         comp = self.tab_panel.comp
+        self._sync_post_process_toolbar(comp)
         tab = self.app_data.get_tab(tabname) if tabname else None
         if comp is not None and hasattr(comp, "sync_camera"):
             comp.sync_camera()
         self._show_property_panel(comp)
         self.footer.set_component(comp, tab.get("type", "") if tab else "")
         self.kb.set_component(comp)
+
+    def _sync_post_process_toolbar(self, comp):
+        """Place active viewport controls above the full three-column page."""
+        get_items = getattr(comp, "_page_toolbar_children", None)
+        items = list(get_items()) if callable(get_items) else []
+        self._post_process_toolbar.ui_children = items
+        self._post_process_toolbar.ui_hidden = not bool(items)
 
     def _show_property_panel(self, comp):
         """Host the active component's own property panel (or a placeholder).

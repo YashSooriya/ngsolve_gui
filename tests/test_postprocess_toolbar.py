@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from ngapp.components import Div
 
+from ngsolve_gui.app import NGSolveGui
 from ngsolve_gui.function import FunctionComponent
 from ngsolve_gui.webgpu_tab import WebgpuTab
 
@@ -50,16 +51,27 @@ def test_page_toolbar_and_clip_controls_are_outside_the_viewport_overlay():
 
     component._sync_viewport_layout(overlays)
 
-    assert component.ui_children == [
-        component._tool_dock,
-        component._clip_toolbar,
-        component._viewport,
+    assert component._page_toolbar_children() == [
+        component._tool_dock, component._clip_toolbar
     ]
+    assert component.ui_children == [component._viewport]
     assert component._viewport.ui_children == [
         canvas,
         pick_overlay,
         canvas_overlay,
     ]
+
+
+def test_active_postprocess_toolbar_is_hosted_above_side_panels():
+    host = SimpleNamespace(ui_children=[], ui_hidden=True)
+    tools = [Div("Camera controls"), Div("Clipping controls")]
+    component = SimpleNamespace(_page_toolbar_children=lambda: tools)
+    app = SimpleNamespace(_post_process_toolbar=host)
+
+    NGSolveGui._sync_post_process_toolbar(app, component)
+
+    assert host.ui_children == tools
+    assert host.ui_hidden is False
 
 
 def test_view_without_page_toolbar_keeps_the_existing_overlay_layout():
