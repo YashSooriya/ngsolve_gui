@@ -187,3 +187,33 @@ def test_function_fieldlines_2d(page: Page, app) -> None:
     np.random.seed(42)
     click_in_section(page, "Vectors & Flow", "Streamlines")
     assert_matches_baseline(page, comp.wgpu, "func_fieldlines_2d.png")
+
+@app_test("ngsolve_gui.appconfig")
+def test_3d_vector_result_can_deform_geometry(page: Page, app) -> None:
+    """A 3D vector result exposes the deformation toggle and multiplier."""
+    mesh = make_mesh_3d()
+    displacement = ngs.GridFunction(
+        ngs.VectorH1(mesh, order=1, dim=3), name="Displacement"
+    )
+    displacement.Set(ngs.CF((ngs.x, ngs.y, ngs.z)))
+    _draw(app, displacement, name="3D displacement")
+
+    component = app.tab_panel.comp
+    assert component.deformation is not None
+    assert component.deformation.dim == 3
+    assert not component.deformation_enabled.value
+
+    app._workspace_mode_toggle.select("post_process")
+    app._update()
+    section = page.locator(".cb-psec").filter(has_text="Deformation").first
+    section.wait_for(state="attached", timeout=5000)
+    assert section.count() == 1
+    section.locator(".cb-psec-head-main").click()
+    multiplier = section.locator('input[type="number"]').first
+    multiplier.fill("250")
+    multiplier.press("Enter")
+    assert component.deformation_scale.value == 250.0
+
+    component.deformation_enabled.value = True
+    component.deformation_scale2.value = 0.4
+    assert component.mdata.deformation_scale == 100.0

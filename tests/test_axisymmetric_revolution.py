@@ -107,3 +107,69 @@ def test_axisymmetric_revolution_control_switches_viewport_dimension(
             del function_module.RegionVisibility
         else:
             function_module.RegionVisibility = previous_region_visibility
+
+@app_test("ngsolve_gui.appconfig")
+def test_vector_displacement_deforms_axisymmetric_revolution(page: Page, app) -> None:
+    """A meridional (radial, axial) displacement becomes Cartesian in 3D."""
+    import ngsolve_gui.function as function_module
+
+    class _RegionVisibility:
+        def set_alphas(self, **_alphas):
+            pass
+
+    missing = object()
+    previous = getattr(function_module, "RegionVisibility", missing)
+    function_module.RegionVisibility = _RegionVisibility
+    try:
+        meridian = _meridian_mesh()
+        displacement = ngs.GridFunction(
+            ngs.VectorH1(meridian, order=1, dim=2), name="Displacement"
+        )
+        displacement.Set(ngs.CF((ngs.x, ngs.y)))
+        _draw(
+            app,
+            displacement,
+            name="Axisymmetric displacement",
+            _ngsolve_gui_axisymmetric=True,
+        )
+        component = app.tab_panel.comp
+
+        assert component.deformation is not None
+        assert component.deformation.dim == 3
+        assert not component.deformation_enabled.value
+
+        component.axisymmetric_revolved.value = True
+        assert component.mesh.dim == 3
+        assert component.deformation is not None
+        assert component.deformation.dim == 3
+        for vertex in component.mesh.vertices:
+            x_coord, y_coord, axial = map(float, component.mesh[vertex].point)
+            radius = math.hypot(x_coord, y_coord)
+            angle = math.atan2(y_coord, x_coord)
+            radial, axial_component = displacement(
+                meridian(radius, axial)
+            )
+            if radius < 1e-12:
+                expected = (0.0, 0.0, axial_component)
+            else:
+                expected = (
+                    radial * math.cos(angle),
+                    radial * math.sin(angle),
+                    axial_component,
+                )
+            actual = component.deformation(
+                component.mesh(x_coord, y_coord, axial)
+            )
+            assert tuple(map(float, actual)) == pytest.approx(
+                expected, abs=1e-8
+            )
+
+        component.deformation_enabled.value = True
+        component.deformation_scale.value = 1000.0
+        component.deformation_scale2.value = 0.5
+        assert component.mdata.deformation_scale == pytest.approx(500.0)
+    finally:
+        if previous is missing:
+            del function_module.RegionVisibility
+        else:
+            function_module.RegionVisibility = previous

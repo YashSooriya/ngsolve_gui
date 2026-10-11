@@ -65,7 +65,7 @@ def _fmt_value(v):
 
 
 class FunctionComponent(WebgpuTab):
-    def _resolve_deformation(self, deform):
+    def _resolve_deformation(self, deform, complex_part="real"):
         """Normalize the ``deformation`` Draw argument into a 3d displacement CF."""
         if deform is None or deform is False:
             return None
@@ -79,6 +79,20 @@ class FunctionComponent(WebgpuTab):
             deform.space, ngs.FacetFESpace
         ):
             return None
+        if deform.is_complex:
+            component = ngs.imag if complex_part == "imag" else ngs.real
+            if deform.dim == 1:
+                deform = component(deform)
+            else:
+                deform = ngs.CF(tuple(component(deform[index]) for index in range(deform.dim)))
+        if (
+            deform.dim == 3
+            and self.mesh.dim == 2
+            and getattr(self, "_axisymmetric_solution", False)
+        ):
+            # Cylindrical (r, theta, z) displacement on the meridian plane:
+            # theta motion is out of plane and does not move the 2D section.
+            return ngs.CF((deform[0], deform[2], 0))
         if deform.dim == 3:
             return deform
         if deform.dim == 2:
@@ -112,6 +126,9 @@ class FunctionComponent(WebgpuTab):
             if isinstance(self.region_or_mesh, ngs.Region)
             else self.region_or_mesh
         )
+        self._axisymmetric_solution = bool(
+            data.get("_ngsolve_gui_axisymmetric", False) and self.mesh.dim == 2
+        )
         self.slice_available = self.mesh.dim == 3 and bool(self.draw_vol)
         self.slice_region_options = (
             [ALL_REGIONS] + [str(name) for name in self.mesh.GetMaterials()]
@@ -128,7 +145,12 @@ class FunctionComponent(WebgpuTab):
             self.order = 2
             if isinstance(cf, ngs.GridFunction):
                 self.order = min(2, cf.space.globalorder)
-        self.deformation = self._resolve_deformation(data.get("deformation", None))
+        deformation_arg = data.get("deformation", None)
+        self._deformation_uses_solution = deformation_arg is True
+        self._deformation_source = (
+            cf if self._deformation_uses_solution else deformation_arg
+        )
+        self.deformation = self._resolve_deformation(deformation_arg)
         self.deformation_order = data.get("deformation_order", self.order)
         self.facet = data.get("facet", None)
         self.contact = data.get("contact", None)
@@ -152,10 +174,23 @@ class FunctionComponent(WebgpuTab):
 
         if (
             self.deformation is None
-            and not "deformation" in data
+            and "deformation" not in data
             and self.cf.dim == 1
             and self.mesh.dim < 3
         ):
+            self._deformation_uses_solution = True
+            self._deformation_source = self.cf
+            self.deformation = self._resolve_deformation(True)
+        if (
+            self.deformation is None
+            and "deformation" not in data
+            and self.cf.dim in (2, 3)
+            and (self.cf.dim == self.mesh.dim or self._axisymmetric_solution)
+        ):
+            # Vector results (especially displacement fields) can be selected
+            # as the source of a geometric warp. Keep it off until requested.
+            self._deformation_uses_solution = True
+            self._deformation_source = self.cf
             self.deformation = self._resolve_deformation(True)
 
         self.axisymmetric_revolution_available = bool(
@@ -323,6 +358,20 @@ class FunctionComponent(WebgpuTab):
         self.deformation_scale2 = Observable(
             s.get("deformation_scale2", 1.0), "deformation_scale2", converter=float
         )
+        self.deformation_complex_part = Observable(
+            s.get("deformation_complex_part", "real"), "deformation_complex_part"
+        )
+        self.deformation_complex = bool(
+            self._deformation_source is not None
+            and getattr(self._deformation_source, "is_complex", False)
+            and getattr(self._deformation_source, "dim", 1) > 1
+        )
+        if self._deformation_source is not None:
+            self.deformation = self._resolve_deformation(
+                self._deformation_source, self.deformation_complex_part.value
+            )
+            if self._axisymmetric_original_state is not None:
+                self._axisymmetric_original_state["deformation"] = self.deformation
         cm = s.get("colormap", (autoscale, discrete_colormap, minval, maxval))
         self.colormap_autoscale = Observable(cm[0], "colormap_autoscale")
         self.colormap_discrete = Observable(cm[1], "colormap_discrete")
@@ -465,6 +514,7 @@ class FunctionComponent(WebgpuTab):
         self.deformation_enabled.on_change(self._apply_deformation_toggle)
         self.deformation_scale.on_change(self._apply_deformation_scale)
         self.deformation_scale2.on_change(self._apply_deformation_scale)
+        self.deformation_complex_part.on_change(self._apply_deformation_complex_part)
         self.contact_enabled.on_change(self._apply_contact)
         self.colormap_autoscale.on_change(self._apply_autoscale)
         self.colormap_discrete.on_change(self._apply_discrete)
@@ -922,25 +972,35 @@ class FunctionComponent(WebgpuTab):
             r.set_needs_update()
         self.wgpu.scene.render()
 
+    def _deformation_factor(self):
+        factor = self.deformation_scale.value * self.deformation_scale2.value
+        return factor if math.isfinite(factor) else 0.0
+
     def _apply_deformation_toggle(self, val, _old):
         if self.mdata is None:
             return
-        if val:
-            self.mdata.deformation_scale = (
-                self.deformation_scale.value * self.deformation_scale2.value
-            )
-        else:
-            self.mdata.deformation_scale = 0.0
+        self.mdata.deformation_scale = self._deformation_factor() if val else 0.0
         self._refresh_deformed_renderers()
 
     def _apply_deformation_scale(self, _val, _old):
         if self.mdata is None:
             return
         if self.deformation_enabled.value:
-            self.mdata.deformation_scale = (
-                self.deformation_scale.value * self.deformation_scale2.value
-            )
+            self.mdata.deformation_scale = self._deformation_factor()
             self._refresh_deformed_renderers()
+
+    def _apply_deformation_complex_part(self, val, _old):
+        source = self._deformation_source
+        if self.axisymmetric_revolved.value and self._deformation_uses_solution:
+            source = self._axisymmetric_revolution_field
+        self.deformation = self._resolve_deformation(source, val)
+        if self._axisymmetric_original_state is not None:
+            self._axisymmetric_original_state["deformation"] = self._resolve_deformation(
+                self._deformation_source, val
+            )
+        if self.mdata is not None:
+            self.mdata = None
+            self.draw()
 
     def _refresh_deformed_renderers(self):
         """Renderers that read the deformation scale on their own (i.e. not via
@@ -1018,7 +1078,15 @@ class FunctionComponent(WebgpuTab):
             self.region_or_mesh = self._axisymmetric_revolution_mesh
             self.cf = self._axisymmetric_revolution_field
             self.visualization_cf = visualization_cf(self.cf)
-            self.deformation = None
+            self.deformation = (
+                self._resolve_deformation(
+                    self._axisymmetric_revolution_field,
+                    self.deformation_complex_part.value,
+                )
+                if self._deformation_uses_solution
+                and getattr(self._axisymmetric_revolution_field, "dim", 1) > 1
+                else None
+            )
         else:
             original = self._axisymmetric_original_state
             self.mesh = original["mesh"]
@@ -1612,9 +1680,7 @@ class FunctionComponent(WebgpuTab):
                 self.mdata = MeshData(self.region_or_mesh)
             mdata = self.mdata
             mdata.deformation_data = deform_data
-            mdata.deformation_scale = (
-                self.deformation_scale.value * self.deformation_scale2.value
-            )
+            mdata.deformation_scale = self._deformation_factor()
             if not self.deformation_enabled.value:
                 mdata.deformation_scale = 0.0
             func_data.mesh_data = mdata
