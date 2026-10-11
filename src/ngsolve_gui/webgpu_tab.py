@@ -162,6 +162,7 @@ class WebgpuTab(PropertyPanelMixin, Div):
         if self._probe_panel is not None:
             overlays.append(self._probe_preview)
             overlays.append(self._probe_panel)
+        overlays.extend(self._build_additional_viewport_overlays())
         super().__init__(*overlays, ui_class="relative-position fit")
 
         self.draw()
@@ -235,6 +236,10 @@ class WebgpuTab(PropertyPanelMixin, Div):
         # The WebGPU canvas is created in the component's own "mounted" handler;
         # ours runs after it, so the canvas is ready when we set the clear color.
         self.wgpu.on("mounted", lambda *a: self.apply_viewport_theme())
+
+    def _build_additional_viewport_overlays(self):
+        """Extra overlays supplied by specialized viewport components."""
+        return []
 
     def apply_viewport_theme(self):
         """Set the scene background (clear color + overlays) from the active theme.

@@ -93,6 +93,8 @@ class ColorbarSection(Section):
             comp.elements2d.set_component(idx - 1)   # idx 0 (|u|) → -1 = magnitude
         if comp.clippingcf is not None:
             comp.clippingcf.set_component(idx - 1)
+        if getattr(comp, "slice_renderer", None) is not None:
+            comp.slice_renderer.set_component(idx - 1)
         comp.colorbar.set_needs_update()
         comp.wgpu.scene.render()
 

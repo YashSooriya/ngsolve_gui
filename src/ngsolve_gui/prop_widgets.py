@@ -348,6 +348,8 @@ class ColorbarLegend(Div):
                 comp.elements2d.set_component(idx)
             if comp.clippingcf is not None:
                 comp.clippingcf.set_component(idx)
+            if getattr(comp, "slice_renderer", None) is not None:
+                comp.slice_renderer.set_component(idx)
             comp.colorbar.set_needs_update()
             comp.wgpu.scene.render()
         except Exception:
@@ -585,6 +587,8 @@ class FieldSummary(Div):
                 comp.elements2d.set_component(idx)
             if comp.clippingcf is not None:
                 comp.clippingcf.set_component(idx)
+            if getattr(comp, "slice_renderer", None) is not None:
+                comp.slice_renderer.set_component(idx)
             comp.colorbar.set_needs_update()
             comp.wgpu.scene.render()
         except Exception:
