@@ -74,6 +74,7 @@ _TREE_GROUPS = (
 
 _FREQUENCY_RESULT_SUFFIX = re.compile(r"_\d+_([0-9.eE+-]+)Hz$", re.IGNORECASE)
 _HIDDEN_RUN_HISTORY_FILE = ".mm_fem_hidden_run_history.json"
+_CANVAS_GRID_SUBDIVISIONS = 5
 _PREVIEW_VISIBILITY_ALPHA = {
     "opaque": 1.0,
     "translucent": 0.38,
@@ -1119,7 +1120,7 @@ class SolveWorkspace(Div):
                 "enabled": bool(self.snap_to_grid),
                 "originX": origin[0],
                 "originY": origin[1],
-                "stepPx": self._canvas_grid_step() * pixels_per_world,
+                "stepPx": self._canvas_snap_step() * pixels_per_world,
             }
             self.js.eval(f"window.__ngsolveSketchSnap = {json.dumps(grid, allow_nan=False)}")
             move_step = 0.00001 * pixels_per_world  # 0.01 mm, represented as 1e-5 m.
@@ -3934,12 +3935,16 @@ class SolveWorkspace(Div):
         plot = self._canvas_plot_bounds()
         return self._coordinate_step(world_width * 80.0 / (plot[2] - plot[0]))
 
+    def _canvas_snap_step(self):
+        """Return the sketch snap interval for a five-by-five grid subdivision."""
+        return self._canvas_grid_step() / _CANVAS_GRID_SUBDIVISIONS
+
     def _snap_canvas_point(self, point):
         if not self.snap_to_grid:
             return point
         project, unproject = self._canvas_projection()
         radial, axial = unproject(point)
-        step = self._canvas_grid_step()
+        step = self._canvas_snap_step()
         radial = max(0.0, round(radial / step) * step)
         axial = round(axial / step) * step
         return project((radial, axial))
@@ -3968,13 +3973,30 @@ class SolveWorkspace(Div):
         grid_step = self._canvas_grid_step()
         radial_ticks = self._ticks_for_step(max(0.0, lower_left[0]), max(0.0, upper_right[0]), grid_step)
         axial_ticks = self._ticks_for_step(lower_left[1], upper_right[1], grid_step)
+        snap_step = self._canvas_snap_step()
+        radial_subticks = self._ticks_for_step(max(0.0, lower_left[0]), max(0.0, upper_right[0]), snap_step)
+        axial_subticks = self._ticks_for_step(lower_left[1], upper_right[1], snap_step)
         grid_signature = (
-            tuple(plot), tuple(lower_left), tuple(upper_right), grid_step,
-            tuple(radial_ticks), tuple(axial_ticks),
+            tuple(plot), tuple(lower_left), tuple(upper_right), grid_step, snap_step,
+            tuple(radial_ticks), tuple(axial_ticks), tuple(radial_subticks), tuple(axial_subticks),
         )
         grid_text_style = "pointer-events:none; user-select:none; -webkit-user-select:none;"
         grid_children = []
         scene_children = []
+        # Keep the existing labelled grid cadence, then add four quieter lines
+        # between each pair of labelled lines for a five-by-five sketch grid.
+        for value in radial_subticks:
+            multiple = value / grid_step
+            if abs(multiple - round(multiple)) <= 1e-8 or abs(value) <= snap_step * 1e-10:
+                continue
+            x = xy((value, 0))[0]
+            grid_children.append(_svg("line", x1=x, y1=plot[1], x2=x, y2=plot[3], stroke="var(--grid-minor, #e8edf2)", stroke_width="0.75"))
+        for value in axial_subticks:
+            multiple = value / grid_step
+            if abs(multiple - round(multiple)) <= 1e-8 or abs(value) <= snap_step * 1e-10:
+                continue
+            y = xy((0, value))[1]
+            grid_children.append(_svg("line", x1=plot[0], y1=y, x2=plot[2], y2=y, stroke="var(--grid-minor, #e8edf2)", stroke_width="0.75"))
         for value in radial_ticks:
             if abs(value) <= grid_step * 1e-10:
                 continue

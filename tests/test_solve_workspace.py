@@ -1842,6 +1842,37 @@ def test_sketch_axes_and_grid_fill_the_responsive_viewport(standalone_components
     assert (zero_height_axis._props["x1"], zero_height_axis._props["x2"]) == (plot[0], plot[2])
 
 
+def test_sketch_grid_has_five_snap_subdivisions_per_major_cell(standalone_components):
+    workspace = SolveWorkspace()
+    plot = workspace._canvas_plot_bounds()
+    _, world_width, _ = workspace._current_canvas_world_view()
+    pixels_per_world = (plot[2] - plot[0]) / world_width
+    major_step = workspace._canvas_grid_step()
+    major_spacing_px = major_step * pixels_per_world
+    snap_spacing_px = workspace._canvas_snap_step() * pixels_per_world
+    _, unproject = workspace._canvas_projection()
+    minor_lines = [
+        item for item in workspace._canvas_grid.ui_children
+        if item._component_name == "line"
+        and item._props.get("stroke") == "var(--grid-minor, #e8edf2)"
+    ]
+
+    assert snap_spacing_px == pytest.approx(major_spacing_px / 5)
+    vertical_coordinates = [
+        unproject((item._props["x1"], (plot[1] + plot[3]) / 2))[0]
+        for item in minor_lines if item._props["x1"] == item._props["x2"]
+    ]
+    horizontal_coordinates = [
+        unproject(((plot[0] + plot[2]) / 2, item._props["y1"]))[1]
+        for item in minor_lines if item._props["y1"] == item._props["y2"]
+    ]
+    assert vertical_coordinates and horizontal_coordinates
+    for coordinate in vertical_coordinates + horizontal_coordinates:
+        major_fraction = coordinate / major_step
+        assert major_fraction * 5 == pytest.approx(round(major_fraction * 5))
+        assert major_fraction != pytest.approx(round(major_fraction))
+
+
 def test_sketch_reprojects_to_resized_viewport_without_distorting_geometry(standalone_components):
     workspace = SolveWorkspace()
     workspace._on_canvas_resize(SimpleNamespace(value={"width": 1200.4, "height": 600.2}))
@@ -2090,11 +2121,13 @@ def test_grid_snap_toggle_snaps_sketch_points_to_grid_intersections(standalone_c
     assert workspace.snap_to_grid
     project, unproject = workspace._canvas_projection()
     grid_step = workspace._canvas_grid_step()
+    snap_step = workspace._canvas_snap_step()
+    assert snap_step == pytest.approx(grid_step / 5)
     unsnapped = project((grid_step * 1.37, grid_step * 2.62))
     snapped = workspace._snap_canvas_point(unsnapped)
     radial, axial = unproject(snapped)
-    assert radial == pytest.approx(round(radial / grid_step) * grid_step)
-    assert axial == pytest.approx(round(axial / grid_step) * grid_step)
+    assert radial == pytest.approx(round(radial / snap_step) * snap_step)
+    assert axial == pytest.approx(round(axial / snap_step) * snap_step)
 
     workspace.toggle_snap_to_grid()
     assert not workspace.snap_to_grid
