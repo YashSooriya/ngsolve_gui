@@ -452,8 +452,8 @@ class NGSolveGui(App):
                 ui_flat=True, ui_dense=True, ui_no_caps=True,
                 ui_class="mmfem-file-action",
                 ui_style=(
-                    "height:27px; min-height:27px; padding:0 4px; "
-                    "font-size:10.5px; min-width:38px; white-space:nowrap;"
+                    "height:28px; min-height:28px; padding:0 5px; "
+                    "font-size:12px; min-width:42px; white-space:nowrap;"
                 ),
             )
             button.on_click(handler)
@@ -464,7 +464,7 @@ class NGSolveGui(App):
                 Div(
                     name,
                     ui_style=(
-                        "font-size:9px; line-height:11px; font-weight:700; "
+                        "font-size:10px; line-height:12px; font-weight:700; "
                         "letter-spacing:.04em; text-transform:uppercase; "
                         "text-align:center; color:var(--fg-subtle);"
                     ),
