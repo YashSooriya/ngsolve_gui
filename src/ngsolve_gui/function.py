@@ -10,6 +10,7 @@ import math
 from .slice_view import (
     ALL_REGIONS,
     material_element_mask,
+    material_region,
     plane_normal,
     position_on_plane,
 )
@@ -115,6 +116,11 @@ class FunctionComponent(WebgpuTab):
         self.slice_region_options = (
             [ALL_REGIONS] + [str(name) for name in self.mesh.GetMaterials()]
             if self.slice_available
+            else []
+        )
+        self.fieldline_seed_region_options = (
+            [ALL_REGIONS] + [str(name) for name in self.mesh.GetMaterials()]
+            if self.cf.dim == self.mesh.dim
             else []
         )
         self.order = data.get("order", None)
@@ -344,6 +350,19 @@ class FunctionComponent(WebgpuTab):
         self.fieldlines_direction = Observable(
             s.get("fieldlines_direction", 0), "fieldlines_direction", converter=int
         )
+        default_fieldline_seed_region = data.get(
+            "_ngsolve_gui_fieldline_seed_material", ALL_REGIONS
+        )
+        if default_fieldline_seed_region not in self.fieldline_seed_region_options:
+            default_fieldline_seed_region = ALL_REGIONS
+        saved_fieldline_seed_region = s.get(
+            "fieldline_seed_region", default_fieldline_seed_region
+        )
+        if saved_fieldline_seed_region not in self.fieldline_seed_region_options:
+            saved_fieldline_seed_region = default_fieldline_seed_region
+        self.fieldline_seed_region = Observable(
+            saved_fieldline_seed_region, "fieldline_seed_region"
+        )
 
         self.hidden_regions = Observable(
             list(s.get("hidden_regions", [])), "hidden_regions"
@@ -432,6 +451,7 @@ class FunctionComponent(WebgpuTab):
         self.clipping_vectors_visible.on_change(self._apply_clipping_vectors)
         self.surface_vectors_visible.on_change(self._apply_surface_vectors)
         self.field_lines_visible.on_change(self._apply_fieldlines)
+        self.fieldline_seed_region.on_change(self._apply_fieldline_seed_region)
         self.clipping_visible.on_change(self._apply_clipping_function)
         self.lic_visible.on_change(self._apply_lic)
         self.lic_kernel_length.on_change(self._apply_lic_kernel_length)
@@ -588,8 +608,11 @@ class FunctionComponent(WebgpuTab):
             self.surface_vectors.active = val
         self.wgpu.scene.render()
 
-    def _fieldline_seed_material(self):
-        """Material selected for streamline seeding, if this field has one."""
+    def _selected_fieldline_seed_region(self):
+        """Return the selected streamline seed region, including the all option."""
+        selected = getattr(self, "fieldline_seed_region", None)
+        if selected is not None:
+            return selected.value
         data = self.data if isinstance(getattr(self, "data", None), dict) else {}
         name = getattr(
             getattr(self, "fieldlines", None),
@@ -614,8 +637,10 @@ class FunctionComponent(WebgpuTab):
             if active is not None
             else bool(self.field_lines_visible.value)
         )
-        seed = self._fieldline_seed_material() if fieldlines_active else None
-        if seed is not None:
+        seed = self._selected_fieldline_seed_region() if fieldlines_active else None
+        if seed == ALL_REGIONS:
+            auto_hidden.update(region_state.unique_materials)
+        elif seed is not None:
             auto_hidden.add(seed)
         if getattr(self, "slice_available", False) and self.slice_enabled.value:
             if self.slice_region.value == ALL_REGIONS:
@@ -631,6 +656,20 @@ class FunctionComponent(WebgpuTab):
         if getattr(self, "fieldlines", None) is not None:
             self.fieldlines.active = val
         if self._sync_fieldline_seed_visibility(bool(val)):
+            self._apply_region_change()
+        else:
+            self.wgpu.scene.render()
+
+    def _apply_fieldline_seed_region(self, value, _old):
+        """Update the streamline start region and refresh its cached trace."""
+        renderer = getattr(self, "fieldlines", None)
+        if renderer is None:
+            return
+        region_name = str(value)
+        renderer.start_region = material_region(self.mesh, region_name)
+        renderer._ngsolve_gui_start_region_name = region_name
+        renderer.set_needs_update()
+        if self._sync_fieldline_seed_visibility(None):
             self._apply_region_change()
         else:
             self.wgpu.scene.render()
@@ -1656,16 +1695,13 @@ class FunctionComponent(WebgpuTab):
                 colormap=self.colormap,
                 clipping=self.clipping,
             )
+            seed_region = self.fieldline_seed_region.value
+            self.fieldlines.start_region = material_region(self.mesh, seed_region)
+            self.fieldlines._ngsolve_gui_start_region_name = seed_region
             draw_data = self.data if isinstance(self.data, dict) else {}
             if self.mesh.dim == 3 and draw_data.get(
                 "_ngsolve_gui_fast_fieldlines", False
             ):
-                seed_material = draw_data.get(
-                    "_ngsolve_gui_fieldline_seed_material"
-                )
-                if seed_material in {str(material) for material in self.mesh.GetMaterials()}:
-                    self.fieldlines.start_region = self.mesh.Materials(seed_material)
-                    self.fieldlines._ngsolve_gui_start_region_name = seed_material
                 from .fast_fieldlines import install_fast_fieldline_update
 
                 install_fast_fieldline_update(self.fieldlines)

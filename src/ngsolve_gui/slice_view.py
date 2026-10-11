@@ -75,3 +75,14 @@ def material_element_mask(mesh, material: str | None):
 
     elements = mesh.ngmesh.Elements3D().NumPy()
     return np.asarray(elements["index"] == material_index, dtype=bool)
+
+
+def material_region(mesh, selection: str | None):
+    """Resolve a material selection to an NGSolve region, including all materials."""
+    if selection in (None, "", ALL_REGIONS):
+        return mesh.Materials(".*")
+    name = str(selection)
+    materials = {str(material) for material in mesh.GetMaterials()}
+    if name not in materials:
+        raise ValueError(f"Unknown mesh material: {selection!r}")
+    return mesh.Materials(name)

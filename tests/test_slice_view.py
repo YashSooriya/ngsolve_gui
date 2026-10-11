@@ -12,6 +12,7 @@ from playwright.sync_api import Page
 from ngsolve_gui.slice_view import (
     ALL_REGIONS,
     material_element_mask,
+    material_region,
     plane_normal,
     position_on_plane,
     projection_bounds,
@@ -59,6 +60,18 @@ def test_material_selection_builds_a_volume_element_mask():
     assert material_element_mask(mesh, ALL_REGIONS) is None
 
 
+def test_all_region_selection_resolves_to_every_mesh_material():
+    mesh = _quarter_box()
+    all_materials = material_region(mesh, ALL_REGIONS)
+    regex_all_materials = mesh.Materials(".*")
+
+    assert list(all_materials.Mask()) == list(regex_all_materials.Mask())
+    material = str(next(iter(mesh.GetMaterials())))
+    assert list(material_region(mesh, material).Mask()) == list(
+        regex_all_materials.Mask()
+    )
+
+
 def test_region_scoped_field_data_matches_slice_mesh_elements():
     from ngsolve import x, y, z
 
@@ -103,6 +116,7 @@ def test_slice_control_adds_viewport_slider_and_hides_only_selected_region(
         component = app.tab_panel.comp
 
         assert component.slice_available
+        assert ALL_REGIONS in component.slice_region_options
         assert any(
             section.__name__ == "SliceViewSection"
             for section in component.property_sections

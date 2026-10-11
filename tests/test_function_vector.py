@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import ngsolve as ngs
 
@@ -17,6 +19,8 @@ from .helpers import (
     click_in_section,
     toggle_clipping,
 )
+from ngsolve_gui.slice_view import ALL_REGIONS
+from ngsolve_gui.sections.vectors_flow import VectorsFlowSection
 
 
 @app_test("ngsolve_gui.appconfig")
@@ -100,6 +104,59 @@ def test_streamline_seed_material_is_temporarily_hidden(page: Page, app) -> None
     comp.field_lines_visible.value = True
     comp.field_lines_visible.value = False
     assert not comp.region_state.material_visible(seed_material)
+
+
+@app_test("ngsolve_gui.appconfig")
+def test_streamline_seed_region_selector_supports_all_regions(page: Page, app) -> None:
+    """The seed selector scopes starts to a material or to the whole mesh."""
+    import ngsolve_gui.function as function_module
+
+    class _RegionVisibility:
+        def set_alphas(self, **_alphas):
+            pass
+
+    mesh = make_mesh_3d()
+    cf = ngs.CF((ngs.x, ngs.y, ngs.z))
+    missing = object()
+    previous = getattr(function_module, "RegionVisibility", missing)
+    function_module.RegionVisibility = _RegionVisibility
+    try:
+        _draw(
+            app,
+            cf,
+            mesh=mesh,
+            name="StreamlineAllSeedRegions",
+            _ngsolve_gui_fast_fieldlines=True,
+        )
+    finally:
+        if previous is missing:
+            del function_module.RegionVisibility
+        else:
+            function_module.RegionVisibility = previous
+    comp = app.tab_panel.comp
+    material_names = [str(material) for material in mesh.GetMaterials()]
+    section = VectorsFlowSection(comp)
+
+    assert comp.fieldline_seed_region_options == [ALL_REGIONS, *material_names]
+    assert section.seed_region.ui_options == comp.fieldline_seed_region_options
+    assert comp.fieldline_seed_region.value == ALL_REGIONS
+
+    material = material_names[0]
+    section._update_seed_region(SimpleNamespace(value=material))
+    assert comp.fieldline_seed_region.value == material
+    assert comp.fieldlines._ngsolve_gui_start_region_name == material
+    assert list(comp.fieldlines.start_region.Mask()) == list(
+        mesh.Materials(material).Mask()
+    )
+
+    comp.field_lines_visible.value = True
+    assert comp.region_state.auto_hidden == {material}
+    section._update_seed_region(SimpleNamespace(value=ALL_REGIONS))
+    assert comp.fieldlines._ngsolve_gui_start_region_name == ALL_REGIONS
+    assert list(comp.fieldlines.start_region.Mask()) == list(
+        mesh.Materials(".*").Mask()
+    )
+    assert comp.region_state.auto_hidden == set(comp.region_state.unique_materials)
 
 
 @app_test("ngsolve_gui.appconfig")
