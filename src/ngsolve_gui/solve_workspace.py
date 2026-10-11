@@ -240,10 +240,28 @@ def _mesh_signature(model):
                 for name, item in parameters.items()
             ),
         }
+    try:
+        region_element_sizes = {
+            str(region_id): evaluate_expression(expression, parameters)
+            for region_id, expression in mesh.get("region_element_sizes", {}).items()
+        }
+    except (AttributeError, TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError):
+        region_element_sizes = {
+            "expressions": repr(mesh.get("region_element_sizes", {})),
+            "parameters": sorted(
+                (str(name), repr(item.get("expression")))
+                for name, item in parameters.items()
+            ),
+        }
     payload = {
         "regions": regions,
         "element_size": element_size,
         "polynomial_order": mesh.get("polynomial_order", 3),
+        "region_element_sizes": region_element_sizes,
+        "hp_layers": mesh.get("hp_layers", 0),
+        "hp_grading_factor": mesh.get("hp_grading_factor", 0.3),
+        "hp_region_ids": sorted(mesh.get("hp_region_ids", [])),
+        "hp_edge_ids": sorted(mesh.get("hp_edge_ids", [])),
     }
     try:
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -2777,6 +2795,24 @@ class SolveWorkspace(Div):
                 region_edges.append(edge["id"])
             region["edge_ids"] = region_edges
         self.model["geometry"]["edges"] = edges
+        # Remove sizing and refinement assignments whose geometry was deleted.
+        mesh = self.model.setdefault("mesh", {})
+        live_region_ids = {region["id"] for region in self.model["geometry"]["regions"]}
+        live_edge_ids = {edge["id"] for edge in edges}
+        region_sizes = mesh.get("region_element_sizes", {})
+        if isinstance(region_sizes, dict):
+            mesh["region_element_sizes"] = {
+                region_id: value for region_id, value in region_sizes.items()
+                if region_id in live_region_ids
+            }
+        mesh["hp_region_ids"] = [
+            region_id for region_id in mesh.get("hp_region_ids", [])
+            if region_id in live_region_ids
+        ]
+        mesh["hp_edge_ids"] = [
+            edge_id for edge_id in mesh.get("hp_edge_ids", [])
+            if edge_id in live_edge_ids
+        ]
         _sync_axis_boundary_conditions(self.model)
         _sync_mechanical_boundary_conditions(self.model)
         if hasattr(self, "selected_edge_ids"):
@@ -3837,12 +3873,81 @@ class SolveWorkspace(Div):
         mesh = self.model["mesh"]
         order = QSelect(ui_label="Polynomial order", ui_options=[1, 2, 3, 4, 5, 6], ui_model_value=mesh["polynomial_order"], ui_dense=True, ui_filled=True)
         order.on_update_model_value(lambda event: self._set_mesh("polynomial_order", int(event.value)))
-        return [
+        children = [
             _section_title("Mesh", "Control mesh density and approximation order."),
             _input("Target element size", mesh["element_size"], lambda event: self._set_mesh("element_size", event.value), suffix="m"),
             order,
-            Div("The sketch must contain valid, non-overlapping regions before mesh generation.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+            Div("Regional sizing", ui_style="font-size:11px; font-weight:700; letter-spacing:.05em; color:var(--fg-muted); padding-top:7px;"),
+            Div("Set a local target size for any subdomain. Leave it blank to use the global target.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
         ]
+        regions = self.model.get("geometry", {}).get("regions", [])
+        region_sizes = mesh.setdefault("region_element_sizes", {})
+        if regions:
+            for region in regions:
+                children.append(_input(
+                    region.get("name", "Region") + " mesh size",
+                    region_sizes.get(region["id"], ""),
+                    lambda event, rid=region["id"]: self._set_region_mesh_size(rid, event.value),
+                    suffix="m",
+                    hint="Blank uses the global target size",
+                ))
+        else:
+            children.append(Div("Add geometry regions to configure subdomain mesh sizes.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"))
+
+        children.extend([
+            Div("Geometric hp layers", ui_style="font-size:11px; font-weight:700; letter-spacing:.05em; color:var(--fg-muted); padding-top:10px;"),
+            Div("Choose boundaries or whole regions to mark. NGSolve will create graded refinement layers around those marks.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+        ])
+        layer_count = QSelect(
+            ui_label="Number of hp layers",
+            ui_options=list(range(0, 9)),
+            ui_model_value=mesh.get("hp_layers", 0),
+            ui_dense=True,
+            ui_filled=True,
+        )
+        layer_count.on_update_model_value(lambda event: self._set_mesh("hp_layers", int(event.value)))
+        grading = _input(
+            "Layer grading factor",
+            mesh.get("hp_grading_factor", 0.3),
+            lambda event: self._set_mesh("hp_grading_factor", event.value),
+            number=True,
+            hint="Between 0 and 1; smaller values make tighter layers",
+        )
+        children.extend([layer_count, grading])
+        if regions:
+            children.append(Div("Whole region boundaries", ui_style="font-size:11px; font-weight:600; padding-top:4px;"))
+            for region in regions:
+                target = QCheckbox(
+                    ui_label=region.get("name", "Region"),
+                    ui_model_value=region["id"] in mesh.get("hp_region_ids", []),
+                    ui_dense=True,
+                )
+                target.on_update_model_value(
+                    lambda event, rid=region["id"]: self._set_hp_layer_target("hp_region_ids", rid, bool(event.value))
+                )
+                children.append(target)
+
+            children.append(Div("Individual boundaries", ui_style="font-size:11px; font-weight:600; padding-top:4px;"))
+            edge_owner = {}
+            for region in regions:
+                for edge_id in region.get("edge_ids", []):
+                    edge_owner.setdefault(edge_id, region.get("name", "Region"))
+            for edge in self.model.get("geometry", {}).get("edges", []):
+                label = edge.get("name", "Boundary")
+                owner = edge_owner.get(edge.get("id"))
+                if owner:
+                    label = f"{owner} · {label}"
+                target = QCheckbox(
+                    ui_label=label,
+                    ui_model_value=edge["id"] in mesh.get("hp_edge_ids", []),
+                    ui_dense=True,
+                )
+                target.on_update_model_value(
+                    lambda event, eid=edge["id"]: self._set_hp_layer_target("hp_edge_ids", eid, bool(event.value))
+                )
+                children.append(target)
+        children.append(Div("The sketch must contain valid, non-overlapping regions before mesh generation.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted); padding-top:5px;"))
+        return children
 
     def _solver_properties(self):
         solver = self.model["solver"]
@@ -4804,6 +4909,36 @@ class SolveWorkspace(Div):
     def _set_mesh(self, key, value):
         self.model["mesh"][key] = value
         self._refresh_model_tree()
+
+    @_history_tracked
+    def _set_region_mesh_size(self, region_id, value):
+        region_ids = {region.get("id") for region in self.model.get("geometry", {}).get("regions", [])}
+        if region_id not in region_ids:
+            return
+        region_sizes = self.model.setdefault("mesh", {}).setdefault("region_element_sizes", {})
+        expression = str(value or "").strip()
+        if expression:
+            region_sizes[region_id] = expression
+        else:
+            region_sizes.pop(region_id, None)
+
+    @_history_tracked
+    def _set_hp_layer_target(self, key, target_id, enabled):
+        if key not in {"hp_region_ids", "hp_edge_ids"}:
+            raise ValueError(f"Unsupported hp-layer target list: {key}")
+        live_ids = {
+            region.get("id") for region in self.model.get("geometry", {}).get("regions", [])
+        } if key == "hp_region_ids" else {
+            edge.get("id") for edge in self.model.get("geometry", {}).get("edges", [])
+        }
+        if target_id not in live_ids:
+            return
+        selected = list(self.model.setdefault("mesh", {}).get(key, []))
+        if enabled and target_id not in selected:
+            selected.append(target_id)
+        elif not enabled:
+            selected = [item for item in selected if item != target_id]
+        self.model["mesh"][key] = selected
 
     @_history_tracked
     def _set_solver(self, key, value):

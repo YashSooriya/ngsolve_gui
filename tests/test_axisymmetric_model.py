@@ -121,6 +121,32 @@ def test_parameter_declaration_and_explicit_si_suffixes_are_checked():
     assert any("Mesh element size: has unit A/m^2; expected m" in error for error in errors)
 
 
+def test_regional_mesh_sizes_and_hp_layer_targets_are_validated():
+    model = _nested_model()
+    model["mesh"].update({
+        "region_element_sizes": {"coil": "0.001"},
+        "hp_layers": 2,
+        "hp_grading_factor": 0.3,
+        "hp_region_ids": ["coil"],
+        "hp_edge_ids": [model["geometry"]["edges"][0]["id"]],
+    })
+    assert validate_model(model) == []
+
+    model["mesh"]["region_element_sizes"]["coil"] = "-0.001"
+    model["mesh"]["hp_edge_ids"] = ["missing-edge"]
+    errors = validate_model(model)
+    assert any("Region 'Coil' mesh size" in error for error in errors)
+    assert any("missing boundary 'missing-edge'" in error for error in errors)
+
+
+def test_hp_layers_require_a_valid_mark_and_safe_grading():
+    model = _nested_model()
+    model["mesh"].update({"hp_layers": 2, "hp_grading_factor": 1.0})
+    errors = validate_model(model)
+    assert any("Select at least one region or boundary" in error for error in errors)
+    assert any("hp grading factor must be between 0 and 1" in error for error in errors)
+
+
 def test_legacy_millimetre_project_migrates_expressions_to_si_metres():
     model = _nested_model()
     model["geometry"].pop("dimension_expression_unit")

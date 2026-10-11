@@ -112,6 +112,58 @@ def test_geometry_and_physics_value_inputs_use_si_units(standalone_components):
     assert study_units["Frequency points (comma separated)"] == "Hz"
 
 
+def test_mesh_panel_exposes_regional_sizes_and_boundary_or_region_hp_targets(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+
+    controls = workspace._mesh_properties()
+
+    def components(items):
+        for item in items:
+            yield item
+            yield from components(getattr(item, "ui_children", []))
+
+    all_controls = list(components(controls))
+    labels = [getattr(item, "ui_label", None) for item in all_controls]
+    assert "square 1 mesh size" in labels
+    assert "Number of hp layers" in labels
+    assert "Layer grading factor" in labels
+    assert region["name"] in labels  # Whole-region boundary selector.
+    assert all(
+        any(edge.get("name") in label for label in labels if isinstance(label, str))
+        for edge in workspace.model["geometry"]["edges"]
+    )
+    region_size_input = next(
+        item for item in all_controls
+        if getattr(item, "ui_label", None) == "square 1 mesh size"
+        and hasattr(item, "ui_suffix")
+    )
+    assert region_size_input.ui_suffix == "m"
+
+    workspace._set_region_mesh_size(region["id"], "0.002")
+    workspace._set_mesh("hp_layers", 2)
+    workspace._set_hp_layer_target("hp_region_ids", region["id"], True)
+    assert workspace.model["mesh"]["region_element_sizes"][region["id"]] == "0.002"
+    assert workspace.model["mesh"]["hp_layers"] == 2
+    assert workspace.model["mesh"]["hp_region_ids"] == [region["id"]]
+    workspace._set_region_mesh_size(region["id"], None)
+    assert region["id"] not in workspace.model["mesh"]["region_element_sizes"]
+
+
+def test_regional_and_hp_settings_invalidate_mesh_preview(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    workspace.set_mesh_preview([((0, 0), (1, 0))])
+    workspace._set_region_mesh_size(region["id"], "0.005")
+    assert workspace.mesh_preview_edges == []
+
+    workspace.set_mesh_preview([((0, 0), (1, 0))])
+    workspace._set_hp_layer_target("hp_edge_ids", workspace.model["geometry"]["edges"][0]["id"], True)
+    assert workspace.mesh_preview_edges == []
+
+
 def test_generated_mesh_preview_is_invalidated_only_by_mesh_relevant_edits(standalone_components):
     workspace = SolveWorkspace()
     workspace.set_mesh_preview([

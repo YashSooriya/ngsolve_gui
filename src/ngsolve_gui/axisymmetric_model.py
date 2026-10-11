@@ -286,7 +286,15 @@ def new_model(name: str = "Untitled axisymmetric model") -> dict:
             "mechanics": {"enabled": False},
             "coupling": {"enabled": False},
         },
-        "mesh": {"element_size": "0.01", "polynomial_order": 3},
+        "mesh": {
+            "element_size": "0.01",
+            "polynomial_order": 3,
+            "region_element_sizes": {},
+            "hp_layers": 0,
+            "hp_grading_factor": 0.3,
+            "hp_region_ids": [],
+            "hp_edge_ids": [],
+        },
         "solver": {
             "linear_solver": "direct",
             "anderson": True,
@@ -813,6 +821,60 @@ def validate_model(model: dict) -> list[str]:
             raise ValueError("target element size must be positive")
     except (TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError) as error:
         errors.append(f"Mesh settings: {error}.")
+
+    region_sizes = mesh.get("region_element_sizes", {})
+    if not isinstance(region_sizes, dict):
+        errors.append("Regional mesh sizes must be an object keyed by region id.")
+        region_sizes = {}
+    for region_id, expression in region_sizes.items():
+        if region_id not in ids:
+            errors.append(f"Regional mesh size refers to missing region {region_id!r}.")
+            continue
+        label = region_by_id.get(region_id, {}).get("name", region_id)
+        try:
+            check_unit(f"Region '{label}' mesh size", expression, "m")
+            if float(evaluate_expression(expression, parameter_map)) <= 0:
+                raise ValueError("target element size must be positive")
+        except (TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError) as error:
+            errors.append(f"Region '{label}' mesh size: {error}.")
+
+    try:
+        hp_layers = mesh.get("hp_layers", 0)
+        if isinstance(hp_layers, bool) or int(hp_layers) != hp_layers or int(hp_layers) not in range(0, 9):
+            raise ValueError("number of hp layers must be an integer between 0 and 8")
+        hp_factor = float(mesh.get("hp_grading_factor", 0.3))
+        if not math.isfinite(hp_factor) or not 0 < hp_factor < 1:
+            raise ValueError("hp grading factor must be between 0 and 1")
+    except (TypeError, ValueError, OverflowError) as error:
+        errors.append(f"HP layer settings: {error}.")
+
+    hp_region_ids = mesh.get("hp_region_ids", [])
+    hp_edge_ids = mesh.get("hp_edge_ids", [])
+    if not isinstance(hp_region_ids, list):
+        errors.append("HP-refined regions must be a list of region ids.")
+        hp_region_ids = []
+    if not isinstance(hp_edge_ids, list):
+        errors.append("HP-refined boundaries must be a list of edge ids.")
+        hp_edge_ids = []
+    if any(not isinstance(item, str) for item in hp_region_ids):
+        errors.append("HP-refined regions must contain region ids as text.")
+    elif len(hp_region_ids) != len(set(hp_region_ids)):
+        errors.append("HP-refined regions must contain unique region ids.")
+    if any(not isinstance(item, str) for item in hp_edge_ids):
+        errors.append("HP-refined boundaries must contain edge ids as text.")
+    elif len(hp_edge_ids) != len(set(hp_edge_ids)):
+        errors.append("HP-refined boundaries must contain unique edge ids.")
+    for region_id in hp_region_ids:
+        if not isinstance(region_id, str) or region_id not in ids:
+            errors.append(f"HP refinement refers to missing region {region_id!r}.")
+    for edge_id in hp_edge_ids:
+        if not isinstance(edge_id, str) or edge_id not in edge_ids:
+            errors.append(f"HP refinement refers to missing boundary {edge_id!r}.")
+    try:
+        if int(mesh.get("hp_layers", 0)) > 0 and not (hp_region_ids or hp_edge_ids):
+            errors.append("Select at least one region or boundary for hp layers, or set the layer count to zero.")
+    except (TypeError, ValueError, OverflowError):
+        pass
 
     solver = model.get("solver", {})
     if not isinstance(solver, dict):
