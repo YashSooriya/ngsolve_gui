@@ -425,7 +425,7 @@ def test_run_history_exposes_a_frequency_selector_for_sweep_fields(standalone_co
     assert run["selected_frequency_hz"] == "500"
 
 
-def test_3d_preview_replaces_viewport_and_restores_editable_sketch(standalone_components):
+def test_3d_preview_opens_large_modal_and_exit_restores_editable_sketch(standalone_components):
     workspace = SolveWorkspace()
     preview = Div()
     workspace._build_3d_preview_component = lambda: preview
@@ -435,20 +435,52 @@ def test_3d_preview_replaces_viewport_and_restores_editable_sketch(standalone_co
 
     assert workspace._preview_3d_active
     assert workspace._preview_3d_component is preview
-    assert workspace._canvas_host.ui_children == [preview, workspace._canvas_resize_observer]
+    assert workspace._preview_3d_dialog.ui_model_value is True
+    assert workspace._preview_3d_viewport.ui_children == [preview]
+    assert workspace._canvas_host.ui_children == [original_canvas, workspace._canvas_resize_observer]
+    assert workspace._preview_3d_dialog._props["maximized"] is True
+    assert workspace._preview_3d_dialog._props["persistent"] is True
+    assert workspace._preview_3d_exit_button.ui_label == "Exit 3D Preview"
     assert workspace._preview_3d_button.ui_label == "Exit 3D Preview"
-    assert all(control.ui_hidden for control in workspace._sketch_view_controls)
+    assert all(not control.ui_hidden for control in workspace._sketch_view_controls)
 
     workspace.toggle_3d_preview()
 
     assert not workspace._preview_3d_active
+    assert workspace._preview_3d_dialog.ui_model_value is False
     assert workspace._preview_3d_component is None
+    assert workspace._preview_3d_viewport.ui_children == []
     assert workspace._canvas_host.ui_children == [original_canvas, workspace._canvas_resize_observer]
     assert workspace._preview_3d_button.ui_label == "Preview in 3D"
     assert all(not control.ui_hidden for control in workspace._sketch_view_controls)
 
 
-def test_3d_preview_shows_opaque_solid_with_edges_and_axis_without_navigation_cube(
+def test_3d_preview_region_table_lists_each_region_with_three_visibility_states(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.model["geometry"]["regions"] = [
+        {"id": "outer", "name": "Outer air"},
+        {"id": "coil", "name": "Coil"},
+    ]
+    workspace._preview_region_visibility = {"outer": "opaque", "coil": "translucent"}
+
+    workspace._render_3d_preview_region_table()
+
+    assert set(workspace._preview_visibility_controls) == {"outer", "coil"}
+    assert len(workspace._preview_3d_region_rows.ui_children) == 2
+    assert workspace._preview_visibility_controls["outer"].ui_model_value == "opaque"
+    assert workspace._preview_visibility_controls["coil"].ui_model_value == "translucent"
+    assert [
+        option["value"]
+        for option in workspace._preview_visibility_controls["outer"]._props["options"]
+    ] == ["opaque", "translucent", "hidden"]
+
+    workspace._set_3d_region_visibility("outer", "hidden")
+
+    assert workspace._preview_region_visibility["outer"] == "hidden"
+    assert workspace._preview_visibility_controls["outer"].ui_model_value == "hidden"
+
+
+def test_3d_preview_supports_opaque_translucent_and_hidden_regions_with_axis(
     standalone_components, monkeypatch
 ):
     import ngapp.components
@@ -457,11 +489,13 @@ def test_3d_preview_shows_opaque_solid_with_edges_and_axis_without_navigation_cu
     axis_indicator = object()
     geometry_renderer = None
     face_colors = None
+    edge_colors = None
     circle_profiles = []
 
     class Solid:
         def __init__(self, profile):
             self.faces = [profile]
+            self.edges = [object()]
 
         def __sub__(self, _child):
             return self
@@ -471,13 +505,19 @@ def test_3d_preview_shows_opaque_solid_with_edges_and_axis_without_navigation_cu
 
     class Renderer:
         def __init__(self, _geometry):
-            self.faces = SimpleNamespace(active=None, set_colors=self.set_face_colors)
-            self.edges = SimpleNamespace(active=None)
+            self.geo = _geometry
+            self.faces = SimpleNamespace(active=None, transparent=False, set_colors=self.set_face_colors)
+            self.edges = SimpleNamespace(active=None, colors=None, set_colors=self.set_edge_colors)
 
         @staticmethod
         def set_face_colors(colors):
             nonlocal face_colors
             face_colors = colors.copy()
+
+        @staticmethod
+        def set_edge_colors(colors):
+            nonlocal edge_colors
+            edge_colors = colors.copy()
 
     def make_geometry_renderer(geometry):
         nonlocal geometry_renderer
@@ -518,6 +558,7 @@ def test_3d_preview_shows_opaque_solid_with_edges_and_axis_without_navigation_cu
     occ.MakePolygon = lambda _vertices: object()
     occ.OCCGeometry = lambda compound: SimpleNamespace(
         faces=[face for solid in compound for face in solid.faces],
+        edges=[edge for solid in compound for edge in solid.edges],
         shape=SimpleNamespace(solids=compound),
     )
     occ.Pnt = lambda *args: args
@@ -568,7 +609,19 @@ def test_3d_preview_shows_opaque_solid_with_edges_and_axis_without_navigation_cu
     assert [radius for _center, _normal, radius, _profile in circle_profiles] == pytest.approx([0.01, 0.002])
     assert face_colors is not None
     assert face_colors[3::4].tolist() == [1.0, 1.0]
+    assert edge_colors is not None
+    assert edge_colors[3::4].tolist() == [1.0, 1.0]
     assert preview.renderers == [geometry_renderer, axis_indicator]
+
+    workspace._set_3d_region_visibility("circle-inner", "translucent")
+    assert face_colors[3::4].tolist() == pytest.approx([1.0, 0.38])
+    assert geometry_renderer.faces.transparent is True
+    assert edge_colors[3::4].tolist() == [1.0, 1.0]
+
+    workspace._set_3d_region_visibility("circle-inner", "hidden")
+    assert face_colors[3::4].tolist() == [1.0, 0.0]
+    assert edge_colors[3::4].tolist() == [1.0, 0.0]
+    assert geometry_renderer.faces.transparent is False
 
 
 def test_3d_preview_failure_keeps_editable_sketch_active(standalone_components):
@@ -578,6 +631,7 @@ def test_3d_preview_failure_keeps_editable_sketch_active(standalone_components):
     workspace.toggle_3d_preview()
 
     assert not workspace._preview_3d_active
+    assert workspace._preview_3d_dialog.ui_model_value is False
     assert workspace._canvas_host.ui_children == [workspace._canvas, workspace._canvas_resize_observer]
     assert workspace._preview_3d_button.ui_label == "Preview in 3D"
     assert "invalid profile" in workspace.message

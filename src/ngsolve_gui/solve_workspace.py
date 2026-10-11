@@ -18,6 +18,7 @@ from ngapp.components import (
     Component,
     Div,
     QBtn,
+    QBtnToggle,
     QCheckbox,
     QDialog,
     QInput,
@@ -72,6 +73,11 @@ _TREE_GROUPS = (
 
 _FREQUENCY_RESULT_SUFFIX = re.compile(r"_\d+_([0-9.eE+-]+)Hz$", re.IGNORECASE)
 _HIDDEN_RUN_HISTORY_FILE = ".mm_fem_hidden_run_history.json"
+_PREVIEW_VISIBILITY_ALPHA = {
+    "opaque": 1.0,
+    "translucent": 0.38,
+    "hidden": 0.0,
+}
 
 
 def _run_history_path_key(path):
@@ -377,6 +383,12 @@ class SolveWorkspace(Div):
         self._canvas_zoom_generation = 0
         self._preview_3d_active = False
         self._preview_3d_component = None
+        self._preview_3d_scene = None
+        self._preview_3d_renderer = None
+        self._preview_face_region_ids = {}
+        self._preview_edge_region_ids = {}
+        self._preview_region_visibility = {}
+        self._preview_visibility_controls = {}
 
         self._canvas_background = _svg(
             "rect", x=0, y=0, width=self._canvas_width, height=self._canvas_height,
@@ -571,6 +583,77 @@ class SolveWorkspace(Div):
             sketch_toolbar_separator, fit_view_button, zoom_out_button,
             zoom_in_button, self._mesh_preview_button,
         ]
+
+        self._preview_3d_viewport = Div(
+            ui_class="mmfem-3d-preview-viewport",
+            ui_style="display:flex; flex:1 1 auto; width:0; min-width:0; min-height:0; overflow:hidden; background:var(--canvas-bg, #f4f6f8);",
+        )
+        self._preview_3d_region_rows = Div(
+            ui_style="display:flex; flex-direction:column; gap:6px; min-height:0; overflow:auto; padding:8px 12px 14px;",
+        )
+        region_legend = Div(
+            Div(QIcon(ui_name="mdi-eye", ui_color="primary"), "Opaque", ui_style="display:flex; align-items:center; gap:4px;"),
+            Div(QIcon(ui_name="mdi-circle-opacity", ui_color="primary"), "Translucent", ui_style="display:flex; align-items:center; gap:4px;"),
+            Div(QIcon(ui_name="mdi-eye-off", ui_color="primary"), "Hidden", ui_style="display:flex; align-items:center; gap:4px;"),
+            ui_style="display:flex; flex-wrap:wrap; gap:8px 12px; padding:10px 12px; border-bottom:1px solid var(--border); font-size:11px; color:var(--fg-muted);",
+        )
+        region_panel_header = Div(
+            Div("REGIONS", ui_style="font-size:11px; font-weight:700; letter-spacing:.08em; color:var(--fg-muted);"),
+            Div("Visibility", ui_style="font-size:11px; font-weight:600; color:var(--fg-muted); text-align:right;"),
+            ui_style="display:grid; grid-template-columns:minmax(0, 1fr) 132px; align-items:center; gap:8px; padding:14px 12px 10px; border-bottom:1px solid var(--border);",
+        )
+        self._preview_3d_region_panel = Div(
+            region_panel_header,
+            region_legend,
+            self._preview_3d_region_rows,
+            ui_style="display:flex; flex-direction:column; flex:0 0 310px; width:310px; min-width:260px; min-height:0; overflow:hidden; border-left:1px solid var(--border); background:var(--surface);",
+        )
+        self._preview_3d_exit_button = QBtn(
+            QTooltip("Close the 3D preview and return to the sketch"),
+            ui_label="Exit 3D Preview",
+            ui_icon="mdi-close",
+            ui_color="primary",
+            ui_outline=True,
+            ui_dense=True,
+            ui_no_caps=True,
+        )
+        self._preview_3d_exit_button.on_click(self.toggle_3d_preview)
+        preview_header = Div(
+            Div(
+                Div("3D Geometry Preview", ui_style="font-size:17px; font-weight:650;"),
+                Div("Rotate, pan, and zoom the revolved axisymmetric geometry.", ui_style="font-size:12px; color:var(--fg-muted); margin-top:2px;"),
+                ui_style="display:flex; flex-direction:column; min-width:0;",
+            ),
+            Div(ui_style="flex:1;"),
+            self._preview_3d_exit_button,
+            ui_style="display:flex; align-items:center; gap:16px; flex:none; min-height:66px; padding:8px 14px 8px 20px; border-bottom:1px solid var(--border); background:var(--surface);",
+        )
+        preview_body = Div(
+            self._preview_3d_viewport,
+            self._preview_3d_region_panel,
+            ui_style="display:flex; flex:1 1 auto; min-height:0; min-width:0; overflow:hidden;",
+        )
+        preview_card = QCard(
+            preview_header,
+            preview_body,
+            ui_class="mmfem-3d-preview-window",
+            ui_style=(
+                "display:flex; flex-direction:column; width:min(1600px, calc(100vw - 48px)); "
+                "height:min(920px, calc(100vh - 72px)); max-width:calc(100vw - 48px); "
+                "max-height:calc(100vh - 72px); min-width:min(680px, calc(100vw - 24px)); "
+                "min-height:min(480px, calc(100vh - 24px)); margin:auto; overflow:hidden; "
+                "border:1px solid var(--border); border-radius:14px; "
+                "box-shadow:0 24px 90px rgba(10, 22, 38, .32);"
+            ),
+        )
+        self._preview_3d_dialog = QDialog(
+            preview_card,
+            ui_model_value=False,
+            ui_persistent=True,
+            ui_maximized=True,
+            ui_transition_duration=160,
+            ui_class="mmfem-3d-preview-dialog",
+        )
         self._canvas_panel = Div(
             toolbar,
             self._canvas_host,
@@ -714,6 +797,7 @@ class SolveWorkspace(Div):
             self._bottom_bar,
             self._rectangle_dialog,
             self._circle_dialog,
+            self._preview_3d_dialog,
             ui_style="display:flex; flex-direction:column; width:100%; height:100%; min-height:0; overflow:hidden; background:var(--app-bg, #f7f8fa); color:var(--fg, #202631);",
         )
         self._refresh_model_tree()
@@ -3988,7 +4072,7 @@ class SolveWorkspace(Div):
         self._schedule_canvas_interaction_reset()
 
     def _build_3d_preview_component(self):
-        """Revolve the current meridian regions and show them without editing tools."""
+        """Revolve the current meridian regions for the modal read-only preview."""
         from netgen.occ import (
             Axis, Circle, Compound, Dir, Face, MakePolygon, OCCGeometry, Pnt,
             Revolve, Vec, Vertex, Wire,
@@ -3998,6 +4082,11 @@ class SolveWorkspace(Div):
         from webgpu import CoordinateAxes
 
         regions = self.model.get("geometry", {}).get("regions", [])
+        live_region_ids = {region.get("id") for region in regions if region.get("id")}
+        self._preview_region_visibility = {
+            region_id: self._preview_region_visibility.get(region_id, "opaque")
+            for region_id in live_region_ids
+        }
         material_names = {
             material.get("id"): material.get("name", "")
             for material in self.model.get("materials", [])
@@ -4048,9 +4137,11 @@ class SolveWorkspace(Div):
             preview_solids.append(solid)
 
         renderers = []
+        self._preview_3d_renderer = None
+        self._preview_3d_scene = None
+        self._preview_face_region_ids = {}
+        self._preview_edge_region_ids = {}
         if preview_solids:
-            import numpy as np
-
             geometry = OCCGeometry(Compound(preview_solids))
             renderer = GeometryRenderer(geometry)
             renderer.faces.active = True
@@ -4059,28 +4150,16 @@ class SolveWorkspace(Div):
             # instead of a wire cage made from the sketch polygon.
             renderer.edges.active = True
 
-            # Nested parent domains were boolean-cut by their child regions
-            # above, so every material can be shown as an opaque solid.
             material_index = {
                 material.get("id"): index
                 for index, material in enumerate(self.model.get("materials", []))
             }
-            face_color_by_hash = {}
             for region, solid in zip(regions, preview_solids):
-                palette = _MATERIAL_COLORS[
-                    material_index.get(region.get("material_id"), 0) % len(_MATERIAL_COLORS)
-                ]
-                rgb = tuple(int(palette[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
-                alpha = 1.0
                 for face in solid.faces:
-                    face_color_by_hash[hash(face)] = (*rgb, alpha)
-            faces = list(geometry.faces)
-            face_colors = np.tile(np.array([0.42, 0.55, 0.68, 1.0], dtype=np.float32), len(faces))
-            for face_index, face in enumerate(faces):
-                color = face_color_by_hash.get(hash(face))
-                if color is not None:
-                    face_colors[4 * face_index:4 * face_index + 4] = color
-            renderer.faces.set_colors(face_colors)
+                    self._preview_face_region_ids.setdefault(hash(face), []).append(region["id"])
+                for edge in solid.edges:
+                    self._preview_edge_region_ids.setdefault(hash(edge), set()).add(region["id"])
+            self._preview_3d_renderer = renderer
             renderers.append(renderer)
         axes = CoordinateAxes()
         renderers.append(axes)
@@ -4091,10 +4170,161 @@ class SolveWorkspace(Div):
         preview.ui_class = "fit"
         preview.on_mounted(lambda *_: self._resize_3d_preview(preview))
         scene = preview.draw(renderers)
+        self._preview_3d_scene = scene
         if preview_solids:
             scene.options.camera.reset(*scene.bounding_box)
             scene.render()
+            self._apply_3d_preview_visibility(render=False)
+            scene.render()
         return preview
+
+    def _render_3d_preview_region_table(self):
+        """Refresh the per-region visibility controls in the preview sidebar."""
+        self._preview_visibility_controls = {}
+        rows = []
+        regions = self.model.get("geometry", {}).get("regions", [])
+        for region_index, region in enumerate(regions):
+            region_id = region.get("id")
+            state = self._preview_region_visibility.get(region_id, "opaque")
+            toggle = QBtnToggle(
+                QTooltip("Opaque: fully visible · Translucent: see through · Hidden: invisible"),
+                ui_model_value=state,
+                ui_options=[
+                    {"value": "opaque", "icon": "mdi-eye", "title": "Opaque"},
+                    {"value": "translucent", "icon": "mdi-circle-opacity", "title": "Translucent"},
+                    {"value": "hidden", "icon": "mdi-eye-off", "title": "Hidden"},
+                ],
+                ui_color="grey-8",
+                ui_toggle_color="primary",
+                ui_toggle_text_color="white",
+                ui_outline=True,
+                ui_dense=True,
+                ui_no_caps=True,
+                ui_no_wrap=True,
+                ui_size="sm",
+                ui_padding="xs",
+                ui_class="full-width",
+                ui_style="width:132px; flex:none;",
+            )
+            toggle._props["aria-label"] = f"Visibility for {region.get('name') or 'unnamed region'}"
+            toggle.on(
+                "update:model-value",
+                lambda event, rid=region_id: self._set_3d_region_visibility(
+                    rid, getattr(event, "value", event)
+                ),
+            )
+            self._preview_visibility_controls[region_id] = toggle
+            rows.append(
+                Div(
+                    Div(
+                        Div(
+                            ui_style=(
+                                "width:9px; height:24px; flex:none; border-radius:5px; "
+                                f"background:{_MATERIAL_COLORS[region_index % len(_MATERIAL_COLORS)]};"
+                            ),
+                        ),
+                        Div(
+                            region.get("name") or f"Region {region_index + 1}",
+                            ui_style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
+                        ),
+                        ui_style="display:flex; align-items:center; gap:9px; min-width:0;",
+                    ),
+                    toggle,
+                    ui_style=(
+                        "display:grid; grid-template-columns:minmax(0, 1fr) 132px; "
+                        "align-items:center; gap:8px; min-height:42px; padding:5px 0; "
+                        "border-bottom:1px solid var(--border); font-size:12px;"
+                    ),
+                )
+            )
+
+        self._preview_3d_region_rows.ui_children = rows or [
+            Div("No regions defined", ui_style="padding:10px 0; color:var(--fg-muted); font-size:12px;")
+        ]
+
+    def _set_3d_region_visibility(self, region_id, state):
+        """Update one preview-only visibility state and redraw its region."""
+        if state not in _PREVIEW_VISIBILITY_ALPHA or region_id not in self._preview_region_visibility:
+            return
+        self._preview_region_visibility[region_id] = state
+        control = self._preview_visibility_controls.get(region_id)
+        if control is not None and control.ui_model_value != state:
+            control.ui_model_value = state
+        self._apply_3d_preview_visibility()
+
+    def _apply_3d_preview_visibility(self, *, render=True):
+        """Apply region alpha and line visibility to the active 3D renderer."""
+        renderer = self._preview_3d_renderer
+        if renderer is None:
+            return
+        import numpy as np
+
+        geometry = renderer.geo
+        faces = list(geometry.faces)
+        face_colors = np.tile(
+            np.array([0.42, 0.55, 0.68, 1.0], dtype=np.float32), len(faces)
+        )
+        face_alphas = []
+        material_index = {
+            material.get("id"): index
+            for index, material in enumerate(self.model.get("materials", []))
+        }
+        regions_by_id = {
+            region.get("id"): region
+            for region in self.model.get("geometry", {}).get("regions", [])
+        }
+        for face_index, face in enumerate(faces):
+            region_ids = self._preview_face_region_ids.get(hash(face), ())
+            visible_regions = [
+                region_id for region_id in region_ids
+                if region_id in regions_by_id
+            ]
+            if not visible_regions:
+                face_alphas.append(1.0)
+                continue
+            region_id = max(
+                visible_regions,
+                key=lambda rid: _PREVIEW_VISIBILITY_ALPHA[
+                    self._preview_region_visibility.get(rid, "opaque")
+                ],
+            )
+            region = regions_by_id[region_id]
+            palette = _MATERIAL_COLORS[
+                material_index.get(region.get("material_id"), 0) % len(_MATERIAL_COLORS)
+            ]
+            rgb = tuple(int(palette[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+            alpha = max(
+                _PREVIEW_VISIBILITY_ALPHA[
+                    self._preview_region_visibility.get(rid, "opaque")
+                ]
+                for rid in visible_regions
+            )
+            face_colors[4 * face_index:4 * face_index + 4] = (*rgb, alpha)
+            face_alphas.append(alpha)
+        renderer.faces.set_colors(face_colors)
+        renderer.faces.transparent = any(0.0 < alpha < 1.0 for alpha in face_alphas)
+
+        edges = list(geometry.edges)
+        edge_colors = getattr(renderer.edges, "colors", None)
+        if edge_colors is None or len(edge_colors) != 4 * len(edges):
+            edge_colors = np.tile(
+                np.array([0.12, 0.16, 0.21, 1.0], dtype=np.float32), len(edges)
+            )
+        else:
+            edge_colors = np.asarray(edge_colors, dtype=np.float32).copy()
+        for edge_index, edge in enumerate(edges):
+            region_ids = self._preview_edge_region_ids.get(hash(edge), ())
+            if region_ids:
+                alpha = max(
+                    _PREVIEW_VISIBILITY_ALPHA[
+                        self._preview_region_visibility.get(rid, "opaque")
+                    ]
+                    for rid in region_ids
+                )
+                edge_colors[4 * edge_index + 3] = 0.0 if alpha == 0.0 else 1.0
+        renderer.edges.set_colors(edge_colors)
+        if render and self._preview_3d_scene is not None:
+            self._preview_3d_scene.render()
 
     @staticmethod
     def _resize_3d_preview(preview):
@@ -4109,19 +4339,22 @@ class SolveWorkspace(Div):
             pass
 
     def toggle_3d_preview(self, *args):
-        """Toggle between the editable meridian canvas and read-only 3D view."""
+        """Open or close the large read-only 3D preview window."""
         if self._preview_3d_active:
             self._preview_3d_active = False
-            self._canvas_host.ui_children = [self._canvas, self._canvas_resize_observer]
+            self._preview_3d_dialog.ui_model_value = False
+            self._preview_3d_viewport.ui_children = []
             self._preview_3d_component = None
+            self._preview_3d_scene = None
+            self._preview_3d_renderer = None
+            self._preview_face_region_ids = {}
+            self._preview_edge_region_ids = {}
+            self._preview_visibility_controls = {}
             self._preview_3d_button.ui_label = "Preview in 3D"
             self._preview_3d_button.ui_icon = "mdi-cube-scan"
             self._preview_3d_button.ui_color = None
             self._preview_3d_button.ui_flat = True
             self._preview_3d_tooltip.ui_children = ["Preview the axisymmetric regions revolved into 3D."]
-            for control in self._sketch_view_controls:
-                control.ui_hidden = False
-            self.render_canvas()
             self._message("Returned to the editable meridian sketch.")
             return
 
@@ -4132,15 +4365,15 @@ class SolveWorkspace(Div):
             return
 
         self._preview_3d_component = preview
-        self._canvas_host.ui_children = [preview, self._canvas_resize_observer]
+        self._preview_3d_viewport.ui_children = [preview]
+        self._render_3d_preview_region_table()
+        self._preview_3d_dialog.ui_model_value = True
         self._preview_3d_active = True
         self._preview_3d_button.ui_label = "Exit 3D Preview"
         self._preview_3d_button.ui_icon = "mdi-cube-outline"
         self._preview_3d_button.ui_color = "primary"
         self._preview_3d_button.ui_flat = False
         self._preview_3d_tooltip.ui_children = ["Return to the editable meridian sketch."]
-        for control in self._sketch_view_controls:
-            control.ui_hidden = True
         self._message("3D preview: left-drag to rotate, middle-drag or Shift+left-drag to pan, scroll to zoom.")
 
     @_history_tracked
