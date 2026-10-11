@@ -61,6 +61,33 @@ def test_workspace_builds_nested_regions_and_recomputes_dimension_parameters(sta
     assert workspace.validation_errors() == []
 
 
+def test_problem_dirty_state_tracks_edits_and_saved_snapshots(standalone_components):
+    workspace = SolveWorkspace()
+    assert workspace.dirty is False
+
+    workspace.model["name"] = "Two solenoids"
+    assert workspace.dirty is True
+
+    workspace.mark_saved()
+    assert workspace.dirty is False
+
+    workspace.studies["studies"][0]["name"] = "Fully coupled study"
+    assert workspace.dirty is True
+    workspace.studies["studies"][0]["name"] = "DC + harmonic"
+    assert workspace.dirty is False
+
+
+def test_loading_a_problem_sets_a_clean_saved_snapshot(standalone_components):
+    workspace = SolveWorkspace()
+    model = copy.deepcopy(workspace.model)
+    model["name"] = "Loaded problem"
+
+    workspace.set_model(model)
+
+    assert workspace.model["name"] == "Loaded problem"
+    assert workspace.dirty is False
+
+
 def test_geometry_and_physics_value_inputs_use_si_units(standalone_components):
     workspace = SolveWorkspace()
     assert workspace._primitive_values[("rectangle", "width")] == pytest.approx(0.02)

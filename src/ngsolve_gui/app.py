@@ -25,7 +25,7 @@ from .cerbsim_style import theme, kb_theme, flex_fill, panel_full
 from .system_monitor import SystemMonitor, available as system_monitor_available
 from .footer import StatusFooter
 from .solve_workspace import SolveWorkspace
-from .axisymmetric_model import unpack_model, package_model
+from .axisymmetric_model import new_model, new_studies, unpack_model, package_model
 from .result_files import (
     MESH_SUFFIX,
     SOLUTION_SUFFIX,
@@ -459,7 +459,14 @@ class NGSolveGui(App):
             button.on_click(handler)
             return button
 
-        def _artifact_group(name, save_handler, load_handler):
+        def _artifact_group(name, save_handler, load_handler, new_handler=None):
+            actions = []
+            if new_handler is not None:
+                actions.append(_file_action("New", f"Start a new {name.lower()}", new_handler))
+            actions.extend((
+                _file_action("Save", f"Save {name.lower()}", save_handler),
+                _file_action("Load", f"Load {name.lower()}", load_handler),
+            ))
             return Div(
                 Div(
                     name,
@@ -470,8 +477,7 @@ class NGSolveGui(App):
                     ),
                 ),
                 Div(
-                    _file_action("Save", f"Save {name.lower()}", save_handler),
-                    _file_action("Load", f"Load {name.lower()}", load_handler),
+                    *actions,
                     ui_style="display:flex; align-items:center; justify-content:center; gap:1px;",
                 ),
                 ui_style=(
@@ -481,7 +487,8 @@ class NGSolveGui(App):
             )
 
         problem_actions = _artifact_group(
-            "Problem", self.save_problem_file, self.load_problem_file
+            "Problem", self.save_problem_file, self.load_problem_file,
+            new_handler=self.new_problem,
         )
         mesh_actions = _artifact_group("Mesh", self.save_mesh_file, self.load_mesh_file)
         solution_actions = _artifact_group(
@@ -507,6 +514,41 @@ class NGSolveGui(App):
             import_file_btn, self._undo_button, self._redo_button,
             ui_class=cb.tb_group,
         )
+
+        cancel_new_problem = QBtn(
+            ui_label="Cancel", ui_flat=True, ui_dense=True, ui_no_caps=True,
+        )
+        discard_new_problem = QBtn(
+            ui_label="Discard", ui_flat=True, ui_dense=True, ui_no_caps=True,
+            ui_color="negative",
+        )
+        save_new_problem = QBtn(
+            ui_label="Save", ui_flat=True, ui_dense=True, ui_no_caps=True,
+            ui_color="primary",
+        )
+        self._new_problem_dialog = QDialog(
+            QCard(
+                QCardSection(
+                    Div("Save changes?", ui_style="font-size:18px; font-weight:650;")
+                ),
+                QCardSection(
+                    "The current problem has unsaved changes. Save them before starting a new "
+                    "problem, discard them, or cancel to keep working."
+                ),
+                QCardActions(
+                    cancel_new_problem,
+                    discard_new_problem,
+                    save_new_problem,
+                    ui_align="right",
+                ),
+                ui_style="width:min(460px, 92vw);",
+            ),
+            ui_model_value=False,
+            ui_persistent=True,
+        )
+        cancel_new_problem.on_click(self._close_new_problem_dialog)
+        discard_new_problem.on_click(self._discard_and_start_new_problem)
+        save_new_problem.on_click(self._save_and_start_new_problem)
 
         # Settings + quit (panel toggles removed — sidebars are draggable;
         # theme lives in the settings menu).
@@ -642,7 +684,7 @@ class NGSolveGui(App):
 
         super().__init__(
             bar, self._post_process_workspace,
-            self._solve_workspace, self._timer_dialog,
+            self._solve_workspace, self._timer_dialog, self._new_problem_dialog,
             self.kb.indicator, self.kb.help_overlay,
             ui_class=str(cb.app_root),
         )
@@ -724,6 +766,56 @@ class NGSolveGui(App):
         if self._solve_shortcut_context_active():
             return self.solve_workspace.redo()
         return False
+
+    def new_problem(self, *args):
+        """Start a blank problem, asking before discarding unsaved edits."""
+        if self._solver_job_active or getattr(self.solve_workspace, "_job_active", False):
+            self._notify(
+                "Wait for the current solve to finish before starting a new problem.",
+                type="warning",
+                timeout=4000,
+            )
+            return False
+        if self.solve_workspace.dirty:
+            self._new_problem_dialog.ui_model_value = True
+            return False
+        return self._start_new_problem()
+
+    def _close_new_problem_dialog(self, *args):
+        self._new_problem_dialog.ui_model_value = False
+
+    def _start_new_problem(self):
+        if self._solver_job_active or getattr(self.solve_workspace, "_job_active", False):
+            self._notify(
+                "Wait for the current solve to finish before starting a new problem.",
+                type="warning",
+                timeout=4000,
+            )
+            return False
+        self._close_new_problem_dialog()
+        self.solve_workspace.set_model(
+            new_model(),
+            new_studies(),
+            {"schema_version": 1, "active_section": "geometry", "camera": "fit"},
+        )
+        self._loaded_mesh_path = None
+        self._loaded_mesh_problem_sha256 = None
+        if self._workspace_mode != "solve":
+            self._workspace_mode_toggle.select("solve")
+        self._notify("Started a new problem.", type="positive", timeout=2500)
+        return True
+
+    def _discard_and_start_new_problem(self, *args):
+        return self._start_new_problem()
+
+    def _save_and_start_new_problem(self, *args):
+        self._close_new_problem_dialog()
+        if not self.save_problem_file():
+            # Keep the decision available if the file picker was cancelled or
+            # saving failed; the current problem must remain intact.
+            self._new_problem_dialog.ui_model_value = True
+            return False
+        return self._start_new_problem()
 
     def _delete_selected_region_shortcut(self, *args):
         if not self._solve_shortcut_context_active():
@@ -815,14 +907,17 @@ class NGSolveGui(App):
             title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in model.get("name", "axisymmetric-model")).strip()
             filename = (title or "axisymmetric-model") + ".ngsmodel"
             if not self._save_artifact(data, filename):
-                return
+                return False
+            self.solve_workspace.mark_saved()
             self._notify("Problem file saved.", type="positive", timeout=2500)
             self.solve_workspace._message(f"Saved {filename}.")
             if errors:
                 self._notify("Model saved as a draft. Review Geometry and Physics before running.", type="warning", timeout=5000)
+            return True
         except Exception as error:
             self._notify(f"Could not save problem file: {error}", type="negative", timeout=7000)
             self.solve_workspace._message(f"Save failed: {error}", error=True)
+            return False
 
     def save_project(self):
         """Compatibility alias for the former Save Project action."""

@@ -101,3 +101,98 @@ def test_workspace_mode_rejects_unknown_mode():
     app = SimpleNamespace()
     with pytest.raises(ValueError, match="Unknown workspace mode"):
         NGSolveGui._set_workspace_mode(app, "solver")
+
+
+def test_new_problem_prompts_when_model_has_unsaved_changes():
+    dialog = SimpleNamespace(ui_model_value=False)
+    app = SimpleNamespace(
+        _solver_job_active=False,
+        solve_workspace=SimpleNamespace(dirty=True, _job_active=False),
+        _new_problem_dialog=dialog,
+    )
+
+    assert NGSolveGui.new_problem(app) is False
+    assert dialog.ui_model_value is True
+
+
+def test_new_problem_starts_immediately_when_model_is_clean():
+    started = []
+    app = SimpleNamespace(
+        _solver_job_active=False,
+        solve_workspace=SimpleNamespace(dirty=False, _job_active=False),
+        _start_new_problem=lambda: started.append(True) or True,
+    )
+
+    assert NGSolveGui.new_problem(app) is True
+    assert started == [True]
+
+
+def test_cancelled_problem_save_keeps_current_problem_and_reopens_prompt():
+    dialog = SimpleNamespace(ui_model_value=True)
+    reset = []
+    app = SimpleNamespace(
+        _new_problem_dialog=dialog,
+        _close_new_problem_dialog=lambda: setattr(dialog, "ui_model_value", False),
+        save_problem_file=lambda: False,
+        _start_new_problem=lambda: reset.append(True) or True,
+    )
+
+    assert NGSolveGui._save_and_start_new_problem(app) is False
+    assert dialog.ui_model_value is True
+    assert reset == []
+
+
+def test_start_new_problem_resets_model_and_loaded_mesh():
+    calls = []
+    dialog = SimpleNamespace(ui_model_value=True)
+    workspace = SimpleNamespace(
+        _job_active=False,
+        set_model=lambda *args: calls.append(args),
+    )
+    mode_selections = []
+    app = SimpleNamespace(
+        _solver_job_active=False,
+        _new_problem_dialog=dialog,
+        _close_new_problem_dialog=lambda: setattr(dialog, "ui_model_value", False),
+        solve_workspace=workspace,
+        _loaded_mesh_path="old.vol",
+        _loaded_mesh_problem_sha256="old-hash",
+        _workspace_mode="post_process",
+        _workspace_mode_toggle=SimpleNamespace(select=mode_selections.append),
+        _notify=lambda *args, **kwargs: None,
+    )
+
+    assert NGSolveGui._start_new_problem(app) is True
+    model, studies, layout = calls[0]
+    assert model["geometry"]["regions"] == []
+    assert studies["studies"]
+    assert layout["active_section"] == "geometry"
+    assert app._loaded_mesh_path is None
+    assert app._loaded_mesh_problem_sha256 is None
+    assert mode_selections == ["solve"]
+    assert dialog.ui_model_value is False
+
+
+@pytest.mark.parametrize("save_succeeds", [True, False])
+def test_problem_save_reports_success_and_marks_only_written_state(monkeypatch, save_succeeds):
+    saved = []
+    messages = []
+    workspace = SimpleNamespace(
+        model={"name": "Solenoid"},
+        studies={"studies": []},
+        layout={"active_section": "geometry"},
+        validation_errors=lambda: [],
+        mark_saved=lambda: saved.append(True),
+        _message=lambda *args, **kwargs: messages.append((args, kwargs)),
+    )
+    app = SimpleNamespace(
+        solve_workspace=workspace,
+        _save_artifact=lambda data, filename: save_succeeds,
+        _notify=lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr("ngsolve_gui.app.package_model", lambda *args: b"problem")
+
+    result = NGSolveGui.save_problem_file(app)
+
+    assert result is save_succeeds
+    assert saved == ([True] if save_succeeds else [])

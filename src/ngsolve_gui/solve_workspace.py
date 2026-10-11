@@ -348,6 +348,8 @@ class SolveWorkspace(Div):
         self._material_library = material_library or MaterialLibrary()
         self._user_materials = self._material_library.load()
         self.studies = new_studies()
+        self._saved_model = copy.deepcopy(self.model)
+        self._saved_studies = copy.deepcopy(self.studies)
         self.layout = {"schema_version": 1, "active_section": "geometry", "camera": "fit"}
         self.on_log = on_log
         self.on_run = on_run
@@ -876,7 +878,15 @@ class SolveWorkspace(Div):
 
     @property
     def dirty(self):
-        return True
+        return (
+            self.model != self._saved_model
+            or self.studies != self._saved_studies
+        )
+
+    def mark_saved(self):
+        """Record the current problem definition as the last saved state."""
+        self._saved_model = copy.deepcopy(self.model)
+        self._saved_studies = copy.deepcopy(self.studies)
 
     @property
     def can_undo(self):
@@ -991,6 +1001,7 @@ class SolveWorkspace(Div):
         self._cancel_model_rename()
         self.model = model
         self.studies = studies
+        self.mark_saved()
         self._undo_history.clear()
         self._redo_history.clear()
         self._notify_history_changed()
