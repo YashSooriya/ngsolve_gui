@@ -1890,7 +1890,14 @@ def test_blank_axisymmetric_view_starts_at_r_zero_with_world_space_ticks(standal
     assert len(steps) == 1
     svg_text = [item for item in workspace._canvas_grid.ui_children if item._component_name == "text"]
     assert any(item._props.get("textContent") == "Axis of rotation  ·  r = 0" for item in svg_text)
-    assert {item._props.get("font-size") for item in svg_text} == {"12"}
+    tick_labels = [
+        item for item in svg_text
+        if item._props.get("textContent") not in {
+            "Axis of rotation  ·  r = 0", "z = 0", "r  [m]", "z  [m]",
+        }
+    ]
+    assert tick_labels
+    assert all(item._props.get("font-size") == "16" for item in tick_labels)
     assert all(not item.ui_children for item in svg_text)
 
 

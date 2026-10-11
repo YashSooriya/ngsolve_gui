@@ -1536,7 +1536,7 @@ class SolveWorkspace(Div):
       if (index % 5 === 0) {
         addLine(x, 0, x, height, 'var(--border, #d9dfe7)', 1);
         const radius = (index / 5) * majorStep;
-        addText(Math.min(Math.max(x, 22), width - 22), height - 5, format(radius), {anchor: 'middle'});
+        addText(Math.min(Math.max(x, 28), width - 28), height - 5, format(radius), {anchor: 'middle', size: 16});
       } else {
         addLine(x, 0, x, height, 'var(--grid-minor, #e8edf2)', 0.75);
       }
@@ -1550,7 +1550,7 @@ class SolveWorkspace(Div):
       if (index % 5 === 0) {
         addLine(0, y, width, y, 'var(--border, #d9dfe7)', 1);
         const axial = (index / 5) * majorStep;
-        addText(6, Math.min(Math.max(y + 4, 12), height - 3), format(axial));
+        addText(6, Math.min(Math.max(y + 4, 12), height - 3), format(axial), {size: 16});
       } else {
         addLine(0, y, width, y, 'var(--grid-minor, #e8edf2)', 0.75);
       }
@@ -2046,6 +2046,9 @@ class SolveWorkspace(Div):
 """
         try:
             self.js.eval(script.replace("__SKETCH_TOOL__", self.sketch_tool))
+            # The initial render can run before the browser JS bridge is ready.
+            # Re-send settings after the mounted handler confirms that bridge.
+            self._sync_canvas_interaction_settings()
         except Exception:
             # Tests and non-browser frontends may not expose a JS runtime.
             return
@@ -4240,14 +4243,14 @@ class SolveWorkspace(Div):
             x = xy((value, 0))[0]
             grid_children.append(_svg("line", x1=x, y1=plot[1], x2=x, y2=plot[3], stroke="var(--border, #d9dfe7)", stroke_width="1"))
             label_x = min(max(x, plot[0] + 28), plot[2] - 28)
-            grid_children.append(_svg("text", x=label_x, y=plot[3] - 5, fill="var(--fg-muted, #697586)", font_size="12", text_anchor="middle", style=grid_text_style, children=f"{value:.5g}"))
+            grid_children.append(_svg("text", x=label_x, y=plot[3] - 5, fill="var(--fg-muted, #697586)", font_size="16", text_anchor="middle", style=grid_text_style, children=f"{value:.5g}"))
         for value in axial_ticks:
             if abs(value) <= grid_step * 1e-10:
                 continue
             y = xy((0, value))[1]
             grid_children.append(_svg("line", x1=plot[0], y1=y, x2=plot[2], y2=y, stroke="var(--border, #d9dfe7)", stroke_width="1"))
             label_y = min(max(y + 4, plot[1] + 12), plot[3] - 3)
-            grid_children.append(_svg("text", x=plot[0] + 6, y=label_y, fill="var(--fg-muted, #697586)", font_size="12", text_anchor="start", style=grid_text_style, children=f"{value:.5g}"))
+            grid_children.append(_svg("text", x=plot[0] + 6, y=label_y, fill="var(--fg-muted, #697586)", font_size="16", text_anchor="start", style=grid_text_style, children=f"{value:.5g}"))
         if lower_left[0] <= 0 <= upper_right[0]:
             xaxis = xy((0, 0))[0]
             grid_children.append(_svg("line", x1=xaxis, y1=plot[1], x2=xaxis, y2=plot[3], stroke="#557187", stroke_width="2", stroke_dasharray="6 4"))
