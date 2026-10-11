@@ -918,6 +918,90 @@ def test_dragging_region_moves_shape_by_hundredth_mm_and_preserves_edge_assignme
     assert moved_edge["boundary_condition_ids"] == ["support"]
 
 
+def test_axis_of_symmetry_boundary_tracks_region_addition_and_movement(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._primitive_values[("rectangle", "r_min")] = 0.0
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+
+    axis_edge = next(
+        edge for edge in workspace.model["geometry"]["edges"]
+        if all(abs(float(point[0])) <= 1e-12 for point in edge["vertices"])
+    )
+    axis_condition = next(
+        condition for condition in workspace.model["boundary_conditions"]
+        if condition["type"] == "axis_of_symmetry"
+    )
+    assert axis_condition["automatic_for_axis"] is True
+    assert axis_edge["boundary_condition_ids"] == [axis_condition["id"]]
+    assert [entry[1] for entry in workspace._tree_subsection("boundaries")[1]] == [
+        "Axis of symmetry · 1 edge"
+    ]
+
+    project, _ = workspace._canvas_projection()
+    workspace._move_region_from_canvas_drag(
+        region["id"], project((0.0, 0.0)), project((0.004, 0.0))
+    )
+
+    assert all(
+        condition["type"] != "axis_of_symmetry"
+        for condition in workspace.model["boundary_conditions"]
+    )
+    assert all(
+        not any(
+            condition.get("type") == "axis_of_symmetry"
+            for condition in workspace.model["boundary_conditions"]
+            if condition["id"] in edge["boundary_condition_ids"]
+        )
+        for edge in workspace.model["geometry"]["edges"]
+    )
+
+    project, _ = workspace._canvas_projection()
+    workspace._move_region_from_canvas_drag(
+        region["id"], project((0.004, 0.0)), project((0.0, 0.0))
+    )
+    assert any(
+        condition["type"] == "axis_of_symmetry"
+        for condition in workspace.model["boundary_conditions"]
+    )
+    assert any(
+        all(abs(float(point[0])) <= 1e-12 for point in edge["vertices"])
+        and any(
+            condition.get("type") == "axis_of_symmetry"
+            for condition in workspace.model["boundary_conditions"]
+            if condition["id"] in edge["boundary_condition_ids"]
+        )
+        for edge in workspace.model["geometry"]["edges"]
+    )
+
+
+def test_loading_pre_axis_model_adds_automatic_axis_boundary(standalone_components):
+    source = SolveWorkspace()
+    source._primitive_values[("rectangle", "r_min")] = 0.0
+    source._add_primitive("rectangle")
+    source._set_region_value(
+        source.model["geometry"]["regions"][0]["id"], "material_id", "material-air"
+    )
+    legacy_axis_model = copy.deepcopy(source.model)
+    legacy_axis_model["boundary_conditions"] = []
+    for edge in legacy_axis_model["geometry"]["edges"]:
+        edge["boundary_condition_ids"] = []
+
+    workspace = SolveWorkspace()
+    workspace.set_model(legacy_axis_model)
+
+    axis_edge = next(
+        edge for edge in workspace.model["geometry"]["edges"]
+        if all(abs(float(point[0])) <= 1e-12 for point in edge["vertices"])
+    )
+    axis_condition = next(
+        condition for condition in workspace.model["boundary_conditions"]
+        if condition["type"] == "axis_of_symmetry"
+    )
+    assert axis_edge["boundary_condition_ids"] == [axis_condition["id"]]
+    assert axis_condition["automatic_for_axis"] is True
+
+
 def test_browser_region_move_keeps_canvas_mounted(standalone_components, monkeypatch):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
@@ -1901,7 +1985,19 @@ def test_model_tree_counts_only_project_materials_and_assigned_boundary_conditio
     workspace._add_primitive("rectangle")
     region = workspace.model["geometry"]["regions"][0]
     edges = workspace.model["geometry"]["edges"]
-    assert all(edge["boundary_condition_ids"] == [] for edge in edges)
+    axis_edge = next(
+        edge for edge in edges
+        if all(abs(float(point[0])) <= 1e-12 for point in edge["vertices"])
+    )
+    axis_condition = next(
+        condition for condition in workspace.model["boundary_conditions"]
+        if condition["type"] == "axis_of_symmetry"
+    )
+    assert axis_edge["boundary_condition_ids"] == [axis_condition["id"]]
+    assert all(
+        edge["boundary_condition_ids"] == []
+        for edge in edges if edge is not axis_edge
+    )
 
     workspace._set_region_value(region["id"], "material_id", "material-air")
     assert workspace._tree_subsection("materials")[1][0][1] == "Air · 1 region"
@@ -1912,9 +2008,11 @@ def test_model_tree_counts_only_project_materials_and_assigned_boundary_conditio
     condition = {"id": "boundary-fixed", "name": "Fixed support", "type": "mechanical_fixed"}
     workspace.model["boundary_conditions"].append(condition)
     workspace._refresh_model_tree()
-    assert workspace._tree_subsection("boundaries")[1][0][1] == "Fixed support · 0 edges"
+    labels = {entry[0]: entry[1] for entry in workspace._tree_subsection("boundaries")[1]}
+    assert labels["boundary-fixed"] == "Fixed support · 0 edges"
     workspace._set_edge_condition(edges[1]["id"], "mechanical", condition["id"])
-    assert workspace._tree_subsection("boundaries")[1][0][1] == "Fixed support · 1 edge"
+    labels = {entry[0]: entry[1] for entry in workspace._tree_subsection("boundaries")[1]}
+    assert labels["boundary-fixed"] == "Fixed support · 1 edge"
 
 
 def test_unused_builtin_material_can_be_removed_from_the_model(standalone_components):

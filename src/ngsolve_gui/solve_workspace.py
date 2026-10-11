@@ -819,6 +819,8 @@ class SolveWorkspace(Div):
         self._cancel_canvas_zoom_render()
         self._clear_mesh_preview()
         model = migrate_legacy_model(model)
+        model = copy.deepcopy(model)
+        _sync_axis_boundary_conditions(model)
         studies = migrate_legacy_studies(studies or new_studies())
         errors = validate_model(model)
         if errors:
@@ -833,7 +835,7 @@ class SolveWorkspace(Div):
         if study_errors:
             raise ValueError("Invalid studies: " + " ".join(study_errors))
         self._cancel_model_rename()
-        self.model = copy.deepcopy(model)
+        self.model = model
         self.studies = studies
         self._undo_history.clear()
         self._redo_history.clear()
@@ -2686,6 +2688,7 @@ class SolveWorkspace(Div):
                 region_edges.append(edge["id"])
             region["edge_ids"] = region_edges
         self.model["geometry"]["edges"] = edges
+        _sync_axis_boundary_conditions(self.model)
         if hasattr(self, "selected_edge_ids"):
             live_ids = {edge["id"] for edge in edges}
             self.selected_edge_ids = [edge_id for edge_id in self.selected_edge_ids if edge_id in live_ids]
@@ -3623,6 +3626,7 @@ class SolveWorkspace(Div):
                 ui_option_label="label",
                 ui_option_value="value",
                 ui_model_value=condition.get("type"),
+                ui_disable=bool(condition.get("automatic_for_axis")),
                 ui_emit_value=True,
                 ui_map_options=True,
                 ui_dense=True,
@@ -4191,6 +4195,10 @@ class SolveWorkspace(Div):
                 ]
             self._recompute_parent_links()
             self._rebuild_edges()
+            # A dimension edit can move a region onto or off r = 0, which
+            # changes the automatically managed axis boundary in the model tree.
+            self._refresh_model_tree()
+            self._render_inspector()
             self._message("Updated sketch dimension.")
         except (ValueError, TypeError, OverflowError) as error:
             region["shape"] = old_shape
@@ -4956,3 +4964,113 @@ def _edge_condition_ids(edge):
     if isinstance(values, str):
         return [values]
     return [value for value in values if value]
+
+
+def _edge_is_on_rotation_axis(edge):
+    """Return whether a straight sketch edge lies on the r = 0 axis."""
+    if not isinstance(edge, dict):
+        return False
+    vertices = edge.get("vertices", [])
+    if not isinstance(vertices, (list, tuple)) or len(vertices) != 2:
+        return False
+    try:
+        return all(abs(float(point[0])) <= 1e-12 for point in vertices)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return False
+
+
+def _sync_axis_boundary_conditions(model):
+    """Keep the axis-of-symmetry condition attached to exactly the r=0 edges.
+
+    The GUI's axis condition represents the electromagnetic regularity boundary
+    used by the axisymmetric solver. It is geometry-managed: creating, editing,
+    moving, or deleting a region updates the assignment automatically.
+    """
+    if not isinstance(model, dict):
+        return
+    geometry = model.get("geometry")
+    if not isinstance(geometry, dict):
+        return
+    edges = geometry.get("edges", [])
+    if not isinstance(edges, list):
+        return
+    conditions = model.setdefault("boundary_conditions", [])
+    if not isinstance(conditions, list):
+        return
+
+    condition_by_id = {
+        item.get("id"): item
+        for item in conditions
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    axis_condition = next(
+        (item for item in conditions if isinstance(item, dict)
+         and item.get("type") == "axis_of_symmetry"
+         and item.get("automatic_for_axis")),
+        None,
+    )
+    if axis_condition is None:
+        axis_condition = next(
+            (item for item in conditions if isinstance(item, dict)
+             and item.get("type") == "axis_of_symmetry"),
+            None,
+        )
+    axis_edges_exist = any(_edge_is_on_rotation_axis(edge) for edge in edges)
+    if axis_edges_exist and (
+        axis_condition is None or not isinstance(axis_condition.get("id"), str)
+    ):
+        axis_condition = {
+            "id": new_id("boundary"),
+            "name": "Axis of symmetry",
+            "type": "axis_of_symmetry",
+            "automatic_for_axis": True,
+        }
+        conditions.append(axis_condition)
+    if axis_edges_exist:
+        axis_condition["automatic_for_axis"] = True
+        axis_condition_id = axis_condition["id"]
+        condition_by_id[axis_condition_id] = axis_condition
+    else:
+        axis_condition_id = None
+
+    electromagnetic_types = {"axis_of_symmetry", "magnetic_potential_zero", "natural"}
+
+    def condition_type(condition_id):
+        if not isinstance(condition_id, str):
+            return None
+        return condition_by_id.get(condition_id, {}).get("type")
+
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        on_axis = _edge_is_on_rotation_axis(edge)
+        try:
+            condition_ids = list(_edge_condition_ids(edge))
+        except TypeError:
+            # Let model validation report malformed assignment containers.
+            continue
+        if on_axis:
+            # Axis regularity takes precedence over user-selectable EM edge
+            # conditions; a single edge cannot carry two EM conditions.
+            condition_ids = [
+                condition_id for condition_id in condition_ids
+                if condition_type(condition_id) not in electromagnetic_types
+            ]
+            if axis_condition_id:
+                condition_ids.append(axis_condition_id)
+        else:
+            # Axis regularity is only meaningful on the rotational axis.
+            condition_ids = [
+                condition_id for condition_id in condition_ids
+                if condition_type(condition_id) != "axis_of_symmetry"
+            ]
+        edge["boundary_condition_ids"] = condition_ids
+        edge.pop("boundary_condition_id", None)
+
+    # Generated definitions disappear when the last axis edge moves away or
+    # is deleted, keeping the boundary tree free of stale automatic entries.
+    if axis_condition_id is None:
+        conditions[:] = [
+            item for item in conditions
+            if not (isinstance(item, dict) and item.get("automatic_for_axis"))
+        ]
