@@ -1541,10 +1541,10 @@ def test_middle_drag_pans_without_leaving_the_radial_axis_margin(standalone_comp
     assert workspace._canvas_drag is None
 
 
-def test_middle_drag_limits_negative_radius_to_a_small_axis_buffer(standalone_components):
+def test_middle_drag_keeps_z_axis_labels_clear_at_negative_r_limit(standalone_components):
     workspace = SolveWorkspace()
     plot = workspace._canvas_plot_bounds()
-    buffer_px = min(32.0, max(12.0, (plot[2] - plot[0]) * 0.035))
+    buffer_px = min(72.0, max(12.0, (plot[2] - plot[0]) * 0.08))
     workspace._pan_canvas_by_pixels((100.0, 120.0), (10000.0, 120.0))
 
     project, _ = workspace._canvas_projection()
@@ -1554,7 +1554,7 @@ def test_middle_drag_limits_negative_radius_to_a_small_axis_buffer(standalone_co
 def test_browser_pan_commit_clamps_negative_radius_when_requested(standalone_components):
     workspace = SolveWorkspace()
     plot = workspace._canvas_plot_bounds()
-    buffer_px = min(32.0, max(12.0, (plot[2] - plot[0]) * 0.035))
+    buffer_px = min(72.0, max(12.0, (plot[2] - plot[0]) * 0.08))
 
     assert workspace._commit_browser_canvas_view(
         (1.0, 10000.0, 0.0, 1), render=False, clamp_negative_r=True
@@ -1878,14 +1878,15 @@ def test_model_tree_groups_sections_and_places_children_under_their_parent(stand
     assert "flex:1 1 auto" in workspace._properties_splitter._props["style"]
 
 
-def test_blank_axisymmetric_view_has_a_small_negative_r_axis_gutter(standalone_components):
+def test_blank_axisymmetric_view_reserves_a_z_label_gutter(standalone_components):
     workspace = SolveWorkspace()
     project, unproject = workspace._canvas_projection()
     plot = workspace._canvas_plot_bounds()
     center = ((plot[0] + plot[2]) / 2, (plot[1] + plot[3]) / 2)
-    buffer_px = min(32.0, max(12.0, (plot[2] - plot[0]) * 0.035))
+    buffer_px = min(72.0, max(12.0, (plot[2] - plot[0]) * 0.08))
 
     assert plot == (0.0, 0.0, 900.0, 640.0)
+    assert buffer_px == pytest.approx(72.0)
     assert project((0.0, 0.0))[0] == pytest.approx(buffer_px)
     assert unproject((plot[0], 320.0))[0] < 0.0
     assert unproject(center)[1] == pytest.approx(0.0)
@@ -1927,7 +1928,7 @@ def test_sketch_axes_and_grid_fill_the_responsive_viewport(standalone_components
         if item._props.get("stroke") == "#557187"
         and item._props.get("stroke-width") == "1.5"
     )
-    buffer_px = min(32.0, max(12.0, (plot[2] - plot[0]) * 0.035))
+    buffer_px = min(72.0, max(12.0, (plot[2] - plot[0]) * 0.08))
     assert (rotation_axis._props["x1"], rotation_axis._props["x2"]) == pytest.approx(
         (buffer_px, buffer_px)
     )
@@ -2108,7 +2109,7 @@ def test_axisymmetric_view_keeps_axis_visible_for_regions_away_from_axis(standal
 
     project, unproject = workspace._canvas_projection()
 
-    buffer_px = min(32.0, max(12.0, workspace._canvas_plot_bounds()[2] * 0.035))
+    buffer_px = min(72.0, max(12.0, workspace._canvas_plot_bounds()[2] * 0.08))
     assert project((0.0, 0.0))[0] == pytest.approx(buffer_px)
     assert project((0.01, 0.0))[0] > buffer_px
     assert unproject((0.0, 320.0))[0] < 0.0

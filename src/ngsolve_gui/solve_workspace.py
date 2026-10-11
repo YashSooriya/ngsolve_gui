@@ -1155,9 +1155,10 @@ class SolveWorkspace(Div):
                 "originY": origin[1],
                 "pixelsPerWorld": pixels_per_world,
                 "majorStep": self._canvas_grid_step(),
-                # A few percent of the viewport gives the rotation axis some
-                # breathing room, while keeping the user out of negative r.
-                "negativeRBufferPx": min(32.0, max(12.0, (plot[2] - plot[0]) * 0.035)),
+                # Keep a generous negative-r gutter so the symmetry axis does
+                # not run through the z-axis tick labels when panning to the
+                # left limit.
+                "negativeRBufferPx": min(72.0, max(12.0, (plot[2] - plot[0]) * 0.08)),
             }
             self.js.eval(
                 f"window.__ngsolveSketchLiveGrid = {json.dumps(live_grid, allow_nan=False)}"
@@ -1256,7 +1257,7 @@ class SolveWorkspace(Div):
         # clipped against the viewport edge. Preserve the fitted positive-r
         # extent when adding that gutter.
         plot_width = plot[2] - plot[0]
-        buffer_px = min(32.0, max(12.0, plot_width * 0.035))
+        buffer_px = min(72.0, max(12.0, plot_width * 0.08))
         buffer_fraction = min(0.2, buffer_px / plot_width)
         fitted_width = width / (1.0 - buffer_fraction)
         center = (fitted_width * (0.5 - buffer_fraction), 0.0)
@@ -1275,7 +1276,7 @@ class SolveWorkspace(Div):
         """Keep r=0 just inside the left edge when panning toward negative r."""
         plot = self._canvas_plot_bounds()
         plot_width = plot[2] - plot[0]
-        buffer_px = min(32.0, max(12.0, plot_width * 0.035))
+        buffer_px = min(72.0, max(12.0, plot_width * 0.08))
         return world_width * (0.5 - buffer_px / plot_width)
 
     def _preserve_canvas_view(self):
@@ -1725,7 +1726,7 @@ class SolveWorkspace(Div):
       const screenStart = dragStartScreen || toViewPoint(dragStart);
       const screenEnd = screenPoint || toViewPoint(point);
       const grid = window.__ngsolveSketchLiveGrid;
-      const maxAxisX = grid ? Number(grid.negativeRBufferPx) : 28;
+      const maxAxisX = grid ? Number(grid.negativeRBufferPx) : 72;
       let translateX = dragBaseTranslateX + screenEnd[0] - screenStart[0];
       if (grid && Number.isFinite(maxAxisX)) {
         translateX = Math.min(translateX, maxAxisX - dragBaseScale * grid.originX);
