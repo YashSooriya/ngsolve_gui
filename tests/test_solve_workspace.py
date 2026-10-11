@@ -18,6 +18,11 @@ from ngsolve_gui.solve_workspace import SolveWorkspace, _load_saved_run_history
 @pytest.fixture
 def standalone_components(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "ngapp-config"))
+    monkeypatch.setattr(
+        utils,
+        "user_config_dir",
+        lambda app_name: str(tmp_path / "user-config" / app_name),
+    )
     environment = utils.Environment(utils.EnvironmentType.STANDALONE, have_backend=False)
     environment.frontend.update_component = lambda *args, **kwargs: None
     monkeypatch.setattr(utils, "_environment", environment)
