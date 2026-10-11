@@ -3267,10 +3267,10 @@ class SolveWorkspace(Div):
         ]
 
     def _material_options(self):
-        """Built-ins are choices; model materials are the project-specific set."""
+        """Offer library presets and project materials without preloading them."""
         options = [{"label": "Unassigned", "value": None}]
         seen = set()
-        for material in [*self.model.get("materials", []), *builtin_materials()]:
+        for material in [*builtin_materials(), *self.model.get("materials", [])]:
             material_id = material.get("id")
             if material_id in seen:
                 continue
@@ -3526,7 +3526,7 @@ class SolveWorkspace(Div):
             name = _input("Region name", region["name"], lambda event, rid=region["id"]: self._set_region_value(rid, "name", event.value))
             material = QSelect(
                 ui_label="Material",
-                ui_options=[{"label": item["name"], "value": item["id"]} for item in self.model["materials"]],
+                ui_options=self._material_options(),
                 ui_option_label="label",
                 ui_option_value="value",
                 ui_model_value=region.get("material_id"),
@@ -3642,7 +3642,7 @@ class SolveWorkspace(Div):
         children = [_section_title("Materials", "Enter material properties in SI units, then assign them to regions.")]
         if not self.model["materials"]:
             return children + [
-                Div("Choose Air or Copper from a region's Material list, or add a custom material here.", ui_style="font-size:12px; color:var(--fg-muted); line-height:1.45;"),
+                Div("Choose a library material from a region's Material list, or add a custom material here. Assigned materials appear in this list and can be reused by other regions.", ui_style="font-size:12px; color:var(--fg-muted); line-height:1.45;"),
                 _button("Add material", "mdi-plus", self.add_material),
             ]
         valid_ids = {item["id"] for item in self.model["materials"]}

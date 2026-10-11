@@ -1777,7 +1777,16 @@ def test_model_tree_groups_sections_and_places_children_under_their_parent(stand
     assert workspace._tree_subsection("materials") == ("MATERIALS · 0", [])
     assert workspace._tree_subsection("boundaries") == ("CONDITIONS · 0", [])
     assert [option["label"] for option in workspace._material_options()] == [
-        "Unassigned", "Air", "Copper"
+        "Unassigned",
+        "Air",
+        "Copper",
+        "Main coil (effective composite)",
+        "Copper (gradient coil)",
+        "Stainless steel (4 K / OVC)",
+        "Aluminium (77 K shield)",
+        "Epoxy",
+        "Shim",
+        "Analytical test material",
     ]
     assert workspace._tree_splitter.ui_slot_before == [workspace._tree]
     assert workspace._tree_splitter.ui_slot_after == [workspace._properties_splitter]
@@ -2186,6 +2195,50 @@ def test_unused_builtin_material_can_be_removed_from_the_model(standalone_compon
 
     assert workspace.model["materials"] == []
     assert workspace._tree_subsection("materials") == ("MATERIALS · 0", [])
+
+
+def test_region_material_dropdown_offers_problem_presets_and_custom_materials(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    workspace.selected_region_id = region["id"]
+
+    material_select = next(
+        item for item in workspace._geometry_properties()
+        if getattr(item, "ui_label", None) == "Material"
+    )
+    assert "Stainless steel (4 K / OVC)" in {
+        option["label"] for option in material_select.ui_options
+    }
+
+    workspace.add_material()
+    custom = workspace.model["materials"][0]
+    workspace._set_material_name(custom["id"], "My alloy")
+    workspace._set_material_property(custom["id"], "electrical_conductivity", "2.4e6")
+
+    material_select = next(
+        item for item in workspace._geometry_properties()
+        if getattr(item, "ui_label", None) == "Material"
+    )
+    assert {option["value"] for option in material_select.ui_options} >= {custom["id"]}
+    workspace._set_region_value(region["id"], "material_id", custom["id"])
+    assert region["material_id"] == custom["id"]
+    assert custom["properties"]["electrical_conductivity"] == "2.4e6"
+
+
+def test_problem_material_preset_is_copied_to_model_when_assigned(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+
+    workspace._set_region_value(region["id"], "material_id", "material-cryogenic-steel")
+
+    expected = next(
+        item for item in builtin_materials()
+        if item["id"] == "material-cryogenic-steel"
+    )
+    assert workspace.model["materials"] == [expected]
+    assert workspace._tree_subsection("materials")[1][0][1] == "Stainless steel (4 K / OVC) · 1 region"
 
 
 def test_parameter_removal_is_available_and_blocked_while_referenced(standalone_components):

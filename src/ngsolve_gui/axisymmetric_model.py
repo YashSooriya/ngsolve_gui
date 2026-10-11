@@ -53,7 +53,12 @@ _LEGACY_EXPRESSION_UNITS = (*_EXPRESSION_UNITS[:-1], "mm", "m")
 
 
 def builtin_materials() -> list[dict]:
-    """Return the built-in material choices without adding them to a model."""
+    """Return the material presets represented in the current problem files.
+
+    Presets are offered in region selectors, but are copied into a model only
+    when a user assigns one.  Values for the magnet-specific entries match
+    the material dictionaries used by the axisymmetric magnet examples.
+    """
     return copy.deepcopy([
         {
             "id": "material-air",
@@ -75,6 +80,83 @@ def builtin_materials() -> list[dict]:
                 "youngs_modulus": "110e9",
                 "poissons_ratio": "0.34",
                 "density": "8960",
+            },
+        },
+        {
+            "id": "material-main-coil-composite",
+            "name": "Main coil (effective composite)",
+            "properties": {
+                "relative_permeability": "1",
+                "electrical_conductivity": "0",
+                "youngs_modulus": "84e9",
+                "poissons_ratio": "0.33",
+                "density": "5700",
+            },
+        },
+        {
+            "id": "material-gradient-coil-copper",
+            "name": "Copper (gradient coil)",
+            "properties": {
+                "relative_permeability": "1",
+                "electrical_conductivity": "59e6",
+                "youngs_modulus": "130e9",
+                "poissons_ratio": "0.34",
+                "density": "8960",
+            },
+        },
+        {
+            "id": "material-cryogenic-steel",
+            "name": "Stainless steel (4 K / OVC)",
+            "properties": {
+                "relative_permeability": "1",
+                "electrical_conductivity": "1.4e6",
+                "youngs_modulus": "210e9",
+                "poissons_ratio": "0.283",
+                "density": "7900",
+            },
+        },
+        {
+            "id": "material-aluminium-77k",
+            "name": "Aluminium (77 K shield)",
+            "properties": {
+                "relative_permeability": "1",
+                "electrical_conductivity": "33e6",
+                "youngs_modulus": "81e9",
+                "poissons_ratio": "0.337",
+                "density": "2698",
+            },
+        },
+        {
+            "id": "material-epoxy",
+            "name": "Epoxy",
+            "properties": {
+                "relative_permeability": "1",
+                "electrical_conductivity": "0",
+                "youngs_modulus": "2.75e9",
+                "poissons_ratio": "0.4",
+                "density": "1160",
+            },
+        },
+        {
+            "id": "material-shim",
+            "name": "Shim",
+            "properties": {
+                "relative_permeability": "1",
+                "electrical_conductivity": "0",
+                "youngs_modulus": "13e9",
+                "poissons_ratio": "0.13",
+                "density": "1850",
+            },
+        },
+        {
+            "id": "material-analytical-test",
+            "name": "Analytical test material",
+            "properties": {
+                "relative_permeability": "1",
+                "electrical_conductivity": "1",
+                "youngs_modulus": "1e7",
+                "poissons_ratio": "0.33",
+                "density": "500",
             },
         },
     ])
