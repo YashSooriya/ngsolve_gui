@@ -1935,13 +1935,11 @@ class SolveWorkspace(Div):
       const dx = grid && grid.enabled ? end[0] - start[0] : quantize(end[0] - start[0]);
       const dy = grid && grid.enabled ? end[1] - start[1] : quantize(end[1] - start[1]);
       const baseOffset = committedRegionOffsets.get(dragRegionId) || [0, 0];
-      for (const shape of svg.querySelectorAll('[data-sketch-region-id]')) {
-        if (shape.getAttribute('data-sketch-region-id') === dragRegionId) {
-          const totalX = baseOffset[0] + dx;
-          const totalY = baseOffset[1] + dy;
-          if (totalX === 0 && totalY === 0) shape.removeAttribute('transform');
-          else shape.setAttribute('transform', `translate(${totalX} ${totalY})`);
-        }
+      for (const shape of regionElements(svg, dragRegionId)) {
+        const totalX = baseOffset[0] + dx;
+        const totalY = baseOffset[1] + dy;
+        if (totalX === 0 && totalY === 0) shape.removeAttribute('transform');
+        else shape.setAttribute('transform', `translate(${totalX} ${totalY})`);
       }
       if (window.__ngsolveSketchSelectedRegionId === dragRegionId) {
         const dimensions = svg.querySelector('#solve-sketch-dimensions');

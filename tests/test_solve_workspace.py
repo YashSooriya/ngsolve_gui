@@ -1964,6 +1964,11 @@ def test_canvas_drag_suppresses_the_click_that_follows_mouseup(standalone_compon
     assert "liveGrid.replaceChildren();" in scripts[0]
     assert "while (liveGrid.firstChild)" not in scripts[0]
     assert "data-sketch-grid-revision" in scripts[0]
+    preview_body = scripts[0].split(
+        "const updatePreview = (svg, point, screenPoint = null) => {", 1
+    )[1].split("const beginGesture", 1)[0]
+    assert "regionElements(svg, dragRegionId)" in preview_body
+    assert "querySelectorAll('[data-sketch-region-id]')" not in preview_body
 
 
 def test_stationary_region_pointer_gesture_selects_region_after_pointer_capture(standalone_components, monkeypatch):
