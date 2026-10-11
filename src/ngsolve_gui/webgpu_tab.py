@@ -142,12 +142,12 @@ class WebgpuTab(PropertyPanelMixin, Div):
 
         self.pick_overlay = PickOverlay()
 
-        # -- Floating viewport overlays (designer): tool dock, clip toolbar,
-        #    camera cluster (reset + bookmarks), and the field probe panel. --
+        # -- Viewport tools, clipping controls, camera bookmarks, and probes. --
         self._probe_active = False
         self._probe_mode = "points"   # or "line"
         self._probe_points = []       # list of (np.array point, value-or-None)
         self._probe_screen = []       # parallel screen (x, y) for the line preview
+        self._page_toolbar_enabled = bool(self._uses_page_toolbar())
         self._tool_dock = self._build_tool_dock()
         self._clip_toolbar = self._build_clip_toolbar()  # None if not 3D
         self._probe_panel = self._build_probe_panel()  # None if no field
@@ -163,7 +163,26 @@ class WebgpuTab(PropertyPanelMixin, Div):
             overlays.append(self._probe_preview)
             overlays.append(self._probe_panel)
         overlays.extend(self._build_additional_viewport_overlays())
-        super().__init__(*overlays, ui_class="relative-position fit")
+        if self._page_toolbar_enabled:
+            viewport_overlays = self._viewport_overlays(overlays)
+            self._viewport = Div(
+                *viewport_overlays,
+                ui_class="relative-position",
+                ui_style=(
+                    "position:relative; display:flex; flex:1 1 auto; min-height:0; "
+                    "min-width:0; width:100%; overflow:hidden;"
+                ),
+            )
+            super().__init__(
+                *self._page_layout_children(),
+                ui_class="fit",
+                ui_style=(
+                    "display:flex; flex-direction:column; flex:1 1 auto; "
+                    "min-height:0; min-width:0; width:100%; overflow:hidden;"
+                ),
+            )
+        else:
+            super().__init__(*overlays, ui_class="relative-position fit")
 
         self.draw()
         if self._camera_needs_fit:
@@ -240,6 +259,33 @@ class WebgpuTab(PropertyPanelMixin, Div):
     def _build_additional_viewport_overlays(self):
         """Extra overlays supplied by specialized viewport components."""
         return []
+
+    def _uses_page_toolbar(self):
+        """Post-processing views use a labeled toolbar above the canvas."""
+        return True
+
+    def _viewport_overlays(self, overlays):
+        """Keep page-level tool rows out of the area used for viewport overlays."""
+        excluded = {id(self._tool_dock)}
+        if self._clip_toolbar is not None:
+            excluded.add(id(self._clip_toolbar))
+        return [item for item in overlays if id(item) not in excluded]
+
+    def _page_layout_children(self):
+        """Build the labeled toolbar rows followed by the flexible viewport."""
+        rows = [self._tool_dock]
+        if self._clip_toolbar is not None:
+            rows.append(self._clip_toolbar)
+        rows.append(self._viewport)
+        return rows
+
+    def _sync_viewport_layout(self, overlays):
+        """Refresh overlays without allowing them to replace the page toolbar."""
+        if self._page_toolbar_enabled:
+            self._viewport.ui_children = self._viewport_overlays(overlays)
+            self.ui_children = self._page_layout_children()
+        else:
+            self.ui_children = overlays
 
     def apply_viewport_theme(self):
         """Set the scene background (clear color + overlays) from the active theme.
@@ -727,8 +773,26 @@ class WebgpuTab(PropertyPanelMixin, Div):
 
     # -- Viewport tool dock + inline clipping toolbar ----------------------
 
-    def _vtool(self, icon, tip, handler):
-        """A single floating viewport tool button."""
+    def _vtool(self, icon, tip, handler, *, label=None):
+        """Build a viewport action as an icon or a labeled page-toolbar button."""
+        if getattr(self, "_page_toolbar_enabled", False):
+            label = label or tip.split("·", 1)[0].strip()
+            btn = QBtn(
+                QTooltip(tip),
+                ui_icon=icon,
+                ui_label=label,
+                ui_flat=True,
+                ui_dense=True,
+                ui_no_caps=True,
+                ui_class=str(cb.vp_tool),
+                ui_style=(
+                    "width:auto; min-width:0; height:32px; padding:0 9px; "
+                    "white-space:nowrap;"
+                ),
+            )
+            btn.on_click(handler)
+            return btn
+
         btn = Div(QIcon(ui_name=icon), QTooltip(tip), ui_class=str(cb.vp_tool))
         btn.on("click", lambda e=None: handler())
         return btn
@@ -747,32 +811,54 @@ class WebgpuTab(PropertyPanelMixin, Div):
     def _build_tool_dock(self):
         self._wf_tool = None
         self._clip_tool = None
-        tools = [self._vtool("mdi-overscan", "Fit view  ·  r", self.reset_camera)]
+        tools = [self._vtool("mdi-overscan", "Fit view  ·  r", self.reset_camera,
+                             label="Fit view")]
         self._link_tool = self._build_camera_link_tool()
         if self._link_tool is not None:
             tools.append(self._link_tool)
         if self._supports_clipping():
             tools.append(self._build_camera_views_tool())
         if hasattr(self, "wireframe_visible"):
-            self._wf_tool = self._vtool("mdi-grid", "Wireframe  ·  w", self.toggle_wireframe)
+            self._wf_tool = self._vtool(
+                "mdi-grid", "Toggle wireframe edges  ·  w", self.toggle_wireframe,
+                label="Wireframe",
+            )
             self._set_tool_active(self._wf_tool, self.wireframe_visible.value)
             tools.append(self._wf_tool)
         if self._supports_clipping():
             tools.append(Div(ui_class=str(cb.vp_sep)))
-            self._clip_tool = self._vtool("mdi-content-cut", "Clipping plane  ·  c",
-                                          self.toggle_clipping)
+            self._clip_tool = self._vtool(
+                "mdi-content-cut", "Show or hide the clipping plane  ·  c",
+                self.toggle_clipping, label="Clipping",
+            )
             tools.append(self._clip_tool)
         self._probe_tool = None
         if self._supports_probe():
             tools.append(Div(ui_class=str(cb.vp_sep)))
             self._probe_tool = self._vtool(
-                "mdi-crosshairs-gps", "Line / point probe  →  plot", self.toggle_probe)
+                "mdi-crosshairs-gps", "Measure field values along a line or at a point",
+                self.toggle_probe, label="Probe",
+            )
             tools.append(self._probe_tool)
         # View tools: fullscreen + view bookmarks.
         tools.append(Div(ui_class=str(cb.vp_sep)))
-        tools.append(self._vtool("mdi-fullscreen", "Fullscreen viewport",
-                                  self._toggle_fullscreen))
+        tools.append(self._vtool(
+            "mdi-fullscreen", "Expand the viewport to fullscreen",
+            self._toggle_fullscreen, label="Fullscreen",
+        ))
         tools.append(self._build_bookmark_tool())
+        if getattr(self, "_page_toolbar_enabled", False):
+            return Div(
+                *tools,
+                ui_class=str(cb.vp_dock),
+                ui_style=(
+                    "position:relative; top:auto; left:auto; transform:none; z-index:auto; "
+                    "display:flex; flex:0 0 auto; align-items:center; gap:5px; "
+                    "width:100%; min-height:42px; box-sizing:border-box; overflow-x:auto; "
+                    "border-radius:0; border-width:0 0 1px; box-shadow:none; "
+                    "backdrop-filter:none; background:var(--panel-header); padding:4px 10px;"
+                ),
+            )
         return Div(*tools, ui_class=str(cb.vp_dock))
 
     def _build_camera_link_tool(self):
@@ -781,18 +867,41 @@ class WebgpuTab(PropertyPanelMixin, Div):
             return None
         self._link_icon = QIcon(ui_name="mdi-link-variant")
         self._link_tip = QTooltip("")
-        btn = Div(self._link_icon, self._link_tip, ui_class=str(cb.vp_tool))
-        btn.on("click", lambda e=None: self.toggle_camera_link())
+        if getattr(self, "_page_toolbar_enabled", False):
+            btn = QBtn(
+                self._link_tip,
+                ui_icon="mdi-link-variant",
+                ui_label="Detach camera" if self.camera_shared.value else "Share camera",
+                ui_flat=True,
+                ui_dense=True,
+                ui_no_caps=True,
+                ui_class=str(cb.vp_tool),
+                ui_style=(
+                    "width:auto; min-width:0; height:32px; padding:0 9px; "
+                    "white-space:nowrap;"
+                ),
+            )
+            self._link_labelled_button = True
+            btn.on_click(self.toggle_camera_link)
+        else:
+            btn = Div(self._link_icon, self._link_tip, ui_class=str(cb.vp_tool))
+            btn.on("click", lambda e=None: self.toggle_camera_link())
+            self._link_labelled_button = False
         return btn
 
     def _sync_camera_link_ui(self, val, _old):
         if getattr(self, "_link_tool", None) is None:
             return
-        self._link_icon.ui_name = "mdi-link-variant" if val else "mdi-link-variant-off"
-        self._link_tip.ui_children = [
+        tooltip = (
             "Camera shared with other views of this mesh  ·  click to detach"
             if val else "Camera detached  ·  click to share again"
-        ]
+        )
+        if getattr(self, "_link_labelled_button", False):
+            self._link_tool.ui_icon = "mdi-link-variant" if val else "mdi-link-variant-off"
+            self._link_tool.ui_label = "Detach camera" if val else "Share camera"
+        else:
+            self._link_icon.ui_name = "mdi-link-variant" if val else "mdi-link-variant-off"
+        self._link_tip.ui_children = [tooltip]
         self._set_tool_active(self._link_tool, val)
 
     def _build_bookmark_tool(self):
@@ -800,11 +909,29 @@ class WebgpuTab(PropertyPanelMixin, Div):
         self._bm_pop = Div(ui_class=str(cb.bm_pop))
         self._bm_pop.ui_hidden = True
         self._bm_pop.on("mouseleave", lambda e=None: self._close_bookmarks())
-        btn = Div(
-            QIcon(ui_name="mdi-bookmark-outline"), QTooltip("Saved views"), self._bm_pop,
-            ui_class=str(cb.vp_tool) + " relative-position",
-        )
-        btn.on("click", lambda e=None: self._toggle_bookmarks())
+        if getattr(self, "_page_toolbar_enabled", False):
+            action = QBtn(
+                QTooltip("Save, rename, or restore a camera view"),
+                ui_icon="mdi-bookmark-outline",
+                ui_label="Saved views",
+                ui_flat=True,
+                ui_dense=True,
+                ui_no_caps=True,
+                ui_class=str(cb.vp_tool),
+                ui_style=(
+                    "width:auto; min-width:0; height:32px; padding:0 9px; "
+                    "white-space:nowrap;"
+                ),
+            )
+            action.on_click(self._toggle_bookmarks)
+            btn = Div(action, self._bm_pop, ui_class="relative-position",
+                      ui_style="display:inline-flex; flex:none;")
+        else:
+            btn = Div(
+                QIcon(ui_name="mdi-bookmark-outline"), QTooltip("Saved views"), self._bm_pop,
+                ui_class=str(cb.vp_tool) + " relative-position",
+            )
+            btn.on("click", lambda e=None: self._toggle_bookmarks())
         self._rebuild_bookmark_menu()
         return btn
 
@@ -813,13 +940,31 @@ class WebgpuTab(PropertyPanelMixin, Div):
         self._camera_views_pop = Div(ui_class=str(cb.bm_pop))
         self._camera_views_pop.ui_hidden = True
         self._camera_views_pop.on("mouseleave", lambda e=None: self._close_camera_views())
-        btn = Div(
-            QIcon(ui_name="mdi-cube-outline"),
-            QTooltip("Camera views"),
-            self._camera_views_pop,
-            ui_class=str(cb.vp_tool) + " relative-position",
-        )
-        btn.on("click", lambda e=None: self._toggle_camera_views())
+        if getattr(self, "_page_toolbar_enabled", False):
+            action = QBtn(
+                QTooltip("Choose an isometric, top, front, or side view"),
+                ui_icon="mdi-cube-outline",
+                ui_label="Camera views",
+                ui_flat=True,
+                ui_dense=True,
+                ui_no_caps=True,
+                ui_class=str(cb.vp_tool),
+                ui_style=(
+                    "width:auto; min-width:0; height:32px; padding:0 9px; "
+                    "white-space:nowrap;"
+                ),
+            )
+            action.on_click(self._toggle_camera_views)
+            btn = Div(action, self._camera_views_pop, ui_class="relative-position",
+                      ui_style="display:inline-flex; flex:none;")
+        else:
+            btn = Div(
+                QIcon(ui_name="mdi-cube-outline"),
+                QTooltip("Camera views"),
+                self._camera_views_pop,
+                ui_class=str(cb.vp_tool) + " relative-position",
+            )
+            btn.on("click", lambda e=None: self._toggle_camera_views())
         self._rebuild_camera_views_menu()
         return btn
 
@@ -855,17 +1000,22 @@ class WebgpuTab(PropertyPanelMixin, Div):
         axis = self._current_clip_axis()
         self._clip_axis_seg = Segmented(
             [("0", "X"), ("1", "Y"), ("2", "Z")], str(axis), self._on_clip_axis)
-        flip = self._vtool("mdi-flip-horizontal", "Flip side", self._flip_clip)
+        flip = self._vtool("mdi-flip-horizontal", "Flip the visible side of the cut",
+                           self._flip_clip, label="Flip side")
         self._clip_offset = QSlider(
             ui_min=-1, ui_max=1, ui_step=0.01, ui_model_value=0.0,
             ui_dense=True, ui_class=str(cb.vc_slider))
         self._clip_offset.on_update_model_value(self._on_clip_offset)
         self._clip_offset_val = Div("0.00", ui_class=str(cb.vc_o_val))
         self._clip_global_tool = self._vtool(
-            "mdi-earth", "Clip all objects (global)", self.use_global_clipping.toggle)
+            "mdi-earth", "Apply this clipping plane to all views of the mesh",
+            self.use_global_clipping.toggle, label="All views",
+        )
         self._set_tool_active(self._clip_global_tool, self.use_global_clipping.value)
-        close = self._vtool("mdi-close", "Close clipping  ·  esc",
-                            lambda: setattr(self.clipping_enabled, "value", False))
+        close = self._vtool(
+            "mdi-close", "Close clipping controls  ·  esc",
+            lambda: setattr(self.clipping_enabled, "value", False), label="Close",
+        )
         toolbar = Div(
             Div(QIcon(ui_name="mdi-content-cut"), "Clip", ui_class=str(cb.vc_lab)),
             Div(self._clip_axis_seg, ui_class=str(cb.vc_axis)),
@@ -875,6 +1025,14 @@ class WebgpuTab(PropertyPanelMixin, Div):
             close,
             ui_class=str(cb.vp_clip),
         )
+        if getattr(self, "_page_toolbar_enabled", False):
+            toolbar.ui_style = (
+                "position:relative; top:auto; left:auto; transform:none; z-index:auto; "
+                "display:flex; flex:0 0 auto; align-items:center; justify-content:flex-start; "
+                "width:100%; min-height:40px; box-sizing:border-box; overflow-x:auto; "
+                "border-radius:0; border-width:0 0 1px; box-shadow:none; "
+                "background:var(--panel-header); padding:4px 10px;"
+            )
         toolbar.ui_hidden = True
         return toolbar
 

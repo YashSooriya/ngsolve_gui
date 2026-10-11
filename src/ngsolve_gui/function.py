@@ -1089,7 +1089,7 @@ class FunctionComponent(WebgpuTab):
             overlays.append(self._legend)
         if self._probe_panel is not None:
             overlays.extend((self._probe_preview, self._probe_panel))
-        self.ui_children = overlays
+        self._sync_viewport_layout(overlays)
         self._sync_clip_ui(self.clipping_enabled.value, None)
         self._sync_camera_link_ui(self.camera_shared.value, None)
 
