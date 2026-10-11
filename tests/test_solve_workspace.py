@@ -1838,7 +1838,6 @@ def test_model_tree_groups_sections_and_places_children_under_their_parent(stand
 
     assert [button.ui_label for button in workspace._section_buttons.values()] == [
         "Geometry",
-        "Parameters",
         "Materials",
         "Physics & coupling",
         "Boundary conditions",
@@ -1854,6 +1853,8 @@ def test_model_tree_groups_sections_and_places_children_under_their_parent(stand
     assert model_group.ui_children[1].ui_children[0] is workspace._section_buttons["geometry"]
     geometry_children = model_group.ui_children[1].ui_children[1]
     assert geometry_children.ui_children[0].ui_children[0] == "REGIONS · 0"
+    assert model_group.ui_children[2].ui_children[0] is workspace._section_buttons["materials"]
+    assert "parameters" not in workspace._section_buttons
     assert analysis_group.ui_children[1].ui_children[0] is workspace._section_buttons["mesh"]
     assert results_group.ui_children[1].ui_children[0] is workspace._section_buttons["runs"]
     assert workspace._tree_subsection("materials") == ("MATERIALS · 0", [])
@@ -2254,18 +2255,21 @@ def test_grid_snap_button_is_present_with_the_sketch_tools(standalone_components
     assert snap_index < fit_view_index
 
 
-def test_added_model_parameter_is_listed_in_tree(standalone_components):
+def test_parameters_are_hidden_from_the_model_tree_but_legacy_values_are_preserved(standalone_components):
     workspace = SolveWorkspace()
-    workspace.select_section("parameters")
-
     workspace.add_parameter()
 
-    model_group = workspace._left_items.ui_children[0]
-    parameter_row = model_group.ui_children[2]
-    parameter_entries = workspace._tree_entry_lists["parameters"]
-    assert parameter_row.ui_children[1] is workspace._tree_entry_containers["parameters"]
-    assert any(child.ui_label == "length_1" for child in parameter_entries.ui_children)
-    assert workspace.selected_parameter_id == workspace.model["parameters"][0]["id"]
+    assert "parameters" not in workspace._section_buttons
+    assert "parameters" not in workspace._tree_entry_lists
+    assert workspace.active_section == "geometry"
+    assert workspace.model["parameters"][0]["name"] == "length_1"
+
+    workspace.set_model(
+        workspace.model,
+        layout={"schema_version": 1, "active_section": "parameters", "camera": "fit"},
+    )
+    assert workspace.active_section == "geometry"
+    assert workspace.model["parameters"][0]["name"] == "length_1"
 
 
 def test_parameter_dimension_is_selected_from_physical_units(standalone_components):

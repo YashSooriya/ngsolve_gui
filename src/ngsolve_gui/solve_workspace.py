@@ -55,7 +55,6 @@ from .material_library import MaterialLibrary
 
 _SECTIONS = [
     ("geometry", "Geometry", "mdi-vector-square"),
-    ("parameters", "Parameters", "mdi-variable"),
     ("materials", "Materials", "mdi-cube-scan"),
     ("physics", "Physics & coupling", "mdi-magnet"),
     ("boundaries", "Boundary conditions", "mdi-vector-link"),
@@ -67,7 +66,7 @@ _SECTIONS = [
 ]
 
 _TREE_GROUPS = (
-    ("MODEL", ("geometry", "parameters", "materials", "physics", "boundaries", "sources")),
+    ("MODEL", ("geometry", "materials", "physics", "boundaries", "sources")),
     ("ANALYSIS", ("mesh", "studies", "solver")),
     ("RESULTS", ("runs",)),
 )
@@ -2712,7 +2711,7 @@ class SolveWorkspace(Div):
     def _validation_issue_section(issue):
         text = issue.lower().replace("_", " ")
         if "parameter" in text:
-            return "parameters"
+            return "geometry"
         if "material" in text:
             return "materials"
         if "source" in text or "current density" in text or "body force" in text:
@@ -3230,11 +3229,9 @@ class SolveWorkspace(Div):
         self._sync_canvas_selection()
 
     def select_parameter(self, parameter_id):
+        """Retain legacy parameter selection without exposing its retired panel."""
         self.selected_parameter_id = parameter_id
-        self.active_section = "parameters"
-        self.layout["active_section"] = self.active_section
-        self._update_model_tree_selection()
-        self._render_inspector()
+        self.select_section("geometry")
 
     def select_source_region(self, region_id):
         self.selected_region_id = region_id
