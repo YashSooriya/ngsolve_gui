@@ -84,7 +84,7 @@ def test_region_scoped_field_data_matches_slice_mesh_elements():
     field_data = FunctionData(mesh_data, source, order=1)
     field_data.need_3d = True
     field_data._create_data()
-    mesh_data._create_data()
+    mesh_data.mesh_buffers._create_data()
 
     tetrahedra = mesh_data.num_elements[ElType.TET]
     assert tetrahedra == int(mask.sum())
