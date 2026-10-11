@@ -163,6 +163,57 @@ class FunctionComponent(WebgpuTab):
                 "deformation": self.deformation,
             }
 
+        self._quarter_symmetry_planes = ()
+        self.quarter_symmetry_expansion_available = False
+        self.symmetry_expanded = Observable(False, "symmetry_expanded")
+        self._symmetry_expanded_mesh = None
+        self._symmetry_expanded_field = None
+        self._symmetry_original_state = None
+        self._symmetry_camera_state = None
+        if self.mesh.dim == 3 and isinstance(cf, ngs.GridFunction):
+            from .quarter_symmetry import find_quarter_symmetry_planes
+
+            self._quarter_symmetry_planes = tuple(
+                data.get("_ngsolve_gui_symmetry_planes")
+                or find_quarter_symmetry_planes(self.mesh)
+            )
+            self.quarter_symmetry_expansion_available = (
+                len(self._quarter_symmetry_planes) == 2
+            )
+            if self.quarter_symmetry_expansion_available:
+                from .sections.quarter_symmetry import QuarterSymmetrySection
+
+                sections = list(type(self).property_sections)
+                sections.insert(1, QuarterSymmetrySection)
+                self.property_sections = sections
+                self._symmetry_original_state = {
+                    "mesh": self.mesh,
+                    "region_or_mesh": self.region_or_mesh,
+                    "cf": self.cf,
+                    "visualization_cf": self.visualization_cf,
+                    "deformation": self.deformation,
+                }
+                field_name = str(name).lower()
+                self._symmetry_vector_kind = data.get(
+                    "_ngsolve_gui_symmetry_vector_kind",
+                    "axial"
+                    if any(
+                        marker in field_name
+                        for marker in (
+                            "magnetic flux density",
+                            "magnetic induction",
+                            "magnetic field",
+                            "gfbdc",
+                            "gfbac",
+                            "b_dc",
+                            "b_ac",
+                            "h_dc",
+                            "h_ac",
+                        )
+                    )
+                    else "polar",
+                )
+
         cv = data.get("clipping_vectors", False)
         sv = data.get("surface_vectors", False)
         fl = data.get("field_lines", False)
@@ -343,6 +394,8 @@ class FunctionComponent(WebgpuTab):
         self.boundary_overrides.on_change(self._apply_region_change)
         if self.axisymmetric_revolution_available:
             self.axisymmetric_revolved.on_change(self._apply_axisymmetric_revolved)
+        if self.quarter_symmetry_expansion_available:
+            self.symmetry_expanded.on_change(self._apply_symmetry_expanded)
 
     # -- GPU side-effect handlers -------------------------------------------
 
@@ -680,6 +733,72 @@ class FunctionComponent(WebgpuTab):
                 camera.orthographic = camera_state["orthographic"]
                 self.scene.render()
             self._axisymmetric_camera_state = None
+
+    def _apply_symmetry_expanded(self, enabled, _old):
+        if not self.quarter_symmetry_expansion_available:
+            return
+
+        if enabled:
+            if self._symmetry_expanded_mesh is None:
+                from .quarter_symmetry import mirror_quarter_gridfunction
+
+                try:
+                    (
+                        self._symmetry_expanded_mesh,
+                        self._symmetry_expanded_field,
+                    ) = mirror_quarter_gridfunction(
+                        self._symmetry_original_state["cf"],
+                        self._quarter_symmetry_planes,
+                        vector_kind=self._symmetry_vector_kind,
+                    )
+                except Exception as error:
+                    print(f"Could not create full symmetry view: {error}")
+                    self.symmetry_expanded.value = False
+                    return
+
+            camera = self.camera
+            self._symmetry_camera_state = {
+                "shared": bool(self.camera_shared.value),
+                "transform": camera.transform.copy(),
+                "orthographic": camera.orthographic,
+            }
+            if self.camera_shared.value:
+                self.camera_shared.value = False
+
+            self.mesh = self._symmetry_expanded_mesh
+            self.region_or_mesh = self._symmetry_expanded_mesh
+            self.cf = self._symmetry_expanded_field
+            self.visualization_cf = visualization_cf(self.cf)
+            self.deformation = None
+        else:
+            original = self._symmetry_original_state
+            self.mesh = original["mesh"]
+            self.region_or_mesh = original["region_or_mesh"]
+            self.cf = original["cf"]
+            self.visualization_cf = original["visualization_cf"]
+            self.deformation = original["deformation"]
+
+        self.region_state = None
+        self.region_visibility = None
+        self._full_range = None
+        self._mesh_data = None
+        self.mdata = None
+        self._facet_supported = bool(self.draw_vol) and self.mesh.dim in (2, 3)
+        self.draw()
+        self._rebuild_dimension_controls()
+
+        if enabled:
+            self.reset_camera()
+        elif self._symmetry_camera_state is not None:
+            camera_state = self._symmetry_camera_state
+            if camera_state["shared"]:
+                self.camera_shared.value = True
+            else:
+                camera = self.camera
+                camera.transform = camera_state["transform"]
+                camera.orthographic = camera_state["orthographic"]
+                self.scene.render()
+            self._symmetry_camera_state = None
 
     def _rebuild_dimension_controls(self):
         """Rebuild viewport controls whose availability depends on mesh dimension."""

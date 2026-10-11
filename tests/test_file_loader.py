@@ -79,6 +79,40 @@ def test_axisymmetric_vector_pickle_uses_radial_and_axial_component_names(monkey
     assert captured["_ngsolve_gui_component_names"] == ("r", "z")
 
 
+def test_default_3d_magnetic_flux_pickle_uses_axial_vector_parity(monkeypatch, tmp_path):
+    from netgen.occ import Box, Pnt, X, Y
+
+    geometry = Box(Pnt(0, 0, 0), Pnt(1, 1, 1))
+    geometry.faces.Min(X).name = "SymmX"
+    geometry.faces.Min(Y).name = "SymmY"
+    mesh = geometry.GenerateMesh(maxh=0.8)
+    grid_function = ngs.GridFunction(ngs.VectorH1(mesh, order=1))
+    gui_dir = tmp_path / "ngsolve_gui"
+    fields_dir = gui_dir / "fields"
+    fields_dir.mkdir(parents=True)
+    field_path = fields_dir / "solution.pkl"
+    field_path.write_bytes(b"field")
+    (gui_dir / "metadata.json").write_text(
+        '{"problem_domain":"3D","default_solution_file":"fields/solution.pkl",'
+        '"default_field":{"field_key":"gfBDC",'
+        '"label":"DC magnetic flux density [T]"}}',
+        encoding="utf-8",
+    )
+    captured = {}
+    monkeypatch.setattr(
+        file_loader,
+        "DrawImpl",
+        lambda obj, **options: captured.update(object=obj, **options),
+    )
+
+    file_loader._draw_pickle_object(
+        grid_function, "solution", field_path=str(field_path)
+    )
+
+    assert captured["object"] is grid_function
+    assert captured["_ngsolve_gui_symmetry_vector_kind"] == "axial"
+
+
 def test_vector_component_selector_uses_axisymmetric_names():
     class Vector:
         dim = 2

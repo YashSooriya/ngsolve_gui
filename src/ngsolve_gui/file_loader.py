@@ -387,10 +387,10 @@ def DrawImpl(
     return _appdata.add_tab(name or default_name, comp, data, _appdata)
 
 
-def _is_axisymmetric_pickle(filename) -> bool:
-    """Check adjacent solver metadata rather than guessing from a 2D mesh."""
+def _pickle_metadata_for_path(filename):
+    """Return adjacent solver metadata and the matching field descriptor."""
     if not filename:
-        return False
+        return None, None
     source_path = Path(filename).resolve()
     for directory in (source_path.parent, *source_path.parents):
         metadata_path = directory / "metadata.json"
@@ -400,24 +400,31 @@ def _is_axisymmetric_pickle(filename) -> bool:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if metadata.get("problem_domain") != "axisymmetric":
-            continue
-
-        referenced_files = [
-            item.get("file")
-            for item in metadata.get("field_files", [])
-            if isinstance(item, dict) and item.get("file")
-        ]
-        if metadata.get("default_solution_file"):
-            referenced_files.append(metadata["default_solution_file"])
-        for relative_path in referenced_files:
+        for item in metadata.get("field_files", []):
+            if not isinstance(item, dict) or not item.get("file"):
+                continue
             try:
-                expected = (metadata_path.parent / relative_path).resolve()
+                expected = (metadata_path.parent / item["file"]).resolve()
                 if os.path.normcase(str(expected)) == os.path.normcase(str(source_path)):
-                    return True
+                    return metadata, item
             except (OSError, TypeError, ValueError):
                 continue
-    return False
+        if metadata.get("default_solution_file"):
+            try:
+                expected = (
+                    metadata_path.parent / metadata["default_solution_file"]
+                ).resolve()
+                if os.path.normcase(str(expected)) == os.path.normcase(str(source_path)):
+                    return metadata, metadata.get("default_field", {})
+            except (OSError, TypeError, ValueError):
+                continue
+    return None, None
+
+
+def _is_axisymmetric_pickle(filename) -> bool:
+    """Check adjacent solver metadata rather than guessing from a 2D mesh."""
+    metadata, _field = _pickle_metadata_for_path(filename)
+    return bool(metadata and metadata.get("problem_domain") == "axisymmetric")
 
 
 def _draw_pickle_object(obj, name: str, field_path=None):
@@ -453,6 +460,32 @@ def _draw_pickle_object(obj, name: str, field_path=None):
         "fieldlines_num_lines": 20,
         "fieldlines_thickness": 0.0001,
     }
+    _metadata, field_metadata = _pickle_metadata_for_path(field_path)
+    if mesh.dim == 3:
+        field_description = " ".join(
+            str(value)
+            for value in (
+                name,
+                (field_metadata or {}).get("field_key", ""),
+                (field_metadata or {}).get("label", ""),
+            )
+        ).lower()
+        magnetic_field_markers = (
+            "magnetic flux density",
+            "magnetic induction",
+            "magnetic field",
+            "gfbdc",
+            "gfbac",
+            "b_dc",
+            "b_ac",
+            "h_dc",
+            "h_ac",
+        )
+        draw_options["_ngsolve_gui_symmetry_vector_kind"] = (
+            "axial"
+            if any(marker in field_description for marker in magnetic_field_markers)
+            else "polar"
+        )
     if _is_axisymmetric_pickle(field_path):
         draw_options["_ngsolve_gui_axisymmetric"] = True
         if obj.dim == 2:
