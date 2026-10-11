@@ -62,6 +62,22 @@ def _set_window_title(js):
     js.document.title = "MM-FEM"
 
 
+def _set_window_icon(js, icon_data_uri):
+    """Replace ngapp's default favicon with the MM-FEM application icon."""
+    document = js.document
+    old_icons = document.querySelectorAll(
+        'link[rel="icon"], link[rel="shortcut icon"]'
+    )
+    for index in range(old_icons.length):
+        old_icons.item(index).remove()
+
+    icon = document.createElement("link")
+    icon.rel = "icon"
+    icon.type = "image/png"
+    icon.href = icon_data_uri
+    document.head.appendChild(icon)
+
+
 class _WorkspaceLogBuffer(io.StringIO):
     """Capture solver output and publish it to the Solve log as it arrives."""
 
@@ -572,6 +588,7 @@ class NGSolveGui(App):
         keybinding_styles.inject(self)
         self.call_js(_inject_solve_status_styles)
         self.call_js(_set_window_title)
+        self.call_js(_set_window_icon, self.load_asset("mm-fem-app-icon.png"))
         self.on_load(self.__on_load)
 
         # Start in Solve while retaining the mounted Post Process workspace so
