@@ -776,16 +776,22 @@ class NGSolveGui(App):
             with open(path, "rb") as source:
                 return path, source.read()
 
-        handles = self.js.showOpenFilePicker({
-            "multiple": False,
-            "types": [{
+        picker_options = {"multiple": False}
+        picker_extensions = (extension, *additional_extensions)
+        # Chromium's File System Access API accepts alphanumeric suffixes only.
+        # Our portable bundle suffixes contain hyphens (for example
+        # ``.mmfem-mesh``), so passing them as ``types`` makes the picker throw
+        # before it opens. In that case let the user choose any file and rely
+        # on the bundle validator below to reject unrelated files safely.
+        if all(re.fullmatch(r"\.[a-z0-9]+", suffix, re.IGNORECASE) for suffix in picker_extensions):
+            picker_options["types"] = [{
                 "description": description,
                 "accept": {
                     "application/zip": [extension],
                     **({"application/octet-stream": list(additional_extensions)} if additional_extensions else {}),
                 },
-            }],
-        })
+            }]
+        handles = self.js.showOpenFilePicker(picker_options)
         if not handles:
             return None, None
         js_file = handles[0].getFile()
