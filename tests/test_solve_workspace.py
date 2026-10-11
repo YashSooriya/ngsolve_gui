@@ -1512,7 +1512,7 @@ def test_canvas_drag_motion_and_release_do_not_rebuild_the_canvas(standalone_com
 def test_middle_drag_pans_and_left_empty_canvas_drag_marquees(standalone_components):
     workspace = SolveWorkspace()
     center_before, width_before, _ = workspace._current_canvas_world_view()
-    start, end = (100.0, 120.0), (138.0, 146.0)
+    start, end = (100.0, 120.0), (120.0, 146.0)
     points = iter((start, end, end))
     workspace._canvas_event_point = lambda event, refresh_transform=False: next(points)
 
@@ -1523,7 +1523,7 @@ def test_middle_drag_pans_and_left_empty_canvas_drag_marquees(standalone_compone
 
     center_after, width_after, _ = workspace._current_canvas_world_view()
     pixels_per_world = (workspace._canvas_plot_bounds()[2] - workspace._canvas_plot_bounds()[0]) / width_before
-    assert center_after[0] == pytest.approx(center_before[0] - 38.0 / pixels_per_world)
+    assert center_after[0] == pytest.approx(center_before[0] - 20.0 / pixels_per_world)
     assert center_after[1] == pytest.approx(center_before[1] + 26.0 / pixels_per_world)
     assert width_after == pytest.approx(width_before)
 
@@ -1534,6 +1534,29 @@ def test_middle_drag_pans_and_left_empty_canvas_drag_marquees(standalone_compone
     workspace._on_canvas_mouse_move(SimpleNamespace(value={}))
     workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
     assert workspace._canvas_drag is None
+
+
+def test_middle_drag_limits_negative_radius_to_a_small_axis_buffer(standalone_components):
+    workspace = SolveWorkspace()
+    plot = workspace._canvas_plot_bounds()
+    buffer_px = min(32.0, max(12.0, (plot[2] - plot[0]) * 0.035))
+    workspace._pan_canvas_by_pixels((100.0, 120.0), (10000.0, 120.0))
+
+    project, _ = workspace._canvas_projection()
+    assert project((0.0, 0.0))[0] == pytest.approx(buffer_px)
+
+
+def test_browser_pan_commit_clamps_negative_radius_when_requested(standalone_components):
+    workspace = SolveWorkspace()
+    plot = workspace._canvas_plot_bounds()
+    buffer_px = min(32.0, max(12.0, (plot[2] - plot[0]) * 0.035))
+
+    assert workspace._commit_browser_canvas_view(
+        (1.0, 10000.0, 0.0, 1), render=False, clamp_negative_r=True
+    )
+
+    project, _ = workspace._canvas_projection()
+    assert project((0.0, 0.0))[0] == pytest.approx(buffer_px)
 
 
 def test_middle_drag_pans_even_when_a_shape_tool_is_selected(standalone_components):
@@ -1796,6 +1819,7 @@ def test_canvas_render_keeps_background_and_layer_components_mounted(standalone_
     assert root_layers == (
         workspace._canvas_background,
         workspace._canvas_grid,
+        workspace._canvas_live_grid,
         workspace._canvas_scene,
         workspace._canvas_dimensions,
         workspace._canvas_preview,
@@ -1866,6 +1890,7 @@ def test_blank_axisymmetric_view_starts_at_r_zero_with_world_space_ticks(standal
     assert len(steps) == 1
     svg_text = [item for item in workspace._canvas_grid.ui_children if item._component_name == "text"]
     assert any(item._props.get("textContent") == "Axis of rotation  ·  r = 0" for item in svg_text)
+    assert {item._props.get("font-size") for item in svg_text} == {"12"}
     assert all(not item.ui_children for item in svg_text)
 
 

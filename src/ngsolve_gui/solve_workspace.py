@@ -417,6 +417,7 @@ class SolveWorkspace(Div):
             fill="var(--canvas-bg, #f4f6f8)",
         )
         self._canvas_grid = Component("g")
+        self._canvas_live_grid = Component("g")
         self._canvas_scene = Component("g")
         self._canvas_mesh_path = _svg(
             "path",
@@ -449,11 +450,16 @@ class SolveWorkspace(Div):
         )
         for component, element_id in (
             (self._canvas_grid, "solve-sketch-grid"),
+            (self._canvas_live_grid, "solve-sketch-live-grid"),
             (self._canvas_scene, "solve-sketch-scene"),
             (self._canvas_dimensions, "solve-sketch-dimensions"),
             (self._canvas_preview, "solve-sketch-preview"),
         ):
             component._props["id"] = element_id
+        self._canvas_live_grid._props.update({
+            "display": "none",
+            "style": "pointer-events:none;",
+        })
 
         self._section_buttons = {}
         for key, label, icon in _SECTIONS:
@@ -469,6 +475,7 @@ class SolveWorkspace(Div):
             "svg",
             self._canvas_background,
             self._canvas_grid,
+            self._canvas_live_grid,
             self._canvas_scene,
             self._canvas_dimensions,
             self._canvas_preview,
@@ -1141,6 +1148,20 @@ class SolveWorkspace(Div):
                 "stepPx": self._canvas_snap_step() * pixels_per_world,
             }
             self.js.eval(f"window.__ngsolveSketchSnap = {json.dumps(grid, allow_nan=False)}")
+            live_grid = {
+                "width": plot[2] - plot[0],
+                "height": plot[3] - plot[1],
+                "originX": origin[0],
+                "originY": origin[1],
+                "pixelsPerWorld": pixels_per_world,
+                "majorStep": self._canvas_grid_step(),
+                # A few percent of the viewport gives the rotation axis some
+                # breathing room, while keeping the user out of negative r.
+                "negativeRBufferPx": min(32.0, max(12.0, (plot[2] - plot[0]) * 0.035)),
+            }
+            self.js.eval(
+                f"window.__ngsolveSketchLiveGrid = {json.dumps(live_grid, allow_nan=False)}"
+            )
             move_step = 0.00001 * pixels_per_world  # 0.01 mm, represented as 1e-5 m.
             self.js.eval(f"window.__ngsolveSketchMoveStep = {move_step!r}")
         except Exception:
@@ -1245,6 +1266,13 @@ class SolveWorkspace(Div):
             center, width = self._view_center, self._view_world_width
         return center, width, width / target_ratio
 
+    def _minimum_radial_canvas_center(self, world_width):
+        """Keep r=0 just inside the left edge when panning toward negative r."""
+        plot = self._canvas_plot_bounds()
+        plot_width = plot[2] - plot[0]
+        buffer_px = min(32.0, max(12.0, plot_width * 0.035))
+        return world_width * (0.5 - buffer_px / plot_width)
+
     def _preserve_canvas_view(self):
         """Keep geometry edits from changing the camera and rebuilding the grid."""
         if self._view_center is not None and self._view_world_width is not None:
@@ -1321,7 +1349,10 @@ class SolveWorkspace(Div):
         if not math.isfinite(pixels_per_world) or pixels_per_world <= 0:
             return
         self._view_center = (
-            center[0] - dx / pixels_per_world,
+            max(
+                center[0] - dx / pixels_per_world,
+                self._minimum_radial_canvas_center(width),
+            ),
             center[1] + dy / pixels_per_world,
         )
         self._view_world_width = width
@@ -1343,7 +1374,7 @@ class SolveWorkspace(Div):
         except Exception:
             return None
 
-    def _commit_browser_canvas_view(self, view=None, *, render=True):
+    def _commit_browser_canvas_view(self, view=None, *, render=True, clamp_negative_r=False):
         """Commit a browser-side pan/zoom matrix to the world-space viewport."""
         view = view or self._read_browser_canvas_view()
         if view is None:
@@ -1362,6 +1393,8 @@ class SolveWorkspace(Div):
         width = old_width / scale
         if not all(math.isfinite(value) for value in (*center, width)) or width <= 0:
             return False
+        if clamp_negative_r:
+            center = (max(center[0], self._minimum_radial_canvas_center(width)), center[1])
         self._view_center = center
         self._view_world_width = width
         self._save_canvas_view_to_layout()
@@ -1414,8 +1447,8 @@ class SolveWorkspace(Div):
         script = r"""
 (() => {
   window.__ngsolveSketchTool = '__SKETCH_TOOL__';
-  if (window.__ngsolveSketchPointerCaptureVersion === 5) return;
-  window.__ngsolveSketchPointerCaptureVersion = 5;
+  if (window.__ngsolveSketchPointerCaptureVersion === 6) return;
+  window.__ngsolveSketchPointerCaptureVersion = 6;
   let active = false;
   let activePointerId = null;
   let dragStart = null;
@@ -1442,8 +1475,7 @@ class SolveWorkspace(Div):
   const forwardedEvents = new WeakSet();
   const selector = 'svg.solve-sketch-canvas';
   const groupIds = [
-    'solve-sketch-grid', 'solve-sketch-scene',
-    'solve-sketch-dimensions', 'solve-sketch-preview',
+    'solve-sketch-scene', 'solve-sketch-dimensions', 'solve-sketch-preview',
   ];
   const pointerSupported = typeof window.PointerEvent === 'function';
   const currentSvg = () => document.querySelector(selector);
@@ -1451,6 +1483,90 @@ class SolveWorkspace(Div):
     svg && event.target && event.target.closest
       && event.target.closest(selector) === svg
   );
+  const drawLiveGrid = (svg, scale, tx, ty) => {
+    const settings = window.__ngsolveSketchLiveGrid;
+    const staticGrid = svg && svg.querySelector('#solve-sketch-grid');
+    const liveGrid = svg && svg.querySelector('#solve-sketch-live-grid');
+    if (!settings || !staticGrid || !liveGrid) return;
+    staticGrid.setAttribute('visibility', 'hidden');
+    liveGrid.setAttribute('display', 'inline');
+    while (liveGrid.firstChild) liveGrid.removeChild(liveGrid.firstChild);
+
+    const width = settings.width;
+    const height = settings.height;
+    const pixelsPerWorld = settings.pixelsPerWorld * scale;
+    if (!(width > 0 && height > 0 && pixelsPerWorld > 0)
+        || !Number.isFinite(pixelsPerWorld)) return;
+    const rawStep = 80 / pixelsPerWorld;
+    const power = 10 ** Math.floor(Math.log10(rawStep));
+    const fraction = rawStep / power;
+    const majorStep = (fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10) * power;
+    const minorStep = majorStep / 5;
+    const minorPixels = minorStep * pixelsPerWorld;
+    if (!(minorPixels > 0) || !Number.isFinite(minorPixels)) return;
+    const axisX = settings.originX * scale + tx;
+    const axisY = settings.originY * scale + ty;
+    const ns = 'http://www.w3.org/2000/svg';
+    const addLine = (x1, y1, x2, y2, stroke, strokeWidth, dash = null) => {
+      const line = document.createElementNS(ns, 'line');
+      for (const [key, value] of Object.entries({x1, y1, x2, y2, stroke, 'stroke-width': strokeWidth})) {
+        line.setAttribute(key, String(value));
+      }
+      if (dash) line.setAttribute('stroke-dasharray', dash);
+      liveGrid.appendChild(line);
+    };
+    const addText = (x, y, text, options = {}) => {
+      const label = document.createElementNS(ns, 'text');
+      label.setAttribute('x', String(x));
+      label.setAttribute('y', String(y));
+      label.setAttribute('fill', options.fill || 'var(--fg-muted, #697586)');
+      label.setAttribute('font-size', String(options.size || 12));
+      if (options.anchor) label.setAttribute('text-anchor', options.anchor);
+      if (options.weight) label.setAttribute('font-weight', options.weight);
+      label.textContent = text;
+      liveGrid.appendChild(label);
+    };
+    const format = value => Number(value.toPrecision(5)).toString();
+
+    const radialMin = Math.max(0, Math.ceil((-axisX / minorPixels) - 1e-9));
+    const radialMax = Math.min(500, Math.floor(((width - axisX) / minorPixels) + 1e-9));
+    for (let index = radialMin; index <= radialMax; index += 1) {
+      const x = axisX + index * minorPixels;
+      if (index === 0) continue;
+      if (index % 5 === 0) {
+        addLine(x, 0, x, height, 'var(--border, #d9dfe7)', 1);
+        const radius = (index / 5) * majorStep;
+        addText(Math.min(Math.max(x, 22), width - 22), height - 5, format(radius), {anchor: 'middle'});
+      } else {
+        addLine(x, 0, x, height, 'var(--grid-minor, #e8edf2)', 0.75);
+      }
+    }
+
+    const axialMin = Math.max(-500, Math.ceil(((axisY - height) / minorPixels) - 1e-9));
+    const axialMax = Math.min(500, Math.floor((axisY / minorPixels) + 1e-9));
+    for (let index = axialMin; index <= axialMax; index += 1) {
+      const y = axisY - index * minorPixels;
+      if (index === 0) continue;
+      if (index % 5 === 0) {
+        addLine(0, y, width, y, 'var(--border, #d9dfe7)', 1);
+        const axial = (index / 5) * majorStep;
+        addText(6, Math.min(Math.max(y + 4, 12), height - 3), format(axial));
+      } else {
+        addLine(0, y, width, y, 'var(--grid-minor, #e8edf2)', 0.75);
+      }
+    }
+
+    if (axisX >= 0 && axisX <= width) {
+      addLine(axisX, 0, axisX, height, '#557187', 2, '6 4');
+      addText(axisX + 7, 15, 'Axis of rotation  ·  r = 0', {fill: '#405e75', size: 12, weight: 600});
+    }
+    if (axisY >= 0 && axisY <= height) {
+      addLine(0, axisY, width, axisY, '#557187', 1.5);
+      addText(width - 4, axisY - 5, 'z = 0', {fill: '#405e75', anchor: 'end'});
+    }
+    addText(width - 6, height - 8, 'r  [m]', {anchor: 'end'});
+    addText(8, 15, 'z  [m]');
+  };
   const applyCanvasTransform = (scale, tx, ty, svg = currentSvg()) => {
     if (!svg) return;
     visualScale = scale;
@@ -1463,6 +1579,7 @@ class SolveWorkspace(Div):
       const group = svg.querySelector('#' + id);
       if (group) group.setAttribute('transform', transform);
     }
+    drawLiveGrid(svg, scale, tx, ty);
   };
   const resetCanvasTransform = (svg = currentSvg()) => {
     if (!svg) return;
@@ -1473,6 +1590,13 @@ class SolveWorkspace(Div):
     for (const id of groupIds) {
       const group = svg.querySelector('#' + id);
       if (group) group.removeAttribute('transform');
+    }
+    const staticGrid = svg.querySelector('#solve-sketch-grid');
+    const liveGrid = svg.querySelector('#solve-sketch-live-grid');
+    if (staticGrid) staticGrid.removeAttribute('visibility');
+    if (liveGrid) {
+      liveGrid.setAttribute('display', 'none');
+      while (liveGrid.firstChild) liveGrid.removeChild(liveGrid.firstChild);
     }
     for (const regionId of committedRegionOffsets.keys()) {
       for (const shape of svg.querySelectorAll('[data-sketch-region-id]')) {
@@ -1595,9 +1719,15 @@ class SolveWorkspace(Div):
     if (dragMode === 'pan') {
       const screenStart = dragStartScreen || toViewPoint(dragStart);
       const screenEnd = screenPoint || toViewPoint(point);
+      const grid = window.__ngsolveSketchLiveGrid;
+      const maxAxisX = grid ? Number(grid.negativeRBufferPx) : 28;
+      let translateX = dragBaseTranslateX + screenEnd[0] - screenStart[0];
+      if (grid && Number.isFinite(maxAxisX)) {
+        translateX = Math.min(translateX, maxAxisX - dragBaseScale * grid.originX);
+      }
       applyCanvasTransform(
         dragBaseScale,
-        dragBaseTranslateX + screenEnd[0] - screenStart[0],
+        translateX,
         dragBaseTranslateY + screenEnd[1] - screenStart[1],
         svg,
       );
@@ -2137,7 +2267,9 @@ class SolveWorkspace(Div):
                     if view_changed:
                         self.render_canvas()
                 elif moved and operation == "pan":
-                    self._commit_browser_canvas_view(view, render=False)
+                    self._commit_browser_canvas_view(
+                        view, render=False, clamp_negative_r=True
+                    )
                     # The pan has already been applied to the local SVG matrix.
                     self.render_canvas()
                 elif moved and operation == "draw":
@@ -4107,15 +4239,15 @@ class SolveWorkspace(Div):
                 continue
             x = xy((value, 0))[0]
             grid_children.append(_svg("line", x1=x, y1=plot[1], x2=x, y2=plot[3], stroke="var(--border, #d9dfe7)", stroke_width="1"))
-            label_x = min(max(x, plot[0] + 22), plot[2] - 22)
-            grid_children.append(_svg("text", x=label_x, y=plot[3] - 5, fill="var(--fg-muted, #697586)", font_size="10", text_anchor="middle", style=grid_text_style, children=f"{value:.5g}"))
+            label_x = min(max(x, plot[0] + 28), plot[2] - 28)
+            grid_children.append(_svg("text", x=label_x, y=plot[3] - 5, fill="var(--fg-muted, #697586)", font_size="12", text_anchor="middle", style=grid_text_style, children=f"{value:.5g}"))
         for value in axial_ticks:
             if abs(value) <= grid_step * 1e-10:
                 continue
             y = xy((0, value))[1]
             grid_children.append(_svg("line", x1=plot[0], y1=y, x2=plot[2], y2=y, stroke="var(--border, #d9dfe7)", stroke_width="1"))
             label_y = min(max(y + 4, plot[1] + 12), plot[3] - 3)
-            grid_children.append(_svg("text", x=plot[0] + 6, y=label_y, fill="var(--fg-muted, #697586)", font_size="10", text_anchor="start", style=grid_text_style, children=f"{value:.5g}"))
+            grid_children.append(_svg("text", x=plot[0] + 6, y=label_y, fill="var(--fg-muted, #697586)", font_size="12", text_anchor="start", style=grid_text_style, children=f"{value:.5g}"))
         if lower_left[0] <= 0 <= upper_right[0]:
             xaxis = xy((0, 0))[0]
             grid_children.append(_svg("line", x1=xaxis, y1=plot[1], x2=xaxis, y2=plot[3], stroke="#557187", stroke_width="2", stroke_dasharray="6 4"))
@@ -4123,7 +4255,7 @@ class SolveWorkspace(Div):
         if lower_left[1] <= 0 <= upper_right[1]:
             zaxis = xy((0, 0))[1]
             grid_children.append(_svg("line", x1=plot[0], y1=zaxis, x2=plot[2], y2=zaxis, stroke="#557187", stroke_width="1.5"))
-            grid_children.append(_svg("text", x=plot[2] - 4, y=zaxis - 5, fill="#405e75", font_size="10", text_anchor="end", style=grid_text_style, children="z = 0"))
+            grid_children.append(_svg("text", x=plot[2] - 4, y=zaxis - 5, fill="#405e75", font_size="12", text_anchor="end", style=grid_text_style, children="z = 0"))
         grid_children.append(_svg("text", x=plot[2] - 6, y=height - 8, fill="var(--fg-muted, #697586)", font_size="12", text_anchor="end", style=grid_text_style, children="r  [m]"))
         grid_children.append(_svg("text", x=plot[0] + 8, y=plot[1] + 15, fill="var(--fg-muted, #697586)", font_size="12", style=grid_text_style, children="z  [m]"))
 
