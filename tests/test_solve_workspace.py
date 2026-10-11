@@ -2451,6 +2451,16 @@ def test_physics_panel_does_not_duplicate_frequency_or_regional_load_fields(stan
 
 def test_model_and_properties_panels_can_be_collapsed_and_restored(standalone_components):
     workspace = SolveWorkspace()
+    toolbar_labels = [getattr(button, "ui_label", None) for button in workspace._sketch_toolbar.ui_children]
+
+    assert "Model" not in toolbar_labels
+    assert "Properties" not in toolbar_labels
+    assert workspace._tree_reopen_tab.ui_label == "Model Tree"
+    assert workspace._tree_reopen_tab.ui_icon == "mdi-chevron-right"
+    assert workspace._properties_reopen_tab.ui_label == "Properties"
+    assert workspace._properties_reopen_tab.ui_icon == "mdi-chevron-left"
+    assert workspace._tree_reopen_tab.ui_hidden
+    assert workspace._properties_reopen_tab.ui_hidden
 
     workspace._toggle_tree_panel()
     workspace._toggle_properties_panel()
@@ -2458,6 +2468,8 @@ def test_model_and_properties_panels_can_be_collapsed_and_restored(standalone_co
     assert workspace._properties_splitter.ui_model_value == 0
     assert workspace._tree_splitter.ui_limits == [0, 420]
     assert workspace._properties_splitter.ui_limits == [0, 500]
+    assert not workspace._tree_reopen_tab.ui_hidden
+    assert not workspace._properties_reopen_tab.ui_hidden
 
     workspace._toggle_tree_panel()
     workspace._toggle_properties_panel()
@@ -2465,6 +2477,8 @@ def test_model_and_properties_panels_can_be_collapsed_and_restored(standalone_co
     assert workspace._properties_splitter.ui_model_value == 340
     assert workspace._tree_splitter.ui_limits == [180, 420]
     assert workspace._properties_splitter.ui_limits == [240, 500]
+    assert workspace._tree_reopen_tab.ui_hidden
+    assert workspace._properties_reopen_tab.ui_hidden
 
 
 def test_setup_validation_checks_actual_study_frequency_list(standalone_components):

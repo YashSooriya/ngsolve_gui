@@ -584,8 +584,6 @@ class SolveWorkspace(Div):
             style="flex:0 0 auto; white-space:nowrap;",
         )
         self._preview_3d_tooltip = self._preview_3d_button.ui_slots["default"][0]
-        model_button = _button("Model", "mdi-file-tree-outline", self._toggle_tree_panel, tooltip="Show or hide the model tree", style="flex:0 0 auto;")
-        properties_button = _button("Properties", "mdi-tune-variant", self._toggle_properties_panel, tooltip="Show or hide properties", style="flex:0 0 auto;")
         toolbar = Div(
             select_button,
             rectangle_button,
@@ -597,10 +595,9 @@ class SolveWorkspace(Div):
             zoom_in_button,
             self._mesh_preview_button,
             self._preview_3d_button,
-            model_button,
-            properties_button,
             ui_style="display:flex; flex-wrap:wrap; align-items:center; gap:4px; flex:none; min-width:0; min-height:42px; padding:4px 8px; border-bottom:1px solid var(--border); background:var(--surface);",
         )
+        self._sketch_toolbar = toolbar
         self._tool_buttons = {
             "select": select_button,
             "rectangle": rectangle_button,
@@ -794,8 +791,48 @@ class SolveWorkspace(Div):
             ui_style="display:flex; align-items:center; gap:8px; flex:none; min-height:40px; padding:4px 12px; border-bottom:1px solid var(--border); background:var(--surface);",
         )
         self._content = Div(
-            ui_style="display:flex; flex:1 1 auto; min-height:0; min-width:0;",
+            ui_style="position:relative; display:flex; flex:1 1 auto; min-height:0; min-width:0; overflow:hidden;",
         )
+        self._tree_reopen_tab = QBtn(
+            QTooltip("Show the model tree"),
+            ui_label="Model Tree",
+            ui_icon="mdi-chevron-right",
+            ui_dense=True,
+            ui_no_caps=True,
+            ui_flat=True,
+            ui_class="mmfem-panel-reopen-tab mmfem-panel-reopen-tab-left",
+            ui_style=(
+                "position:absolute; top:50%; left:0; z-index:20; transform:translateY(-50%); "
+                "width:36px; min-width:36px; height:136px; padding:8px 4px; "
+                "writing-mode:vertical-rl; text-orientation:mixed; "
+                "border:1px solid var(--border); border-left:0; "
+                "border-radius:0 8px 8px 0; background:var(--surface); color:var(--fg); "
+                "box-shadow:0 2px 8px rgba(18, 32, 48, .12);"
+            ),
+        )
+        self._tree_reopen_tab._props["aria-label"] = "Show model tree"
+        self._tree_reopen_tab.on_click(self._toggle_tree_panel)
+        self._tree_reopen_tab.ui_hidden = True
+        self._properties_reopen_tab = QBtn(
+            QTooltip("Show properties"),
+            ui_label="Properties",
+            ui_icon="mdi-chevron-left",
+            ui_dense=True,
+            ui_no_caps=True,
+            ui_flat=True,
+            ui_class="mmfem-panel-reopen-tab mmfem-panel-reopen-tab-right",
+            ui_style=(
+                "position:absolute; top:50%; right:0; z-index:20; transform:translateY(-50%); "
+                "width:36px; min-width:36px; height:136px; padding:8px 4px; "
+                "writing-mode:vertical-rl; text-orientation:mixed; "
+                "border:1px solid var(--border); border-right:0; "
+                "border-radius:8px 0 0 8px; background:var(--surface); color:var(--fg); "
+                "box-shadow:0 2px 8px rgba(18, 32, 48, .12);"
+            ),
+        )
+        self._properties_reopen_tab._props["aria-label"] = "Show properties"
+        self._properties_reopen_tab.on_click(self._toggle_properties_panel)
+        self._properties_reopen_tab.ui_hidden = True
         self._properties_splitter = QSplitter(
             ui_model_value=self._properties_panel_width,
             ui_reverse=True,
@@ -817,7 +854,11 @@ class SolveWorkspace(Div):
             ui_style="flex:1 1 auto; width:100%; min-width:0; min-height:0;",
         )
         self._tree_splitter.on_update_model_value(self._on_tree_width_change)
-        self._content.ui_children = [self._tree_splitter]
+        self._content.ui_children = [
+            self._tree_splitter,
+            self._tree_reopen_tab,
+            self._properties_reopen_tab,
+        ]
         super().__init__(
             top,
             self._content,
@@ -1067,11 +1108,22 @@ class SolveWorkspace(Div):
         value = float(event.value)
         if value > 30:
             self._tree_panel_width = value
+        self._sync_panel_reopen_tabs()
 
     def _on_properties_width_change(self, event):
         value = float(event.value)
         if value > 30:
             self._properties_panel_width = value
+        self._sync_panel_reopen_tabs()
+
+    def _sync_panel_reopen_tabs(self):
+        """Show edge tabs only while their corresponding panel is collapsed."""
+        tree_tab = getattr(self, "_tree_reopen_tab", None)
+        properties_tab = getattr(self, "_properties_reopen_tab", None)
+        if tree_tab is not None:
+            tree_tab.ui_hidden = float(self._tree_splitter.ui_model_value) > 30
+        if properties_tab is not None:
+            properties_tab.ui_hidden = float(self._properties_splitter.ui_model_value) > 30
 
     def _toggle_tree_panel(self, *_):
         if self._tree_splitter.ui_model_value > 30:
@@ -1081,6 +1133,7 @@ class SolveWorkspace(Div):
         else:
             self._tree_splitter.ui_model_value = self._tree_panel_width
             self._tree_splitter.ui_limits = [180, 420]
+        self._sync_panel_reopen_tabs()
 
     def _toggle_properties_panel(self, *_):
         if self._properties_splitter.ui_model_value > 30:
@@ -1090,6 +1143,7 @@ class SolveWorkspace(Div):
         else:
             self._properties_splitter.ui_model_value = self._properties_panel_width
             self._properties_splitter.ui_limits = [240, 500]
+        self._sync_panel_reopen_tabs()
 
     def set_sketch_tool(self, tool, *, announce=True):
         if tool not in {"select", "rectangle", "circle"}:
