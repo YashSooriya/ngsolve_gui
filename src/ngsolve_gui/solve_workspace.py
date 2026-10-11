@@ -1252,10 +1252,15 @@ class SolveWorkspace(Div):
         else:
             rmin, rmax, zmin, zmax = 0.0, 0.024, -0.012, 0.012
         width = max(rmax - rmin, (zmax - zmin) * target_ratio, 1e-12)
-        # Keep r = 0 on the left edge of the sketch grid while fitting the
-        # region extents into the remaining positive-r area.
-        center = (width / 2, 0.0)
-        return center, width
+        # Start with a narrow negative-r gutter so the rotation axis is not
+        # clipped against the viewport edge. Preserve the fitted positive-r
+        # extent when adding that gutter.
+        plot_width = plot[2] - plot[0]
+        buffer_px = min(32.0, max(12.0, plot_width * 0.035))
+        buffer_fraction = min(0.2, buffer_px / plot_width)
+        fitted_width = width / (1.0 - buffer_fraction)
+        center = (fitted_width * (0.5 - buffer_fraction), 0.0)
+        return center, fitted_width
 
     def _current_canvas_world_view(self):
         plot = self._canvas_plot_bounds()

@@ -1509,10 +1509,10 @@ def test_canvas_drag_motion_and_release_do_not_rebuild_the_canvas(standalone_com
     assert len(workspace.selected_edge_ids) == 4
 
 
-def test_middle_drag_pans_and_left_empty_canvas_drag_marquees(standalone_components):
+def test_middle_drag_pans_without_leaving_the_radial_axis_margin(standalone_components):
     workspace = SolveWorkspace()
     center_before, width_before, _ = workspace._current_canvas_world_view()
-    start, end = (100.0, 120.0), (120.0, 146.0)
+    start, end = (100.0, 120.0), (80.0, 146.0)
     points = iter((start, end, end))
     workspace._canvas_event_point = lambda event, refresh_transform=False: next(points)
 
@@ -1523,7 +1523,7 @@ def test_middle_drag_pans_and_left_empty_canvas_drag_marquees(standalone_compone
 
     center_after, width_after, _ = workspace._current_canvas_world_view()
     pixels_per_world = (workspace._canvas_plot_bounds()[2] - workspace._canvas_plot_bounds()[0]) / width_before
-    assert center_after[0] == pytest.approx(center_before[0] - 20.0 / pixels_per_world)
+    assert center_after[0] == pytest.approx(center_before[0] + 20.0 / pixels_per_world)
     assert center_after[1] == pytest.approx(center_before[1] + 26.0 / pixels_per_world)
     assert width_after == pytest.approx(width_before)
 
@@ -1873,15 +1873,16 @@ def test_model_tree_groups_sections_and_places_children_under_their_parent(stand
     assert "flex:1 1 auto" in workspace._properties_splitter._props["style"]
 
 
-def test_blank_axisymmetric_view_starts_at_r_zero_with_world_space_ticks(standalone_components):
+def test_blank_axisymmetric_view_has_a_small_negative_r_axis_gutter(standalone_components):
     workspace = SolveWorkspace()
     project, unproject = workspace._canvas_projection()
     plot = workspace._canvas_plot_bounds()
     center = ((plot[0] + plot[2]) / 2, (plot[1] + plot[3]) / 2)
+    buffer_px = min(32.0, max(12.0, (plot[2] - plot[0]) * 0.035))
 
     assert plot == (0.0, 0.0, 900.0, 640.0)
-    assert project((0.0, 0.0))[0] == pytest.approx(plot[0])
-    assert unproject((plot[0], 320.0))[0] == pytest.approx(0.0)
+    assert project((0.0, 0.0))[0] == pytest.approx(buffer_px)
+    assert unproject((plot[0], 320.0))[0] < 0.0
     assert unproject(center)[1] == pytest.approx(0.0)
     assert unproject((center[0], plot[1]))[1] == pytest.approx(-unproject((center[0], plot[3]))[1])
     ticks = workspace._coordinate_ticks(0.0, 0.022)
@@ -1921,7 +1922,10 @@ def test_sketch_axes_and_grid_fill_the_responsive_viewport(standalone_components
         if item._props.get("stroke") == "#557187"
         and item._props.get("stroke-width") == "1.5"
     )
-    assert (rotation_axis._props["x1"], rotation_axis._props["x2"]) == (plot[0], plot[0])
+    buffer_px = min(32.0, max(12.0, (plot[2] - plot[0]) * 0.035))
+    assert (rotation_axis._props["x1"], rotation_axis._props["x2"]) == pytest.approx(
+        (buffer_px, buffer_px)
+    )
     assert (rotation_axis._props["y1"], rotation_axis._props["y2"]) == (plot[1], plot[3])
     assert (zero_height_axis._props["x1"], zero_height_axis._props["x2"]) == (plot[0], plot[2])
 
@@ -2099,9 +2103,10 @@ def test_axisymmetric_view_keeps_axis_visible_for_regions_away_from_axis(standal
 
     project, unproject = workspace._canvas_projection()
 
-    assert project((0.0, 0.0))[0] == pytest.approx(0.0)
-    assert project((0.01, 0.0))[0] > 0.0
-    assert unproject((0.0, 320.0))[0] == pytest.approx(0.0)
+    buffer_px = min(32.0, max(12.0, workspace._canvas_plot_bounds()[2] * 0.035))
+    assert project((0.0, 0.0))[0] == pytest.approx(buffer_px)
+    assert project((0.01, 0.0))[0] > buffer_px
+    assert unproject((0.0, 320.0))[0] < 0.0
 
 
 def test_grid_zoom_keeps_world_geometry_and_anchor_aligned(standalone_components):
