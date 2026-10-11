@@ -1774,7 +1774,14 @@ class SolveWorkspace(Div):
   };
   const removeViewCommitSnapshot = (svg = currentSvg()) => {
     const snapshot = svg && svg.querySelector('[data-sketch-view-commit-snapshot="true"]');
-    if (snapshot) snapshot.remove();
+    if (!snapshot) return;
+    for (const entry of snapshot.__ngsolveHiddenLayers || []) {
+      const layer = entry.layer;
+      if (!layer || !layer.isConnected) continue;
+      if (entry.visibility === null) layer.removeAttribute('visibility');
+      else layer.setAttribute('visibility', entry.visibility);
+    }
+    snapshot.remove();
   };
   const beginViewCommitSnapshot = () => {
     const svg = currentSvg();
@@ -1785,16 +1792,20 @@ class SolveWorkspace(Div):
     const snapshot = document.createElementNS('http://www.w3.org/2000/svg', 'g');
     snapshot.setAttribute('data-sketch-view-commit-snapshot', 'true');
     snapshot.setAttribute('pointer-events', 'none');
+    snapshot.__ngsolveHiddenLayers = [];
     for (const id of [
       'solve-sketch-grid', 'solve-sketch-live-grid',
       'solve-sketch-scene', 'solve-sketch-dimensions', 'solve-sketch-preview',
     ]) {
       const layer = svg.querySelector('#' + id);
       if (!layer) continue;
+      const visibility = layer.getAttribute('visibility');
       const copy = layer.cloneNode(true);
       copy.removeAttribute('id');
       copy.querySelectorAll('[id]').forEach(node => node.removeAttribute('id'));
       snapshot.appendChild(copy);
+      snapshot.__ngsolveHiddenLayers.push({layer, visibility});
+      layer.setAttribute('visibility', 'hidden');
     }
     svg.appendChild(snapshot);
     return true;
