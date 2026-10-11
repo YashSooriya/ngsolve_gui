@@ -1967,6 +1967,8 @@ def test_canvas_drag_suppresses_the_click_that_follows_mouseup(standalone_compon
     assert "snapshot.__ngsolveHiddenLayers" in scripts[0]
     assert "layer.setAttribute('visibility', 'hidden')" in scripts[0]
     assert "layer.setAttribute('visibility', entry.visibility)" in scripts[0]
+    reset_body = scripts[0].split("window.__ngsolveResetSketchPreview =", 1)[1]
+    assert reset_body.index("removeViewCommitSnapshot(current)") < reset_body.index("clearPreview(current)")
     preview_body = scripts[0].split(
         "const updatePreview = (svg, point, screenPoint = null) => {", 1
     )[1].split("const beginGesture", 1)[0]

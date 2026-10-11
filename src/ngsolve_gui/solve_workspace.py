@@ -2242,8 +2242,8 @@ class SolveWorkspace(Div):
           requestAnimationFrame(waitForRenderedView);
           return;
         }
-        clearPreview(current);
         removeViewCommitSnapshot(current);
+        clearPreview(current);
       }));
     };
     waitForRenderedView();
