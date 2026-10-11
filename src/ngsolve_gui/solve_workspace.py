@@ -50,6 +50,7 @@ from .axisymmetric_model import (
     validate_studies,
 )
 from .units import UNIT_OPTIONS
+from .material_library import MaterialLibrary
 
 
 _SECTIONS = [
@@ -324,8 +325,10 @@ def _section_title(title, subtitle=None):
 class SolveWorkspace(Div):
     """Editable axisymmetric r-z model with a selectable sketch viewport."""
 
-    def __init__(self, on_log=None, on_run=None, on_mesh=None, on_open_file=None, on_history_change=None, on_cancel=None):
+    def __init__(self, on_log=None, on_run=None, on_mesh=None, on_open_file=None, on_history_change=None, on_cancel=None, material_library=None):
         self.model = new_model()
+        self._material_library = material_library or MaterialLibrary()
+        self._user_materials = self._material_library.load()
         self.studies = new_studies()
         self.layout = {"schema_version": 1, "active_section": "geometry", "camera": "fit"}
         self.on_log = on_log
@@ -3270,7 +3273,11 @@ class SolveWorkspace(Div):
         """Offer library presets and project materials without preloading them."""
         options = [{"label": "Unassigned", "value": None}]
         seen = set()
-        for material in [*builtin_materials(), *self.model.get("materials", [])]:
+        for material in [
+            *builtin_materials(),
+            *self._user_materials,
+            *self.model.get("materials", []),
+        ]:
             material_id = material.get("id")
             if material_id in seen:
                 continue
@@ -3642,7 +3649,7 @@ class SolveWorkspace(Div):
         children = [_section_title("Materials", "Enter material properties in SI units, then assign them to regions.")]
         if not self.model["materials"]:
             return children + [
-                Div("Choose a library material from a region's Material list, or add a custom material here. Assigned materials appear in this list and can be reused by other regions.", ui_style="font-size:12px; color:var(--fg-muted); line-height:1.45;"),
+                Div("Choose a built-in or saved material from a region's Material list, or add a custom material here. Custom entries are stored in local settings and remain available after app updates.", ui_style="font-size:12px; color:var(--fg-muted); line-height:1.45;"),
                 _button("Add material", "mdi-plus", self.add_material),
             ]
         valid_ids = {item["id"] for item in self.model["materials"]}
@@ -3679,6 +3686,16 @@ class SolveWorkspace(Div):
             _button("Add material", "mdi-plus", self.add_material),
         ])
         children.append(_button("Remove material", "mdi-delete-outline", lambda *a, mid=material["id"]: self.remove_material(mid)))
+        if any(item["id"] == material["id"] for item in self._user_materials):
+            children.append(Div(
+                "This custom material is stored in local app settings, outside the installed release.",
+                ui_style="font-size:11px; color:var(--fg-muted); line-height:1.4;",
+            ))
+            children.append(_button(
+                "Remove from local library",
+                "mdi-bookmark-remove-outline",
+                lambda *a, mid=material["id"]: self.remove_material_from_library(mid),
+            ))
         return children
 
     def _boundary_properties(self):
@@ -4400,11 +4417,11 @@ class SolveWorkspace(Div):
         if key == "material_id" and value:
             material = next((item for item in self.model["materials"] if item["id"] == value), None)
             if material is None:
-                material = next((item for item in builtin_materials() if item["id"] == value), None)
+                material = next((item for item in [*builtin_materials(), *self._user_materials] if item["id"] == value), None)
                 if material is None:
                     self._message("Choose a material from the available list.", error=True)
                     return
-                self.model["materials"].append(material)
+                self.model["materials"].append(copy.deepcopy(material))
         region[key] = str(value).strip() if key == "name" else value
         if key == "mechanical":
             self._rebuild_edges()
@@ -4637,12 +4654,14 @@ class SolveWorkspace(Div):
 
     @_history_tracked
     def add_material(self, *args):
-        index = len(self.model["materials"]) + 1
+        index = len(self._user_materials) + 1
         material = builtin_materials()[0]
         material.update({"id": new_id("material"), "name": f"Material {index}"})
-        self.model["materials"].append(material)
+        self.model["materials"].append(copy.deepcopy(material))
+        self._user_materials.append(copy.deepcopy(material))
         self.selected_material_id = material["id"]
-        self._message(f"Added {material['name']}.")
+        if self._save_user_materials():
+            self._message(f"Added {material['name']} to this model and the local material library.")
         self._refresh_model_tree()
         self._render_inspector()
 
@@ -4657,11 +4676,39 @@ class SolveWorkspace(Div):
         self._refresh_model_tree()
         self._render_inspector()
 
+    def _save_user_materials(self):
+        try:
+            self._material_library.save(self._user_materials)
+        except OSError as error:
+            self._message(f"Could not save the local material library: {error}", error=True)
+            return False
+        return True
+
+    def remove_material_from_library(self, material_id):
+        material = next((item for item in self._user_materials if item["id"] == material_id), None)
+        if material is None:
+            return False
+        remaining = [item for item in self._user_materials if item["id"] != material_id]
+        try:
+            self._material_library.save(remaining)
+        except OSError as error:
+            self._message(f"Could not update the local material library: {error}", error=True)
+            return False
+        self._user_materials = remaining
+        self._message(f"Removed {material['name']} from the local library. Its copy in this model is unchanged.")
+        self._render_inspector()
+        self._update_geometry_inspector()
+        return True
+
     @_history_tracked
     def _set_material_name(self, material_id, value):
         material = next((item for item in self.model["materials"] if item["id"] == material_id), None)
         if material:
             material["name"] = str(value).strip()
+            library_material = next((item for item in self._user_materials if item["id"] == material_id), None)
+            if library_material is not None:
+                library_material["name"] = material["name"]
+                self._save_user_materials()
             self._refresh_model_tree()
 
     @_history_tracked
@@ -4669,6 +4716,10 @@ class SolveWorkspace(Div):
         material = next((item for item in self.model["materials"] if item["id"] == material_id), None)
         if material:
             material.setdefault("properties", {})[key] = str(value).strip()
+            library_material = next((item for item in self._user_materials if item["id"] == material_id), None)
+            if library_material is not None:
+                library_material.setdefault("properties", {})[key] = str(value).strip()
+                self._save_user_materials()
 
     @_history_tracked
     def add_boundary(self, *args):

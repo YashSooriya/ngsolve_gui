@@ -16,7 +16,8 @@ from ngsolve_gui.solve_workspace import SolveWorkspace, _load_saved_run_history
 
 
 @pytest.fixture
-def standalone_components(monkeypatch):
+def standalone_components(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "ngapp-config"))
     environment = utils.Environment(utils.EnvironmentType.STANDALONE, have_backend=False)
     environment.frontend.update_component = lambda *args, **kwargs: None
     monkeypatch.setattr(utils, "_environment", environment)
@@ -2239,6 +2240,40 @@ def test_problem_material_preset_is_copied_to_model_when_assigned(standalone_com
     )
     assert workspace.model["materials"] == [expected]
     assert workspace._tree_subsection("materials")[1][0][1] == "Stainless steel (4 K / OVC) · 1 region"
+
+
+def test_custom_materials_persist_locally_across_new_models(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.add_material()
+    custom = workspace.model["materials"][0]
+    workspace._set_material_name(custom["id"], "Persistent alloy")
+    workspace._set_material_property(custom["id"], "electrical_conductivity", "2.4e6")
+
+    next_workspace = SolveWorkspace()
+    assert next_workspace.model["materials"] == []
+    option = next(
+        item for item in next_workspace._material_options()
+        if item["value"] == custom["id"]
+    )
+    assert option["label"] == "Persistent alloy"
+    assert next_workspace._material_library.path.name == "material_library.json"
+    assert "site-packages" not in str(next_workspace._material_library.path)
+
+    next_workspace._add_primitive("rectangle")
+    next_region = next_workspace.model["geometry"]["regions"][0]
+    next_workspace._set_region_value(next_region["id"], "material_id", custom["id"])
+    assert next_workspace.model["materials"][0]["properties"]["electrical_conductivity"] == "2.4e6"
+
+
+def test_custom_material_can_be_removed_from_local_library(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.add_material()
+    custom_id = workspace.model["materials"][0]["id"]
+
+    assert workspace.remove_material_from_library(custom_id)
+    assert any(item["id"] == custom_id for item in workspace.model["materials"])
+    assert all(item["id"] != custom_id for item in workspace._user_materials)
+    assert all(option["value"] != custom_id for option in SolveWorkspace()._material_options())
 
 
 def test_parameter_removal_is_available_and_blocked_while_referenced(standalone_components):
