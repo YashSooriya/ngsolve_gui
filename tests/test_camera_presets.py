@@ -13,7 +13,6 @@ def _tab_with_camera(camera):
         render=lambda: None,
     )
     tab.wgpu = SimpleNamespace(scene=scene)
-    tab._camera_views_pop = SimpleNamespace(ui_hidden=False)
     return tab
 
 
@@ -53,7 +52,6 @@ def test_camera_presets_preserve_current_view_center_and_zoom():
     for view in ("top", "bottom", "front", "back", "right", "left", "isometric"):
         tab.set_camera_view(view)
         _assert_target_centered_and_scale_preserved(camera, center, scale)
-        assert tab._camera_views_pop.ui_hidden
 
 
 def test_unknown_camera_preset_is_rejected():

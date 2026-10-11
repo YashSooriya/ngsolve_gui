@@ -21,13 +21,13 @@ from .cerbsim_style import overlay_tr, VIEWPORT_CLEAR, VIEWPORT_TEXT
 
 
 _CAMERA_VIEW_PRESETS = (
-    ("Isometric", "isometric", "mdi-cube-outline", None),
-    ("Top (+Z)", "top", "mdi-axis-z-arrow", None),
-    ("Bottom (−Z)", "bottom", "mdi-axis-z-arrow", "scaleY(-1)"),
-    ("Front (+Y)", "front", "mdi-axis-y-arrow", None),
-    ("Back (−Y)", "back", "mdi-axis-y-arrow", "scaleY(-1)"),
-    ("Right (+X)", "right", "mdi-axis-x-arrow", None),
-    ("Left (−X)", "left", "mdi-axis-x-arrow", "scaleX(-1)"),
+    ("Isometric", "isometric", "mdi-cube-outline"),
+    ("X+", "right", "mdi-axis-x-arrow"),
+    ("X-", "left", "mdi-axis-x-arrow"),
+    ("Y+", "front", "mdi-axis-y-arrow"),
+    ("Y-", "back", "mdi-axis-y-arrow"),
+    ("Z+", "top", "mdi-axis-z-arrow"),
+    ("Z-", "bottom", "mdi-axis-z-arrow"),
 )
 
 _CAMERA_VIEW_AXES = {
@@ -189,6 +189,7 @@ class WebgpuTab(PropertyPanelMixin, Div):
             self.reset_camera()
         self._sync_clip_ui(self.clipping_enabled.value, None)
         self._sync_camera_link_ui(self.camera_shared.value, None)
+        self._sync_projection_tool()
 
         # Enable selection on right-click (needed for nav cube)
         def _on_click_select(event):
@@ -753,16 +754,20 @@ class WebgpuTab(PropertyPanelMixin, Div):
             self._last_view_plane = plane
             self._last_view_flip = flip
         self.scene.render()
-        if hasattr(self, "_camera_views_pop"):
-            self._close_camera_views()
 
     def set_orthographic(self, value):
         """Switch between orthographic and perspective camera projection."""
         camera = self.scene.options.camera
         if camera.orthographic == value:
+            self._sync_projection_tool()
             return
         camera.set_orthographic(value)
         self.scene.render()
+        self._sync_projection_tool()
+
+    def toggle_projection(self):
+        """Toggle between perspective and parallel (orthographic) projection."""
+        self.set_orthographic(not self.scene.options.camera.orthographic)
 
     def _apply_clipping_enabled(self, val, _old):
         self.clipping.enable_clipping(val)
@@ -804,6 +809,13 @@ class WebgpuTab(PropertyPanelMixin, Div):
     def _supports_clipping(self):
         return not hasattr(self, "mesh") or self.mesh.dim == 3
 
+    def _supports_camera_view_buttons(self):
+        """Show standard camera controls for 3D post-processing views only."""
+        return (
+            getattr(self, "_page_toolbar_enabled", False)
+            and getattr(getattr(self, "mesh", None), "dim", None) == 3
+        )
+
     def toggle_wireframe(self):
         if hasattr(self, "wireframe_visible"):
             self.wireframe_visible.toggle()
@@ -811,13 +823,26 @@ class WebgpuTab(PropertyPanelMixin, Div):
     def _build_tool_dock(self):
         self._wf_tool = None
         self._clip_tool = None
+        self._camera_view_tools = {}
+        self._projection_tool = None
+        self._projection_tooltip = None
         tools = [self._vtool("mdi-overscan", "Fit view  ·  r", self.reset_camera,
                              label="Fit view")]
         self._link_tool = self._build_camera_link_tool()
         if self._link_tool is not None:
             tools.append(self._link_tool)
-        if self._supports_clipping():
-            tools.append(self._build_camera_views_tool())
+        if self._supports_camera_view_buttons():
+            tools.append(Div(ui_class=str(cb.vp_sep)))
+            tools.append(Div(
+                "View:",
+                ui_style=(
+                    "font-size:12px; font-weight:600; color:var(--text-secondary); "
+                    "white-space:nowrap; padding:0 2px;"
+                ),
+            ))
+            tools.extend(self._build_camera_view_buttons())
+            self._projection_tool = self._build_projection_tool()
+            tools.append(self._projection_tool)
         if hasattr(self, "wireframe_visible"):
             self._wf_tool = self._vtool(
                 "mdi-grid", "Toggle wireframe edges  ·  w", self.toggle_wireframe,
@@ -935,63 +960,70 @@ class WebgpuTab(PropertyPanelMixin, Div):
         self._rebuild_bookmark_menu()
         return btn
 
-    def _build_camera_views_tool(self):
-        """Build a compact menu of standard engineering camera orientations."""
-        self._camera_views_pop = Div(ui_class=str(cb.bm_pop))
-        self._camera_views_pop.ui_hidden = True
-        self._camera_views_pop.on("mouseleave", lambda e=None: self._close_camera_views())
-        if getattr(self, "_page_toolbar_enabled", False):
-            action = QBtn(
-                QTooltip("Choose an isometric, top, front, or side view"),
-                ui_icon="mdi-cube-outline",
-                ui_label="Camera views",
+    def _build_camera_view_buttons(self):
+        """Build one-click standard views for the post-processing toolbar."""
+        buttons = []
+        for label, view, icon in _CAMERA_VIEW_PRESETS:
+            if view == "isometric":
+                tooltip = "Isometric camera view"
+            else:
+                axis = {
+                    "right": "X", "left": "X",
+                    "front": "Y", "back": "Y",
+                    "top": "Z", "bottom": "Z",
+                }[view]
+                sign = "+" if view in {"right", "front", "top"} else "-"
+                tooltip = f"View from {sign}{axis}"
+            button = QBtn(
+                QTooltip(tooltip),
+                ui_icon=icon,
+                ui_label=label,
                 ui_flat=True,
                 ui_dense=True,
                 ui_no_caps=True,
                 ui_class=str(cb.vp_tool),
                 ui_style=(
-                    "width:auto; min-width:0; height:32px; padding:0 9px; "
+                    "width:auto; min-width:0; height:32px; padding:0 7px; "
                     "white-space:nowrap;"
                 ),
             )
-            action.on_click(self._toggle_camera_views)
-            btn = Div(action, self._camera_views_pop, ui_class="relative-position",
-                      ui_style="display:inline-flex; flex:none;")
-        else:
-            btn = Div(
-                QIcon(ui_name="mdi-cube-outline"),
-                QTooltip("Camera views"),
-                self._camera_views_pop,
-                ui_class=str(cb.vp_tool) + " relative-position",
+            button.on_click(
+                lambda _event=None, view=view: self.set_camera_view(view)
             )
-            btn.on("click", lambda e=None: self._toggle_camera_views())
-        self._rebuild_camera_views_menu()
-        return btn
+            self._camera_view_tools[view] = button
+            buttons.append(button)
+        return buttons
 
-    def _toggle_camera_views(self):
-        if self._camera_views_pop.ui_hidden:
-            self._camera_views_pop.ui_hidden = False
-        else:
-            self._camera_views_pop.ui_hidden = True
+    def _build_projection_tool(self):
+        """Build a persistent-state toggle for parallel projection."""
+        self._projection_tooltip = QTooltip("")
+        button = QBtn(
+            self._projection_tooltip,
+            ui_label="Parallel",
+            ui_flat=True,
+            ui_dense=True,
+            ui_no_caps=True,
+            ui_class=str(cb.vp_tool),
+            ui_style=(
+                "width:auto; min-width:0; height:32px; padding:0 9px; "
+                "white-space:nowrap;"
+            ),
+        )
+        button.on_click(self.toggle_projection)
+        return button
 
-    def _close_camera_views(self):
-        self._camera_views_pop.ui_hidden = True
-
-    def _rebuild_camera_views_menu(self):
-        rows = [Div("Camera views", ui_class=str(cb.bm_title))]
-        for label, view, icon, mirror in _CAMERA_VIEW_PRESETS:
-            icon_style = (
-                f"display: inline-block; transform: {mirror};"
-                if mirror else None
-            )
-            row = Div(
-                QIcon(ui_name=icon, ui_style=icon_style),
-                label,
-                ui_class=str(cb.bm_row),
-            )
-            row.on("click", lambda e=None, view=view: self.set_camera_view(view))
-            rows.append(row)
-        self._camera_views_pop.ui_children = rows
+    def _sync_projection_tool(self):
+        button = getattr(self, "_projection_tool", None)
+        tooltip = getattr(self, "_projection_tooltip", None)
+        if button is None or tooltip is None:
+            return
+        parallel = bool(self.scene.options.camera.orthographic)
+        self._set_tool_active(button, parallel)
+        tooltip.ui_children = [
+            "Parallel projection is enabled. Click to use perspective projection."
+            if parallel
+            else "Parallel projection is off. Click to enable it."
+        ]
 
     def _build_clip_toolbar(self):
         if not self._supports_clipping():
