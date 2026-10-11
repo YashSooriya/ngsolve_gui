@@ -905,6 +905,7 @@ class SolveWorkspace(Div):
         model = migrate_legacy_model(model)
         model = copy.deepcopy(model)
         _sync_axis_boundary_conditions(model)
+        _sync_mechanical_boundary_conditions(model)
         studies = migrate_legacy_studies(studies or new_studies())
         errors = validate_model(model)
         if errors:
@@ -2773,6 +2774,7 @@ class SolveWorkspace(Div):
             region["edge_ids"] = region_edges
         self.model["geometry"]["edges"] = edges
         _sync_axis_boundary_conditions(self.model)
+        _sync_mechanical_boundary_conditions(self.model)
         if hasattr(self, "selected_edge_ids"):
             live_ids = {edge["id"] for edge in edges}
             self.selected_edge_ids = [edge_id for edge_id in self.selected_edge_ids if edge_id in live_ids]
@@ -3489,6 +3491,11 @@ class SolveWorkspace(Div):
             conditions = {item["id"]: item for item in self.model.get("boundary_conditions", [])}
             em_condition = next((cid for cid in selected_ids if conditions.get(cid, {}).get("type") in {"axis_of_symmetry", "magnetic_potential_zero", "natural"}), None)
             mech_condition = next((cid for cid in selected_ids if conditions.get(cid, {}).get("type", "").startswith("mechanical_")), None)
+            has_auto_transmission = any(
+                conditions.get(cid, {}).get("automatic_for_mechanics")
+                and conditions.get(cid, {}).get("type") == "transmission_interface"
+                for cid in selected_ids
+            )
             em_options = [{"label": "Natural / material interface", "value": None}] + [
                 {"label": item["name"], "value": item["id"]}
                 for item in self.model.get("boundary_conditions", [])
@@ -3512,6 +3519,7 @@ class SolveWorkspace(Div):
                 name_input,
                 em_select,
                 mech_select,
+                *([Div("Transmission interface · automatic", ui_style="font-size:11px; color:var(--fg-muted);")] if has_auto_transmission else []),
                 Div("Electromagnetic and mechanical conditions are assigned independently, so one edge can participate in both physics." + (" The axis is excluded from mechanical support assignments in this version." if on_axis else ""), ui_style="font-size:11px; color:var(--fg-muted); line-height:1.45;"),
             ]
         if region:
@@ -3704,13 +3712,15 @@ class SolveWorkspace(Div):
             ))
         condition = next((item for item in conditions if item["id"] == self.selected_boundary_id), None)
         if condition:
+            if condition.get("type") == "transmission_interface":
+                kinds.append(("transmission_interface", "Transmission interface"))
             type_select = QSelect(
                 ui_label="Condition type",
                 ui_options=[{"label": label, "value": value} for value, label in kinds],
                 ui_option_label="label",
                 ui_option_value="value",
                 ui_model_value=condition.get("type"),
-                ui_disable=bool(condition.get("automatic_for_axis")),
+                ui_disable=bool(condition.get("automatic_for_axis") or condition.get("automatic_for_mechanics")),
                 ui_emit_value=True,
                 ui_map_options=True,
                 ui_dense=True,
@@ -3738,7 +3748,13 @@ class SolveWorkspace(Div):
                     _input("Tangential stiffness", condition.get("stiffness_tangential", "0"), lambda event, bid=condition["id"]: self._set_boundary_value(bid, "stiffness_tangential", event.value), suffix="N/m³"),
                 ])
             children.append(Div("Highlighted orange edges use this condition. Select edges in Geometry to assign or change their conditions.", ui_style="font-size:11px; line-height:1.45; color:var(--fg-muted);"))
-            children.append(_button("Remove condition", "mdi-delete-outline", lambda *a, bid=condition["id"]: self.remove_boundary(bid)))
+            if condition.get("automatic_for_mechanics"):
+                children.append(Div(
+                    "Assigned automatically where a mechanical region meets non-mechanical material. Shared mechanical interfaces use the default condition.",
+                    ui_style="font-size:11px; line-height:1.45; color:var(--fg-muted);",
+                ))
+            if not condition.get("automatic_for_axis") and not condition.get("automatic_for_mechanics"):
+                children.append(_button("Remove condition", "mdi-delete-outline", lambda *a, bid=condition["id"]: self.remove_boundary(bid)))
         children.append(_button("Add boundary condition", "mdi-plus", self.add_boundary))
         return children
 
@@ -4390,8 +4406,10 @@ class SolveWorkspace(Div):
                     return
                 self.model["materials"].append(material)
         region[key] = str(value).strip() if key == "name" else value
+        if key == "mechanical":
+            self._rebuild_edges()
         self._refresh_model_tree()
-        if key == "material_id":
+        if key in {"material_id", "mechanical"}:
             self._render_inspector()
         self.render_canvas()
 
@@ -4683,6 +4701,10 @@ class SolveWorkspace(Div):
     def _set_boundary_value(self, boundary_id, key, value):
         condition = next((item for item in self.model.get("boundary_conditions", []) if item["id"] == boundary_id), None)
         if condition:
+            if key == "type" and (condition.get("automatic_for_axis") or condition.get("automatic_for_mechanics")):
+                return
+            if key == "type" and value == "transmission_interface":
+                return
             condition[key] = str(value).strip() if key != "type" else value
             self._refresh_model_tree()
             if key == "type":
@@ -5306,4 +5328,109 @@ def _sync_axis_boundary_conditions(model):
         conditions[:] = [
             item for item in conditions
             if not (isinstance(item, dict) and item.get("automatic_for_axis"))
+        ]
+
+
+def _sync_mechanical_boundary_conditions(model):
+    """Mark contours between mechanical and non-mechanical material automatically.
+
+    In the axisymmetric sketch each region contour separates that region from
+    its nearest containing region (or the exterior). A contour is a
+    transmission interface when exactly one of those two materials participates
+    in mechanics. A contour between two mechanical materials stays on the
+    default condition, so the solver treats it as an internal mechanical
+    interface.
+    """
+    if not isinstance(model, dict):
+        return
+    geometry = model.get("geometry")
+    if not isinstance(geometry, dict):
+        return
+    regions = geometry.get("regions", [])
+    edges = geometry.get("edges", [])
+    conditions = model.setdefault("boundary_conditions", [])
+    if not isinstance(regions, list) or not isinstance(edges, list) or not isinstance(conditions, list):
+        return
+
+    regions_by_id = {
+        item.get("id"): item
+        for item in regions
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    condition_by_id = {
+        item.get("id"): item
+        for item in conditions
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    edge_by_id = {
+        item.get("id"): item
+        for item in edges
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+
+    desired_edge_ids = set()
+    for region in regions_by_id.values():
+        parent = regions_by_id.get(region.get("parent_id"))
+        region_is_mechanical = bool(region.get("mechanical"))
+        parent_is_mechanical = bool(parent and parent.get("mechanical"))
+        if region_is_mechanical == parent_is_mechanical:
+            continue
+        region_edge_ids = region.get("edge_ids", [])
+        if not isinstance(region_edge_ids, list):
+            continue
+        desired_edge_ids.update(
+            edge_id for edge_id in region_edge_ids
+            if isinstance(edge_id, str) and edge_id in edge_by_id
+        )
+
+    interface_condition = next(
+        (
+            item for item in conditions
+            if isinstance(item, dict)
+            and item.get("type") == "transmission_interface"
+            and item.get("automatic_for_mechanics")
+        ),
+        None,
+    )
+    if desired_edge_ids and interface_condition is None:
+        interface_condition = {
+            "id": new_id("boundary"),
+            "name": "Transmission interface",
+            "type": "transmission_interface",
+            "automatic_for_mechanics": True,
+        }
+        conditions.append(interface_condition)
+        condition_by_id[interface_condition["id"]] = interface_condition
+
+    interface_condition_id = interface_condition.get("id") if interface_condition else None
+    for edge_id, edge in edge_by_id.items():
+        try:
+            condition_ids = _edge_condition_ids(edge)
+        except TypeError:
+            # Keep malformed values intact for validate_model() to explain.
+            continue
+        if any(not isinstance(condition_id, str) for condition_id in condition_ids):
+            continue
+        condition_ids = [
+            condition_id for condition_id in condition_ids
+            if not (
+                isinstance(condition_id, str)
+                and condition_id in condition_by_id
+                and condition_by_id[condition_id].get("automatic_for_mechanics")
+                and condition_by_id[condition_id].get("type") == "transmission_interface"
+            )
+        ]
+        if edge_id in desired_edge_ids and interface_condition_id:
+            condition_ids.append(interface_condition_id)
+        edge["boundary_condition_ids"] = list(dict.fromkeys(condition_ids))
+        edge.pop("boundary_condition_id", None)
+
+    if not desired_edge_ids:
+        conditions[:] = [
+            item for item in conditions
+            if not (
+                isinstance(item, dict)
+                and item.get("automatic_for_mechanics")
+                and item.get("type") == "transmission_interface"
+            )
         ]

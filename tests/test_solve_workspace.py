@@ -672,7 +672,14 @@ def test_same_edge_can_have_independent_em_and_mechanical_conditions(standalone_
     workspace._set_edge_condition(coil_edge["id"], "mechanical", "boundary-fixed")
 
     updated_edge = next(edge for edge in workspace.model["geometry"]["edges"] if edge["id"] == coil_edge["id"])
-    assert set(updated_edge["boundary_condition_ids"]) == {"boundary-outer", "boundary-fixed"}
+    automatic_interface = next(
+        condition for condition in workspace.model["boundary_conditions"]
+        if condition.get("type") == "transmission_interface"
+        and condition.get("automatic_for_mechanics")
+    )
+    assert set(updated_edge["boundary_condition_ids"]) == {
+        "boundary-outer", "boundary-fixed", automatic_interface["id"]
+    }
     assert workspace.validation_errors() == []
 
 
@@ -1026,6 +1033,105 @@ def test_axis_of_symmetry_boundary_tracks_region_addition_and_movement(standalon
             if condition["id"] in edge["boundary_condition_ids"]
         )
         for edge in workspace.model["geometry"]["edges"]
+    )
+
+
+def test_mechanical_region_gets_automatic_transmission_boundary(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    workspace._set_region_value(region["id"], "material_id", "material-air")
+
+    workspace._set_region_value(region["id"], "mechanical", True)
+
+    condition = next(
+        item for item in workspace.model["boundary_conditions"]
+        if item.get("type") == "transmission_interface"
+    )
+    assert condition["automatic_for_mechanics"] is True
+    assert all(
+        condition["id"] in next(
+            edge for edge in workspace.model["geometry"]["edges"]
+            if edge["id"] == edge_id
+        )["boundary_condition_ids"]
+        for edge_id in region["edge_ids"]
+    )
+
+    saved_model = copy.deepcopy(workspace.model)
+    saved_model["boundary_conditions"] = [
+        item for item in saved_model["boundary_conditions"]
+        if not item.get("automatic_for_mechanics")
+    ]
+    for edge in saved_model["geometry"]["edges"]:
+        edge["boundary_condition_ids"] = [
+            item for item in edge["boundary_condition_ids"]
+            if item != condition["id"]
+        ]
+    loaded = SolveWorkspace()
+    loaded.set_model(saved_model)
+    loaded_region = loaded.model["geometry"]["regions"][0]
+    loaded_interface = next(
+        item for item in loaded.model["boundary_conditions"]
+        if item.get("type") == "transmission_interface"
+    )
+    assert all(
+        loaded_interface["id"] in next(edge for edge in loaded.model["geometry"]["edges"] if edge["id"] == edge_id)["boundary_condition_ids"]
+        for edge_id in loaded_region["edge_ids"]
+    )
+
+    loaded._set_region_value(loaded_region["id"], "mechanical", False)
+
+    assert not any(
+        item.get("type") == "transmission_interface"
+        for item in loaded.model["boundary_conditions"]
+    )
+
+
+def test_nested_mechanical_regions_use_default_shared_contour_and_update_after_move(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.0,
+        ("rectangle", "z_min"): -0.01,
+        ("rectangle", "width"): 0.02,
+        ("rectangle", "height"): 0.02,
+    })
+    workspace._add_primitive("rectangle")
+    parent = workspace.model["geometry"]["regions"][0]
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.004,
+        ("rectangle", "z_min"): -0.002,
+        ("rectangle", "width"): 0.004,
+        ("rectangle", "height"): 0.004,
+    })
+    workspace._add_primitive("rectangle")
+    child = workspace.model["geometry"]["regions"][1]
+    assert child["parent_id"] == parent["id"]
+
+    workspace._set_region_value(parent["id"], "mechanical", True)
+    interface = next(
+        item for item in workspace.model["boundary_conditions"]
+        if item.get("type") == "transmission_interface"
+    )
+    assert all(
+        interface["id"] in next(edge for edge in workspace.model["geometry"]["edges"] if edge["id"] == edge_id)["boundary_condition_ids"]
+        for edge_id in child["edge_ids"]
+    )
+
+    workspace._set_region_value(child["id"], "mechanical", True)
+    assert all(
+        interface["id"] not in next(edge for edge in workspace.model["geometry"]["edges"] if edge["id"] == edge_id)["boundary_condition_ids"]
+        for edge_id in child["edge_ids"]
+    )
+
+    project, _ = workspace._canvas_projection()
+    workspace._move_region_from_canvas_drag(
+        child["id"], project((0.005, 0.0)), project((0.045, 0.0))
+    )
+
+    assert child["parent_id"] is None
+    assert all(
+        interface["id"] in next(edge for edge in workspace.model["geometry"]["edges"] if edge["id"] == edge_id)["boundary_condition_ids"]
+        for edge_id in child["edge_ids"]
     )
 
 

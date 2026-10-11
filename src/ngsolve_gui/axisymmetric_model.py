@@ -543,6 +543,7 @@ def validate_model(model: dict) -> list[str]:
     allowed_boundary_types = {
         "axis_of_symmetry", "magnetic_potential_zero", "natural",
         "mechanical_fixed", "mechanical_prescribed", "mechanical_traction", "mechanical_robin",
+        "transmission_interface",
     }
     for condition in conditions:
         if not isinstance(condition, dict):

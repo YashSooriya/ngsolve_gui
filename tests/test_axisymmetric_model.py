@@ -91,6 +91,19 @@ def test_parameter_dimensions_reject_values_used_in_incompatible_fields():
     assert any("dc_current_density: has unit m; expected A/m^2" in error for error in errors)
 
 
+def test_transmission_interface_is_a_supported_auto_boundary_type():
+    model = _nested_model()
+    model["boundary_conditions"].append({
+        "id": "automatic-interface",
+        "name": "Transmission interface",
+        "type": "transmission_interface",
+        "automatic_for_mechanics": True,
+    })
+    model["geometry"]["edges"][0]["boundary_condition_ids"].append("automatic-interface")
+
+    assert validate_model(model) == []
+
+
 def test_parameter_declaration_and_explicit_si_suffixes_are_checked():
     model = _nested_model()
     model["parameters"].append({
