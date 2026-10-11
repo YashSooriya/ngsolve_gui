@@ -1,4 +1,5 @@
 import copy
+import os
 import json
 import math
 import sys
@@ -438,7 +439,7 @@ def test_saved_run_history_recovers_manifest_and_marks_running_as_interrupted(tm
     runs = _load_saved_run_history(tmp_path)
 
     assert runs == [{
-        "id": str(run_dir.resolve()),
+        "id": os.path.normcase(str(run_dir.resolve())),
         "name": "Study: Nested model",
         "kind": "Study",
         "status": "Interrupted",
@@ -1591,6 +1592,65 @@ def test_browser_pan_commit_clamps_negative_radius_when_requested(standalone_com
     assert project((0.0, 0.0))[0] == pytest.approx(buffer_px)
 
 
+def test_zooming_out_keeps_negative_r_within_the_axis_buffer(standalone_components):
+    workspace = SolveWorkspace()
+    plot = workspace._canvas_plot_bounds()
+    buffer_px = min(96.0, max(72.0, (plot[2] - plot[0]) * 0.08))
+    _, initial_width, _ = workspace._current_canvas_world_view()
+
+    workspace.zoom_canvas(
+        2.0,
+        ((plot[0] + plot[2]) / 2, (plot[1] + plot[3]) / 2),
+        render=False,
+    )
+
+    project, _ = workspace._canvas_projection()
+    assert workspace._current_canvas_world_view()[1] == pytest.approx(initial_width * 2)
+    assert project((0.0, 0.0))[0] == pytest.approx(buffer_px)
+
+
+def test_browser_zoom_out_commit_clamps_axis_to_negative_r_buffer(standalone_components):
+    workspace = SolveWorkspace()
+    plot = workspace._canvas_plot_bounds()
+    buffer_px = min(96.0, max(72.0, (plot[2] - plot[0]) * 0.08))
+    center_x = (plot[0] + plot[2]) / 2
+    center_y = (plot[1] + plot[3]) / 2
+    _, initial_width, _ = workspace._current_canvas_world_view()
+
+    assert workspace._commit_browser_canvas_view(
+        (0.5, center_x * 0.5, center_y * 0.5, 1),
+        render=False,
+        clamp_negative_r=True,
+    )
+
+    project, _ = workspace._canvas_projection()
+    assert workspace._current_canvas_world_view()[1] == pytest.approx(initial_width * 2)
+    assert project((0.0, 0.0))[0] == pytest.approx(buffer_px)
+
+
+def test_pan_release_snapshots_view_before_redrawing(standalone_components, monkeypatch):
+    import webgpu.platform as platform
+
+    workspace = SolveWorkspace()
+    completed = [
+        "pan", "select", 0.0, 0.0, 50.0, 25.0, "", False, True,
+        1.0, 50.0, 25.0, 1, "",
+    ]
+    operations = []
+
+    class FakeJS:
+        def eval(self, *_args, **_kwargs):
+            return completed
+
+    monkeypatch.setattr(platform, "js", FakeJS())
+    workspace._prepare_canvas_view_commit_snapshot = lambda: operations.append("snapshot")
+    workspace.render_canvas = lambda: operations.append("render")
+
+    workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
+
+    assert operations == ["snapshot", "render"]
+
+
 def test_middle_drag_pans_even_when_a_shape_tool_is_selected(standalone_components):
     workspace = SolveWorkspace()
     workspace.set_sketch_tool("rectangle", announce=False)
@@ -1770,6 +1830,94 @@ def test_selecting_geometry_restores_its_inspector_after_another_section(standal
     assert not workspace._edge_panel.ui_hidden
 
 
+def test_boundary_stage_accumulates_region_edges_without_duplicates(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.005,
+        ("rectangle", "z_min"): 0.005,
+        ("rectangle", "width"): 0.005,
+        ("rectangle", "height"): 0.005,
+    })
+    workspace._add_primitive("rectangle")
+    first, second = workspace.model["geometry"]["regions"]
+    first_edges = first["edge_ids"]
+    second["edge_ids"] = [first_edges[1], *second["edge_ids"]]
+    workspace.select_section("boundaries")
+    project, _ = workspace._canvas_projection()
+    for world_point in ((0.017, 0.017), (0.0075, 0.0075)):
+        point = project(world_point)
+        workspace._canvas_event_point = lambda event, refresh_transform=False, point=point: point
+        workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0}))
+        workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
+
+    assert workspace.active_section == "boundaries"
+    assert workspace.selected_edge_ids == list(dict.fromkeys([*first_edges, *second["edge_ids"]]))
+    assert len(workspace.selected_edge_ids) == len(set(workspace.selected_edge_ids))
+
+
+def test_boundary_stage_edge_toggle_removes_only_the_clicked_edge(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    workspace.select_section("boundaries")
+    edges = [edge["id"] for edge in workspace.model["geometry"]["edges"]]
+    workspace._set_boundary_stage_selection(edges[:3])
+
+    workspace.toggle_boundary_stage_edge(edges[1])
+    assert workspace.selected_edge_ids == [edges[0], edges[2]]
+    workspace.toggle_boundary_stage_edge(edges[3])
+    assert workspace.selected_edge_ids == [edges[0], edges[2], edges[3]]
+    assert workspace.active_section == "boundaries"
+
+
+def test_boundary_stage_edge_hit_has_priority_over_region_hit(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    workspace.select_section("boundaries")
+    region = workspace.model["geometry"]["regions"][0]
+    edge = workspace.model["geometry"]["edges"][1]
+    project, _ = workspace._canvas_projection()
+    first, second = [project(point) for point in edge["vertices"]]
+    point = ((first[0] + second[0]) / 2, (first[1] + second[1]) / 2)
+    workspace._canvas_event_point = lambda event, refresh_transform=False: point
+
+    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0}))
+    assert workspace._canvas_drag["operation"] == "edge"
+    workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
+    # The native click follows pointer release in the browser and must not
+    # toggle the same edge a second time.
+    workspace._on_canvas_edge_click(edge["id"])
+
+    assert workspace.selected_edge_ids == [edge["id"]]
+    assert workspace.active_section == "boundaries"
+    assert workspace.selected_region_id is None
+
+
+def test_boundary_stage_applies_one_condition_to_the_unified_selection(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    condition = {"id": "boundary-test", "name": "Outer reference", "type": "magnetic_potential_zero"}
+    workspace.model["boundary_conditions"].append(condition)
+    workspace.select_boundary(condition["id"])
+    non_axis_edges = [
+        edge["id"] for edge in workspace.model["geometry"]["edges"]
+        if not all(abs(float(point[0])) <= 1e-12 for point in edge["vertices"])
+    ]
+    workspace._set_boundary_stage_selection(non_axis_edges[:2])
+    workspace._boundary_properties()
+
+    assert workspace._boundary_apply_selection_button.ui_disable is False
+    workspace._apply_selected_boundary_condition()
+
+    assigned = {
+        edge["id"] for edge in workspace.model["geometry"]["edges"]
+        if condition["id"] in edge.get("boundary_condition_ids", [])
+    }
+    assert set(non_axis_edges[:2]) <= assigned
+    assert region["id"] in {item["id"] for item in workspace.model["geometry"]["regions"]}
+
+
 def test_region_properties_explain_the_current_sketch_constraint_scope(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
@@ -1812,6 +1960,10 @@ def test_canvas_drag_suppresses_the_click_that_follows_mouseup(standalone_compon
     assert "![0, 1].includes(event.button)" in scripts[0]
     assert "const middlePan = event.button === 1" in scripts[0]
     assert "? 'marquee'" in scripts[0]
+    assert "gridCacheFor" in scripts[0]
+    assert "liveGrid.replaceChildren();" in scripts[0]
+    assert "while (liveGrid.firstChild)" not in scripts[0]
+    assert "data-sketch-grid-revision" in scripts[0]
 
 
 def test_stationary_region_pointer_gesture_selects_region_after_pointer_capture(standalone_components, monkeypatch):
@@ -2183,12 +2335,12 @@ def test_grid_zoom_keeps_world_geometry_and_anchor_aligned(standalone_components
     ]
     span_before = project_before((0.020, 0.0))[0] - project_before((0.0, 0.0))[0]
 
-    workspace.zoom_canvas(0.5, anchor)
+    workspace.zoom_canvas(0.8, anchor)
 
     project_after, unproject_after = workspace._canvas_projection()
     span_after = project_after((0.020, 0.0))[0] - project_after((0.0, 0.0))[0]
     assert unproject_after(anchor) == pytest.approx(anchor_world)
-    assert span_after == pytest.approx(2 * span_before)
+    assert span_after == pytest.approx(span_before / 0.8)
     assert [tuple(point) for point in workspace.model["geometry"]["regions"][0]["vertices"]] == original_vertices
 
 
@@ -2590,3 +2742,53 @@ def test_canvas_event_reads_pointer_cache_when_ngapp_omits_coordinates(standalon
     )
 
     assert point == pytest.approx((20.0, 80.0))
+
+
+@pytest.mark.parametrize("section", ["geometry", "boundaries"])
+def test_middle_pan_release_clamps_negative_radius_in_every_solve_section(
+    standalone_components, monkeypatch, section
+):
+    import webgpu.platform as platform
+
+    workspace = SolveWorkspace()
+    workspace.active_section = section
+    completed = [
+        "pan", "select", 0.0, 0.0, 50.0, 25.0, "", False, True,
+        1.0, 50.0, 25.0, 1, "",
+    ]
+    commits = []
+    renders = []
+
+    class FakeJS:
+        def eval(self, *_args, **_kwargs):
+            return completed
+
+    monkeypatch.setattr(platform, "js", FakeJS())
+    workspace._commit_browser_canvas_view = (
+        lambda view=None, **kwargs: commits.append(kwargs) or True
+    )
+    workspace._render_canvas_after_interaction = lambda: renders.append("render")
+
+    workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
+
+    assert commits == [{"render": False, "clamp_negative_r": True}]
+    assert renders == ["render"]
+
+
+def test_committed_pan_projection_matches_the_visible_browser_transform(standalone_components):
+    workspace = SolveWorkspace()
+    before, _ = workspace._canvas_projection()
+    points = ((0.0, 0.0), (0.012, 0.004), (0.028, -0.009))
+    visible_before = [before(point) for point in points]
+    scale, tx, ty = 1.1, -10.0, -18.0
+
+    assert workspace._commit_browser_canvas_view(
+        (scale, tx, ty, 1),
+        render=False,
+        clamp_negative_r=True,
+    )
+
+    after, _ = workspace._canvas_projection()
+    visible_after = [after(point) for point in points]
+    for old, new in zip(visible_before, visible_after):
+        assert new == pytest.approx((scale * old[0] + tx, scale * old[1] + ty))

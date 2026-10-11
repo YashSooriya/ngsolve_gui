@@ -401,6 +401,8 @@ class SolveWorkspace(Div):
         self._canvas_drag = None
         self._screen_to_svg = None
         self._canvas_view_commit_version = 0
+        self._canvas_view_render_version = 0
+        self._canvas_grid_render_version = 0
         self._canvas_zoom_timer = None
         self._canvas_zoom_timer_lock = Lock()
         self._canvas_zoom_generation = 0
@@ -488,6 +490,7 @@ class SolveWorkspace(Div):
             "preserveAspectRatio": "xMidYMid meet",
             "role": "img",
             "aria-label": "Axisymmetric radial-axial sketch",
+            "data-sketch-render-version": "0",
         })
         self._canvas.on_mounted(self._install_canvas_pointer_capture)
         self._canvas.on("mousedown", self._on_canvas_mouse_down)
@@ -1382,6 +1385,10 @@ class SolveWorkspace(Div):
             anchor_world[0] - fx * new_width,
             anchor_world[1] + fy * new_height,
         )
+        center = (
+            max(center[0], self._minimum_radial_canvas_center(new_width)),
+            center[1],
+        )
         if not all(math.isfinite(value) for value in (*center, new_width)):
             return
         self._view_center = center
@@ -1474,6 +1481,7 @@ class SolveWorkspace(Div):
             return False
         if clamp_negative_r:
             center = (max(center[0], self._minimum_radial_canvas_center(width)), center[1])
+        self._prepare_canvas_view_commit_snapshot()
         self._view_center = center
         self._view_world_width = width
         self._save_canvas_view_to_layout()
@@ -1483,7 +1491,15 @@ class SolveWorkspace(Div):
 
     def _on_canvas_wheel(self, event):
         """Commit one settled browser-side wheel gesture, never each tick."""
-        if self._commit_browser_canvas_view(render=True):
+        view = self._read_browser_canvas_view()
+        if view is not None and view[3] > self._canvas_view_commit_version:
+            changed = self._commit_browser_canvas_view(
+                view, render=False, clamp_negative_r=True
+            )
+            if changed:
+                self._render_canvas_after_interaction()
+            else:
+                self._schedule_canvas_interaction_reset()
             return
         # Retain the event-driven fallback for frontends without the local SVG
         # handler and for unit tests that send a native wheel event directly.
@@ -1526,8 +1542,8 @@ class SolveWorkspace(Div):
         script = r"""
 (() => {
   window.__ngsolveSketchTool = '__SKETCH_TOOL__';
-  if (window.__ngsolveSketchPointerCaptureVersion === 6) return;
-  window.__ngsolveSketchPointerCaptureVersion = 6;
+  if (window.__ngsolveSketchPointerCaptureVersion === 9) return;
+  window.__ngsolveSketchPointerCaptureVersion = 9;
   let active = false;
   let activePointerId = null;
   let dragStart = null;
@@ -1547,6 +1563,7 @@ class SolveWorkspace(Div):
   let visualTranslateX = 0;
   let visualTranslateY = 0;
   let viewVersion = 0;
+  let pendingViewResetToken = 0;
   const committedRegionOffsets = new Map();
   window.__ngsolveSketchViewTransform = [1, 0, 0, viewVersion];
   window.__ngsolveSketchCompletedGesture = null;
@@ -1562,14 +1579,85 @@ class SolveWorkspace(Div):
     svg && event.target && event.target.closest
       && event.target.closest(selector) === svg
   );
+  const gridCacheFor = (liveGrid) => {
+    let cache = liveGrid.__ngsolveSketchGridCache;
+    if (cache && cache.host === liveGrid && cache.nodes.every(node => node.isConnected)) return cache;
+    liveGrid.replaceChildren();
+    const ns = 'http://www.w3.org/2000/svg';
+    const path = (stroke, width, dash = null) => {
+      const node = document.createElementNS(ns, 'path');
+      node.setAttribute('fill', 'none');
+      node.setAttribute('stroke', stroke);
+      node.setAttribute('stroke-width', String(width));
+      node.setAttribute('pointer-events', 'none');
+      if (dash) node.setAttribute('stroke-dasharray', dash);
+      liveGrid.appendChild(node);
+      return node;
+    };
+    const text = (size, anchor = null, fill = 'var(--fg-muted, #697586)', weight = null) => {
+      const node = document.createElementNS(ns, 'text');
+      node.setAttribute('font-size', String(size));
+      node.setAttribute('fill', fill);
+      node.setAttribute('pointer-events', 'none');
+      node.setAttribute('style', 'user-select:none; -webkit-user-select:none;');
+      if (anchor) node.setAttribute('text-anchor', anchor);
+      if (weight) node.setAttribute('font-weight', weight);
+      liveGrid.appendChild(node);
+      return node;
+    };
+    cache = {
+      host: liveGrid,
+      minor: path('var(--grid-minor, #e8edf2)', 0.75),
+      major: path('var(--border, #d9dfe7)', 1),
+      axisX: path('#557187', 2, '6 4'),
+      axisY: path('#557187', 1.5),
+      radialLabels: [],
+      axialLabels: [],
+      rotationLabel: text(12, null, '#405e75', 600),
+      zeroLabel: text(12, 'end', '#405e75'),
+      radialUnit: text(12, 'end'),
+      axialUnit: text(12),
+      nodes: [],
+    };
+    cache.nodes = [
+      cache.minor, cache.major, cache.axisX, cache.axisY,
+      cache.rotationLabel, cache.zeroLabel, cache.radialUnit, cache.axialUnit,
+    ];
+    liveGrid.__ngsolveSketchGridCache = cache;
+    return cache;
+  };
+  const setSvgValue = (node, name, value) => {
+    const text = String(value);
+    if (node.getAttribute(name) !== text) node.setAttribute(name, text);
+  };
+  const setGridLabel = (node, x, y, value, visible = true) => {
+    setSvgValue(node, 'x', Number(x.toFixed(2)));
+    setSvgValue(node, 'y', Number(y.toFixed(2)));
+    if (node.textContent !== value) node.textContent = value;
+    const display = visible ? 'inline' : 'none';
+    if (node.getAttribute('display') !== display) node.setAttribute('display', display);
+  };
+  const pooledLabel = (cache, pool, index, anchor) => {
+    while (pool.length <= index) {
+      const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      label.setAttribute('font-size', '16');
+      label.setAttribute('fill', 'var(--fg-muted, #697586)');
+      label.setAttribute('pointer-events', 'none');
+      label.setAttribute('style', 'user-select:none; -webkit-user-select:none;');
+      label.setAttribute('text-anchor', anchor);
+      cache.host.appendChild(label);
+      pool.push(label);
+      cache.nodes.push(label);
+    }
+    return pool[index];
+  };
   const drawLiveGrid = (svg, scale, tx, ty) => {
     const settings = window.__ngsolveSketchLiveGrid;
     const staticGrid = svg && svg.querySelector('#solve-sketch-grid');
     const liveGrid = svg && svg.querySelector('#solve-sketch-live-grid');
     if (!settings || !staticGrid || !liveGrid) return;
-    staticGrid.setAttribute('visibility', 'hidden');
-    liveGrid.setAttribute('display', 'inline');
-    while (liveGrid.firstChild) liveGrid.removeChild(liveGrid.firstChild);
+    if (staticGrid.getAttribute('visibility') !== 'hidden') staticGrid.setAttribute('visibility', 'hidden');
+    if (liveGrid.getAttribute('display') !== 'inline') liveGrid.setAttribute('display', 'inline');
 
     const width = settings.width;
     const height = settings.height;
@@ -1585,66 +1673,67 @@ class SolveWorkspace(Div):
     if (!(minorPixels > 0) || !Number.isFinite(minorPixels)) return;
     const axisX = settings.originX * scale + tx;
     const axisY = settings.originY * scale + ty;
-    const ns = 'http://www.w3.org/2000/svg';
-    const addLine = (x1, y1, x2, y2, stroke, strokeWidth, dash = null) => {
-      const line = document.createElementNS(ns, 'line');
-      for (const [key, value] of Object.entries({x1, y1, x2, y2, stroke, 'stroke-width': strokeWidth})) {
-        line.setAttribute(key, String(value));
-      }
-      if (dash) line.setAttribute('stroke-dasharray', dash);
-      liveGrid.appendChild(line);
-    };
-    const addText = (x, y, text, options = {}) => {
-      const label = document.createElementNS(ns, 'text');
-      label.setAttribute('x', String(x));
-      label.setAttribute('y', String(y));
-      label.setAttribute('fill', options.fill || 'var(--fg-muted, #697586)');
-      label.setAttribute('font-size', String(options.size || 12));
-      if (options.anchor) label.setAttribute('text-anchor', options.anchor);
-      if (options.weight) label.setAttribute('font-weight', options.weight);
-      label.textContent = text;
-      liveGrid.appendChild(label);
-    };
+    const cache = gridCacheFor(liveGrid);
     const format = value => Number(value.toPrecision(5)).toString();
+    const minorSegments = [];
+    const majorSegments = [];
 
     const radialMin = Math.max(0, Math.ceil((-axisX / minorPixels) - 1e-9));
     const radialMax = Math.min(500, Math.floor(((width - axisX) / minorPixels) + 1e-9));
+    let radialLabelIndex = 0;
     for (let index = radialMin; index <= radialMax; index += 1) {
       const x = axisX + index * minorPixels;
       if (index === 0) continue;
       if (index % 5 === 0) {
-        addLine(x, 0, x, height, 'var(--border, #d9dfe7)', 1);
+        majorSegments.push('M' + x.toFixed(2) + ' 0V' + height);
         const radius = (index / 5) * majorStep;
-        addText(Math.min(Math.max(x, 28), width - 28), height - 5, format(radius), {anchor: 'middle', size: 16});
+        const label = pooledLabel(cache, cache.radialLabels, radialLabelIndex, 'middle');
+        setGridLabel(label, Math.min(Math.max(x, 28), width - 28), height - 5, format(radius));
+        radialLabelIndex += 1;
       } else {
-        addLine(x, 0, x, height, 'var(--grid-minor, #e8edf2)', 0.75);
+        minorSegments.push('M' + x.toFixed(2) + ' 0V' + height);
       }
+    }
+    for (let index = radialLabelIndex; index < cache.radialLabels.length; index += 1) {
+      setGridLabel(cache.radialLabels[index], 0, 0, '', false);
     }
 
     const axialMin = Math.max(-500, Math.ceil(((axisY - height) / minorPixels) - 1e-9));
     const axialMax = Math.min(500, Math.floor((axisY / minorPixels) + 1e-9));
+    let axialLabelIndex = 0;
     for (let index = axialMin; index <= axialMax; index += 1) {
       const y = axisY - index * minorPixels;
       if (index === 0) continue;
       if (index % 5 === 0) {
-        addLine(0, y, width, y, 'var(--border, #d9dfe7)', 1);
+        majorSegments.push('M0 ' + y.toFixed(2) + 'H' + width);
         const axial = (index / 5) * majorStep;
-        addText(6, Math.min(Math.max(y + 4, 12), height - 3), format(axial), {size: 16});
+        const label = pooledLabel(cache, cache.axialLabels, axialLabelIndex, 'start');
+        setGridLabel(label, 6, Math.min(Math.max(y + 4, 12), height - 3), format(axial));
+        axialLabelIndex += 1;
       } else {
-        addLine(0, y, width, y, 'var(--grid-minor, #e8edf2)', 0.75);
+        minorSegments.push('M0 ' + y.toFixed(2) + 'H' + width);
       }
     }
+    for (let index = axialLabelIndex; index < cache.axialLabels.length; index += 1) {
+      setGridLabel(cache.axialLabels[index], 0, 0, '', false);
+    }
 
-    if (axisX >= 0 && axisX <= width) {
-      addLine(axisX, 0, axisX, height, '#557187', 2, '6 4');
-      addText(axisX + 7, 15, 'Axis of rotation  ·  r = 0', {fill: '#405e75', size: 12, weight: 600});
-    }
-    if (axisY >= 0 && axisY <= height) {
-      addLine(0, axisY, width, axisY, '#557187', 1.5);
-      addText(width - 4, axisY - 5, 'z = 0', {fill: '#405e75', anchor: 'end'});
-    }
-    addText(width - 6, height - 8, 'r  [m]', {anchor: 'end'});
-    addText(8, 15, 'z  [m]');
+    setSvgValue(cache.minor, 'd', minorSegments.join(''));
+    setSvgValue(cache.major, 'd', majorSegments.join(''));
+    setSvgValue(cache.axisX, 'd', axisX >= 0 && axisX <= width
+      ? 'M' + axisX.toFixed(2) + ' 0V' + height : '');
+    setSvgValue(cache.axisY, 'd', axisY >= 0 && axisY <= height
+      ? 'M0 ' + axisY.toFixed(2) + 'H' + width : '');
+    setGridLabel(
+      cache.rotationLabel, axisX + 7, 15, 'Axis of rotation  -  r = 0',
+      axisX >= 0 && axisX <= width,
+    );
+    setGridLabel(
+      cache.zeroLabel, width - 4, axisY - 5, 'z = 0',
+      axisY >= 0 && axisY <= height,
+    );
+    setGridLabel(cache.radialUnit, width - 6, height - 8, 'r  [m]');
+    setGridLabel(cache.axialUnit, 8, 15, 'z  [m]');
   };
   const applyCanvasTransform = (scale, tx, ty, svg = currentSvg()) => {
     if (!svg) return;
@@ -1673,10 +1762,7 @@ class SolveWorkspace(Div):
     const staticGrid = svg.querySelector('#solve-sketch-grid');
     const liveGrid = svg.querySelector('#solve-sketch-live-grid');
     if (staticGrid) staticGrid.removeAttribute('visibility');
-    if (liveGrid) {
-      liveGrid.setAttribute('display', 'none');
-      while (liveGrid.firstChild) liveGrid.removeChild(liveGrid.firstChild);
-    }
+    if (liveGrid) liveGrid.setAttribute('display', 'none');
     for (const regionId of committedRegionOffsets.keys()) {
       for (const shape of svg.querySelectorAll('[data-sketch-region-id]')) {
         if (shape.getAttribute('data-sketch-region-id') === regionId) {
@@ -1686,6 +1772,35 @@ class SolveWorkspace(Div):
     }
     committedRegionOffsets.clear();
   };
+  const removeViewCommitSnapshot = (svg = currentSvg()) => {
+    const snapshot = svg && svg.querySelector('[data-sketch-view-commit-snapshot="true"]');
+    if (snapshot) snapshot.remove();
+  };
+  const beginViewCommitSnapshot = () => {
+    const svg = currentSvg();
+    if (!svg || svg.querySelector('[data-sketch-view-commit-snapshot="true"]')) return false;
+    if (Math.abs(visualScale - 1) < 1e-12
+        && Math.abs(visualTranslateX) < 1e-9
+        && Math.abs(visualTranslateY) < 1e-9) return false;
+    const snapshot = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    snapshot.setAttribute('data-sketch-view-commit-snapshot', 'true');
+    snapshot.setAttribute('pointer-events', 'none');
+    for (const id of [
+      'solve-sketch-grid', 'solve-sketch-live-grid',
+      'solve-sketch-scene', 'solve-sketch-dimensions', 'solve-sketch-preview',
+    ]) {
+      const layer = svg.querySelector('#' + id);
+      if (!layer) continue;
+      const copy = layer.cloneNode(true);
+      copy.removeAttribute('id');
+      copy.querySelectorAll('[id]').forEach(node => node.removeAttribute('id'));
+      snapshot.appendChild(copy);
+    }
+    svg.appendChild(snapshot);
+    return true;
+  };
+  window.__ngsolveBeginSketchViewCommit = beginViewCommitSnapshot;
+
   const remember = (event) => {
     window.__ngsolveSketchPointer = [event.clientX, event.clientY];
     const targetRegion = event.target && event.target.closest
@@ -1716,6 +1831,31 @@ class SolveWorkspace(Div):
     }
     if (pointerEvents.length > 256) pointerEvents.splice(0, pointerEvents.length - 256);
   };
+  const updateHover = (event, svg) => {
+    if (!svg || !window.__ngsolveSketchBoundarySelection) return;
+    const target = document.elementFromPoint(event.clientX, event.clientY);
+    const edgeHit = target && target.closest ? target.closest('[data-sketch-edge-role="hit"]') : null;
+    const regionHit = !edgeHit && target && target.closest ? target.closest('[data-sketch-region-role="shape"]') : null;
+    const edgeId = edgeHit ? edgeHit.getAttribute('data-sketch-edge-id') : null;
+    const regionId = regionHit ? regionHit.getAttribute('data-sketch-region-id') : null;
+    if (window.__ngsolveSketchHoveredEdgeId === edgeId && window.__ngsolveSketchHoveredRegionId === regionId) return;
+    window.__ngsolveSketchHoveredEdgeId = edgeId;
+    window.__ngsolveSketchHoveredRegionId = regionId;
+    svg.querySelectorAll('[data-sketch-edge-role="visible"]').forEach((line) => {
+      const selected = line.getAttribute('data-sketch-selected') === 'true';
+      const highlighted = line.getAttribute('data-sketch-condition-highlight') === 'true';
+      const hovered = line.getAttribute('data-sketch-edge-id') === edgeId;
+      line.setAttribute('stroke', selected ? '#0877b9' : (hovered ? '#e29a12' : (highlighted ? '#c66f16' : '#263746')));
+      line.setAttribute('stroke-width', selected ? '3.2' : (hovered ? '3.1' : (highlighted ? '2.2' : '1.6')));
+    });
+    svg.querySelectorAll('[data-sketch-region-role="shape"]').forEach((shape) => {
+      const selected = shape.getAttribute('data-sketch-selected') === 'true';
+      const hovered = shape.getAttribute('data-sketch-region-id') === regionId;
+      shape.setAttribute('fill-opacity', selected ? '0.48' : (hovered ? '0.40' : '0.33'));
+      shape.setAttribute('stroke', selected ? '#1b73ae' : (hovered ? '#17824b' : '#344658'));
+      shape.setAttribute('stroke-width', selected ? '2.6' : (hovered ? '2.8' : '1.6'));
+    });
+  };
   const svgPoint = (svg, event) => {
     const point = svg.createSVGPoint();
     point.x = event.clientX;
@@ -1725,12 +1865,18 @@ class SolveWorkspace(Div):
     const mapped = point.matrixTransform(matrix.inverse());
     return [mapped.x, mapped.y];
   };
+  const regionElements = (svg, regionId) => {
+    if (!svg || !regionId) return [];
+    const escaped = window.CSS && window.CSS.escape
+      ? window.CSS.escape(String(regionId))
+      : String(regionId).replace(/[\"\\]/g, '\\$&');
+    return svg.querySelectorAll('[data-sketch-region-id=\"' + escaped + '\"]');
+  };
   const setRegionOffset = (svg, regionId, offset) => {
     if (!svg || !regionId) return;
-    for (const shape of svg.querySelectorAll('[data-sketch-region-id]')) {
-      if (shape.getAttribute('data-sketch-region-id') !== regionId) continue;
+    for (const shape of regionElements(svg, regionId)) {
       if (offset && (offset[0] !== 0 || offset[1] !== 0)) {
-        shape.setAttribute('transform', `translate(${offset[0]} ${offset[1]})`);
+        shape.setAttribute('transform', 'translate(' + offset[0] + ' ' + offset[1] + ')');
       } else {
         shape.removeAttribute('transform');
       }
@@ -1738,6 +1884,10 @@ class SolveWorkspace(Div):
   };
   const clearPreview = (svg = currentSvg(), resetView = true, preserveCommitted = false) => {
     if (!svg) return;
+    if (dragRegionId && window.__ngsolveSketchSelectedRegionId === dragRegionId) {
+      const dimensions = svg.querySelector('#solve-sketch-dimensions');
+      if (dimensions) dimensions.removeAttribute('transform');
+    }
     for (const id of ['solve-sketch-drag-rect', 'solve-sketch-drag-circle']) {
       const shape = svg.querySelector('#' + id);
       if (shape) shape.setAttribute('display', 'none');
@@ -1791,6 +1941,13 @@ class SolveWorkspace(Div):
           const totalY = baseOffset[1] + dy;
           if (totalX === 0 && totalY === 0) shape.removeAttribute('transform');
           else shape.setAttribute('transform', `translate(${totalX} ${totalY})`);
+        }
+      }
+      if (window.__ngsolveSketchSelectedRegionId === dragRegionId) {
+        const dimensions = svg.querySelector('#solve-sketch-dimensions');
+        if (dimensions) {
+          if (dx === 0 && dy === 0) dimensions.removeAttribute('transform');
+          else dimensions.setAttribute('transform', `translate(${dx} ${dy})`);
         }
       }
       return;
@@ -1873,25 +2030,29 @@ class SolveWorkspace(Div):
     const edge = event.target && event.target.closest
       ? event.target.closest('[data-sketch-edge-id]')
       : null;
-    dragRegionId = (window.__ngsolveSketchTool || 'select') === 'select' && region
+    const selectionEnabled = (window.__ngsolveSketchTool || 'select') === 'select'
+      || Boolean(window.__ngsolveSketchBoundarySelection);
+    dragRegionId = selectionEnabled && region
       ? region.getAttribute('data-sketch-region-id')
       : null;
-    dragEdgeId = (window.__ngsolveSketchTool || 'select') === 'select' && edge
+    dragEdgeId = selectionEnabled && edge
       ? edge.getAttribute('data-sketch-edge-id')
       : null;
     window.__ngsolveSketchLastRegionId = dragRegionId;
     const tool = window.__ngsolveSketchTool || 'select';
     dragMode = middlePan
       ? 'pan'
-      : tool !== 'select'
+      : tool !== 'select' && !window.__ngsolveSketchBoundarySelection
         ? 'draw'
-        : (event.shiftKey || event.ctrlKey)
-          ? 'marquee'
-          : dragEdgeId
-            ? 'edge'
-            : dragRegionId
-              ? 'region'
-              : 'marquee';
+        : window.__ngsolveSketchBoundarySelection
+          ? (dragEdgeId ? 'edge' : (dragRegionId ? 'region' : 'boundary'))
+          : (event.shiftKey || event.ctrlKey)
+            ? 'marquee'
+            : dragEdgeId
+              ? 'edge'
+              : dragRegionId
+                ? 'region'
+                : 'marquee';
     window.__ngsolveSketchGestureActive = true;
     if (dragMode === 'pan') svg.style.cursor = 'grabbing';
     if (tool === 'select' && !middlePan) {
@@ -2012,34 +2173,71 @@ class SolveWorkspace(Div):
     const svg = currentSvg();
     setRegionOffset(svg, regionId, offset);
     const dimensions = svg && svg.querySelector('#solve-sketch-dimensions');
-    const selected = window.__ngsolveSketchSelectedRegionId;
-    if (dimensions && selected === regionId) {
-      if (offset[0] || offset[1]) dimensions.setAttribute('transform', `translate(${offset[0]} ${offset[1]})`);
-      else dimensions.removeAttribute('transform');
-    }
+    if (dimensions) dimensions.removeAttribute('transform');
   };
   window.__ngsolveSyncSketchDimensionOffset = (regionId) => {
     const svg = currentSvg();
     const dimensions = svg && svg.querySelector('#solve-sketch-dimensions');
     if (!dimensions) return;
     window.__ngsolveSketchSelectedRegionId = regionId || null;
-    const offset = regionId ? committedRegionOffsets.get(regionId) : null;
-    if (offset && (offset[0] || offset[1])) dimensions.setAttribute('transform', `translate(${offset[0]} ${offset[1]})`);
-    else dimensions.removeAttribute('transform');
+    // Dimension markup is regenerated from the model's current geometry, so it
+    // already includes every committed region move. Only active drag preview
+    // deltas should temporarily translate it.
+    dimensions.removeAttribute('transform');
   };
   window.__ngsolveRollbackSketchRegionMove = (regionId) => {
     const svg = currentSvg();
     setRegionOffset(svg, regionId, committedRegionOffsets.get(regionId) || null);
     const dimensions = svg && svg.querySelector('#solve-sketch-dimensions');
-    if (dimensions && window.__ngsolveSketchSelectedRegionId === regionId) {
-      const offset = committedRegionOffsets.get(regionId);
-      if (offset && (offset[0] || offset[1])) dimensions.setAttribute('transform', `translate(${offset[0]} ${offset[1]})`);
-      else dimensions.removeAttribute('transform');
-    }
+    if (dimensions) dimensions.removeAttribute('transform');
   };
-  window.__ngsolveResetSketchPreview = () => {
-    if (active) return;
-    clearPreview(currentSvg());
+  window.__ngsolveResetSketchPreview = (expectedRenderVersion) => {
+    const token = ++pendingViewResetToken;
+    const expected = Number(expectedRenderVersion);
+    const hasExpected = Number.isFinite(expected);
+    const ready = (svg) => {
+      if (!hasExpected) return true;
+      if (Number(svg.getAttribute('data-sketch-render-version') || 0) < expected) return false;
+      const layers = [
+        ['solve-sketch-grid', 'data-sketch-grid-revision'],
+        ['solve-sketch-scene', 'data-sketch-scene-revision'],
+        ['solve-sketch-dimensions', 'data-sketch-dimensions-revision'],
+      ];
+      return layers.every(([id, revisionAttribute]) => {
+        const node = svg.querySelector('#' + id);
+        const revision = Number(svg.getAttribute(revisionAttribute) || 0);
+        return node && Number(node.getAttribute('data-sketch-render-version') || 0) >= revision;
+      });
+    };
+    const waitForRenderedView = () => {
+      if (token !== pendingViewResetToken) return;
+      if (active) {
+        requestAnimationFrame(waitForRenderedView);
+        return;
+      }
+      const svg = currentSvg();
+      if (!svg) return;
+      if (!ready(svg)) {
+        requestAnimationFrame(waitForRenderedView);
+        return;
+      }
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        if (token !== pendingViewResetToken) return;
+        if (active) {
+          requestAnimationFrame(waitForRenderedView);
+          return;
+        }
+        const current = currentSvg();
+        if (!current) return;
+        if (!ready(current)) {
+          requestAnimationFrame(waitForRenderedView);
+          return;
+        }
+        clearPreview(current);
+        removeViewCommitSnapshot(current);
+      }));
+    };
+    waitForRenderedView();
   };
   const handleWheel = (event, svg) => {
     if (!targetIsSvg(event, svg)) return;
@@ -2054,9 +2252,15 @@ class SolveWorkspace(Div):
     if (!point) return;
     const clampedDelta = Math.max(-300, Math.min(300, delta));
     const factor = Math.exp(-clampedDelta * 0.0015);
-    const tx = point[0] + factor * (visualTranslateX - point[0]);
+    const nextScale = visualScale * factor;
+    let tx = point[0] + factor * (visualTranslateX - point[0]);
+    const grid = window.__ngsolveSketchLiveGrid;
+    const maxAxisX = grid ? Number(grid.negativeRBufferPx) : NaN;
+    if (grid && Number.isFinite(maxAxisX) && Number.isFinite(grid.originX)) {
+      tx = Math.min(tx, maxAxisX - nextScale * grid.originX);
+    }
     const ty = point[1] + factor * (visualTranslateY - point[1]);
-    applyCanvasTransform(visualScale * factor, tx, ty, svg);
+    applyCanvasTransform(nextScale, tx, ty, svg);
     if (wheelCommitTimer) window.clearTimeout(wheelCommitTimer);
     wheelCommitTimer = window.setTimeout(() => {
       wheelCommitTimer = 0;
@@ -2100,12 +2304,19 @@ class SolveWorkspace(Div):
       return;
     }
     if (!active) return;
-    if (event.type === 'mousemove') moveGesture(event, svg);
+    if (event.type === 'mousemove') {
+      updateHover(event, svg);
+      moveGesture(event, svg);
+    }
     if (event.type === 'mouseup') finishGesture(event, svg);
   };
   if (pointerSupported) {
     document.addEventListener('pointerdown', event => beginGesture(event, currentSvg()), true);
-    document.addEventListener('pointermove', event => moveGesture(event, currentSvg()), true);
+    document.addEventListener('pointermove', event => {
+      const svg = currentSvg();
+      updateHover(event, svg);
+      moveGesture(event, svg);
+    }, true);
     document.addEventListener('pointerup', event => finishGesture(event, currentSvg()), true);
     document.addEventListener('pointercancel', event => finishGesture(event, currentSvg(), true), true);
     document.addEventListener('lostpointercapture', event => {
@@ -2240,7 +2451,7 @@ class SolveWorkspace(Div):
             return
         if button not in {0, 1}:
             return
-        tool = self.sketch_tool
+        tool = "select" if self.active_section == "boundaries" else self.sketch_tool
         middle_pan = button == 1
         # Resolve the hit target before _canvas_event_point consumes the
         # matching browser pointer record to obtain clientX/clientY.
@@ -2255,12 +2466,17 @@ class SolveWorkspace(Div):
         if not middle_pan:
             if tool != "select":
                 point = self._snap_canvas_point(point)
-            elif not region_id and not browser_hit_is_known:
-                region_id = self._region_at_canvas_point(point)
+            else:
+                if self.active_section == "boundaries":
+                    edge_id = edge_id or self._edge_at_canvas_point(point)
+                if not region_id and not browser_hit_is_known:
+                    region_id = self._region_at_canvas_point(point)
         if middle_pan:
             operation = "pan"
         elif tool != "select":
             operation = "draw"
+        elif self.active_section == "boundaries":
+            operation = "edge" if edge_id else ("region" if region_id else "boundary")
         elif value.get("shiftKey") or value.get("ctrlKey"):
             operation = "marquee"
         elif edge_id:
@@ -2284,7 +2500,7 @@ class SolveWorkspace(Div):
         # retarget the eventual click away from the SVG region element. Doing
         # selection here makes a simple viewport press reliable and exposes
         # that region's properties before the pointer is released.
-        if operation == "region" and region_id:
+        if operation == "region" and region_id and self.active_section != "boundaries":
             self.select_region(region_id)
 
     def _region_at_canvas_point(self, point):
@@ -2298,6 +2514,28 @@ class SolveWorkspace(Div):
             and _point_in_or_on_polygon(world_point, region["vertices"])
         ]
         return min(candidates)[1] if candidates else None
+
+    def _edge_at_canvas_point(self, point, tolerance=7.0):
+        """Hit-test edges in viewport pixels before falling back to regions."""
+        project, _ = self._canvas_projection()
+        x, y = float(point[0]), float(point[1])
+        candidates = []
+        for order, edge in enumerate(self.model["geometry"].get("edges", [])):
+            vertices = edge.get("vertices", [])
+            if len(vertices) != 2:
+                continue
+            (x1, y1), (x2, y2) = (project(vertex) for vertex in vertices)
+            dx, dy = x2 - x1, y2 - y1
+            length_squared = dx * dx + dy * dy
+            if length_squared <= 1e-18:
+                distance_squared = (x - x1) ** 2 + (y - y1) ** 2
+            else:
+                fraction = min(1.0, max(0.0, ((x - x1) * dx + (y - y1) * dy) / length_squared))
+                nearest_x, nearest_y = x1 + fraction * dx, y1 + fraction * dy
+                distance_squared = (x - nearest_x) ** 2 + (y - nearest_y) ** 2
+            if distance_squared <= tolerance * tolerance:
+                candidates.append((distance_squared, order, edge["id"]))
+        return min(candidates)[2] if candidates else None
 
     def _on_canvas_mouse_move(self, event):
         if self._canvas_drag is None:
@@ -2334,6 +2572,25 @@ class SolveWorkspace(Div):
             except (TypeError, ValueError, OverflowError):
                 completed = None
             else:
+                pending_drag = self._canvas_drag or {}
+                if self.active_section == "boundaries":
+                    region_id = region_id or pending_drag.get("region_id")
+                    edge_id = edge_id or pending_drag.get("edge_id")
+                    self._canvas_drag = None
+                    self._screen_to_svg = None
+                    view_changed = self._commit_browser_canvas_view(
+                        view, render=False, clamp_negative_r=True
+                    )
+                    if not moved:
+                        if edge_id:
+                            self.toggle_boundary_stage_edge(edge_id)
+                        elif region_id:
+                            self.add_boundary_stage_region(region_id)
+                    if view_changed:
+                        self._render_canvas_after_interaction()
+                    elif moved and operation == "pan":
+                        self._schedule_canvas_interaction_reset()
+                    return
                 self._canvas_drag = None
                 self._screen_to_svg = None
                 if moved and operation in {"region", "edge"} and region_id:
@@ -2342,25 +2599,27 @@ class SolveWorkspace(Div):
                     # visible during the drag. If a wheel transform was still
                     # pending, commit it after the region move and redraw once.
                     if self._commit_browser_canvas_view(view, render=False):
-                        self.render_canvas()
+                        self._render_canvas_after_interaction()
                 elif moved and operation == "marquee":
                     view_changed = self._commit_browser_canvas_view(view, render=False)
                     self._select_edges_in_canvas_box(start, end, additive=additive)
                     if view_changed:
-                        self.render_canvas()
+                        self._render_canvas_after_interaction()
                 elif moved and operation == "pan":
-                    self._commit_browser_canvas_view(
+                    view_changed = self._commit_browser_canvas_view(
                         view, render=False, clamp_negative_r=True
                     )
-                    # The pan has already been applied to the local SVG matrix.
-                    self.render_canvas()
+                    if view_changed:
+                        self._render_canvas_after_interaction()
+                    else:
+                        self._schedule_canvas_interaction_reset()
                 elif moved and operation == "draw":
                     view_changed = self._commit_browser_canvas_view(view, render=False)
                     region_count = len(self.model["geometry"].get("regions", []))
                     self._create_region_from_canvas_drag(tool, start, end)
                     if len(self.model["geometry"].get("regions", [])) == region_count:
                         if view_changed:
-                            self.render_canvas()
+                            self._render_canvas_after_interaction()
                         else:
                             self._schedule_canvas_interaction_reset()
                 elif edge_id:
@@ -2369,7 +2628,7 @@ class SolveWorkspace(Div):
                     if self.selected_region_id != region_id:
                         self.select_region(region_id)
                 elif self._commit_browser_canvas_view(view, render=False):
-                    self.render_canvas()
+                    self._render_canvas_after_interaction()
                 return
         drag = self._canvas_drag
         if drag is None:
@@ -2384,6 +2643,13 @@ class SolveWorkspace(Div):
         moved = math.hypot(end[0] - start[0], end[1] - start[1]) >= 4.0
         self._canvas_drag = None
         self._screen_to_svg = None
+        if self.active_section == "boundaries":
+            if not moved:
+                if drag.get("edge_id"):
+                    self.toggle_boundary_stage_edge(drag["edge_id"])
+                elif drag.get("region_id"):
+                    self.add_boundary_stage_region(drag["region_id"])
+            return
         if moved and drag["operation"] in {"region", "edge"} and drag.get("region_id"):
             self._move_region_from_canvas_drag(drag["region_id"], start, end)
         elif moved and drag["operation"] == "marquee":
@@ -3280,6 +3546,22 @@ class SolveWorkspace(Div):
         self._sync_canvas_selection()
         self._render_canvas_dimensions()
 
+    def _on_canvas_region_click(self, region_id, event=None):
+        if self.active_section == "boundaries":
+            # Boundary-stage selection is committed on pointer release; the
+            # following native click must not apply the same action twice.
+            return
+        self.select_region(region_id)
+
+    def _on_canvas_edge_click(self, edge_id, event=None):
+        if self.active_section == "boundaries":
+            # In this stage pointer release handles edge toggles. A second
+            # native click would immediately undo the just-applied toggle.
+            return
+        value = getattr(event, "value", None) or {}
+        additive = isinstance(value, dict) and bool(value.get("shiftKey") or value.get("ctrlKey"))
+        self.select_edge(edge_id, additive=additive)
+
     def select_edge(self, edge_id, additive=False):
         if additive:
             selected = list(self.selected_edge_ids)
@@ -3303,6 +3585,69 @@ class SolveWorkspace(Div):
         self._sync_canvas_selection()
         self._render_canvas_dimensions()
 
+    def _set_boundary_stage_selection(self, edge_ids):
+        live_edge_ids = {edge["id"] for edge in self.model.get("geometry", {}).get("edges", [])}
+        self.selected_edge_ids = list(dict.fromkeys(edge_id for edge_id in edge_ids if edge_id in live_edge_ids))
+        self.selected_edge_id = self.selected_edge_ids[-1] if self.selected_edge_ids else None
+        self.selected_region_id = None
+        self._selected_condition_id = self.selected_boundary_id
+        self.active_section = "boundaries"
+        self.layout["active_section"] = self.active_section
+        self._update_model_tree_selection()
+        self._sync_canvas_selection()
+        self._render_canvas_dimensions()
+        self._sync_boundary_selection_controls()
+
+    def add_boundary_stage_region(self, region_id):
+        """Add all boundary edges associated with a clicked region."""
+        region = next((item for item in self.model.get("geometry", {}).get("regions", []) if item.get("id") == region_id), None)
+        if region is None:
+            return
+        self._set_boundary_stage_selection([*self.selected_edge_ids, *region.get("edge_ids", [])])
+
+    def toggle_boundary_stage_edge(self, edge_id):
+        """Toggle one edge independently of how it entered the selection."""
+        live_edge_ids = {edge["id"] for edge in self.model.get("geometry", {}).get("edges", [])}
+        if edge_id not in live_edge_ids:
+            return
+        selected = list(self.selected_edge_ids)
+        if edge_id in selected:
+            selected.remove(edge_id)
+        else:
+            selected.append(edge_id)
+        self._set_boundary_stage_selection(selected)
+
+    def _sync_boundary_selection_controls(self):
+        summary = getattr(self, "_boundary_selection_summary", None)
+        button = getattr(self, "_boundary_apply_selection_button", None)
+        if summary is None or button is None:
+            return
+        selected_count = len(self.selected_edge_ids)
+        condition = next((item for item in self.model.get("boundary_conditions", []) if item.get("id") == self.selected_boundary_id), None)
+        if condition is None:
+            detail = "Add or select a condition in this panel, then apply it to the selected boundaries."
+            button.ui_label = f"Apply condition to {selected_count} selected boundaries"
+            button.ui_disable = selected_count == 0
+        else:
+            detail = f"Selected condition: {condition.get('name', 'Boundary condition')} · {selected_count} {'boundary' if selected_count == 1 else 'boundaries'} selected."
+            button.ui_label = f"Apply {condition.get('name', 'condition')} to {selected_count} selected boundaries"
+            button.ui_disable = selected_count == 0 or bool(condition.get("automatic_for_axis") or condition.get("automatic_for_mechanics"))
+        summary.ui_children = [
+            Div("Geometry selection", ui_style="font-size:10px; font-weight:700; letter-spacing:.06em; color:var(--fg-muted);"),
+            Div("Click a region to add all its boundaries. Click an edge to toggle just that edge.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+            Div(detail, ui_style="font-size:12px; font-weight:600; line-height:1.4; padding-top:4px;"),
+        ]
+
+    def _apply_selected_boundary_condition(self, *args):
+        condition = next((item for item in self.model.get("boundary_conditions", []) if item.get("id") == self.selected_boundary_id), None)
+        if condition is None or not self.selected_edge_ids:
+            return
+        if condition.get("automatic_for_axis") or condition.get("automatic_for_mechanics"):
+            self._message("Automatic boundary conditions cannot be assigned manually.", error=True)
+            return
+        physics = "mechanical" if str(condition.get("type", "")).startswith("mechanical_") else "electromagnetic"
+        self._set_edge_conditions(self.selected_edge_ids, physics, condition["id"])
+
     def _sync_canvas_selection(self):
         """Update selected sketch styling without replacing canvas geometry."""
         edge_ids = json.dumps(self.selected_edge_ids)
@@ -3319,18 +3664,24 @@ class SolveWorkspace(Div):
   const selectedEdges = new Set({edge_ids});
   const selectedRegion = {region_id};
   const highlightedEdges = new Set({highlighted_ids});
-  svg.querySelectorAll('[data-sketch-edge-id]').forEach((line) => {{
+  window.__ngsolveSketchBoundarySelection = {str(self.active_section == "boundaries").lower()};
+  svg.querySelectorAll('[data-sketch-edge-role="visible"]').forEach((line) => {{
     const id = line.getAttribute('data-sketch-edge-id');
     const selected = selectedEdges.has(id);
     const highlighted = highlightedEdges.has(id);
-    line.setAttribute('stroke', selected ? '#0877b9' : (highlighted ? '#c66f16' : '#263746'));
-    line.setAttribute('stroke-width', selected || highlighted ? '2.2' : '1.6');
+    line.setAttribute('data-sketch-selected', String(selected));
+    line.setAttribute('data-sketch-condition-highlight', String(highlighted));
+    const hovered = window.__ngsolveSketchBoundarySelection && window.__ngsolveSketchHoveredEdgeId === id;
+    line.setAttribute('stroke', selected ? '#0877b9' : (hovered ? '#e29a12' : (highlighted ? '#c66f16' : '#263746')));
+    line.setAttribute('stroke-width', selected ? '3.2' : (hovered ? '3.1' : (highlighted ? '2.2' : '1.6')));
   }});
-  svg.querySelectorAll('[data-sketch-region-id]').forEach((shape) => {{
+  svg.querySelectorAll('[data-sketch-region-role="shape"]').forEach((shape) => {{
     const selected = shape.getAttribute('data-sketch-region-id') === selectedRegion;
-    shape.setAttribute('fill-opacity', selected ? '0.48' : '0.33');
-    shape.setAttribute('stroke', selected ? '#1b73ae' : '#344658');
-    shape.setAttribute('stroke-width', selected ? '2.2' : '1.6');
+    const hovered = window.__ngsolveSketchBoundarySelection && window.__ngsolveSketchHoveredRegionId === shape.getAttribute('data-sketch-region-id');
+    shape.setAttribute('data-sketch-selected', String(selected));
+    shape.setAttribute('fill-opacity', selected ? '0.48' : (hovered ? '0.40' : '0.33'));
+    shape.setAttribute('stroke', selected ? '#1b73ae' : (hovered ? '#17824b' : '#344658'));
+    shape.setAttribute('stroke-width', selected ? '2.6' : (hovered ? '2.8' : '1.6'));
   }});
 }})()
 """
@@ -3949,6 +4300,16 @@ class SolveWorkspace(Div):
 
     def _boundary_properties(self):
         children = [_section_title("Boundary conditions", "Enter displacements in m, tractions in N/m², and stiffnesses in N/m³.")]
+        self._boundary_selection_summary = Div(ui_style="display:flex; flex-direction:column; gap:4px; padding:9px 10px; border:1px solid var(--border); border-radius:6px; background:var(--surface-subtle, #f7f9fb);")
+        self._boundary_apply_selection_button = _button(
+            "Apply condition to selected boundaries",
+            "mdi-vector-link",
+            self._apply_selected_boundary_condition,
+            color="primary",
+            style="width:100%; justify-content:flex-start; text-align:left;",
+            align="left",
+        )
+        children.extend([self._boundary_selection_summary, self._boundary_apply_selection_button])
         kinds = [
             ("axis_of_symmetry", "Axis of symmetry"),
             ("magnetic_potential_zero", "Magnetic potential = 0"),
@@ -3962,6 +4323,7 @@ class SolveWorkspace(Div):
         valid_ids = {item["id"] for item in conditions}
         if self.selected_boundary_id not in valid_ids:
             self.selected_boundary_id = conditions[0]["id"] if conditions else None
+        self._sync_boundary_selection_controls()
         if conditions:
             children.append(Div("Condition definitions · assigned edges", ui_style="font-size:10px; font-weight:700; color:var(--fg-muted); padding:3px 6px;"))
         else:
@@ -4013,7 +4375,7 @@ class SolveWorkspace(Div):
                     _input("Normal stiffness", condition.get("stiffness_normal", "0"), lambda event, bid=condition["id"]: self._set_boundary_value(bid, "stiffness_normal", event.value), suffix="N/m³"),
                     _input("Tangential stiffness", condition.get("stiffness_tangential", "0"), lambda event, bid=condition["id"]: self._set_boundary_value(bid, "stiffness_tangential", event.value), suffix="N/m³"),
                 ])
-            children.append(Div("Highlighted orange edges use this condition. Select edges in Geometry to assign or change their conditions.", ui_style="font-size:11px; line-height:1.45; color:var(--fg-muted);"))
+            children.append(Div("Condition type and values stay here. Select boundaries directly in the viewport, then use the apply button above.", ui_style="font-size:11px; line-height:1.45; color:var(--fg-muted);"))
             if condition.get("automatic_for_mechanics"):
                 children.append(Div(
                     "Assigned automatically where a mechanical region meets non-mechanical material. Shared mechanical interfaces use the default condition.",
@@ -4266,13 +4628,30 @@ class SolveWorkspace(Div):
         axial = round(axial / step) * step
         return project((radial, axial))
 
-    def _schedule_canvas_interaction_reset(self):
-        """Clear temporary SVG transforms after the committed scene is patched."""
+    def _render_canvas_after_interaction(self):
+        """Flush a committed interaction redraw in deterministic frontend order."""
+        with self._batch_frontend_updates():
+            self.render_canvas()
+
+    def _prepare_canvas_view_commit_snapshot(self):
+        """Hold the visible camera frame while the committed SVG is patched."""
         try:
+            return bool(self.js.eval(
+                "(() => { const begin = window.__ngsolveBeginSketchViewCommit; "
+                "return begin ? begin() : false; })()"
+            ))
+        except Exception:
+            # Standalone tests and non-browser frontends do not expose JS.
+            return False
+
+    def _schedule_canvas_interaction_reset(self):
+        """Reset browser transforms after the matching SVG render reaches the DOM."""
+        try:
+            version = int(getattr(self, "_canvas_view_render_version", 0))
             self.js.eval(
                 "(() => { const reset = window.__ngsolveResetSketchPreview; "
-                "if (!reset) return; "
-                "requestAnimationFrame(() => requestAnimationFrame(reset)); })()"
+                "if (reset) reset("
+                f"{version}); }})()"
             )
         except Exception:
             # Standalone tests and non-browser frontends do not expose JS.
@@ -4355,13 +4734,14 @@ class SolveWorkspace(Div):
                 "stroke": "#344658" if not selected else "#1b73ae",
                 "stroke_width": "2.2" if selected else "1.6",
                 "data_sketch_region_id": region_id,
+                "data_sketch_region_role": "shape",
                 "tabindex": "0",
                 "style": f"cursor:{region_cursor};",
             }
             shape = self._canvas_region_nodes.get(region_id)
             if shape is None:
                 shape = _svg("polygon", **props)
-                shape.on("click", lambda event, rid=region_id: self.select_region(rid))
+                shape.on("click", lambda event, rid=region_id: self._on_canvas_region_click(rid, event))
                 self._canvas_region_nodes[region_id] = shape
             else:
                 _update_svg_props(shape, **props)
@@ -4390,6 +4770,10 @@ class SolveWorkspace(Div):
             for region in regions
             for edge_id in region.get("edge_ids", [])
         }
+        highlighted_edges = {
+            edge["id"] for edge in self.model["geometry"].get("edges", [])
+            if self._selected_condition_id in _edge_condition_ids(edge)
+        }
         live_edge_ids = set()
         for edge in self.model["geometry"].get("edges", []):
             edge_id = edge["id"]
@@ -4405,6 +4789,9 @@ class SolveWorkspace(Div):
                 "stroke": edge_color,
                 "stroke_width": "2.2" if selected else "1.6",
                 "data_sketch_edge_id": edge_id,
+                "data_sketch_edge_role": "visible",
+                "data_sketch_selected": str(selected).lower(),
+                "data_sketch_condition_highlight": str(edge_id in highlighted_edges).lower(),
                 "data_sketch_region_id": region_id,
                 "style": "pointer-events:none;",
             }
@@ -4412,6 +4799,7 @@ class SolveWorkspace(Div):
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "stroke": "transparent", "stroke_width": "12",
                 "data_sketch_edge_id": edge_id,
+                "data_sketch_edge_role": "hit",
                 "data_sketch_region_id": region_id,
                 "style": f"cursor:{region_cursor}; pointer-events:stroke;",
             }
@@ -4419,10 +4807,7 @@ class SolveWorkspace(Div):
             if nodes is None:
                 visible = _svg("line", **visible_props)
                 hit = _svg("line", **hit_props)
-                hit.on("click", lambda event, eid=edge_id: self.select_edge(
-                    eid, additive=bool((getattr(event, "value", None) or {}).get("shiftKey", False)
-                        or (getattr(event, "value", None) or {}).get("ctrlKey", False))
-                ))
+                hit.on("click", lambda event, eid=edge_id: self._on_canvas_edge_click(eid, event))
                 nodes = (visible, hit)
                 self._canvas_edge_nodes[edge_id] = nodes
             else:
@@ -4433,7 +4818,8 @@ class SolveWorkspace(Div):
         for edge_id in self._canvas_edge_nodes.keys() - live_edge_ids:
             del self._canvas_edge_nodes[edge_id]
 
-        if grid_signature != self._canvas_grid_signature:
+        grid_changed = grid_signature != self._canvas_grid_signature
+        if grid_changed:
             self._canvas_grid.ui_children = grid_children
             self._canvas_grid_signature = grid_signature
         scene_component_ids = tuple(id(component) for component in scene_children)
@@ -4442,6 +4828,23 @@ class SolveWorkspace(Div):
             self._canvas_scene_component_ids = scene_component_ids
         self._render_canvas_dimensions()
         self._sync_canvas_interaction_settings()
+        self._canvas_view_render_version += 1
+        render_version = str(self._canvas_view_render_version)
+        if grid_changed:
+            self._canvas_grid_render_version = self._canvas_view_render_version
+            _update_svg_props(
+                self._canvas_grid,
+                data_sketch_render_version=str(self._canvas_grid_render_version),
+            )
+        _update_svg_props(self._canvas_scene, data_sketch_render_version=render_version)
+        _update_svg_props(self._canvas_dimensions, data_sketch_render_version=render_version)
+        _update_svg_props(
+            self._canvas,
+            data_sketch_render_version=render_version,
+            data_sketch_grid_revision=str(self._canvas_grid_render_version),
+            data_sketch_scene_revision=render_version,
+            data_sketch_dimensions_revision=render_version,
+        )
         self._schedule_canvas_interaction_reset()
 
     def _build_3d_preview_component(self):
