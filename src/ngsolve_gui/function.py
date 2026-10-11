@@ -80,11 +80,13 @@ class FunctionComponent(WebgpuTab):
         ):
             return None
         if deform.is_complex:
-            component = ngs.imag if complex_part == "imag" else ngs.real
+            component = "imag" if complex_part == "imag" else "real"
             if deform.dim == 1:
-                deform = component(deform)
+                deform = getattr(deform, component)
             else:
-                deform = ngs.CF(tuple(component(deform[index]) for index in range(deform.dim)))
+                deform = ngs.CF(
+                    tuple(getattr(deform[index], component) for index in range(deform.dim))
+                )
         if (
             deform.dim == 3
             and self.mesh.dim == 2

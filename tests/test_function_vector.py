@@ -19,6 +19,7 @@ from .helpers import (
     click_in_section,
     toggle_clipping,
 )
+from ngsolve_gui.function import FunctionComponent
 from ngsolve_gui.slice_view import ALL_REGIONS
 from ngsolve_gui.sections.vectors_flow import VectorsFlowSection
 
@@ -187,6 +188,38 @@ def test_function_fieldlines_2d(page: Page, app) -> None:
     np.random.seed(42)
     click_in_section(page, "Vectors & Flow", "Streamlines")
     assert_matches_baseline(page, comp.wgpu, "func_fieldlines_2d.png")
+
+def test_complex_vector_deformation_extracts_real_and_imaginary_components() -> None:
+    mesh = make_mesh_3d()
+    displacement = ngs.GridFunction(
+        ngs.VectorH1(mesh, order=1, dim=3, complex=True), name="Complex displacement"
+    )
+    displacement.Set(ngs.CF((1 + 2j, 3 + 4j, 5 + 6j)))
+    view = SimpleNamespace(mesh=mesh, _axisymmetric_solution=False)
+
+    real = FunctionComponent._resolve_deformation(view, displacement, "real")
+    imaginary = FunctionComponent._resolve_deformation(view, displacement, "imag")
+
+    assert real.dim == imaginary.dim == 3
+    assert not real.is_complex
+    assert not imaginary.is_complex
+    volume = ngs.Integrate(1, mesh, ngs.VOL)
+    real_means = [ngs.Integrate(real[index], mesh, ngs.VOL) / volume for index in range(3)]
+    imaginary_means = [
+        ngs.Integrate(imaginary[index], mesh, ngs.VOL) / volume
+        for index in range(3)
+    ]
+    expected_real = [
+        ngs.Integrate(displacement[index].real, mesh, ngs.VOL) / volume
+        for index in range(3)
+    ]
+    expected_imaginary = [
+        ngs.Integrate(displacement[index].imag, mesh, ngs.VOL) / volume
+        for index in range(3)
+    ]
+    assert np.allclose(real_means, expected_real)
+    assert np.allclose(imaginary_means, expected_imaginary)
+
 
 @app_test("ngsolve_gui.appconfig")
 def test_3d_vector_result_can_deform_geometry(page: Page, app) -> None:
