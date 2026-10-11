@@ -182,6 +182,17 @@ def field(label, control):
     return Div(Div(label, ui_class=cb.prop_flab), control, ui_class=cb.prop_field)
 
 
+def _component_display_names(comp):
+    """Return the labels used by vector component selectors."""
+    dim = getattr(comp.cf, "dim", 1)
+    names = getattr(comp, "component_names", None)
+    if names is not None and len(names) == dim:
+        return tuple(names)
+    if dim <= 3:
+        return tuple(["x", "y", "z"][:dim])
+    return tuple(str(index + 1) for index in range(dim))
+
+
 class ColorbarLegend(Div):
     """In-viewport colorbar legend (top-right corner). Shows the quantity, a
     vertical gradient and ticks; clicking it opens a popover to pick the
@@ -301,7 +312,7 @@ class ColorbarLegend(Div):
         if dim <= 1:
             return None
         if dim <= 3:
-            names = ["x", "y", "z"][:dim]
+            names = _component_display_names(comp)
             opts = [("norm", "|u|")] + [(str(i), names[i]) for i in range(dim)]
             return Div(Segmented(opts, "norm", self._set_component), ui_class=cb.legend_comp)
         # >3 components: |u| pill + dropdown (1..dim).
@@ -337,6 +348,8 @@ class ColorbarLegend(Div):
                 comp.elements2d.set_component(idx)
             if comp.clippingcf is not None:
                 comp.clippingcf.set_component(idx)
+            if getattr(comp, "slice_renderer", None) is not None:
+                comp.slice_renderer.set_component(idx)
             comp.colorbar.set_needs_update()
             comp.wgpu.scene.render()
         except Exception:
@@ -522,8 +535,12 @@ class FieldSummary(Div):
 
         # Showing — component selector for vectors, quantity text for scalars.
         if comp.cf.dim > 1:
-            comp_names = ["x", "y", "z"] if comp.cf.dim <= 3 else [str(i + 1) for i in range(comp.cf.dim)]
-            opts = [("norm", "|u|")] + [(str(i), f"u_{comp_names[i]}") for i in range(comp.cf.dim)]
+            comp_names = _component_display_names(comp)
+            opts = [("norm", "|u|")] + [
+                (str(i), comp_names[i] if getattr(comp, "component_names", None)
+                 else f"u_{comp_names[i]}")
+                for i in range(comp.cf.dim)
+            ]
             showing = Segmented(opts, "norm", self._set_component)
             rows.append(Div(Div("Showing", ui_class=cb.ps_lab),
                             Div(showing, ui_class=cb.grow), ui_class=cb.ps_row))
@@ -570,6 +587,8 @@ class FieldSummary(Div):
                 comp.elements2d.set_component(idx)
             if comp.clippingcf is not None:
                 comp.clippingcf.set_component(idx)
+            if getattr(comp, "slice_renderer", None) is not None:
+                comp.slice_renderer.set_component(idx)
             comp.colorbar.set_needs_update()
             comp.wgpu.scene.render()
         except Exception:

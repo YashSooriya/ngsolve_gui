@@ -1,0 +1,5644 @@
+"""Axisymmetric model authoring workspace."""
+
+from __future__ import annotations
+
+import copy
+from functools import wraps
+import json
+import math
+import os
+import re
+import time
+from contextlib import contextmanager
+from decimal import Decimal, ROUND_HALF_UP
+from threading import Lock, Timer, get_ident
+from pathlib import Path
+
+from ngapp.components import (
+    Component,
+    Div,
+    QBtn,
+    QBtnToggle,
+    QCheckbox,
+    QDialog,
+    QInput,
+    QSelect,
+    QSeparator,
+    QTooltip,
+    QCard,
+    QCardSection,
+    QSplitter,
+    QResizeObserver,
+    QIcon,
+    QList,
+    QItem,
+    QItemSection,
+    QMenu,
+)
+from ngapp.utils import EnvironmentType, get_environment
+
+from . import cerbsim_style as cb
+from .axisymmetric_model import (
+    builtin_materials,
+    evaluate_expression,
+    migrate_legacy_model,
+    migrate_legacy_studies,
+    new_id,
+    new_model,
+    new_studies,
+    validate_model,
+    validate_studies,
+)
+from .units import UNIT_OPTIONS
+from .material_library import MaterialLibrary
+
+
+_SECTIONS = [
+    ("geometry", "Geometry", "mdi-vector-square"),
+    ("parameters", "Parameters", "mdi-variable"),
+    ("materials", "Materials", "mdi-cube-scan"),
+    ("physics", "Physics & coupling", "mdi-magnet"),
+    ("boundaries", "Boundary conditions", "mdi-vector-link"),
+    ("sources", "Sources & loads", "mdi-flash-outline"),
+    ("mesh", "Mesh", "mdi-vector-triangle"),
+    ("solver", "Solver settings", "mdi-tune-variant"),
+    ("studies", "Study", "mdi-play-box-multiple-outline"),
+    ("runs", "Run history", "mdi-history"),
+]
+
+_TREE_GROUPS = (
+    ("MODEL", ("geometry", "parameters", "materials", "physics", "boundaries", "sources")),
+    ("ANALYSIS", ("mesh", "studies", "solver")),
+    ("RESULTS", ("runs",)),
+)
+
+_FREQUENCY_RESULT_SUFFIX = re.compile(r"_\d+_([0-9.eE+-]+)Hz$", re.IGNORECASE)
+_HIDDEN_RUN_HISTORY_FILE = ".mm_fem_hidden_run_history.json"
+_CANVAS_GRID_SUBDIVISIONS = 5
+_PREVIEW_VISIBILITY_ALPHA = {
+    "opaque": 1.0,
+    "translucent": 0.38,
+    "hidden": 0.0,
+}
+
+
+def _run_history_path_key(path):
+    """Return a stable key for a run output path across GUI restarts."""
+    return os.path.normcase(str(Path(path).expanduser().resolve()))
+
+
+def _load_hidden_run_history(root):
+    try:
+        data = json.loads((Path(root) / _HIDDEN_RUN_HISTORY_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return set()
+    paths = data.get("hidden_output_paths", []) if isinstance(data, dict) else []
+    return {
+        _run_history_path_key(path)
+        for path in paths
+        if isinstance(path, str) and path.strip()
+    }
+
+
+def _save_hidden_run_history(root, paths):
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    destination = root / _HIDDEN_RUN_HISTORY_FILE
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps({"schema": 1, "hidden_output_paths": sorted(paths)}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(destination)
+
+
+def _load_saved_run_history(root=None, limit=40):
+    """Recover prior GUI runs from their manifests or legacy output folders."""
+    root = Path(root) if root is not None else Path.home() / "NGSolve_results"
+    try:
+        directories = [path for path in root.iterdir() if path.is_dir()]
+        directories.sort(key=lambda path: path.stat().st_mtime)
+    except OSError:
+        return []
+
+    hidden_paths = _load_hidden_run_history(root)
+    runs = []
+    for directory in directories[-max(1, int(limit)):]:
+        if _run_history_path_key(directory) in hidden_paths:
+            continue
+        manifest_path = directory / "run_manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            manifest = None
+        if isinstance(manifest, dict) and manifest.get("schema") == "mm-fem.run":
+            kind = str(manifest.get("kind", "study")).title()
+            status = str(manifest.get("status", "complete")).title()
+            if status == "Running":
+                status = "Interrupted"
+            name = str(manifest.get("run_name") or f"{kind}: {manifest.get('model_name', directory.name)}")
+            finished = str(manifest.get("finished_utc") or manifest.get("created_utc") or "")
+        else:
+            has_project = any(directory.glob("*.ngsmodel"))
+            fields = list((directory / "ngsolve_gui" / "fields").glob("*.pkl")) if (directory / "ngsolve_gui" / "fields").is_dir() else []
+            has_mesh = (directory / "mesh.vol").is_file() or (directory / "mesh_preview.json").is_file()
+            if not (has_project or fields or has_mesh):
+                continue
+            kind = "Study" if fields else "Mesh"
+            status = "Complete" if fields or has_mesh else "Interrupted"
+            name = f"{kind}: {directory.name.rsplit('_', 1)[0]}"
+            finished = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(directory.stat().st_mtime))
+        runs.append({
+            "id": _run_history_path_key(directory),
+            "name": name,
+            "kind": kind,
+            "status": status,
+            "finished": finished,
+            "output_path": str(directory),
+        })
+    return runs
+
+_MATERIAL_COLORS = ["#6886ac", "#d58651", "#69a77b", "#ae8bb7", "#d1b44f", "#4cabb0"]
+
+
+def _history_tracked(method):
+    """Record one model snapshot around a top-level user edit."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        depth = getattr(self, "_history_transaction_depth", 0)
+        if depth:
+            self._history_transaction_depth = depth + 1
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                self._history_transaction_depth -= 1
+
+        before = self._capture_history_state()
+        self._history_transaction_depth = 1
+        failed = False
+        try:
+            return method(self, *args, **kwargs)
+        except Exception:
+            failed = True
+            raise
+        finally:
+            self._history_transaction_depth = 0
+            if not failed:
+                self._finish_history_transaction(before)
+
+    return wrapped
+
+
+def _round_sketch_m(value):
+    """Round mouse-derived geometry to 0.01 mm, represented in metres."""
+    return float(Decimal(str(value)).quantize(Decimal("0.00001"), rounding=ROUND_HALF_UP))
+
+
+def _mesh_signature(model):
+    """Describe only model inputs that can change the generated mesh."""
+    geometry = model.get("geometry", {}) if isinstance(model, dict) else {}
+    regions = []
+    for region in geometry.get("regions", []) if isinstance(geometry, dict) else []:
+        if not isinstance(region, dict):
+            regions.append(repr(region))
+            continue
+        shape = region.get("shape", {})
+        if not isinstance(shape, dict):
+            shape = {}
+        shape_type = shape.get("type")
+        dimension_keys = {
+            "rectangle": ("r_min", "z_min", "width", "height"),
+            "circle": ("r_center", "z_center", "radius"),
+        }.get(shape_type, ())
+        regions.append({
+            "id": region.get("id"),
+            "parent_id": region.get("parent_id"),
+            "vertices": region.get("vertices", []),
+            "shape": {
+                "type": shape_type,
+                **{key: shape.get(key) for key in dimension_keys},
+            },
+        })
+
+    mesh = model.get("mesh", {}) if isinstance(model, dict) else {}
+    if not isinstance(mesh, dict):
+        mesh = {}
+    parameters = {
+        item.get("name"): item
+        for item in model.get("parameters", [])
+        if isinstance(item, dict) and item.get("name")
+    } if isinstance(model, dict) else {}
+    try:
+        element_size = evaluate_expression(mesh.get("element_size", "0.01"), parameters)
+    except (AttributeError, TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError):
+        # While a mesh field is invalid or being edited, treat its raw input as
+        # part of the signature so a preview cannot appear to match it.
+        element_size = {
+            "expression": repr(mesh.get("element_size", "0.01")),
+            "parameters": sorted(
+                (str(name), repr(item.get("expression")))
+                for name, item in parameters.items()
+            ),
+        }
+    try:
+        region_element_sizes = {
+            str(region_id): evaluate_expression(expression, parameters)
+            for region_id, expression in mesh.get("region_element_sizes", {}).items()
+        }
+    except (AttributeError, TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError):
+        region_element_sizes = {
+            "expressions": repr(mesh.get("region_element_sizes", {})),
+            "parameters": sorted(
+                (str(name), repr(item.get("expression")))
+                for name, item in parameters.items()
+            ),
+        }
+    payload = {
+        "regions": regions,
+        "element_size": element_size,
+        "polynomial_order": mesh.get("polynomial_order", 3),
+        "region_element_sizes": region_element_sizes,
+        "hp_layers": mesh.get("hp_layers", 0),
+        "hp_grading_factor": mesh.get("hp_grading_factor", 0.3),
+        "hp_region_ids": sorted(mesh.get("hp_region_ids", [])),
+        "hp_edge_ids": sorted(mesh.get("hp_edge_ids", [])),
+    }
+    try:
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError):
+        return repr(payload)
+
+
+def _input(label, value, callback, *, number=False, suffix=None, width=None, hint=None):
+    widget = QInput(
+        ui_label=label,
+        ui_model_value=value,
+        ui_type="number" if number else "text",
+        ui_debounce=250,
+        ui_suffix=suffix,
+        ui_hint=hint,
+        ui_dense=True,
+        ui_filled=True,
+        ui_hide_bottom_space=True,
+        ui_style=f"width:{width};" if width else "width:100%;",
+    )
+    widget.on_update_model_value(callback)
+    return widget
+
+
+def _button(label, icon, callback, *, color=None, disable=False, tooltip=None, style=None, align=None):
+    button = QBtn(
+        QTooltip(tooltip or label),
+        ui_label=label,
+        ui_icon=icon,
+        ui_dense=True,
+        ui_no_caps=True,
+        ui_flat=color is None,
+        ui_color=color,
+        ui_disable=disable,
+        ui_class="q-px-sm",
+        ui_style=style,
+        ui_align=align,
+    )
+    if callback:
+        button.on_click(callback)
+    return button
+
+
+def _svg(tag, **props):
+    """Create a small standard SVG element through ngapp's generic component."""
+    children = props.pop("children", None)
+    component = Component(tag)
+    component._props.update({key.replace("_", "-"): value for key, value in props.items() if value is not None})
+    if children is not None:
+        if tag == "text":
+            # Generic ngapp slots wrap strings in HTML divs, which are invalid
+            # children of SVG <text>. Vue maps textContent to the native DOM
+            # property, keeping the text inside the SVG namespace.
+            component._props["textContent"] = str(children)
+        else:
+            component.ui_slots["default"] = [children]
+    return component
+
+
+def _update_svg_props(component, **props):
+    """Patch changed SVG attributes on a mounted component in one update."""
+    changed = {}
+    for key, value in props.items():
+        prop_name = key.replace("_", "-")
+        if component._props.get(prop_name) != value:
+            changed[prop_name] = value
+    if changed:
+        component._props.update(changed)
+        component._update_frontend({"props": changed})
+
+
+def _section_title(title, subtitle=None):
+    return Div(
+        Div(title, ui_style="font-size:12px; font-weight:700; letter-spacing:.08em; text-transform:uppercase;"),
+        Div(subtitle, ui_style="font-size:11px; color:var(--fg-muted); margin-top:3px;") if subtitle else Div(),
+        ui_style="padding:14px 14px 10px; border-bottom:1px solid var(--border);",
+    )
+
+
+class SolveWorkspace(Div):
+    """Editable axisymmetric r-z model with a selectable sketch viewport."""
+
+    def __init__(self, on_log=None, on_run=None, on_mesh=None, on_open_file=None, on_history_change=None, on_cancel=None, material_library=None):
+        self.model = new_model()
+        self._material_library = material_library or MaterialLibrary()
+        self._user_materials = self._material_library.load()
+        self.studies = new_studies()
+        self.layout = {"schema_version": 1, "active_section": "geometry", "camera": "fit"}
+        self.on_log = on_log
+        self.on_run = on_run
+        self.on_mesh = on_mesh
+        self.on_open_file = on_open_file
+        self.on_history_change = on_history_change
+        self.on_cancel = on_cancel
+        self._job_active = False
+        self._undo_history = []
+        self._redo_history = []
+        self._history_transaction_depth = 0
+        self._history_limit = 100
+        self.active_section = "geometry"
+        self.selected_region_id = None
+        self.selected_edge_id = None
+        self.selected_edge_ids = []
+        self.message = "Choose Rectangle or Circle in the viewport toolbar to begin. Enter lengths in SI metres (m)."
+        self.message_is_error = False
+        self._log_visible = False
+        self._log_messages = ["Axisymmetric model editor ready."]
+        self._run_history_root = Path.home() / "NGSolve_results"
+        self.runs = _load_saved_run_history(self._run_history_root)
+        self.mesh_preview_edges = []
+        self.mesh_preview_visible = False
+        self._mesh_preview_signature = None
+        self.selected_material_id = None
+        self.selected_boundary_id = None
+        self.selected_parameter_id = None
+        self._selected_condition_id = None
+        self._tree_panel_width = 240
+        self._properties_panel_width = 340
+        self.snap_to_grid = False
+        self._view_center = None
+        self._view_world_width = None
+        self._canvas_width = 900
+        self._canvas_height = 640
+        self._inspector_view = None
+        self._geometry_inspector_ready = False
+        self._tree_entry_buttons = {}
+        self._tree_entry_containers = {}
+        self._tree_entry_titles = {}
+        self._tree_entry_lists = {}
+        self._tree_entry_order = {}
+        self._tree_structure_initialized = False
+        self._messages_visible = False
+        self._status_flash_variant = 0
+        self.validation_issues = []
+        self.sketch_tool = "select"
+        self._canvas_drag = None
+        self._screen_to_svg = None
+        self._canvas_view_commit_version = 0
+        self._canvas_zoom_timer = None
+        self._canvas_zoom_timer_lock = Lock()
+        self._canvas_zoom_generation = 0
+        self._preview_3d_active = False
+        self._preview_3d_component = None
+        self._preview_3d_scene = None
+        self._preview_3d_renderer = None
+        self._preview_face_region_ids = {}
+        self._preview_edge_region_ids = {}
+        self._preview_region_visibility = {}
+        self._preview_visibility_controls = {}
+
+        self._canvas_background = _svg(
+            "rect", x=0, y=0, width=self._canvas_width, height=self._canvas_height,
+            fill="var(--canvas-bg, #f4f6f8)",
+        )
+        self._canvas_grid = Component("g")
+        self._canvas_scene = Component("g")
+        self._canvas_mesh_path = _svg(
+            "path",
+            fill="none",
+            stroke="#203c57",
+            stroke_width="0.9",
+            stroke_opacity="0.82",
+            vector_effect="non-scaling-stroke",
+            style="pointer-events:none;",
+        )
+        self._canvas_dimensions = Component("g")
+        self._canvas_grid_signature = None
+        self._canvas_scene_component_ids = None
+        self._canvas_region_nodes = {}
+        self._canvas_edge_nodes = {}
+        self._canvas_preview = Component(
+            "g",
+            _svg(
+                "rect", id="solve-sketch-drag-rect", x=0, y=0, width=0, height=0,
+                display="none", fill="#2385bd20", stroke="#0877b9",
+                stroke_width="2", stroke_dasharray="6 4",
+                style="pointer-events:none;",
+            ),
+            _svg(
+                "circle", id="solve-sketch-drag-circle", cx=0, cy=0, r=0,
+                display="none", fill="#2385bd20", stroke="#0877b9",
+                stroke_width="2", stroke_dasharray="6 4",
+                style="pointer-events:none;",
+            ),
+        )
+        for component, element_id in (
+            (self._canvas_grid, "solve-sketch-grid"),
+            (self._canvas_scene, "solve-sketch-scene"),
+            (self._canvas_dimensions, "solve-sketch-dimensions"),
+            (self._canvas_preview, "solve-sketch-preview"),
+        ):
+            component._props["id"] = element_id
+
+        self._section_buttons = {}
+        for key, label, icon in _SECTIONS:
+            button = _button(label, icon, lambda *_, selected=key: self.select_section(selected))
+            button.ui_align = "left"
+            button.ui_no_wrap = True
+            button.ui_class = "full-width q-px-sm text-left"
+            button.ui_style = "width:100%; justify-content:flex-start; text-align:left; min-height:34px;"
+            self._section_buttons[key] = button
+
+        self._left_items = Div(ui_style="display:flex; flex-direction:column; gap:12px; padding:8px;")
+        self._canvas = Component(
+            "svg",
+            self._canvas_background,
+            self._canvas_grid,
+            self._canvas_scene,
+            self._canvas_dimensions,
+            self._canvas_preview,
+            ui_class="solve-sketch-canvas",
+            ui_style="display:block; width:100%; height:100%; min-height:0; background:var(--canvas-bg, #f4f6f8); cursor:default; user-select:none; -webkit-user-select:none; touch-action:none; overscroll-behavior:contain;",
+        )
+        self._canvas._props.update({
+            "viewBox": "0 0 900 640",
+            "preserveAspectRatio": "xMidYMid meet",
+            "role": "img",
+            "aria-label": "Axisymmetric radial-axial sketch",
+        })
+        self._canvas.on_mounted(self._install_canvas_pointer_capture)
+        self._canvas.on("mousedown", self._on_canvas_mouse_down)
+        self._canvas.on("mouseup", self._on_canvas_mouse_up)
+        self._canvas.on("wheel", self._on_canvas_wheel)
+        self._inspector = Div(ui_style="display:flex; flex-direction:column; gap:12px; padding:12px; overflow:auto; min-height:0;")
+        self._status = Div(ui_style="display:flex; align-items:center; gap:8px; min-width:0; overflow:hidden; white-space:nowrap;")
+        self._log_body = Div(
+            *[Div(line) for line in self._log_messages],
+            ui_style="flex:1 1 auto; min-height:0; overflow:auto; padding:6px 14px 10px; font:12px/1.5 monospace;",
+        )
+        self._log_close_button = _button(
+            "", "mdi-close", self.hide_log,
+            tooltip="Minimise solver log",
+            style="margin-left:auto;",
+        )
+        log_header = Div(
+            Div("Log", ui_style="font-size:12px; font-weight:600;"),
+            self._log_close_button,
+            ui_style="display:flex; align-items:center; gap:8px; flex:none; min-height:34px; padding:0 8px 0 14px; border-bottom:1px solid var(--border);",
+        )
+        self._log_panel = Div(
+            log_header,
+            self._log_body,
+            ui_hidden=True,
+            ui_style="display:flex; flex-direction:column; flex:0 0 170px; min-height:0; overflow:hidden; border-top:1px solid var(--border); background:var(--surface);",
+        )
+        self._messages_panel = Div(ui_hidden=True, ui_style="max-height:180px; flex:none; overflow:auto; border-top:1px solid var(--border); background:var(--surface); padding:8px 14px;")
+        self._canvas_resize_observer = QResizeObserver(ui_debounce=80)
+        self._canvas_resize_observer.on_resize(self._on_canvas_resize)
+        self._canvas_host = Div(
+            self._canvas,
+            self._canvas_resize_observer,
+            ui_class="relative-position",
+            ui_style="position:relative; display:flex; flex:1 1 0%; height:0; flex-direction:column; min-width:0; min-height:0; overflow:hidden;",
+        )
+        tree_header = Div(
+            Div("MODEL TREE", ui_style="font-size:11px; font-weight:700; letter-spacing:.08em;"),
+            _button("", "mdi-chevron-left", self._toggle_tree_panel, tooltip="Collapse model tree", style="margin-left:auto;"),
+            ui_style="display:flex; align-items:center; padding:14px 12px 10px; border-bottom:1px solid var(--border); color:var(--fg-muted);",
+        )
+        self._tree = Div(
+            tree_header,
+            self._left_items,
+            ui_style="display:flex; flex-direction:column; min-width:0; min-height:0; overflow:auto; background:var(--surface);",
+        )
+        self._right_header = Div(
+            Div("PROPERTIES", ui_style="font-size:11px; font-weight:700; letter-spacing:.08em; color:var(--fg-muted);"),
+            _button("", "mdi-chevron-right", self._toggle_properties_panel, tooltip="Collapse properties", style="margin-left:auto;"),
+            ui_style="display:flex; align-items:center; padding:14px 12px 10px; border-bottom:1px solid var(--border); flex:none;",
+        )
+        self._right = Div(
+            self._right_header,
+            self._inspector,
+            ui_style="display:flex; flex-direction:column; min-width:0; min-height:0; overflow:hidden; background:var(--surface);",
+        )
+
+        select_button = _button(
+            "Select", "mdi-cursor-default-outline",
+            lambda *a: self.set_sketch_tool("select"),
+            tooltip="Drag regions to move them; drag empty space to select edges; middle-drag to pan. Hold Shift to add to the selection.",
+            style="flex:0 0 auto; white-space:nowrap;",
+        )
+        rectangle_button = _button(
+            "Rectangle", "mdi-rectangle-outline",
+            lambda *a: self.set_sketch_tool("rectangle"),
+            tooltip="Draw a rectangle by dragging between opposite corners.",
+            style="flex:0 0 auto; white-space:nowrap;",
+        )
+        circle_button = _button(
+            "Circle", "mdi-circle-outline",
+            lambda *a: self.set_sketch_tool("circle"),
+            tooltip="Draw a circle by dragging from its centre to its radius.",
+            style="flex:0 0 auto; white-space:nowrap;",
+        )
+        snap_button = _button("Snap", "mdi-magnet", self.toggle_snap_to_grid, tooltip="Snap sketch points to grid intersections", style="flex:0 0 auto; white-space:nowrap;")
+        sketch_toolbar_separator = QSeparator(ui_vertical=True)
+        fit_view_button = _button(
+            "Fit view", "mdi-fit-to-screen-outline",
+            self.fit_canvas_view,
+            tooltip="Fit the sketch to the viewport.",
+            style="flex:0 0 auto; white-space:nowrap;",
+        )
+        zoom_out_button = _button("Zoom out", "mdi-minus", lambda *a: self.zoom_canvas(1.2), tooltip="Zoom out one step", style="flex:0 0 auto;")
+        zoom_in_button = _button("Zoom in", "mdi-plus", lambda *a: self.zoom_canvas(1 / 1.2), tooltip="Zoom in one step", style="flex:0 0 auto;")
+        self._mesh_preview_button = _button(
+            "Mesh preview", "mdi-vector-polygon", self.toggle_mesh_preview,
+            disable=True,
+            tooltip="Generate a mesh before previewing it.",
+            style="flex:0 0 auto; white-space:nowrap;",
+        )
+        self._preview_3d_button = _button(
+            "Preview in 3D", "mdi-cube-scan", self.toggle_3d_preview,
+            tooltip="Preview the axisymmetric regions revolved into 3D.",
+            style="flex:0 0 auto; white-space:nowrap;",
+        )
+        self._preview_3d_tooltip = self._preview_3d_button.ui_slots["default"][0]
+        model_button = _button("Model", "mdi-file-tree-outline", self._toggle_tree_panel, tooltip="Show or hide the model tree", style="flex:0 0 auto;")
+        properties_button = _button("Properties", "mdi-tune-variant", self._toggle_properties_panel, tooltip="Show or hide properties", style="flex:0 0 auto;")
+        toolbar = Div(
+            select_button,
+            rectangle_button,
+            circle_button,
+            snap_button,
+            sketch_toolbar_separator,
+            fit_view_button,
+            zoom_out_button,
+            zoom_in_button,
+            self._mesh_preview_button,
+            self._preview_3d_button,
+            model_button,
+            properties_button,
+            ui_style="display:flex; flex-wrap:wrap; align-items:center; gap:4px; flex:none; min-width:0; min-height:42px; padding:4px 8px; border-bottom:1px solid var(--border); background:var(--surface);",
+        )
+        self._tool_buttons = {
+            "select": select_button,
+            "rectangle": rectangle_button,
+            "circle": circle_button,
+        }
+        self._snap_button = snap_button
+        self._sketch_view_controls = [
+            select_button, rectangle_button, circle_button, snap_button,
+            sketch_toolbar_separator, fit_view_button, zoom_out_button,
+            zoom_in_button, self._mesh_preview_button,
+        ]
+
+        self._preview_3d_viewport = Div(
+            ui_class="mmfem-3d-preview-viewport",
+            ui_style="display:flex; flex:1 1 auto; width:0; min-width:0; min-height:0; overflow:hidden; background:var(--canvas-bg, #f4f6f8);",
+        )
+        self._preview_3d_region_rows = Div(
+            ui_style="display:flex; flex-direction:column; gap:6px; min-height:0; overflow:auto; padding:8px 12px 14px;",
+        )
+        region_legend = Div(
+            Div(QIcon(ui_name="mdi-eye", ui_color="primary"), "Opaque", ui_style="display:flex; align-items:center; gap:4px;"),
+            Div(QIcon(ui_name="mdi-circle-opacity", ui_color="primary"), "Translucent", ui_style="display:flex; align-items:center; gap:4px;"),
+            Div(QIcon(ui_name="mdi-eye-off", ui_color="primary"), "Hidden", ui_style="display:flex; align-items:center; gap:4px;"),
+            ui_style="display:flex; flex-wrap:wrap; gap:8px 12px; padding:10px 12px; border-bottom:1px solid var(--border); font-size:11px; color:var(--fg-muted);",
+        )
+        region_panel_header = Div(
+            Div("REGIONS", ui_style="font-size:11px; font-weight:700; letter-spacing:.08em; color:var(--fg-muted);"),
+            Div("Visibility", ui_style="font-size:11px; font-weight:600; color:var(--fg-muted); text-align:right;"),
+            ui_style="display:grid; grid-template-columns:minmax(0, 1fr) 132px; align-items:center; gap:8px; padding:14px 12px 10px; border-bottom:1px solid var(--border);",
+        )
+        self._preview_3d_region_panel = Div(
+            region_panel_header,
+            region_legend,
+            self._preview_3d_region_rows,
+            ui_style="display:flex; flex-direction:column; flex:0 0 310px; width:310px; min-width:260px; min-height:0; overflow:hidden; border-left:1px solid var(--border); background:var(--surface);",
+        )
+        self._preview_3d_exit_button = QBtn(
+            QTooltip("Close the 3D preview and return to the sketch"),
+            ui_label="Exit 3D Preview",
+            ui_icon="mdi-close",
+            ui_color="primary",
+            ui_outline=True,
+            ui_dense=True,
+            ui_no_caps=True,
+        )
+        self._preview_3d_exit_button.on_click(self.toggle_3d_preview)
+        preview_header = Div(
+            Div(
+                Div("3D Geometry Preview", ui_style="font-size:17px; font-weight:650;"),
+                Div("Rotate, pan, and zoom the revolved axisymmetric geometry.", ui_style="font-size:12px; color:var(--fg-muted); margin-top:2px;"),
+                ui_style="display:flex; flex-direction:column; min-width:0;",
+            ),
+            Div(ui_style="flex:1;"),
+            self._preview_3d_exit_button,
+            ui_style="display:flex; align-items:center; gap:16px; flex:none; min-height:66px; padding:8px 14px 8px 20px; border-bottom:1px solid var(--border); background:var(--surface);",
+        )
+        preview_body = Div(
+            self._preview_3d_viewport,
+            self._preview_3d_region_panel,
+            ui_style="display:flex; flex:1 1 auto; min-height:0; min-width:0; overflow:hidden;",
+        )
+        preview_card = QCard(
+            preview_header,
+            preview_body,
+            ui_class="mmfem-3d-preview-window",
+            ui_style=(
+                "display:flex; flex-direction:column; width:min(1600px, calc(100vw - 48px)); "
+                "height:min(920px, calc(100vh - 72px)); max-width:calc(100vw - 48px); "
+                "max-height:calc(100vh - 72px); min-width:min(680px, calc(100vw - 24px)); "
+                "min-height:min(480px, calc(100vh - 24px)); margin:auto; overflow:hidden; "
+                "border:1px solid var(--border); border-radius:14px; "
+                "box-shadow:0 24px 90px rgba(10, 22, 38, .32);"
+            ),
+        )
+        self._preview_3d_dialog = QDialog(
+            preview_card,
+            ui_model_value=False,
+            ui_persistent=True,
+            ui_maximized=True,
+            ui_transition_duration=160,
+            ui_class="mmfem-3d-preview-dialog",
+        )
+        self._canvas_panel = Div(
+            toolbar,
+            self._canvas_host,
+            ui_style="display:flex; flex:1 1 auto; flex-direction:column; width:100%; height:100%; min-width:0; min-height:0;",
+        )
+
+        self._rectangle_dialog = self._make_primitive_dialog("rectangle")
+        self._circle_dialog = self._make_primitive_dialog("circle")
+        self._model_title_editing = False
+        self._model_title_draft = self.model.get("name", "Untitled axisymmetric model")
+        self._model_title = QInput(
+            ui_model_value=self._model_title_draft,
+            ui_readonly=True,
+            ui_dense=True,
+            ui_borderless=True,
+            ui_hide_bottom_space=True,
+            ui_input_style="font-size:14px; font-weight:600; padding:0; min-width:0; cursor:pointer;",
+            ui_style="flex:1 1 auto; width:0; min-width:180px; min-height:30px;",
+        )
+        self._model_title._props["title"] = "Model name. Double-click to edit or use Rename."
+        self._model_title.on("dblclick", self._begin_model_rename)
+        self._model_title.on_update_model_value(self._update_model_rename_draft)
+        self._model_title.on_blur(self._commit_model_rename)
+        self._model_title.on("keydown", self._on_model_rename_keydown)
+        self._model_title_input = self._model_title
+        self._model_title_rename_button = QBtn(
+            QTooltip("Rename this model"),
+            ui_label="Rename",
+            ui_icon="mdi-pencil-outline",
+            ui_color="primary",
+            ui_outline=True,
+            ui_dense=True,
+            ui_no_caps=True,
+            ui_size="sm",
+        )
+        self._model_title_rename_button.on_click(self._begin_model_rename)
+        self._model_title_control_style = (
+            "display:flex; align-items:center; gap:8px; flex:0 1 520px; "
+            "width:min(520px, 100%); min-width:0; min-height:36px; "
+            "padding:2px 5px 2px 10px; border:1px solid var(--border); "
+            "border-radius:7px; background:var(--surface); "
+            "transition:border-color 120ms ease, box-shadow 120ms ease;"
+        )
+        self._model_title_control_editing_style = (
+            "display:flex; align-items:center; gap:8px; flex:0 1 520px; "
+            "width:min(520px, 100%); min-width:0; min-height:36px; "
+            "padding:2px 5px 2px 10px; border:1px solid var(--primary); "
+            "border-radius:7px; background:var(--surface); "
+            "box-shadow:0 0 0 2px color-mix(in srgb, var(--primary) 16%, transparent);"
+        )
+        self._model_title_control = Div(
+            self._model_title,
+            self._model_title_rename_button,
+            ui_class="mmfem-model-title-control",
+            ui_style=self._model_title_control_style,
+        )
+        self._validate_button = _button(
+            "Check setup",
+            "mdi-check-decagram-outline",
+            self.validate_action,
+            tooltip="Check model inputs and solver prerequisites. This does not generate a mesh or run the solver.",
+        )
+        self._mesh_button = _button(
+            "Generate mesh",
+            "mdi-vector-triangle",
+            self.run_mesh_action,
+            tooltip="Check the geometry and mesh settings, then build the finite-element mesh.",
+        )
+        self._run_button = _button(
+            "Run study",
+            "mdi-play",
+            self.run_study_action,
+            color="primary",
+            tooltip="Check the full setup, then run the selected study.",
+        )
+        self._cancel_button = _button(
+            "Cancel run", "mdi-stop-circle-outline", self._cancel_solver_job,
+            color="negative", tooltip="Stop the active mesh or solver job.",
+        )
+        self._cancel_button.ui_hidden = True
+
+        self._status_text = Div(self.message, ui_style="overflow:hidden; text-overflow:ellipsis; font-size:11px;")
+        self._messages_button = QBtn(QTooltip("Show setup issues and validation results"), ui_icon="mdi-message-alert-outline", ui_label="Messages", ui_flat=True, ui_dense=True, ui_no_caps=True)
+        self._messages_button.on_click(self.toggle_messages)
+        log_button = QBtn(QTooltip("Show solver output"), ui_icon="mdi-console", ui_label="Log", ui_flat=True, ui_dense=True, ui_no_caps=True)
+        log_button.on_click(self.toggle_log)
+        self._bottom_bar = Div(
+            self._status_text,
+            Div(ui_style="flex:1;"),
+            Div(f"Regions: 0  ·  Mesh order: {self.model['mesh']['polynomial_order']}", ui_style="font-size:11px; color:var(--fg-muted);"),
+            self._messages_button,
+            log_button,
+            # ngapp's powered-by link is positioned over the root's lower
+            # right corner, so leave it room rather than drawing controls
+            # underneath it.
+            ui_class="mmfem-solve-status-bar",
+            ui_style="display:flex; align-items:center; gap:8px; flex:0 0 34px; min-height:34px; padding:0 225px 0 10px; border-top:1px solid var(--border); background:var(--surface);",
+        )
+        self._bottom_count = self._bottom_bar.ui_slots["default"][2]
+        self._bottom_count.ui_style += " margin-left:12px;"
+
+        top = Div(
+            self._model_title_control,
+            Div(ui_style="flex:1;"),
+            self._validate_button,
+            self._mesh_button,
+            self._run_button,
+            self._cancel_button,
+            ui_style="display:flex; align-items:center; gap:8px; flex:none; min-height:40px; padding:4px 12px; border-bottom:1px solid var(--border); background:var(--surface);",
+        )
+        self._content = Div(
+            ui_style="display:flex; flex:1 1 auto; min-height:0; min-width:0;",
+        )
+        self._properties_splitter = QSplitter(
+            ui_model_value=self._properties_panel_width,
+            ui_reverse=True,
+            ui_unit="px",
+            ui_limits=[240, 500],
+            ui_emit_immediately=True,
+            ui_slots={"before": [self._canvas_panel], "after": [self._right]},
+            ui_class="solve-properties-splitter",
+            ui_style="flex:1 1 auto; width:100%; min-width:0; min-height:0;",
+        )
+        self._properties_splitter.on_update_model_value(self._on_properties_width_change)
+        self._tree_splitter = QSplitter(
+            ui_model_value=self._tree_panel_width,
+            ui_unit="px",
+            ui_limits=[180, 420],
+            ui_emit_immediately=True,
+            ui_slots={"before": [self._tree], "after": [self._properties_splitter]},
+            ui_class="solve-tree-splitter",
+            ui_style="flex:1 1 auto; width:100%; min-width:0; min-height:0;",
+        )
+        self._tree_splitter.on_update_model_value(self._on_tree_width_change)
+        self._content.ui_children = [self._tree_splitter]
+        super().__init__(
+            top,
+            self._content,
+            self._messages_panel,
+            self._log_panel,
+            self._bottom_bar,
+            self._rectangle_dialog,
+            self._circle_dialog,
+            self._preview_3d_dialog,
+            ui_style="display:flex; flex-direction:column; width:100%; height:100%; min-height:0; overflow:hidden; background:var(--app-bg, #f7f8fa); color:var(--fg, #202631);",
+        )
+        self._refresh_model_tree()
+        self._render_inspector()
+        self._refresh_sketch_tool_buttons()
+        self.render_canvas()
+
+    @property
+    def dirty(self):
+        return True
+
+    @property
+    def can_undo(self):
+        return bool(self._undo_history)
+
+    @property
+    def can_redo(self):
+        return bool(self._redo_history)
+
+    def _capture_history_state(self):
+        return {
+            "model": copy.deepcopy(self.model),
+            "studies": copy.deepcopy(self.studies),
+            "selection": {
+                "region_id": self.selected_region_id,
+                "edge_id": self.selected_edge_id,
+                "edge_ids": list(self.selected_edge_ids),
+                "parameter_id": self.selected_parameter_id,
+                "material_id": self.selected_material_id,
+                "boundary_id": self.selected_boundary_id,
+                "active_section": self.active_section,
+            },
+        }
+
+    def _finish_history_transaction(self, before):
+        if before["model"] == self.model and before["studies"] == self.studies:
+            return
+        if (
+            self._mesh_preview_signature is not None
+            and _mesh_signature(self.model) != self._mesh_preview_signature
+        ):
+            self._clear_mesh_preview()
+        self._undo_history.append(before)
+        del self._undo_history[:-self._history_limit]
+        self._redo_history.clear()
+        self._notify_history_changed()
+
+    def _notify_history_changed(self):
+        if self.on_history_change:
+            self.on_history_change()
+
+    def _restore_history_state(self, state):
+        self._preserve_canvas_view()
+        mesh_preview_signature = self._mesh_preview_signature
+        self.model = copy.deepcopy(state["model"])
+        self.studies = copy.deepcopy(state["studies"])
+        if (
+            mesh_preview_signature is not None
+            and _mesh_signature(self.model) != mesh_preview_signature
+        ):
+            self._clear_mesh_preview()
+        selection = state["selection"]
+        region_ids = {item["id"] for item in self.model["geometry"].get("regions", [])}
+        edge_ids = {item["id"] for item in self.model["geometry"].get("edges", [])}
+        self.selected_region_id = selection["region_id"] if selection["region_id"] in region_ids else None
+        self.selected_edge_id = selection["edge_id"] if selection["edge_id"] in edge_ids else None
+        self.selected_edge_ids = [item for item in selection["edge_ids"] if item in edge_ids]
+        self.selected_parameter_id = selection["parameter_id"]
+        self.selected_material_id = selection["material_id"]
+        self.selected_boundary_id = selection["boundary_id"]
+        self._selected_condition_id = self.selected_boundary_id if selection["active_section"] == "boundaries" else None
+        if selection["active_section"] in {key for key, _, _ in _SECTIONS}:
+            self.active_section = selection["active_section"]
+            self.layout["active_section"] = self.active_section
+        self._recompute_parent_links()
+        with self._batch_frontend_updates():
+            self._refresh_model_tree()
+            self._render_inspector()
+            self.render_canvas()
+
+    def undo(self):
+        if not self.can_undo:
+            return False
+        self._redo_history.append(self._capture_history_state())
+        state = self._undo_history.pop()
+        self._restore_history_state(state)
+        self._message("Undid the last model change.")
+        self._notify_history_changed()
+        return True
+
+    def redo(self):
+        if not self.can_redo:
+            return False
+        self._undo_history.append(self._capture_history_state())
+        del self._undo_history[:-self._history_limit]
+        state = self._redo_history.pop()
+        self._restore_history_state(state)
+        self._message("Redid the model change.")
+        self._notify_history_changed()
+        return True
+
+    def set_model(self, model, studies=None, layout=None):
+        self._cancel_canvas_zoom_render()
+        self._clear_mesh_preview()
+        model = migrate_legacy_model(model)
+        model = copy.deepcopy(model)
+        _sync_axis_boundary_conditions(model)
+        _sync_mechanical_boundary_conditions(model)
+        studies = migrate_legacy_studies(studies or new_studies())
+        errors = validate_model(model)
+        if errors:
+            raise ValueError("Invalid model: " + " ".join(errors))
+        studies = copy.deepcopy(studies)
+        parameter_map = {
+            item.get("name"): item
+            for item in model.get("parameters", [])
+            if isinstance(item, dict) and item.get("name")
+        }
+        study_errors = validate_studies(studies, parameter_map)
+        if study_errors:
+            raise ValueError("Invalid studies: " + " ".join(study_errors))
+        self._cancel_model_rename()
+        self.model = model
+        self.studies = studies
+        self._undo_history.clear()
+        self._redo_history.clear()
+        self._notify_history_changed()
+        self.layout = copy.deepcopy(layout or {"schema_version": 1, "active_section": "geometry", "camera": "fit"})
+        self._load_canvas_view_from_layout()
+        self.selected_material_id = None
+        self.selected_boundary_id = None
+        self.selected_parameter_id = None
+        self._selected_condition_id = None
+        requested_section = self.layout.get("active_section", "geometry")
+        self.active_section = requested_section if requested_section in {key for key, _, _ in _SECTIONS} else "geometry"
+        self.selected_region_id = None
+        self.selected_edge_id = None
+        self.selected_edge_ids = []
+        self._canvas_drag = None
+        self._screen_to_svg = None
+        self.set_sketch_tool("select", announce=False)
+        self._message(f"Loaded {self.model.get('name', 'axisymmetric model')}.")
+        self._refresh_model_tree()
+        self._render_inspector()
+        self.render_canvas()
+
+    def select_section(self, section):
+        if section not in dict((key, label) for key, label, _ in _SECTIONS):
+            return
+        self.active_section = section
+        self.layout["active_section"] = section
+        if section != "boundaries":
+            self._selected_condition_id = None
+        for key, button in self._section_buttons.items():
+            button.ui_color = "primary" if key == section else None
+            button.ui_flat = key != section
+        self._render_inspector()
+        self._update_model_tree_selection()
+        if section == "boundaries":
+            self._selected_condition_id = self.selected_boundary_id
+        self._sync_canvas_selection()
+
+    def _begin_model_rename(self, event=None):
+        """Enable the inline model-name input on double-click."""
+        if self._model_title_editing:
+            return
+        self._model_title_editing = True
+        self._model_title_draft = str(self.model.get("name", "Untitled axisymmetric model"))
+        self._model_title.ui_model_value = self._model_title_draft
+        self._model_title.ui_readonly = False
+        self._model_title_rename_button.ui_hidden = True
+        self._model_title_control.ui_style = self._model_title_control_editing_style
+        if get_environment().type == EnvironmentType.LOCAL_APP:
+            self._model_title.ui_focus()
+            self._model_title.ui_select()
+
+    def _update_model_rename_draft(self, event):
+        self._model_title_draft = str(getattr(event, "value", "") or "")
+
+    def _on_model_rename_keydown(self, event):
+        payload = getattr(event, "value", None)
+        key = payload.get("key") if isinstance(payload, dict) else getattr(payload, "key", None)
+        key = str(key or "").lower()
+        if key in {"enter", "numpadenter"}:
+            self._commit_model_rename()
+        elif key == "escape":
+            self._cancel_model_rename()
+
+    @_history_tracked
+    def _commit_model_rename(self, event=None):
+        if not self._model_title_editing:
+            return
+        name = str(self._model_title_draft or "").strip()
+        if name:
+            self.model["name"] = name
+        self._finish_model_rename()
+
+    def _cancel_model_rename(self, event=None):
+        if not getattr(self, "_model_title_editing", False):
+            return
+        self._finish_model_rename()
+
+    def _finish_model_rename(self):
+        self._model_title_editing = False
+        self._model_title_draft = str(self.model.get("name", "Untitled axisymmetric model"))
+        if hasattr(self, "_model_title"):
+            self._model_title.ui_model_value = self._model_title_draft
+            self._model_title.ui_readonly = True
+            self._model_title_rename_button.ui_hidden = False
+            self._model_title_control.ui_style = self._model_title_control_style
+
+    def _tree_selected_entry(self):
+        if self.active_section == "geometry" and self.selected_region_id:
+            return f"geometry:{self.selected_region_id}"
+        if self.active_section == "sources" and self.selected_region_id:
+            return f"sources:{self.selected_region_id}"
+        if self.active_section == "parameters" and self.selected_parameter_id:
+            return f"parameters:{self.selected_parameter_id}"
+        if self.active_section == "materials" and self.selected_material_id:
+            return f"materials:{self.selected_material_id}"
+        if self.active_section == "boundaries" and self.selected_boundary_id:
+            return f"boundaries:{self.selected_boundary_id}"
+        return None
+
+    def _update_model_tree_selection(self):
+        """Highlight the selected tree rows without replacing the tree slots."""
+        for key, button in self._section_buttons.items():
+            selected = key == self.active_section
+            button.ui_color = "primary" if selected else None
+            button.ui_flat = not selected
+        selected_entry = self._tree_selected_entry()
+        for key, button in self._tree_entry_buttons.items():
+            selected = key == selected_entry
+            button.ui_color = "primary" if selected else None
+            button.ui_flat = not selected
+
+    def _on_tree_width_change(self, event):
+        value = float(event.value)
+        if value > 30:
+            self._tree_panel_width = value
+
+    def _on_properties_width_change(self, event):
+        value = float(event.value)
+        if value > 30:
+            self._properties_panel_width = value
+
+    def _toggle_tree_panel(self, *_):
+        if self._tree_splitter.ui_model_value > 30:
+            self._tree_panel_width = float(self._tree_splitter.ui_model_value)
+            self._tree_splitter.ui_limits = [0, 420]
+            self._tree_splitter.ui_model_value = 0
+        else:
+            self._tree_splitter.ui_model_value = self._tree_panel_width
+            self._tree_splitter.ui_limits = [180, 420]
+
+    def _toggle_properties_panel(self, *_):
+        if self._properties_splitter.ui_model_value > 30:
+            self._properties_panel_width = float(self._properties_splitter.ui_model_value)
+            self._properties_splitter.ui_limits = [0, 500]
+            self._properties_splitter.ui_model_value = 0
+        else:
+            self._properties_splitter.ui_model_value = self._properties_panel_width
+            self._properties_splitter.ui_limits = [240, 500]
+
+    def set_sketch_tool(self, tool, *, announce=True):
+        if tool not in {"select", "rectangle", "circle"}:
+            return
+        self.sketch_tool = tool
+        self._canvas_drag = None
+        self._screen_to_svg = None
+        try:
+            self.js.eval(
+                "if (window.__ngsolveCancelSketchGesture) window.__ngsolveCancelSketchGesture(); "
+                f"window.__ngsolveSketchTool = '{tool}'"
+            )
+        except Exception:
+            # Standalone tests and non-browser frontends have no JS runtime.
+            pass
+        self._canvas.ui_style = (
+            "display:block; width:100%; height:100%; min-height:0; "
+            "background:var(--canvas-bg, #f4f6f8); touch-action:none; "
+            "overscroll-behavior:contain; cursor:"
+            + ("crosshair;" if tool != "select" else "default;")
+            + " user-select:none; -webkit-user-select:none;"
+        )
+        self._refresh_sketch_tool_buttons()
+        self._sync_canvas_interaction_settings()
+        if announce:
+            help_text = {
+                "select": "Drag regions to move them; drag empty space to select edges; middle-drag to pan. Hold Shift to add to the selection.",
+                "rectangle": "Drag between opposite corners to sketch a rectangle; its dimensions remain editable.",
+                "circle": "Drag from the circle centre to its radius; its position and radius remain editable.",
+            }
+            self._message(help_text[tool])
+
+    def _refresh_sketch_tool_buttons(self):
+        for tool, button in getattr(self, "_tool_buttons", {}).items():
+            button.ui_color = "primary" if tool == self.sketch_tool else None
+            button.ui_flat = tool != self.sketch_tool
+
+    def _refresh_snap_button(self):
+        button = getattr(self, "_snap_button", None)
+        if button is not None:
+            button.ui_color = "primary" if self.snap_to_grid else None
+            button.ui_flat = not self.snap_to_grid
+
+    def _sync_canvas_interaction_settings(self):
+        try:
+            project, _ = self._canvas_projection()
+            origin = project((0.0, 0.0))
+            plot = self._canvas_plot_bounds()
+            world_center, world_width, _ = self._current_canvas_world_view()
+            del world_center
+            pixels_per_world = (plot[2] - plot[0]) / world_width
+            grid = {
+                "enabled": bool(self.snap_to_grid),
+                "originX": origin[0],
+                "originY": origin[1],
+                "stepPx": self._canvas_snap_step() * pixels_per_world,
+            }
+            self.js.eval(f"window.__ngsolveSketchSnap = {json.dumps(grid, allow_nan=False)}")
+            move_step = 0.00001 * pixels_per_world  # 0.01 mm, represented as 1e-5 m.
+            self.js.eval(f"window.__ngsolveSketchMoveStep = {move_step!r}")
+        except Exception:
+            # Tests and non-browser frontends have no JavaScript runtime.
+            pass
+
+    def toggle_snap_to_grid(self, *args):
+        self.snap_to_grid = not self.snap_to_grid
+        self._refresh_snap_button()
+        self._sync_canvas_interaction_settings()
+        self._message(
+            "Grid snapping is on; sketch points snap to visible grid intersections."
+            if self.snap_to_grid else "Grid snapping is off."
+        )
+
+    def _load_canvas_view_from_layout(self):
+        view = self.layout.get("view") if isinstance(self.layout, dict) else None
+        try:
+            center = (float(view["center_r"]), float(view["center_z"]))
+            width = float(view["width"])
+            if not all(math.isfinite(value) for value in (*center, width)) or width <= 0:
+                raise ValueError
+        except (KeyError, TypeError, ValueError, OverflowError):
+            center, width = None, None
+        self._view_center = center
+        self._view_world_width = width
+
+    def _save_canvas_view_to_layout(self):
+        if self._view_center is None or self._view_world_width is None:
+            self.layout.pop("view", None)
+            return
+        self.layout["view"] = {
+            "center_r": self._view_center[0],
+            "center_z": self._view_center[1],
+            "width": self._view_world_width,
+        }
+
+    def fit_canvas_view(self, *args):
+        self._cancel_canvas_zoom_render()
+        self._view_center = None
+        self._view_world_width = None
+        self._save_canvas_view_to_layout()
+        self.render_canvas()
+
+    def _canvas_plot_bounds(self):
+        # The sketch, grid, and axes use the complete SVG viewport. Coordinate
+        # labels are drawn just inside its borders instead of reserving a
+        # separate inset plot area.
+        return (0.0, 0.0, float(self._canvas_width), float(self._canvas_height))
+
+    def _on_canvas_resize(self, event):
+        """Reproject the sketch after the available viewport size changes."""
+        value = getattr(event, "value", None)
+        if not isinstance(value, dict):
+            return
+        try:
+            width = int(round(float(value["width"])))
+            height = int(round(float(value["height"])))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return
+        if width < 100 or height < 100:
+            return
+        if (width, height) == (self._canvas_width, self._canvas_height):
+            return
+        self._canvas_width = width
+        self._canvas_height = height
+        self.render_canvas()
+
+    def _fit_canvas_world_view(self):
+        plot = self._canvas_plot_bounds()
+        target_ratio = (plot[2] - plot[0]) / (plot[3] - plot[1])
+        regions = self.model.get("geometry", {}).get("regions", [])
+        points = [point for region in regions for point in region.get("vertices", [])]
+        if points:
+            rmin = 0.0
+            rmax = max(max(point[0] for point in points), 0.01)
+            zmin = min(point[1] for point in points)
+            zmax = max(point[1] for point in points)
+            pad_r = max(rmax, 0.01) * 0.08
+            # The meridian model is expected to be centred on z = 0. Keep
+            # that plane at the middle of the default view even when the
+            # current geometry only occupies positive or negative z.
+            z_extent = max(abs(zmin), abs(zmax), 0.01)
+            pad_z = z_extent * 0.08
+            rmax += pad_r
+            zmin = -(z_extent + pad_z)
+            zmax = z_extent + pad_z
+        else:
+            rmin, rmax, zmin, zmax = 0.0, 0.024, -0.012, 0.012
+        width = max(rmax - rmin, (zmax - zmin) * target_ratio, 1e-12)
+        # Keep r = 0 on the left edge of the sketch grid while fitting the
+        # region extents into the remaining positive-r area.
+        center = (width / 2, 0.0)
+        return center, width
+
+    def _current_canvas_world_view(self):
+        plot = self._canvas_plot_bounds()
+        target_ratio = (plot[2] - plot[0]) / (plot[3] - plot[1])
+        if self._view_center is None or self._view_world_width is None:
+            center, width = self._fit_canvas_world_view()
+        else:
+            center, width = self._view_center, self._view_world_width
+        return center, width, width / target_ratio
+
+    def _preserve_canvas_view(self):
+        """Keep geometry edits from changing the camera and rebuilding the grid."""
+        if self._view_center is not None and self._view_world_width is not None:
+            return
+        self._view_center, self._view_world_width, _ = self._current_canvas_world_view()
+        self._save_canvas_view_to_layout()
+
+    def zoom_canvas(self, factor, anchor=None, *, render=True):
+        """Zoom in-place, preserving the world coordinate beneath the anchor."""
+        try:
+            factor = float(factor)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(factor) or factor <= 0 or factor == 1:
+            return
+        plot = self._canvas_plot_bounds()
+        if anchor is None:
+            anchor = ((plot[0] + plot[2]) / 2, (plot[1] + plot[3]) / 2)
+        project, unproject = self._canvas_projection()
+        del project
+        anchor_world = unproject(anchor)
+        old_center, old_width, _ = self._current_canvas_world_view()
+        new_width = min(1e300, max(1e-300, old_width * factor))
+        new_height = new_width / ((plot[2] - plot[0]) / (plot[3] - plot[1]))
+        fx = (anchor[0] - (plot[0] + plot[2]) / 2) / (plot[2] - plot[0])
+        fy = (anchor[1] - (plot[1] + plot[3]) / 2) / (plot[3] - plot[1])
+        center = (
+            anchor_world[0] - fx * new_width,
+            anchor_world[1] + fy * new_height,
+        )
+        if not all(math.isfinite(value) for value in (*center, new_width)):
+            return
+        self._view_center = center
+        self._view_world_width = new_width
+        self._save_canvas_view_to_layout()
+        if render:
+            self._cancel_canvas_zoom_render()
+            self.render_canvas()
+
+    def _schedule_canvas_zoom_render(self):
+        """Rebuild grid labels once wheel input settles, not once per tick."""
+        with self._canvas_zoom_timer_lock:
+            self._canvas_zoom_generation += 1
+            generation = self._canvas_zoom_generation
+            if self._canvas_zoom_timer is not None:
+                self._canvas_zoom_timer.cancel()
+            timer = Timer(0.12, self._flush_canvas_zoom_render, args=(generation,))
+            timer.daemon = True
+            self._canvas_zoom_timer = timer
+            timer.start()
+
+    def _cancel_canvas_zoom_render(self):
+        with self._canvas_zoom_timer_lock:
+            self._canvas_zoom_generation += 1
+            if self._canvas_zoom_timer is not None:
+                self._canvas_zoom_timer.cancel()
+                self._canvas_zoom_timer = None
+
+    def _flush_canvas_zoom_render(self, generation):
+        with self._canvas_zoom_timer_lock:
+            if generation != self._canvas_zoom_generation:
+                return
+            self._canvas_zoom_timer = None
+        self.render_canvas()
+
+    def _pan_canvas_by_pixels(self, start, end):
+        """Pan the meridian view by a drag measured in SVG canvas units."""
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        if math.hypot(dx, dy) < 1e-9:
+            return
+        plot = self._canvas_plot_bounds()
+        center, width, _ = self._current_canvas_world_view()
+        pixels_per_world = (plot[2] - plot[0]) / width
+        if not math.isfinite(pixels_per_world) or pixels_per_world <= 0:
+            return
+        self._view_center = (
+            center[0] - dx / pixels_per_world,
+            center[1] + dy / pixels_per_world,
+        )
+        self._view_world_width = width
+        self._save_canvas_view_to_layout()
+        self.render_canvas()
+
+    def _read_browser_canvas_view(self):
+        """Read the browser's coalesced view transform after a local gesture."""
+        try:
+            values = self.js.eval(
+                "(() => window.__ngsolveSketchViewTransform || null)()"
+            )
+            if values is None or len(values) < 4:
+                return None
+            scale, tx, ty, version = (float(values[index]) for index in range(4))
+            if not all(math.isfinite(value) for value in (scale, tx, ty, version)) or scale <= 0:
+                return None
+            return scale, tx, ty, int(version)
+        except Exception:
+            return None
+
+    def _commit_browser_canvas_view(self, view=None, *, render=True):
+        """Commit a browser-side pan/zoom matrix to the world-space viewport."""
+        view = view or self._read_browser_canvas_view()
+        if view is None:
+            return False
+        scale, tx, ty, version = view
+        if version <= self._canvas_view_commit_version:
+            return False
+        self._canvas_view_commit_version = version
+        if abs(scale - 1.0) < 1e-12 and abs(tx) < 1e-9 and abs(ty) < 1e-9:
+            return False
+        plot = self._canvas_plot_bounds()
+        old_center, old_width, _ = self._current_canvas_world_view()
+        _, unproject = self._canvas_projection()
+        pixel_center = ((plot[0] + plot[2]) / 2, (plot[1] + plot[3]) / 2)
+        center = unproject(((pixel_center[0] - tx) / scale, (pixel_center[1] - ty) / scale))
+        width = old_width / scale
+        if not all(math.isfinite(value) for value in (*center, width)) or width <= 0:
+            return False
+        self._view_center = center
+        self._view_world_width = width
+        self._save_canvas_view_to_layout()
+        if render:
+            self.render_canvas()
+        return True
+
+    def _on_canvas_wheel(self, event):
+        """Commit one settled browser-side wheel gesture, never each tick."""
+        if self._commit_browser_canvas_view(render=True):
+            return
+        # Retain the event-driven fallback for frontends without the local SVG
+        # handler and for unit tests that send a native wheel event directly.
+        value = getattr(event, "value", None)
+        if not isinstance(value, dict):
+            return
+        try:
+            delta = float(value.get("deltaY", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(delta) or delta == 0:
+            return
+        delta = min(300.0, max(-300.0, delta))
+        anchor = self._canvas_event_point(event, refresh_transform=True)
+        factor = math.exp(delta * 0.0015)
+        self.zoom_canvas(factor, anchor, render=False)
+        self._schedule_canvas_zoom_render()
+
+    def _read_screen_to_svg_transform(self):
+        """Read the current SVG screen matrix once when a pointer gesture starts."""
+        try:
+            values = self.js.eval(
+                "(() => { const svg = document.querySelector('svg.solve-sketch-canvas'); "
+                "const m = svg && svg.getScreenCTM(); "
+                "return m ? [m.a, m.b, m.c, m.d, m.e, m.f] : null; })()"
+            )
+            if values is None or len(values) != 6:
+                return None
+            return tuple(float(values[index]) for index in range(6))
+        except Exception:
+            return None
+
+    def _install_canvas_pointer_capture(self, *_):
+        """Keep sketch gestures alive through release and render previews locally.
+
+        Pointer capture makes sketch gestures independent of which SVG child
+        is beneath the pointer. Preview updates stay local; Python receives one
+        compact event after release rather than the full stream of mouse moves.
+        """
+        script = r"""
+(() => {
+  window.__ngsolveSketchTool = '__SKETCH_TOOL__';
+  if (window.__ngsolveSketchPointerCaptureVersion === 5) return;
+  window.__ngsolveSketchPointerCaptureVersion = 5;
+  let active = false;
+  let activePointerId = null;
+  let dragStart = null;
+  let dragStartScreen = null;
+  let dragBaseScale = 1;
+  let dragBaseTranslateX = 0;
+  let dragBaseTranslateY = 0;
+  let dragRegionId = null;
+  let dragEdgeId = null;
+  let dragMode = null;
+  let gestureNumber = 0;
+  let suppressCanvasClickUntil = 0;
+  let previewFrame = 0;
+  let pendingPreview = null;
+  let wheelCommitTimer = 0;
+  let visualScale = 1;
+  let visualTranslateX = 0;
+  let visualTranslateY = 0;
+  let viewVersion = 0;
+  const committedRegionOffsets = new Map();
+  window.__ngsolveSketchViewTransform = [1, 0, 0, viewVersion];
+  window.__ngsolveSketchCompletedGesture = null;
+  const pointerEvents = window.__ngsolveSketchPointerEvents = [];
+  const forwardedEvents = new WeakSet();
+  const selector = 'svg.solve-sketch-canvas';
+  const groupIds = [
+    'solve-sketch-grid', 'solve-sketch-scene',
+    'solve-sketch-dimensions', 'solve-sketch-preview',
+  ];
+  const pointerSupported = typeof window.PointerEvent === 'function';
+  const currentSvg = () => document.querySelector(selector);
+  const targetIsSvg = (event, svg) => Boolean(
+    svg && event.target && event.target.closest
+      && event.target.closest(selector) === svg
+  );
+  const applyCanvasTransform = (scale, tx, ty, svg = currentSvg()) => {
+    if (!svg) return;
+    visualScale = scale;
+    visualTranslateX = tx;
+    visualTranslateY = ty;
+    viewVersion += 1;
+    window.__ngsolveSketchViewTransform = [scale, tx, ty, viewVersion];
+    const transform = `matrix(${scale} 0 0 ${scale} ${tx} ${ty})`;
+    for (const id of groupIds) {
+      const group = svg.querySelector('#' + id);
+      if (group) group.setAttribute('transform', transform);
+    }
+  };
+  const resetCanvasTransform = (svg = currentSvg()) => {
+    if (!svg) return;
+    visualScale = 1;
+    visualTranslateX = 0;
+    visualTranslateY = 0;
+    window.__ngsolveSketchViewTransform = [1, 0, 0, viewVersion];
+    for (const id of groupIds) {
+      const group = svg.querySelector('#' + id);
+      if (group) group.removeAttribute('transform');
+    }
+    for (const regionId of committedRegionOffsets.keys()) {
+      for (const shape of svg.querySelectorAll('[data-sketch-region-id]')) {
+        if (shape.getAttribute('data-sketch-region-id') === regionId) {
+          shape.removeAttribute('transform');
+        }
+      }
+    }
+    committedRegionOffsets.clear();
+  };
+  const remember = (event) => {
+    window.__ngsolveSketchPointer = [event.clientX, event.clientY];
+    const targetRegion = event.target && event.target.closest
+      ? (event.target.closest('[data-sketch-region-id]') || {}).getAttribute('data-sketch-region-id')
+      : null;
+    const targetEdge = event.target && event.target.closest
+      ? (event.target.closest('[data-sketch-edge-id]') || {}).getAttribute('data-sketch-edge-id')
+      : null;
+    const fallbackRegion = event.type === 'mousedown'
+      && window.__ngsolveSketchRegionForNextMouseDownKnown
+      ? window.__ngsolveSketchRegionForNextMouseDown
+      : null;
+    const regionKnown = event.type === 'mousedown'
+      ? Boolean(window.__ngsolveSketchRegionForNextMouseDownKnown)
+      : targetIsSvg(event, currentSvg());
+    pointerEvents.push({
+      type: event.type,
+      timeStamp: event.timeStamp,
+      x: event.clientX,
+      y: event.clientY,
+      regionId: targetRegion || fallbackRegion || null,
+      edgeId: targetEdge || null,
+      regionKnown,
+    });
+    if (event.type === 'mousedown') {
+      window.__ngsolveSketchRegionForNextMouseDown = null;
+      window.__ngsolveSketchRegionForNextMouseDownKnown = false;
+    }
+    if (pointerEvents.length > 256) pointerEvents.splice(0, pointerEvents.length - 256);
+  };
+  const svgPoint = (svg, event) => {
+    const point = svg.createSVGPoint();
+    point.x = event.clientX;
+    point.y = event.clientY;
+    const matrix = svg.getScreenCTM();
+    if (!matrix) return null;
+    const mapped = point.matrixTransform(matrix.inverse());
+    return [mapped.x, mapped.y];
+  };
+  const setRegionOffset = (svg, regionId, offset) => {
+    if (!svg || !regionId) return;
+    for (const shape of svg.querySelectorAll('[data-sketch-region-id]')) {
+      if (shape.getAttribute('data-sketch-region-id') !== regionId) continue;
+      if (offset && (offset[0] !== 0 || offset[1] !== 0)) {
+        shape.setAttribute('transform', `translate(${offset[0]} ${offset[1]})`);
+      } else {
+        shape.removeAttribute('transform');
+      }
+    }
+  };
+  const clearPreview = (svg = currentSvg(), resetView = true, preserveCommitted = false) => {
+    if (!svg) return;
+    for (const id of ['solve-sketch-drag-rect', 'solve-sketch-drag-circle']) {
+      const shape = svg.querySelector('#' + id);
+      if (shape) shape.setAttribute('display', 'none');
+    }
+    if (dragRegionId) {
+      setRegionOffset(
+        svg,
+        dragRegionId,
+        preserveCommitted ? committedRegionOffsets.get(dragRegionId) || null : null,
+      );
+    }
+    window.__ngsolveSketchLastRegionId = null;
+    if (resetView) resetCanvasTransform(svg);
+    dragStart = null;
+    dragStartScreen = null;
+    dragRegionId = null;
+    dragEdgeId = null;
+    dragMode = null;
+  };
+  const snapPoint = (point) => {
+    const grid = window.__ngsolveSketchSnap;
+    if (!point || !grid || !grid.enabled || !Number.isFinite(grid.stepPx) || grid.stepPx <= 0) return point;
+    const snappedX = grid.originX + Math.round((point[0] - grid.originX) / grid.stepPx) * grid.stepPx;
+    const snappedY = grid.originY + Math.round((point[1] - grid.originY) / grid.stepPx) * grid.stepPx;
+    return [Math.max(grid.originX, snappedX), snappedY];
+  };
+  const sketchPoint = (point) =>
+    (window.__ngsolveSketchTool || 'select') === 'select' ? point : snapPoint(point);
+  const toScenePoint = (point) => [
+    (point[0] - visualTranslateX) / visualScale,
+    (point[1] - visualTranslateY) / visualScale,
+  ];
+  const toViewPoint = (point) => [
+    visualScale * point[0] + visualTranslateX,
+    visualScale * point[1] + visualTranslateY,
+  ];
+  const updatePreview = (svg, point, screenPoint = null) => {
+    if (!active || !dragStart || !point) return;
+    if ((dragMode === 'region' || dragMode === 'edge') && dragRegionId) {
+      const grid = window.__ngsolveSketchSnap;
+      const start = grid && grid.enabled ? snapPoint(dragStart) : dragStart;
+      const end = grid && grid.enabled ? snapPoint(point) : point;
+      const step = Math.max(1e-12, Number(window.__ngsolveSketchMoveStep) || 0);
+      const quantize = (value) => Math.sign(value) * Math.round(Math.abs(value) / step) * step;
+      const dx = grid && grid.enabled ? end[0] - start[0] : quantize(end[0] - start[0]);
+      const dy = grid && grid.enabled ? end[1] - start[1] : quantize(end[1] - start[1]);
+      const baseOffset = committedRegionOffsets.get(dragRegionId) || [0, 0];
+      for (const shape of svg.querySelectorAll('[data-sketch-region-id]')) {
+        if (shape.getAttribute('data-sketch-region-id') === dragRegionId) {
+          const totalX = baseOffset[0] + dx;
+          const totalY = baseOffset[1] + dy;
+          if (totalX === 0 && totalY === 0) shape.removeAttribute('transform');
+          else shape.setAttribute('transform', `translate(${totalX} ${totalY})`);
+        }
+      }
+      return;
+    }
+    if (dragMode === 'pan') {
+      const screenStart = dragStartScreen || toViewPoint(dragStart);
+      const screenEnd = screenPoint || toViewPoint(point);
+      applyCanvasTransform(
+        dragBaseScale,
+        dragBaseTranslateX + screenEnd[0] - screenStart[0],
+        dragBaseTranslateY + screenEnd[1] - screenStart[1],
+        svg,
+      );
+      svg.style.cursor = 'grabbing';
+      return;
+    }
+    if (dragMode !== 'marquee') point = sketchPoint(point);
+    const dx = point[0] - dragStart[0];
+    const dy = point[1] - dragStart[1];
+    const tool = window.__ngsolveSketchTool || 'select';
+    const isSelection = dragMode === 'marquee';
+    const rect = svg.querySelector('#solve-sketch-drag-rect');
+    const circle = svg.querySelector('#solve-sketch-drag-circle');
+    if (Math.hypot(dx, dy) < 4) {
+      if (rect) rect.setAttribute('display', 'none');
+      if (circle) circle.setAttribute('display', 'none');
+      return;
+    }
+    if (tool === 'circle') {
+      if (rect) rect.setAttribute('display', 'none');
+      if (!circle) return;
+      circle.setAttribute('display', 'inline');
+      circle.setAttribute('cx', dragStart[0]);
+      circle.setAttribute('cy', dragStart[1]);
+      circle.setAttribute('r', Math.hypot(dx, dy));
+      return;
+    }
+    if (circle) circle.setAttribute('display', 'none');
+    if (!rect) return;
+    const windowSelection = point[0] >= dragStart[0];
+    const fill = isSelection
+      ? (windowSelection ? '#2385bd22' : '#dd8a3222')
+      : '#2385bd20';
+    const stroke = isSelection
+      ? (windowSelection ? '#2385bd' : '#c66f16')
+      : '#0877b9';
+    rect.setAttribute('display', 'inline');
+    rect.setAttribute('x', Math.min(dragStart[0], point[0]));
+    rect.setAttribute('y', Math.min(dragStart[1], point[1]));
+    rect.setAttribute('width', Math.abs(dx));
+    rect.setAttribute('height', Math.abs(dy));
+    rect.setAttribute('fill', fill);
+    rect.setAttribute('stroke', stroke);
+    rect.setAttribute('stroke-width', isSelection ? '1.5' : '2');
+  };
+  const beginGesture = (event, svg) => {
+    if (!targetIsSvg(event, svg) || ![0, 1].includes(event.button) || event.isPrimary === false) return;
+    const middlePan = event.button === 1;
+    if (active) clearPreview(svg, false, true);
+    window.__ngsolveSketchCompletedGesture = null;
+    active = true;
+    activePointerId = event.pointerId === undefined ? null : event.pointerId;
+    gestureNumber += 1;
+    clearPreview(svg, false, true);
+    const screenStart = svgPoint(svg, event);
+    dragStartScreen = screenStart;
+    dragBaseScale = visualScale;
+    dragBaseTranslateX = visualTranslateX;
+    dragBaseTranslateY = visualTranslateY;
+    dragStart = middlePan ? toScenePoint(screenStart) : sketchPoint(toScenePoint(screenStart));
+    const region = event.target && event.target.closest
+      ? event.target.closest('[data-sketch-region-id]')
+      : null;
+    const edge = event.target && event.target.closest
+      ? event.target.closest('[data-sketch-edge-id]')
+      : null;
+    dragRegionId = (window.__ngsolveSketchTool || 'select') === 'select' && region
+      ? region.getAttribute('data-sketch-region-id')
+      : null;
+    dragEdgeId = (window.__ngsolveSketchTool || 'select') === 'select' && edge
+      ? edge.getAttribute('data-sketch-edge-id')
+      : null;
+    window.__ngsolveSketchLastRegionId = dragRegionId;
+    const tool = window.__ngsolveSketchTool || 'select';
+    dragMode = middlePan
+      ? 'pan'
+      : tool !== 'select'
+        ? 'draw'
+        : (event.shiftKey || event.ctrlKey)
+          ? 'marquee'
+          : dragEdgeId
+            ? 'edge'
+            : dragRegionId
+              ? 'region'
+              : 'marquee';
+    window.__ngsolveSketchGestureActive = true;
+    if (dragMode === 'pan') svg.style.cursor = 'grabbing';
+    if (tool === 'select' && !middlePan) {
+      window.__ngsolveSketchRegionForNextMouseDown = dragRegionId || '';
+      window.__ngsolveSketchRegionForNextMouseDownKnown = true;
+    }
+    remember(event);
+    if (activePointerId !== null && svg.setPointerCapture) {
+      try { svg.setPointerCapture(activePointerId); } catch (_) { /* capture may already be ending */ }
+    }
+  };
+  const moveGesture = (event, svg) => {
+    if (!active || (activePointerId !== null && event.pointerId !== activePointerId)) return;
+    pendingPreview = {event, svg};
+    if (previewFrame) return;
+    previewFrame = requestAnimationFrame(() => {
+      previewFrame = 0;
+      const pending = pendingPreview;
+      pendingPreview = null;
+      if (!active || !pending) return;
+      const screenPoint = svgPoint(pending.svg, pending.event);
+      if (screenPoint) updatePreview(pending.svg, toScenePoint(screenPoint), screenPoint);
+    });
+  };
+  const finishGesture = (event, svg, cancelled = false) => {
+    if (!active || (activePointerId !== null && event.pointerId !== undefined && event.pointerId !== activePointerId)) return;
+    if (previewFrame) cancelAnimationFrame(previewFrame);
+    previewFrame = 0;
+    pendingPreview = null;
+    const screenPoint = svgPoint(svg, event);
+    const point = screenPoint ? toScenePoint(screenPoint) : null;
+    if (!cancelled && point) updatePreview(svg, point, screenPoint);
+    const moved = Boolean(!cancelled && dragStartScreen && screenPoint
+      && Math.hypot(screenPoint[0] - dragStartScreen[0], screenPoint[1] - dragStartScreen[1]) >= 4);
+    const hasCompletedPointerGesture = Boolean(!cancelled && dragStartScreen && screenPoint);
+    const finishedGesture = gestureNumber;
+    const finishedRegionId = ['region', 'edge'].includes(dragMode) ? dragRegionId : null;
+    const finishedEdgeId = dragEdgeId;
+    const preserveVisual = moved && ['draw', 'pan', 'region', 'edge'].includes(dragMode);
+    const shouldForward = active && !targetIsSvg(event, svg) && event.type !== 'pointercancel';
+    if (!cancelled && dragStartScreen && screenPoint) {
+      const operation = dragMode;
+      const tool = window.__ngsolveSketchTool || 'select';
+      window.__ngsolveSketchCompletedGesture = [
+        operation, tool,
+        dragStartScreen[0], dragStartScreen[1], screenPoint[0], screenPoint[1],
+        dragRegionId || '', Boolean(event.shiftKey || event.ctrlKey), moved,
+        visualScale, visualTranslateX, visualTranslateY, viewVersion,
+        finishedEdgeId || '',
+      ];
+      if (wheelCommitTimer) window.clearTimeout(wheelCommitTimer);
+      wheelCommitTimer = 0;
+    }
+    if (hasCompletedPointerGesture) {
+      // Selection is resolved from this completed gesture because pointer
+      // capture retargets the browser's following click to the SVG root.
+      // Suppress that click to avoid selecting the region below its endpoint.
+      suppressCanvasClickUntil = performance.now() + 1000;
+    }
+    active = false;
+    activePointerId = null;
+    window.__ngsolveSketchGestureActive = false;
+    if (svg) svg.style.cursor = (window.__ngsolveSketchTool || 'select') === 'select' ? 'default' : 'crosshair';
+    if (svg) requestAnimationFrame(() => {
+      if (!active) svg.style.cursor = (window.__ngsolveSketchTool || 'select') === 'select' ? 'default' : 'crosshair';
+    });
+    if (!preserveVisual) clearPreview(svg, false);
+    else window.setTimeout(() => {
+      if (gestureNumber === finishedGesture) {
+        clearPreview(svg, false, Boolean(
+          finishedRegionId && committedRegionOffsets.has(finishedRegionId)
+        ));
+      }
+    }, 2500);
+    if (shouldForward) {
+      const forwarded = new MouseEvent('mouseup', {
+        bubbles: true,
+        button: event.button,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        shiftKey: event.shiftKey,
+        ctrlKey: event.ctrlKey,
+      });
+      forwardedEvents.add(forwarded);
+      remember(forwarded);
+      svg.dispatchEvent(forwarded);
+    }
+  };
+  const cancelGesture = (notifyPython = false) => {
+    const svg = currentSvg();
+    if (!svg) return;
+    const wasActive = active;
+    const pointerId = activePointerId;
+    if (previewFrame) cancelAnimationFrame(previewFrame);
+    previewFrame = 0;
+    pendingPreview = null;
+    active = false;
+    activePointerId = null;
+    window.__ngsolveSketchGestureActive = false;
+    clearPreview(svg, false, true);
+    svg.style.cursor = (window.__ngsolveSketchTool || 'select') === 'select' ? 'default' : 'crosshair';
+    if (wasActive && notifyPython) {
+      const cancelled = new PointerEvent('pointercancel', {
+        bubbles: true, pointerId: pointerId === null ? 1 : pointerId,
+        pointerType: 'mouse', button: 0,
+        clientX: (window.__ngsolveSketchPointer || [0, 0])[0],
+        clientY: (window.__ngsolveSketchPointer || [0, 0])[1],
+      });
+      svg.dispatchEvent(cancelled);
+    }
+  };
+  window.__ngsolveCancelSketchGesture = () => cancelGesture(true);
+  window.__ngsolveCommitSketchRegionMove = (regionId, dx, dy) => {
+    if (!regionId || !Number.isFinite(dx) || !Number.isFinite(dy)) return;
+    const previous = committedRegionOffsets.get(regionId) || [0, 0];
+    const offset = [previous[0] + dx, previous[1] + dy];
+    committedRegionOffsets.set(regionId, offset);
+    const svg = currentSvg();
+    setRegionOffset(svg, regionId, offset);
+    const dimensions = svg && svg.querySelector('#solve-sketch-dimensions');
+    const selected = window.__ngsolveSketchSelectedRegionId;
+    if (dimensions && selected === regionId) {
+      if (offset[0] || offset[1]) dimensions.setAttribute('transform', `translate(${offset[0]} ${offset[1]})`);
+      else dimensions.removeAttribute('transform');
+    }
+  };
+  window.__ngsolveSyncSketchDimensionOffset = (regionId) => {
+    const svg = currentSvg();
+    const dimensions = svg && svg.querySelector('#solve-sketch-dimensions');
+    if (!dimensions) return;
+    window.__ngsolveSketchSelectedRegionId = regionId || null;
+    const offset = regionId ? committedRegionOffsets.get(regionId) : null;
+    if (offset && (offset[0] || offset[1])) dimensions.setAttribute('transform', `translate(${offset[0]} ${offset[1]})`);
+    else dimensions.removeAttribute('transform');
+  };
+  window.__ngsolveRollbackSketchRegionMove = (regionId) => {
+    const svg = currentSvg();
+    setRegionOffset(svg, regionId, committedRegionOffsets.get(regionId) || null);
+    const dimensions = svg && svg.querySelector('#solve-sketch-dimensions');
+    if (dimensions && window.__ngsolveSketchSelectedRegionId === regionId) {
+      const offset = committedRegionOffsets.get(regionId);
+      if (offset && (offset[0] || offset[1])) dimensions.setAttribute('transform', `translate(${offset[0]} ${offset[1]})`);
+      else dimensions.removeAttribute('transform');
+    }
+  };
+  window.__ngsolveResetSketchPreview = () => {
+    if (active) return;
+    clearPreview(currentSvg());
+  };
+  const handleWheel = (event, svg) => {
+    if (!targetIsSvg(event, svg)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (active) {
+      return;
+    }
+    const delta = Number(event.deltaY) || 0;
+    if (!Number.isFinite(delta) || delta === 0) return;
+    const point = svgPoint(svg, event);
+    if (!point) return;
+    const clampedDelta = Math.max(-300, Math.min(300, delta));
+    const factor = Math.exp(-clampedDelta * 0.0015);
+    const tx = point[0] + factor * (visualTranslateX - point[0]);
+    const ty = point[1] + factor * (visualTranslateY - point[1]);
+    applyCanvasTransform(visualScale * factor, tx, ty, svg);
+    if (wheelCommitTimer) window.clearTimeout(wheelCommitTimer);
+    wheelCommitTimer = window.setTimeout(() => {
+      wheelCommitTimer = 0;
+      if (active) return;
+      const target = currentSvg();
+      if (!target) return;
+      const settled = new WheelEvent('wheel', {bubbles: true, cancelable: true, deltaY: 0});
+      forwardedEvents.add(settled);
+      target.dispatchEvent(settled);
+    }, 140);
+  };
+  const capture = (event) => {
+    if (forwardedEvents.has(event)) return;
+    const svg = currentSvg();
+    if (!svg) return;
+    const targetIsCanvas = targetIsSvg(event, svg);
+    if (event.type === 'wheel') {
+      handleWheel(event, svg);
+      return;
+    }
+    if (event.type === 'click') {
+      if (targetIsCanvas && performance.now() < suppressCanvasClickUntil) {
+        suppressCanvasClickUntil = 0;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+      return;
+    }
+    if (pointerSupported) {
+      if (event.type === 'mousedown' && targetIsCanvas && [0, 1].includes(event.button)) {
+        remember(event);
+        // Avoid the browser's middle-click autoscroll while preserving the
+        // compatibility mouse events used by the canvas callbacks.
+        if (event.button === 1) event.preventDefault();
+      }
+      else if (event.type === 'mouseup' && (targetIsCanvas || active)) remember(event);
+      return;
+    }
+    if (event.type === 'mousedown') {
+      beginGesture(event, svg);
+      return;
+    }
+    if (!active) return;
+    if (event.type === 'mousemove') moveGesture(event, svg);
+    if (event.type === 'mouseup') finishGesture(event, svg);
+  };
+  if (pointerSupported) {
+    document.addEventListener('pointerdown', event => beginGesture(event, currentSvg()), true);
+    document.addEventListener('pointermove', event => moveGesture(event, currentSvg()), true);
+    document.addEventListener('pointerup', event => finishGesture(event, currentSvg()), true);
+    document.addEventListener('pointercancel', event => finishGesture(event, currentSvg(), true), true);
+    document.addEventListener('lostpointercapture', event => {
+      if (active && event.pointerId === activePointerId) cancelGesture(true);
+    }, true);
+  }
+  window.addEventListener('blur', () => cancelGesture(true));
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) cancelGesture(true);
+  });
+  document.addEventListener('mousedown', capture, true);
+  document.addEventListener('mousemove', capture, true);
+  document.addEventListener('mouseup', capture, true);
+  document.addEventListener('click', capture, true);
+  document.addEventListener('wheel', capture, {capture:true, passive:false});
+})()
+"""
+        try:
+            self.js.eval(script.replace("__SKETCH_TOOL__", self.sketch_tool))
+        except Exception:
+            # Tests and non-browser frontends may not expose a JS runtime.
+            return
+
+    def _read_canvas_pointer(self, value):
+        try:
+            event_type = value.get("type")
+            timestamp = value.get("timeStamp")
+            if event_type in {"mousedown", "mousemove", "mouseup"} and timestamp is not None:
+                values = self.js.eval(
+                    "((type, timestamp) => { "
+                    "const events = window.__ngsolveSketchPointerEvents || []; "
+                    "const index = events.findIndex(event => event.type === type "
+                    "&& Math.abs(event.timeStamp - timestamp) < 1); "
+                    "if (index >= 0) { const event = events.splice(index, 1)[0]; "
+                    "return [event.x, event.y]; } "
+                    "return window.__ngsolveSketchPointer || null; })"
+                    f"('{event_type}', {float(timestamp)!r})"
+                )
+            else:
+                values = self.js.eval(
+                    "(() => window.__ngsolveSketchPointer || null)()"
+                )
+            if values is None or len(values) != 2:
+                return None
+            return float(values[0]), float(values[1])
+        except Exception:
+            return None
+
+    def _read_canvas_region_id(self, value):
+        """Return the sketch region hit by a native pointer event, if any."""
+        if not isinstance(value, dict):
+            return None
+        event_type = value.get("type")
+        timestamp = value.get("timeStamp")
+        if event_type not in {None, "mousedown"}:
+            return value.get("region_id") or value.get("regionId")
+        try:
+            timestamp_js = "null" if timestamp is None else repr(float(timestamp))
+            region_id = self.js.eval(
+                "((timestamp) => { "
+                "const events = window.__ngsolveSketchPointerEvents || []; "
+                "const event = (timestamp === null ? null : events.find(item => item.type === 'mousedown' "
+                "&& Math.abs(item.timeStamp - timestamp) < 1)) "
+                "|| [...events].reverse().find(item => item.type === 'mousedown'); "
+                "return event ? (event.regionKnown ? (event.regionId || '') : null) : null; })"
+                f"({timestamp_js})"
+            )
+            return str(region_id) if region_id is not None else None
+        except Exception:
+            return value.get("region_id") or value.get("regionId")
+
+    def _read_canvas_edge_id(self, value):
+        """Return the sketch edge hit by a native pointer event, if any."""
+        if not isinstance(value, dict):
+            return None
+        event_type = value.get("type")
+        timestamp = value.get("timeStamp")
+        if event_type not in {None, "mousedown"}:
+            return value.get("edge_id") or value.get("edgeId")
+        try:
+            timestamp_js = "null" if timestamp is None else repr(float(timestamp))
+            edge_id = self.js.eval(
+                "((timestamp) => { "
+                "const events = window.__ngsolveSketchPointerEvents || []; "
+                "const event = (timestamp === null ? null : events.find(item => item.type === 'mousedown' "
+                "&& Math.abs(item.timeStamp - timestamp) < 1)) "
+                "|| [...events].reverse().find(item => item.type === 'mousedown'); "
+                "return event ? event.edgeId || null : null; })"
+                f"({timestamp_js})"
+            )
+            return str(edge_id) if edge_id is not None else None
+        except Exception:
+            return value.get("edge_id") or value.get("edgeId")
+
+    def _canvas_event_point(self, event, *, refresh_transform=False):
+        value = getattr(event, "value", None)
+        if not isinstance(value, dict):
+            return None
+        try:
+            coordinates = (value.get("x"), value.get("y"))
+            if any(coordinate is None for coordinate in coordinates):
+                coordinates = self._read_canvas_pointer(value)
+            if coordinates is None:
+                return None
+            screen_x, screen_y = (float(coordinate) for coordinate in coordinates)
+            if refresh_transform or self._screen_to_svg is None:
+                self._screen_to_svg = self._read_screen_to_svg_transform()
+            if self._screen_to_svg is None:
+                return None
+            a, b, c, d, e, f = self._screen_to_svg
+            determinant = a * d - b * c
+            if abs(determinant) <= 1e-15:
+                return None
+            dx, dy = screen_x - e, screen_y - f
+            return (
+                (d * dx - c * dy) / determinant,
+                (-b * dx + a * dy) / determinant,
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+
+    def _on_canvas_mouse_down(self, event):
+        value = getattr(event, "value", None)
+        if not isinstance(value, dict):
+            return
+        try:
+            button = int(value.get("button", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if button not in {0, 1}:
+            return
+        tool = self.sketch_tool
+        middle_pan = button == 1
+        # Resolve the hit target before _canvas_event_point consumes the
+        # matching browser pointer record to obtain clientX/clientY.
+        region_id = self._read_canvas_region_id(value) if tool == "select" and not middle_pan else None
+        edge_id = self._read_canvas_edge_id(value) if tool == "select" and not middle_pan else None
+        browser_hit_is_known = region_id == ""
+        if browser_hit_is_known:
+            region_id = None
+        point = self._canvas_event_point(event, refresh_transform=True)
+        if point is None:
+            return
+        if not middle_pan:
+            if tool != "select":
+                point = self._snap_canvas_point(point)
+            elif not region_id and not browser_hit_is_known:
+                region_id = self._region_at_canvas_point(point)
+        if middle_pan:
+            operation = "pan"
+        elif tool != "select":
+            operation = "draw"
+        elif value.get("shiftKey") or value.get("ctrlKey"):
+            operation = "marquee"
+        elif edge_id:
+            operation = "edge"
+        elif region_id:
+            operation = "region"
+        else:
+            operation = "marquee"
+        self._canvas_drag = {
+            "tool": tool,
+            "operation": operation,
+            "start": point,
+            "current": point,
+            "region_id": region_id,
+            "edge_id": edge_id,
+            "additive": bool(value.get("shiftKey") or value.get("ctrlKey")),
+            "moved": False,
+        }
+        # Activate a region as soon as the user presses it. The browser-side
+        # pointer capture keeps the gesture alive for dragging, but it can
+        # retarget the eventual click away from the SVG region element. Doing
+        # selection here makes a simple viewport press reliable and exposes
+        # that region's properties before the pointer is released.
+        if operation == "region" and region_id:
+            self.select_region(region_id)
+
+    def _region_at_canvas_point(self, point):
+        """Hit-test a canvas position against regions, preferring the innermost."""
+        _, unproject = self._canvas_projection()
+        world_point = unproject(point)
+        candidates = [
+            (abs(_polygon_area(region.get("vertices", []))), region["id"])
+            for region in self.model["geometry"].get("regions", [])
+            if len(region.get("vertices", [])) >= 3
+            and _point_in_or_on_polygon(world_point, region["vertices"])
+        ]
+        return min(candidates)[1] if candidates else None
+
+    def _on_canvas_mouse_move(self, event):
+        if self._canvas_drag is None:
+            return
+        point = self._canvas_event_point(event)
+        if point is None:
+            return
+        if self._canvas_drag["operation"] == "draw":
+            point = self._snap_canvas_point(point)
+        self._canvas_drag["current"] = point
+        start = self._canvas_drag["start"]
+        moved = math.hypot(point[0] - start[0], point[1] - start[1]) >= 4.0
+        if moved != self._canvas_drag["moved"]:
+            self._canvas_drag["moved"] = moved
+
+    def _on_canvas_mouse_up(self, event):
+        try:
+            completed = self.js.eval(
+                "(() => { const gesture = window.__ngsolveSketchCompletedGesture || null; "
+                "window.__ngsolveSketchCompletedGesture = null; return gesture; })()"
+            )
+        except Exception:
+            completed = None
+        if isinstance(completed, (list, tuple)) and len(completed) >= 13:
+            operation, tool = str(completed[0]), str(completed[1])
+            try:
+                start = (float(completed[2]), float(completed[3]))
+                end = (float(completed[4]), float(completed[5]))
+                region_id = str(completed[6]) or None
+                additive = bool(completed[7])
+                moved = bool(completed[8])
+                view = tuple(float(completed[index]) for index in (9, 10, 11)) + (int(completed[12]),)
+                edge_id = (str(completed[13]) or None) if len(completed) >= 14 else None
+            except (TypeError, ValueError, OverflowError):
+                completed = None
+            else:
+                self._canvas_drag = None
+                self._screen_to_svg = None
+                if moved and operation in {"region", "edge"} and region_id:
+                    self._move_region_from_canvas_drag(region_id, start, end, preserve_canvas=True)
+                    # Interpret the pointer coordinates in the view that was
+                    # visible during the drag. If a wheel transform was still
+                    # pending, commit it after the region move and redraw once.
+                    if self._commit_browser_canvas_view(view, render=False):
+                        self.render_canvas()
+                elif moved and operation == "marquee":
+                    view_changed = self._commit_browser_canvas_view(view, render=False)
+                    self._select_edges_in_canvas_box(start, end, additive=additive)
+                    if view_changed:
+                        self.render_canvas()
+                elif moved and operation == "pan":
+                    self._commit_browser_canvas_view(view, render=False)
+                    # The pan has already been applied to the local SVG matrix.
+                    self.render_canvas()
+                elif moved and operation == "draw":
+                    view_changed = self._commit_browser_canvas_view(view, render=False)
+                    region_count = len(self.model["geometry"].get("regions", []))
+                    self._create_region_from_canvas_drag(tool, start, end)
+                    if len(self.model["geometry"].get("regions", [])) == region_count:
+                        if view_changed:
+                            self.render_canvas()
+                        else:
+                            self._schedule_canvas_interaction_reset()
+                elif edge_id:
+                    self.select_edge(edge_id, additive=additive)
+                elif operation == "region" and region_id:
+                    if self.selected_region_id != region_id:
+                        self.select_region(region_id)
+                elif self._commit_browser_canvas_view(view, render=False):
+                    self.render_canvas()
+                return
+        drag = self._canvas_drag
+        if drag is None:
+            self._screen_to_svg = None
+            return
+        point = self._canvas_event_point(event)
+        if point is not None:
+            if drag["operation"] == "draw":
+                point = self._snap_canvas_point(point)
+            drag["current"] = point
+        start, end = drag["start"], drag["current"]
+        moved = math.hypot(end[0] - start[0], end[1] - start[1]) >= 4.0
+        self._canvas_drag = None
+        self._screen_to_svg = None
+        if moved and drag["operation"] in {"region", "edge"} and drag.get("region_id"):
+            self._move_region_from_canvas_drag(drag["region_id"], start, end)
+        elif moved and drag["operation"] == "marquee":
+            self._select_edges_in_canvas_box(start, end, additive=drag["additive"])
+        elif moved and drag["operation"] == "pan":
+            self._pan_canvas_by_pixels(start, end)
+        elif moved and drag["operation"] == "draw":
+            self._create_region_from_canvas_drag(drag["tool"], start, end)
+        elif drag.get("edge_id"):
+            self.select_edge(drag["edge_id"], additive=drag["additive"])
+        elif drag["operation"] == "region" and drag.get("region_id"):
+            if self.selected_region_id != drag["region_id"]:
+                self.select_region(drag["region_id"])
+
+    def _on_canvas_pointer_cancel(self, event=None):
+        """Discard an incomplete sketch gesture after a cancelled pointer."""
+        self._canvas_drag = None
+        self._screen_to_svg = None
+
+    @contextmanager
+    def _batch_frontend_updates(self):
+        """Coalesce duplicate component updates and flush them in order.
+
+        Browser-backed components share one frontend event loop. Dispatching
+        their patches from a thread pool can race slot updates and briefly
+        unmount visible panels, so keep the final flush on the caller thread.
+        """
+        frontend = get_environment().frontend
+        send_update = frontend.update_component
+        owner_thread = get_ident()
+        queued = {}
+
+        def collect(component, data, method, blocking=True):
+            if get_ident() != owner_thread:
+                return send_update(component, data, method, blocking=blocking)
+            key = (id(component), method)
+            if key not in queued:
+                queued[key] = [component, data, method, blocking]
+                return
+            previous = queued[key][1]
+            if previous is None or data is None:
+                queued[key][1] = None
+                return
+            combined = dict(previous)
+            for key, value in data.items():
+                if key in {"props", "slots"} and isinstance(value, dict):
+                    merged = dict(combined.get(key, {}))
+                    merged.update(value)
+                    combined[key] = merged
+                else:
+                    combined[key] = value
+            queued[(id(component), method)][1] = combined
+
+        frontend.update_component = collect
+        try:
+            yield
+        finally:
+            frontend.update_component = send_update
+            for component, data, method, blocking in queued.values():
+                send_update(component, data, method, blocking=blocking)
+
+    def _select_edges_in_canvas_box(self, start, end, *, additive=False):
+        project, _ = self._canvas_projection()
+        box = (min(start[0], end[0]), max(start[0], end[0]), min(start[1], end[1]), max(start[1], end[1]))
+        window_selection = end[0] >= start[0]
+        selected = []
+        for edge in self.model["geometry"].get("edges", []):
+            points = [project(point) for point in edge.get("vertices", [])]
+            if len(points) != 2:
+                continue
+            if window_selection:
+                matches = all(_point_in_box(point, box) for point in points)
+            else:
+                matches = _segment_intersects_box(points[0], points[1], box)
+            if matches:
+                selected.append(edge["id"])
+        if additive:
+            selected = list(dict.fromkeys([*self.selected_edge_ids, *selected]))
+        self.selected_edge_ids = selected
+        self.selected_edge_id = selected[-1] if selected else None
+        self.selected_region_id = None
+        self._selected_condition_id = None
+        self.active_section = "geometry"
+        self.layout["active_section"] = self.active_section
+        kind = "enclosed" if window_selection else "crossed"
+        self._message(f"Selected {len(selected)} {kind} edge{'s' if len(selected) != 1 else ''}.")
+        self._update_model_tree_selection()
+        self._update_geometry_inspector()
+        self._sync_canvas_selection()
+        self._render_canvas_dimensions()
+
+    def _create_region_from_canvas_drag(self, tool, start, end):
+        if self.snap_to_grid:
+            start = self._snap_canvas_point(start)
+            end = self._snap_canvas_point(end)
+        _, unproject = self._canvas_projection()
+        # Mouse placement is intentionally limited to 0.01 mm (1e-5 m). The
+        # property editor remains full precision for direct SI input.
+        first = tuple(_round_sketch_m(coordinate) for coordinate in unproject(start))
+        second = tuple(_round_sketch_m(coordinate) for coordinate in unproject(end))
+        before = len(self.model["geometry"]["regions"])
+        if tool == "rectangle":
+            r_min, r_max = sorted((first[0], second[0]))
+            z_min, z_max = sorted((first[1], second[1]))
+            values = {
+                "r_min": _round_sketch_m(r_min),
+                "z_min": _round_sketch_m(z_min),
+                "width": _round_sketch_m(r_max - r_min),
+                "height": _round_sketch_m(z_max - z_min),
+            }
+        else:
+            radius = math.hypot(second[0] - first[0], second[1] - first[1])
+            values = {
+                "r_center": _round_sketch_m(first[0]),
+                "z_center": _round_sketch_m(first[1]),
+                "radius": _round_sketch_m(radius),
+            }
+        for key, value in values.items():
+            self._primitive_values[(tool, key)] = value
+        self._add_primitive(tool)
+        if len(self.model["geometry"]["regions"]) > before:
+            self.set_sketch_tool("select", announce=False)
+
+    @staticmethod
+    def _dimension_literal_m(value_m):
+        """Format a stored metre coordinate as a stable SI expression."""
+        return format(value_m, ".12g")
+
+    @_history_tracked
+    def _move_region_from_canvas_drag(self, region_id, start, end, *, preserve_canvas=False):
+        region = next(
+            (item for item in self.model["geometry"]["regions"] if item["id"] == region_id),
+            None,
+        )
+        if region is None:
+            return
+        if self.snap_to_grid:
+            start = self._snap_canvas_point(start)
+            end = self._snap_canvas_point(end)
+        _, unproject = self._canvas_projection()
+        start_world, end_world = unproject(start), unproject(end)
+        dr = _round_sketch_m(end_world[0] - start_world[0])
+        dz = _round_sketch_m(end_world[1] - start_world[1])
+        if dr == 0 and dz == 0:
+            if preserve_canvas:
+                self._rollback_canvas_region_move(region_id)
+            else:
+                self.render_canvas()
+            return False
+
+        self._preserve_canvas_view()
+        old_shape = copy.deepcopy(region["shape"])
+        old_vertices = copy.deepcopy(region["vertices"])
+        old_parents = {item["id"]: item.get("parent_id") for item in self.model["geometry"]["regions"]}
+        old_edges = copy.deepcopy(self.model["geometry"].get("edges", []))
+        try:
+            shape = region["shape"]
+            expressions = shape.setdefault("dimension_expressions", {})
+            if shape["type"] == "rectangle":
+                shape["r_min"] += dr
+                shape["z_min"] += dz
+                if shape["r_min"] < -1e-12:
+                    raise ValueError("A region cannot be moved left of the r = 0 axis.")
+                shape["r_min"] = max(0.0, shape["r_min"])
+                expressions["r_min"] = self._dimension_literal_m(shape["r_min"])
+                expressions["z_min"] = self._dimension_literal_m(shape["z_min"])
+                r0, z0 = shape["r_min"], shape["z_min"]
+                width, height = shape["width"], shape["height"]
+                region["vertices"] = [[r0, z0], [r0 + width, z0], [r0 + width, z0 + height], [r0, z0 + height]]
+            else:
+                shape["r_center"] += dr
+                shape["z_center"] += dz
+                if shape["r_center"] < shape["radius"] - 1e-12:
+                    raise ValueError("The circle must remain at r ≥ 0.")
+                shape["r_center"] = max(shape["radius"], shape["r_center"])
+                expressions["r_center"] = self._dimension_literal_m(shape["r_center"])
+                expressions["z_center"] = self._dimension_literal_m(shape["z_center"])
+                radius = shape["radius"]
+                rcenter, zcenter = shape["r_center"], shape["z_center"]
+                segments = int(shape.get("segments", 48))
+                region["vertices"] = [
+                    [rcenter + radius * math.cos(2 * math.pi * index / segments),
+                     zcenter + radius * math.sin(2 * math.pi * index / segments)]
+                    for index in range(segments)
+                ]
+
+            # Moving existing edges before rebuilding preserves their IDs,
+            # names, and electromagnetic/mechanical boundary assignments.
+            edge_ids = set(region.get("edge_ids", []))
+            for edge in self.model["geometry"].get("edges", []):
+                if edge["id"] in edge_ids:
+                    edge["vertices"] = [[point[0] + dr, point[1] + dz] for point in edge["vertices"]]
+            self._recompute_parent_links()
+            self._rebuild_edges()
+            self.selected_region_id = region_id
+            self.selected_edge_id = None
+            self.selected_edge_ids = []
+            self._selected_condition_id = None
+            self.active_section = "geometry"
+            self.layout["active_section"] = self.active_section
+            with self._batch_frontend_updates():
+                self._refresh_model_tree()
+                self._render_inspector()
+                if preserve_canvas:
+                    self._sync_canvas_selection()
+                    self._render_canvas_dimensions()
+                    self._commit_canvas_region_move(region_id, dr, dz)
+                else:
+                    self.render_canvas()
+            self._message(f"Moved {region['name']} by {dr:g} m radially and {dz:g} m axially.")
+            return True
+        except (ValueError, TypeError, OverflowError) as error:
+            region["shape"] = old_shape
+            region["vertices"] = old_vertices
+            self.model["geometry"]["edges"] = old_edges
+            for item in self.model["geometry"]["regions"]:
+                item["parent_id"] = old_parents[item["id"]]
+            self._message(str(error), error=True)
+            if preserve_canvas:
+                self._rollback_canvas_region_move(region_id)
+            else:
+                self.render_canvas()
+            return False
+
+    def _commit_canvas_region_move(self, region_id, dr, dz):
+        """Keep the live SVG scene mounted and commit its region preview offset."""
+        project, _ = self._canvas_projection()
+        origin = project((0.0, 0.0))
+        moved = project((dr, dz))
+        dx, dy = moved[0] - origin[0], moved[1] - origin[1]
+        try:
+            self.js.eval(
+                "(() => { const commit = window.__ngsolveCommitSketchRegionMove; "
+                f"if (commit) commit({json.dumps(region_id)}, {dx!r}, {dy!r}); "
+                "})()"
+            )
+        except Exception:
+            # Standalone tests and non-browser frontends have no JS runtime.
+            pass
+
+    def _rollback_canvas_region_move(self, region_id):
+        """Restore the committed SVG offset when a proposed move is rejected."""
+        try:
+            self.js.eval(
+                "(() => { const rollback = window.__ngsolveRollbackSketchRegionMove; "
+                f"if (rollback) rollback({json.dumps(region_id)}); "
+                "})()"
+            )
+        except Exception:
+            # Standalone tests and non-browser frontends have no JS runtime.
+            pass
+
+    def _message(self, text, error=False):
+        self.message = str(text)
+        self.message_is_error = error
+        self._status_text.ui_children = [self.message]
+        self._status_text.ui_style = (
+            "overflow:hidden; text-overflow:ellipsis; font-size:11px; "
+            + ("color:var(--negative);" if error else "color:var(--fg-muted);")
+        )
+        self._log_messages.append(self.message)
+        self._log_messages = self._log_messages[-200:]
+        self._log_body.ui_children = [Div(line) for line in self._log_messages]
+        if self.on_log:
+            self.on_log(self.message, error)
+
+    def toggle_messages(self, *args):
+        self._messages_visible = not self._messages_visible
+        self._messages_panel.ui_hidden = not self._messages_visible
+
+    def _show_validation_issues(self, errors):
+        self.validation_issues = list(errors)
+        self._messages_button.ui_label = f"Messages ({len(errors)})" if errors else "Messages"
+        if not errors:
+            self._messages_panel.ui_children = [Div(
+                "Setup checks passed. Meshing and solving still need to complete successfully.",
+                ui_style="font-size:12px; color:var(--positive); padding:5px 0;",
+            )]
+            self._messages_visible = True
+            self._messages_panel.ui_hidden = False
+            return
+        rows = []
+        for issue in errors:
+            rows.append(_button(
+                issue,
+                "mdi-alert-circle-outline",
+                lambda *a, selected_issue=issue: self._navigate_to_validation_issue(selected_issue),
+                style="width:100%; justify-content:flex-start; text-align:left; white-space:normal;",
+                align="left",
+            ))
+        self._messages_panel.ui_children = rows
+        self._messages_visible = True
+        self._messages_panel.ui_hidden = False
+
+    def _navigate_to_validation_issue(self, issue):
+        """Open the relevant inspector item when a setup message is clicked."""
+        text = str(issue)
+        section = self._validation_issue_section(text)
+        matchers = (
+            ("parameter", r"Parameter '([^']+)'"),
+            ("materials", r"Material '([^']+)'"),
+            ("boundaries", r"Boundary '([^']+)'"),
+            ("boundaries", r"(?:Geometry )?Edge '([^']+)'"),
+            ("region", r"Region '([^']+)'"),
+        )
+        target_kind = None
+        target_name = None
+        for kind, pattern in matchers:
+            found = re.search(pattern, text, re.IGNORECASE)
+            if found:
+                target_kind, target_name = kind, found.group(1)
+                break
+
+        if target_name is not None:
+            if target_kind == "parameter":
+                matches = [item for item in self.model.get("parameters", []) if item.get("name") == target_name]
+                if len(matches) == 1:
+                    self.select_parameter(matches[0]["id"])
+                    return
+            elif target_kind == "materials":
+                matches = [item for item in self.model.get("materials", []) if item.get("name") == target_name]
+                if len(matches) == 1:
+                    self.select_material(matches[0]["id"])
+                    return
+            elif target_kind == "boundaries":
+                matches = [item for item in self.model.get("boundary_conditions", []) if item.get("name") == target_name]
+                if len(matches) == 1:
+                    self.select_boundary(matches[0]["id"])
+                    return
+                edge_matches = [item for item in self.model.get("geometry", {}).get("edges", []) if item.get("name") == target_name or item.get("id") == target_name]
+                if len(edge_matches) == 1:
+                    self.select_edge(edge_matches[0]["id"])
+                    return
+            elif target_kind == "region":
+                matches = [item for item in self.model.get("geometry", {}).get("regions", []) if item.get("name") == target_name or item.get("id") == target_name]
+                if len(matches) == 1:
+                    if section == "sources":
+                        self.select_source_region(matches[0]["id"])
+                    else:
+                        self.select_region(matches[0]["id"])
+                    return
+        self.select_section(section)
+
+    @staticmethod
+    def _validation_issue_section(issue):
+        text = issue.lower().replace("_", " ")
+        if "parameter" in text:
+            return "parameters"
+        if "material" in text:
+            return "materials"
+        if "source" in text or "current density" in text or "body force" in text:
+            return "sources"
+        if "study" in text or "frequency" in text:
+            return "studies"
+        if "mesh" in text:
+            return "mesh"
+        if "solver" in text or "anderson" in text or "iteration" in text or "tolerance" in text:
+            return "solver"
+        if "boundary" in text or "edge" in text or "support" in text:
+            return "boundaries"
+        if "physics" in text or "magnetic" in text or "mechanic" in text or "coupl" in text:
+            return "physics"
+        return "geometry"
+
+    def append_solver_output(self, lines):
+        additions = [str(line).rstrip() for line in lines if str(line).strip()]
+        if not additions:
+            return
+        self._log_messages.extend(additions)
+        self._log_messages = self._log_messages[-200:]
+        self._log_body.ui_children = [Div(line) for line in self._log_messages]
+
+    def toggle_log(self, *args):
+        if self._log_visible:
+            self.hide_log()
+        else:
+            self.show_log()
+
+    def show_log(self, *args):
+        self._log_visible = True
+        self._log_panel.ui_hidden = False
+
+    def hide_log(self, *args):
+        self._log_visible = False
+        self._log_panel.ui_hidden = True
+
+    def _flash_status_bar(self):
+        self._status_flash_variant = 1 - self._status_flash_variant
+        variant = "a" if self._status_flash_variant else "b"
+        self._bottom_bar.ui_class = f"mmfem-solve-status-bar mmfem-solve-status-flash-{variant}"
+
+    def _make_primitive_dialog(self, kind):
+        rectangle = kind == "rectangle"
+        fields = (
+            [
+                ("r_min", "Inner radius", "0", "m"),
+                ("z_min", "Bottom", "0", "m"),
+                ("width", "Radial width", "0.02", "m"),
+                ("height", "Axial height", "0.02", "m"),
+            ]
+            if rectangle
+            else [
+                ("r_center", "Centre radius", "0.015", "m"),
+                ("z_center", "Centre height", "0.01", "m"),
+                ("radius", "Radius", "0.005", "m"),
+            ]
+        )
+        self._primitive_values = getattr(self, "_primitive_values", {})
+        inputs = []
+        for key, label, value, unit in fields:
+            self._primitive_values[(kind, key)] = float(value)
+            widget = QInput(
+                ui_label=label,
+                ui_model_value=value,
+                ui_type="number",
+                ui_suffix=unit,
+                ui_dense=True,
+                ui_filled=True,
+                ui_style="width:100%;",
+            )
+            widget.on_update_model_value(lambda event, k=key, primitive=kind: self._set_primitive_value(primitive, k, event.value))
+            inputs.append(widget)
+        cancel = QBtn(ui_label="Cancel", ui_flat=True, ui_no_caps=True)
+        cancel.on_click(lambda *a, primitive=kind: self._close_dialog(primitive))
+        confirm = QBtn(ui_label="Create region", ui_color="primary", ui_no_caps=True)
+        confirm.on_click(lambda *a, primitive=kind: self._add_primitive(primitive))
+        content = QCard(
+            QCardSection(Div(f"Create {'rectangle' if rectangle else 'circle'} region", ui_style="font-weight:600; font-size:16px;")),
+            QCardSection(*inputs),
+            QCardSection(Div(cancel, confirm, ui_style="display:flex; justify-content:flex-end; gap:8px;")),
+            ui_style="width:min(420px, 90vw);",
+        )
+        dialog = QDialog(content, ui_model_value=False, ui_persistent=False)
+        dialog._solve_kind = kind
+        return dialog
+
+    def _set_primitive_value(self, kind, key, value):
+        try:
+            self._primitive_values[(kind, key)] = float(value)
+        except (TypeError, ValueError):
+            self._primitive_values[(kind, key)] = math.nan
+
+    def open_rectangle_dialog(self, *args):
+        self._rectangle_dialog.ui_model_value = True
+
+    def open_circle_dialog(self, *args):
+        self._circle_dialog.ui_model_value = True
+
+    @_history_tracked
+    def _add_primitive(self, kind):
+        try:
+            vals = {key: value for (primitive, key), value in self._primitive_values.items() if primitive == kind}
+            if not all(math.isfinite(value) for value in vals.values()):
+                raise ValueError("Enter a number in each dimension.")
+            if kind == "rectangle":
+                r0 = vals["r_min"]
+                z0 = vals["z_min"]
+                width = vals["width"]
+                height = vals["height"]
+                if r0 < 0 or width <= 0 or height <= 0:
+                    raise ValueError("Radius must be non-negative and both dimensions must be positive.")
+                vertices = [[r0, z0], [r0 + width, z0], [r0 + width, z0 + height], [r0, z0 + height]]
+                primitive_data = {
+                    "type": "rectangle", "r_min": r0, "z_min": z0, "width": width, "height": height,
+                    "dimension_expressions": {key: str(vals[key]) for key in ("r_min", "z_min", "width", "height")},
+                }
+                label = "square"
+            else:
+                radius = vals["radius"]
+                rcenter = vals["r_center"]
+                zcenter = vals["z_center"]
+                if radius <= 0 or rcenter < radius:
+                    raise ValueError("Radius must be positive and the circle must stay at r ≥ 0.")
+                vertices = [
+                    [rcenter + radius * math.cos(2 * math.pi * i / 48), zcenter + radius * math.sin(2 * math.pi * i / 48)]
+                    for i in range(48)
+                ]
+                primitive_data = {
+                    "type": "circle", "r_center": rcenter, "z_center": zcenter, "radius": radius, "segments": 48,
+                    "dimension_expressions": {key: str(vals[key]) for key in ("r_center", "z_center", "radius")},
+                }
+                label = "circle"
+            parent_id = self._find_containing_region(vertices)
+            if self._has_unsupported_overlap(vertices, parent_id):
+                raise ValueError("Regions must be nested or disjoint; crossing material boundaries are not supported yet.")
+            used_indices = []
+            for existing in self.model["geometry"]["regions"]:
+                if existing.get("shape", {}).get("type") != primitive_data["type"]:
+                    continue
+                match = re.fullmatch(rf"{label} (\d+)", existing.get("name", ""))
+                if match:
+                    used_indices.append(int(match.group(1)))
+            index = max(used_indices, default=0) + 1
+            region = {
+                "id": new_id("region"),
+                "name": f"{label} {index}",
+                "shape": primitive_data,
+                "vertices": vertices,
+                "material_id": None,
+                "parent_id": parent_id,
+                "mechanical": False,
+                "sources": {
+                    "dc_current_density": "0",
+                    "ac_current_density_real": "0",
+                    "ac_current_density_imaginary": "0",
+                    "mechanical_body_force": {"r": "0", "z": "0"},
+                },
+                "edge_ids": [],
+                "constraints": self._primitive_constraints(kind),
+            }
+            self._preserve_canvas_view()
+            with self._batch_frontend_updates():
+                self.model["geometry"]["regions"].append(region)
+                try:
+                    self._recompute_parent_links()
+                except ValueError:
+                    self.model["geometry"]["regions"].pop()
+                    raise
+                self._rebuild_edges()
+                self.selected_region_id = region["id"]
+                self.selected_edge_id = None
+                self.selected_edge_ids = []
+                self._selected_condition_id = None
+                self.active_section = "geometry"
+                self.layout["active_section"] = self.active_section
+                self._close_dialog(kind)
+                self._message(f"Created {region['name']} with {len(region['constraints'])} driving sketch constraints.")
+                self._refresh_model_tree()
+                self._render_inspector()
+                self.render_canvas()
+        except (KeyError, ValueError, OverflowError) as error:
+            self._message(str(error), error=True)
+
+    def _close_dialog(self, kind):
+        dialog = self._rectangle_dialog if kind == "rectangle" else self._circle_dialog
+        dialog.ui_model_value = False
+
+    def _primitive_constraints(self, kind):
+        if kind == "rectangle":
+            return [
+                {"type": "horizontal", "target": "edge-0", "driving": False},
+                {"type": "vertical", "target": "edge-1", "driving": False},
+                {"type": "horizontal", "target": "edge-2", "driving": False},
+                {"type": "vertical", "target": "edge-3", "driving": False},
+                {"type": "radial_position", "target": "shape", "driving": True},
+                {"type": "axial_position", "target": "shape", "driving": True},
+                {"type": "width", "target": "shape", "driving": True},
+                {"type": "height", "target": "shape", "driving": True},
+            ]
+        return [
+            {"type": "radial_position", "target": "shape", "driving": True},
+            {"type": "axial_position", "target": "shape", "driving": True},
+            {"type": "radius", "target": "shape", "driving": True},
+            {"type": "equal_segments", "target": "tessellation", "driving": False},
+        ]
+
+    def _find_containing_region(self, vertices):
+        candidates = []
+        for region in self.model["geometry"]["regions"]:
+            polygon = region["vertices"]
+            if _strictly_contains(polygon, vertices):
+                area = abs(_polygon_area(polygon))
+                candidates.append((area, region["id"]))
+        return min(candidates)[1] if candidates else None
+
+    def _has_unsupported_overlap(self, vertices, parent_id):
+        for region in self.model["geometry"]["regions"]:
+            existing = region["vertices"]
+            if _strictly_contains(existing, vertices) or _strictly_contains(vertices, existing):
+                continue
+            if _polygons_overlap(vertices, existing):
+                return True
+        return False
+
+    def _recompute_parent_links(self):
+        regions = self.model["geometry"]["regions"]
+        for index, first in enumerate(regions):
+            for second in regions[index + 1:]:
+                a, b = first["vertices"], second["vertices"]
+                if _strictly_contains(a, b) or _strictly_contains(b, a):
+                    continue
+                if _polygons_overlap(a, b):
+                    raise ValueError("Regions must be strictly nested or disjoint; crossing or touching material boundaries are not supported.")
+        parents = {}
+        for child in regions:
+            child_area = abs(_polygon_area(child["vertices"]))
+            containers = [
+                (abs(_polygon_area(outer["vertices"])), outer["id"])
+                for outer in regions
+                if outer["id"] != child["id"]
+                and abs(_polygon_area(outer["vertices"])) > child_area
+                and _strictly_contains(outer["vertices"], child["vertices"])
+            ]
+            parents[child["id"]] = min(containers)[1] if containers else None
+        for region in regions:
+            region["parent_id"] = parents[region["id"]]
+
+    def _rebuild_edges(self):
+        old_edges = self.model["geometry"].get("edges", [])
+        old_by_key = {_edge_key(edge["vertices"]): edge for edge in old_edges}
+        edges = []
+        for region in self.model["geometry"]["regions"]:
+            region_edges = []
+            points = region["vertices"]
+            for index, start in enumerate(points):
+                end = points[(index + 1) % len(points)]
+                key = _edge_key([start, end])
+                edge = old_by_key.get(key)
+                if edge is None:
+                    edge = {
+                        "id": new_id("edge"),
+                        "vertices": [list(start), list(end)],
+                        "name": f"Edge {len(edges) + 1}",
+                        "boundary_condition_ids": [],
+                    }
+                else:
+                    edge = copy.deepcopy(edge)
+                    if "boundary_condition_ids" not in edge:
+                        legacy_condition = edge.pop("boundary_condition_id", None)
+                        edge["boundary_condition_ids"] = [legacy_condition] if legacy_condition else []
+                if all(existing["id"] != edge["id"] for existing in edges):
+                    edges.append(edge)
+                region_edges.append(edge["id"])
+            region["edge_ids"] = region_edges
+        self.model["geometry"]["edges"] = edges
+        # Remove sizing and refinement assignments whose geometry was deleted.
+        mesh = self.model.setdefault("mesh", {})
+        live_region_ids = {region["id"] for region in self.model["geometry"]["regions"]}
+        live_edge_ids = {edge["id"] for edge in edges}
+        region_sizes = mesh.get("region_element_sizes", {})
+        if isinstance(region_sizes, dict):
+            mesh["region_element_sizes"] = {
+                region_id: value for region_id, value in region_sizes.items()
+                if region_id in live_region_ids
+            }
+        mesh["hp_region_ids"] = [
+            region_id for region_id in mesh.get("hp_region_ids", [])
+            if region_id in live_region_ids
+        ]
+        mesh["hp_edge_ids"] = [
+            edge_id for edge_id in mesh.get("hp_edge_ids", [])
+            if edge_id in live_edge_ids
+        ]
+        _sync_axis_boundary_conditions(self.model)
+        _sync_mechanical_boundary_conditions(self.model)
+        if hasattr(self, "selected_edge_ids"):
+            live_ids = {edge["id"] for edge in edges}
+            self.selected_edge_ids = [edge_id for edge_id in self.selected_edge_ids if edge_id in live_ids]
+            if self.selected_edge_id not in live_ids:
+                self.selected_edge_id = self.selected_edge_ids[-1] if self.selected_edge_ids else None
+
+    def _refresh_model_tree(self):
+        labels = {key: label for key, label, _ in _SECTIONS}
+        for key, button in self._section_buttons.items():
+            button.ui_label = labels[key]
+            button.ui_color = "primary" if key == self.active_section else None
+            button.ui_flat = key != self.active_section
+        if not self._tree_structure_initialized:
+            tree_groups = []
+            for group_label, section_keys in _TREE_GROUPS:
+                rows = []
+                for key in section_keys:
+                    title = Div(
+                        "",
+                        ui_style="font-size:10px; font-weight:700; letter-spacing:.06em; color:var(--fg-muted); padding:7px 8px 3px 10px;",
+                    )
+                    entries = Div(
+                        ui_style="display:flex; flex-direction:column; gap:1px;",
+                    )
+                    self._tree_entry_titles[key] = title
+                    self._tree_entry_lists[key] = entries
+                    self._tree_entry_order[key] = ()
+                    subsection = Div(
+                        title,
+                        entries,
+                        ui_style="display:flex; flex-direction:column; gap:1px; margin:0 0 4px 12px; border-left:1px solid var(--border); padding-left:4px;",
+                    )
+                    self._tree_entry_containers[key] = subsection
+                    rows.append(Div(
+                        self._section_buttons[key],
+                        subsection,
+                        ui_style="display:flex; flex-direction:column; gap:1px;",
+                    ))
+                tree_groups.append(Div(
+                    Div(group_label, ui_style="font-size:10px; font-weight:700; letter-spacing:.09em; color:var(--fg-muted); padding:7px 8px 5px;"),
+                    *rows,
+                    ui_style="display:flex; flex-direction:column; gap:2px;",
+                ))
+            self._left_items.ui_children = tree_groups
+            self._tree_structure_initialized = True
+
+        for key in self._section_buttons:
+            subsection = self._tree_subsection(key)
+            if not subsection:
+                continue
+            title, entries = subsection
+            title_component = self._tree_entry_titles[key]
+            if title_component.ui_children != [title]:
+                title_component.ui_children = [title]
+
+            old_order = self._tree_entry_order[key]
+            entry_ids = tuple(entry_id for entry_id, *_ in entries)
+            for entry_id in old_order:
+                if entry_id not in entry_ids:
+                    self._tree_entry_buttons.pop(f"{key}:{entry_id}", None)
+
+            entry_buttons = []
+            for entry_id, label, icon, callback, selected in entries:
+                identity = f"{key}:{entry_id}"
+                button = self._tree_entry_buttons.get(identity)
+                if button is None:
+                    button = self._make_tree_entry_button(
+                        key, entry_id, label, icon, callback, selected
+                    )
+                else:
+                    button.ui_label = label
+                    button.ui_icon = icon
+                entry_buttons.append(button)
+            if entry_ids != old_order:
+                self._tree_entry_lists[key].ui_children = entry_buttons
+                self._tree_entry_order[key] = entry_ids
+
+        self._update_model_tree_selection()
+        if hasattr(self, "_bottom_count"):
+            count_text = f"Regions: {len(self.model['geometry']['regions'])}  ·  Mesh order: {self.model['mesh']['polynomial_order']}"
+            if self._bottom_count.ui_children != [count_text]:
+                self._bottom_count.ui_children = [count_text]
+        if hasattr(self, "_model_title") and not self._model_title_editing:
+            self._model_title.ui_model_value = self.model.get("name", "Untitled axisymmetric model")
+
+    def _make_tree_entry_button(self, section, entry_id, label, icon, callback, selected):
+        button = _button(
+            label,
+            icon,
+            callback,
+            color="primary" if selected else None,
+            style="width:100%; justify-content:flex-start; text-align:left; padding-left:10px; min-height:30px;",
+            align="left",
+        )
+        if section == "runs":
+            delete_item = QItem(
+                QItemSection(
+                    QIcon(ui_name="mdi-delete", ui_size="xs"),
+                    ui_avatar=True,
+                ),
+                QItemSection("Delete"),
+                ui_clickable=True,
+                ui_dense=True,
+            )
+            delete_item.on_click(
+                lambda e=None, run_id=entry_id: self.delete_run_history_entry(run_id)
+            )
+            button.ui_children = [
+                *button.ui_children,
+                QMenu(QList(delete_item, ui_dense=True), ui_context_menu=True),
+            ]
+        self._tree_entry_buttons[f"{section}:{entry_id}"] = button
+        return button
+
+    def _tree_subsection(self, section):
+        if section == "geometry":
+            entries = [
+                (region["id"], region["name"], "mdi-vector-square-outline", lambda *a, rid=region["id"]: self.select_region(rid), region["id"] == self.selected_region_id)
+                for region in self.model["geometry"]["regions"]
+            ]
+            return f"REGIONS · {len(entries)}", entries
+        if section == "parameters":
+            entries = [
+                (item["id"], item.get("name", "Parameter"), "mdi-variable", lambda *a, pid=item["id"]: self.select_parameter(pid), item["id"] == self.selected_parameter_id)
+                for item in self.model.get("parameters", [])
+            ]
+            return f"PARAMETERS · {len(entries)}", entries
+        if section == "materials":
+            entries = []
+            for item in self.model.get("materials", []):
+                assigned = sum(region.get("material_id") == item["id"] for region in self.model["geometry"]["regions"])
+                noun = "region" if assigned == 1 else "regions"
+                entries.append((
+                    item["id"],
+                    f"{item['name']} · {assigned} {noun}",
+                    "mdi-cube-outline",
+                    lambda *a, mid=item["id"]: self.select_material(mid),
+                    item["id"] == self.selected_material_id,
+                ))
+            return f"MATERIALS · {len(entries)}", entries
+        if section == "boundaries":
+            entries = []
+            for item in self.model.get("boundary_conditions", []):
+                assigned = sum(item["id"] in _edge_condition_ids(edge) for edge in self.model["geometry"].get("edges", []))
+                noun = "edge" if assigned == 1 else "edges"
+                entries.append((
+                    item["id"],
+                    f"{item['name']} · {assigned} {noun}",
+                    "mdi-vector-link",
+                    lambda *a, bid=item["id"]: self.select_boundary(bid),
+                    item["id"] == self.selected_boundary_id,
+                ))
+            return f"CONDITIONS · {len(entries)}", entries
+        if section == "sources":
+            entries = [
+                (region["id"], region["name"], "mdi-flash-outline", lambda *a, rid=region["id"]: self.select_source_region(rid), region["id"] == self.selected_region_id)
+                for region in self.model["geometry"].get("regions", [])
+            ]
+            return f"REGION LOADS · {len(entries)}", entries
+        if section == "studies":
+            entries = [
+                (item.get("id", item.get("name", "Study")), item.get("name", "Study"), "mdi-play-box-outline", lambda *a: self.select_section("studies"), False)
+                for item in self.studies.get("studies", [])
+            ]
+            return f"STUDY · {len(entries)}", entries
+        if section == "runs":
+            entries = [
+                (item.get("id") or item.get("output_path") or item.get("name", "Run"), item.get("name", "Run"), "mdi-file-chart-outline", lambda *a: self.select_section("runs"), False)
+                for item in reversed(self.runs)
+            ]
+            return f"RUNS · {len(entries)}", entries
+        return None
+
+    def delete_run_history_entry(self, run_id):
+        """Hide one Run History entry without deleting its output files."""
+        run = next(
+            (
+                item for item in self.runs
+                if str(item.get("id") or item.get("output_path") or item.get("name", "Run")) == str(run_id)
+            ),
+            None,
+        )
+        if run is None:
+            return False
+
+        output_path = run.get("output_path")
+        if output_path:
+            hidden_paths = _load_hidden_run_history(self._run_history_root)
+            hidden_paths.add(_run_history_path_key(output_path))
+            try:
+                _save_hidden_run_history(self._run_history_root, hidden_paths)
+            except OSError as error:
+                self._message(f"Could not save the Run History change: {error}", error=True)
+                return False
+
+        self.runs.remove(run)
+        self._refresh_model_tree()
+        if self.active_section == "runs":
+            self._render_inspector()
+        return True
+
+    def select_material(self, material_id):
+        self.selected_material_id = material_id
+        self.active_section = "materials"
+        self.layout["active_section"] = self.active_section
+        self._selected_condition_id = None
+        self._update_model_tree_selection()
+        self._render_inspector()
+        self._sync_canvas_selection()
+
+    def select_boundary(self, boundary_id):
+        self.selected_boundary_id = boundary_id
+        self._selected_condition_id = boundary_id
+        self.active_section = "boundaries"
+        self.layout["active_section"] = self.active_section
+        self._update_model_tree_selection()
+        self._render_inspector()
+        self._sync_canvas_selection()
+
+    def select_parameter(self, parameter_id):
+        self.selected_parameter_id = parameter_id
+        self.active_section = "parameters"
+        self.layout["active_section"] = self.active_section
+        self._update_model_tree_selection()
+        self._render_inspector()
+
+    def select_source_region(self, region_id):
+        self.selected_region_id = region_id
+        self.selected_edge_id = None
+        self.selected_edge_ids = []
+        self._selected_condition_id = None
+        self.active_section = "sources"
+        self.layout["active_section"] = self.active_section
+        self._update_model_tree_selection()
+        self._render_inspector()
+        self._sync_canvas_selection()
+        self._render_canvas_dimensions()
+
+    def select_region(self, region_id):
+        self.selected_region_id = region_id
+        self.selected_edge_id = None
+        self.selected_edge_ids = []
+        self._selected_condition_id = None
+        self.active_section = "geometry"
+        self.layout["active_section"] = self.active_section
+        self._update_model_tree_selection()
+        if self._inspector_view != "geometry":
+            self._render_inspector()
+        else:
+            self._update_geometry_inspector()
+        self._sync_canvas_selection()
+        self._render_canvas_dimensions()
+
+    def select_edge(self, edge_id, additive=False):
+        if additive:
+            selected = list(self.selected_edge_ids)
+            if edge_id in selected:
+                selected.remove(edge_id)
+            else:
+                selected.append(edge_id)
+            self.selected_edge_ids = selected
+        else:
+            self.selected_edge_ids = [edge_id]
+        self.selected_edge_id = self.selected_edge_ids[-1] if self.selected_edge_ids else None
+        self.selected_region_id = None
+        self._selected_condition_id = None
+        self.active_section = "geometry"
+        self.layout["active_section"] = self.active_section
+        self._update_model_tree_selection()
+        if self._inspector_view != "geometry":
+            self._render_inspector()
+        else:
+            self._update_geometry_inspector()
+        self._sync_canvas_selection()
+        self._render_canvas_dimensions()
+
+    def _sync_canvas_selection(self):
+        """Update selected sketch styling without replacing canvas geometry."""
+        edge_ids = json.dumps(self.selected_edge_ids)
+        region_id = json.dumps(self.selected_region_id)
+        highlighted_edges = [
+            edge["id"] for edge in self.model.get("geometry", {}).get("edges", [])
+            if self._selected_condition_id in _edge_condition_ids(edge)
+        ]
+        highlighted_ids = json.dumps(highlighted_edges)
+        script = f"""
+(() => {{
+  const svg = document.querySelector('svg.solve-sketch-canvas');
+  if (!svg) return;
+  const selectedEdges = new Set({edge_ids});
+  const selectedRegion = {region_id};
+  const highlightedEdges = new Set({highlighted_ids});
+  svg.querySelectorAll('[data-sketch-edge-id]').forEach((line) => {{
+    const id = line.getAttribute('data-sketch-edge-id');
+    const selected = selectedEdges.has(id);
+    const highlighted = highlightedEdges.has(id);
+    line.setAttribute('stroke', selected ? '#0877b9' : (highlighted ? '#c66f16' : '#263746'));
+    line.setAttribute('stroke-width', selected || highlighted ? '2.2' : '1.6');
+  }});
+  svg.querySelectorAll('[data-sketch-region-id]').forEach((shape) => {{
+    const selected = shape.getAttribute('data-sketch-region-id') === selectedRegion;
+    shape.setAttribute('fill-opacity', selected ? '0.48' : '0.33');
+    shape.setAttribute('stroke', selected ? '#1b73ae' : '#344658');
+    shape.setAttribute('stroke-width', selected ? '2.2' : '1.6');
+  }});
+}})()
+"""
+        try:
+            self.js.eval(script)
+        except Exception:
+            # Standalone tests and non-browser frontends have no JS runtime.
+            pass
+
+    def _selected_region(self):
+        return next((region for region in self.model["geometry"]["regions"] if region["id"] == self.selected_region_id), None)
+
+    def _selected_edge(self):
+        return next((edge for edge in self.model["geometry"]["edges"] if edge["id"] == self.selected_edge_id), None)
+
+    def _selected_edges(self):
+        selected = set(self.selected_edge_ids)
+        return [edge for edge in self.model["geometry"]["edges"] if edge["id"] in selected]
+
+    def _canvas_dimension_components(self):
+        """Build the selected region's dimension annotations separately."""
+        region = self._selected_region()
+        return self._region_dimension_components(region)
+
+    def _region_dimension_components(self, region):
+        """Build dimensions for a region, whether or not it is selected."""
+        if region is None:
+            return []
+
+        xy, _ = self._canvas_projection()
+        shape_data = region.get("shape", {})
+        if shape_data.get("type") == "rectangle":
+            p0, p1, p2, _ = [xy(point) for point in region["vertices"][:4]]
+            width_m = float(shape_data.get("width", 0))
+            height_m = float(shape_data.get("height", 0))
+            dim_style = "stroke:#455f78; stroke-width:1; fill:none; pointer-events:none;"
+            text_style = "fill:#263746; font-size:11px; font-weight:600; pointer-events:none;"
+            offset = 18
+            return [
+                _svg("line", x1=p0[0], y1=p0[1] + offset, x2=p1[0], y2=p1[1] + offset, style=dim_style),
+                _svg("line", x1=p0[0], y1=p0[1] + 4, x2=p0[0], y2=p0[1] + offset + 3, style=dim_style),
+                _svg("line", x1=p1[0], y1=p1[1] + 4, x2=p1[0], y2=p1[1] + offset + 3, style=dim_style),
+                _svg("text", x=(p0[0] + p1[0]) / 2, y=p0[1] + offset + 14, text_anchor="middle", style=text_style, children=f"W {width_m:.4g} m"),
+                _svg("line", x1=p1[0] + offset, y1=p1[1], x2=p2[0] + offset, y2=p2[1], style=dim_style),
+                _svg("line", x1=p1[0] + 4, y1=p1[1], x2=p1[0] + offset + 3, y2=p1[1], style=dim_style),
+                _svg("line", x1=p2[0] + 4, y1=p2[1], x2=p2[0] + offset + 3, y2=p2[1], style=dim_style),
+                _svg("text", x=p1[0] + offset + 5, y=(p1[1] + p2[1]) / 2, style=text_style, children=f"H {height_m:.4g} m"),
+            ]
+        if shape_data.get("type") == "circle":
+            center = xy((shape_data["r_center"], shape_data["z_center"]))
+            radial = xy((shape_data["r_center"] + shape_data["radius"], shape_data["z_center"]))
+            radius_m = float(shape_data.get("radius", 0))
+            return [
+                _svg("line", x1=center[0], y1=center[1], x2=radial[0], y2=radial[1], stroke="#455f78", stroke_width="1", style="pointer-events:none;"),
+                _svg("text", x=(center[0] + radial[0]) / 2, y=center[1] - 7, text_anchor="middle", fill="#263746", font_size="11", font_weight="600", style="pointer-events:none;", children=f"R {radius_m:.4g} m"),
+            ]
+        return []
+
+    def _render_canvas_dimensions(self):
+        """Update selected dimensions without replacing the full sketch scene."""
+        region = self._selected_region()
+        self._canvas_dimensions.ui_children = self._region_dimension_components(region)
+        region_id = region.get("id") if region else None
+        try:
+            self.js.eval(
+                "(() => { const sync = window.__ngsolveSyncSketchDimensionOffset; "
+                f"if (sync) sync({json.dumps(region_id)}); "
+                "})()"
+            )
+        except Exception:
+            # Standalone tests and non-browser frontends have no JS runtime.
+            pass
+
+    def _build_geometry_inspector(self):
+        self._geometry_empty_panel = Div(
+            _section_title("Geometry", "Click a region or edge to edit it."),
+            Div("Choose Rectangle or Circle in the viewport toolbar. Select a region to edit its dimensions and assignments; select an edge to set boundary conditions.", ui_style="font-size:12px; line-height:1.5; color:var(--fg-muted);"),
+            Div("r ≥ 0 is enforced for axisymmetric geometry. Nested regions must be strictly contained or disjoint.", ui_style="font-size:11px; color:var(--fg-muted); line-height:1.45;"),
+        )
+
+        self._region_subtitle = Div("", ui_style="font-size:11px; color:var(--fg-muted); margin-top:3px;")
+        self._region_title = Div(
+            Div("Region properties", ui_style="font-size:12px; font-weight:700; letter-spacing:.08em; text-transform:uppercase;"),
+            self._region_subtitle,
+            ui_style="padding:14px 14px 10px; border-bottom:1px solid var(--border);",
+        )
+        self._region_name_input = _input("Region name", "", lambda event: self._set_selected_region_value("name", event.value))
+        self._region_dimension_groups = {}
+        for shape_type, fields in {
+            "rectangle": (("r_min", "Inner radius"), ("z_min", "Bottom"), ("width", "Radial width"), ("height", "Axial height")),
+            "circle": (("r_center", "Centre radius"), ("z_center", "Centre height"), ("radius", "Radius")),
+        }.items():
+            inputs = []
+            for key, label in fields:
+                inputs.append(_input(
+                    label,
+                    "",
+                    lambda event, dimension=key: self._set_selected_region_dimension(dimension, event.value),
+                    suffix="m",
+                    hint="Enter lengths in SI metres.",
+                ))
+                self._region_dimension_groups.setdefault(shape_type, {})[key] = inputs[-1]
+            self._region_dimension_groups[shape_type]["group"] = Div(
+                *inputs,
+                ui_hidden=True,
+                ui_style="display:flex; flex-direction:column; gap:7px;",
+            )
+
+        self._region_material_select = QSelect(
+            ui_label="Material",
+            ui_options=self._material_options(),
+            ui_option_label="label",
+            ui_option_value="value",
+            ui_model_value=None,
+            ui_emit_value=True,
+            ui_map_options=True,
+            ui_dense=True,
+            ui_filled=True,
+        )
+        self._region_material_select.on_update_model_value(lambda event: self._set_selected_region_value("material_id", event.value))
+        self._region_mechanical_checkbox = QCheckbox(ui_label="Include in mechanics", ui_model_value=False, ui_dense=True)
+        self._region_mechanical_checkbox.on_update_model_value(lambda event: self._set_selected_region_value("mechanical", bool(event.value)))
+        self._region_constraints = Div(ui_style="display:flex; flex-direction:column; gap:2px;")
+        self._region_panel = Div(
+            self._region_title,
+            Div("GEOMETRY", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted);"),
+            self._region_name_input,
+            Div("Driving dimensions", ui_style="font-size:11px; font-weight:700; letter-spacing:.05em; padding-top:4px;"),
+            Div("Dimensions are shown in SI metres (m). The sketch updates while preserving the current rectangle or circle shape.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+            *[group["group"] for group in self._region_dimension_groups.values()],
+            Div("ASSIGNMENTS", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:6px;"),
+            self._region_material_select,
+            self._region_mechanical_checkbox,
+            Div("SKETCH CONSTRAINTS", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:6px;"),
+            Div("These are built-in relationships for the rectangle and circle tools. This version does not solve general user-defined sketch constraints.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+            self._region_constraints,
+            _button("Delete region", "mdi-delete-outline", lambda *a: self.delete_region(self.selected_region_id) if self.selected_region_id else None, color="negative"),
+            ui_hidden=True,
+            ui_style="display:flex; flex-direction:column; gap:12px;",
+        )
+
+        self._edge_subtitle = Div("", ui_style="font-size:11px; color:var(--fg-muted); margin-top:3px;")
+        self._edge_title = Div(
+            Div("Boundary assignment", ui_style="font-size:12px; font-weight:700; letter-spacing:.08em; text-transform:uppercase;"),
+            self._edge_subtitle,
+            ui_style="padding:14px 14px 10px; border-bottom:1px solid var(--border);",
+        )
+        self._edge_name_input = _input("Edge name", "", lambda event: self._set_selected_edge_name(event.value))
+        em_options = self._edge_condition_options("electromagnetic")
+        mech_options = self._edge_condition_options("mechanical")
+        self._edge_em_select = QSelect(
+            ui_label="Electromagnetic condition", ui_options=em_options,
+            ui_option_label="label", ui_option_value="value", ui_model_value=None,
+            ui_emit_value=True, ui_map_options=True, ui_dense=True, ui_filled=True,
+        )
+        self._edge_em_select.on_update_model_value(lambda event: self._set_edge_conditions(self.selected_edge_ids, "electromagnetic", event.value))
+        self._edge_mech_select = QSelect(
+            ui_label="Mechanical condition", ui_options=mech_options,
+            ui_option_label="label", ui_option_value="value", ui_model_value=None,
+            ui_emit_value=True, ui_map_options=True, ui_dense=True, ui_filled=True,
+        )
+        self._edge_mech_select.on_update_model_value(lambda event: self._set_edge_conditions(self.selected_edge_ids, "mechanical", event.value))
+        self._edge_panel = Div(
+            self._edge_title,
+            self._edge_name_input,
+            self._edge_em_select,
+            self._edge_mech_select,
+            Div("Electromagnetic and mechanical conditions are assigned independently, so one edge can participate in both physics. The axis is excluded from mechanical support assignments in this version.", ui_style="font-size:11px; color:var(--fg-muted); line-height:1.45;"),
+            ui_hidden=True,
+            ui_style="display:flex; flex-direction:column; gap:12px;",
+        )
+        self._geometry_inspector_children = [self._geometry_empty_panel, self._region_panel, self._edge_panel]
+        self._geometry_inspector_ready = True
+
+    def _edge_condition_options(self, physics):
+        if physics == "mechanical":
+            kinds = lambda item: item.get("type", "").startswith("mechanical_")
+            empty = "No mechanical condition"
+        else:
+            kinds = lambda item: item.get("type") in {"axis_of_symmetry", "magnetic_potential_zero", "natural"}
+            empty = "Natural / material interface"
+        return [{"label": empty, "value": None}] + [
+            {"label": item["name"], "value": item["id"]}
+            for item in self.model.get("boundary_conditions", [])
+            if kinds(item)
+        ]
+
+    def _material_options(self):
+        """Offer library presets and project materials without preloading them."""
+        options = [{"label": "Unassigned", "value": None}]
+        seen = set()
+        for material in [
+            *builtin_materials(),
+            *self._user_materials,
+            *self.model.get("materials", []),
+        ]:
+            material_id = material.get("id")
+            if material_id in seen:
+                continue
+            seen.add(material_id)
+            options.append({"label": material.get("name", "Material"), "value": material_id})
+        return options
+
+    def _set_selected_region_value(self, key, value):
+        region = self._selected_region()
+        if region is not None:
+            self._set_region_value(region["id"], key, value)
+
+    def _set_selected_region_dimension(self, key, value):
+        region = self._selected_region()
+        if region is not None:
+            self._set_region_dimension(region["id"], key, value)
+
+    def _set_selected_edge_name(self, value):
+        edge = self._selected_edge()
+        if edge is not None and len(self.selected_edge_ids) == 1:
+            self._set_edge_name(edge["id"], value)
+
+    def _update_geometry_inspector(self):
+        if not self._geometry_inspector_ready or self.active_section != "geometry":
+            return
+        region = self._selected_region()
+        edges = self._selected_edges()
+        show_region = region is not None and not edges
+        show_edges = bool(edges)
+        self._geometry_empty_panel.ui_hidden = show_region or show_edges
+        self._region_panel.ui_hidden = not show_region
+        self._edge_panel.ui_hidden = not show_edges
+        if show_region:
+            shape = region.get("shape", {})
+            shape_type = shape.get("type")
+            parent = next((item["name"] for item in self.model["geometry"]["regions"] if item["id"] == region.get("parent_id")), "Exterior")
+            self._region_subtitle.ui_children = [f"{shape_type.title() if shape_type else 'Region'} · parent: {parent}"]
+            self._region_name_input.ui_model_value = region.get("name", "")
+            self._region_material_select.ui_options = self._material_options()
+            self._region_material_select.ui_model_value = region.get("material_id")
+            self._region_mechanical_checkbox.ui_model_value = bool(region.get("mechanical", False))
+            expressions = shape.get("dimension_expressions", {})
+            for dimension, widget in self._region_dimension_groups.get(shape_type, {}).items():
+                if dimension in shape:
+                    widget.ui_model_value = expressions.get(dimension, str(float(shape[dimension])))
+            for type_name, group in self._region_dimension_groups.items():
+                group["group"].ui_hidden = type_name != shape_type
+            self._region_constraints.ui_children = [
+                Div(
+                    f"{constraint['type'].replace('_', ' ').title()}  ·  {'driving' if constraint.get('driving') else 'reference'}",
+                    ui_style="font-size:11px; padding:3px 0; color:var(--fg-muted);",
+                )
+                for constraint in region.get("constraints", [])
+            ]
+        elif show_edges:
+            if len(edges) == 1:
+                edge = edges[0]
+                self._edge_subtitle.ui_children = [edge.get("name", "Edge") + " · single edge"]
+                self._edge_name_input.ui_model_value = edge.get("name", "")
+                self._edge_name_input.ui_hidden = False
+            else:
+                self._edge_subtitle.ui_children = [f"{len(edges)} edges selected · assignments apply to all"]
+                self._edge_name_input.ui_hidden = True
+            conditions = {item["id"]: item for item in self.model.get("boundary_conditions", [])}
+            assignments = [_edge_condition_ids(edge) for edge in edges]
+            em_values = [next((cid for cid in ids if conditions.get(cid, {}).get("type") in {"axis_of_symmetry", "magnetic_potential_zero", "natural"}), None) for ids in assignments]
+            mech_values = [next((cid for cid in ids if conditions.get(cid, {}).get("type", "").startswith("mechanical_")), None) for ids in assignments]
+            self._edge_em_select.ui_options = self._edge_condition_options("electromagnetic")
+            self._edge_em_select.ui_model_value = em_values[0] if all(value == em_values[0] for value in em_values) else None
+            self._edge_mech_select.ui_options = self._edge_condition_options("mechanical")
+            self._edge_mech_select.ui_model_value = mech_values[0] if all(value == mech_values[0] for value in mech_values) else None
+            on_axis = any(all(abs(float(point[0])) <= 1e-12 for point in edge.get("vertices", [])) for edge in edges)
+            self._edge_mech_select.ui_disable = on_axis
+
+    def _render_inspector(self):
+        if self.active_section == "geometry":
+            if not self._geometry_inspector_ready:
+                self._build_geometry_inspector()
+            self._update_geometry_inspector()
+            if self._inspector_view != "geometry":
+                self._inspector.ui_children = self._geometry_inspector_children
+                self._inspector_view = "geometry"
+            return
+        elif self.active_section == "parameters":
+            children = self._parameter_properties()
+        elif self.active_section == "materials":
+            children = self._material_properties()
+        elif self.active_section == "boundaries":
+            children = self._boundary_properties()
+        elif self.active_section == "physics":
+            children = self._physics_properties()
+        elif self.active_section == "sources":
+            children = self._sources_properties()
+        elif self.active_section == "mesh":
+            children = self._mesh_properties()
+        elif self.active_section == "solver":
+            children = self._solver_properties()
+        elif self.active_section == "studies":
+            children = self._study_properties()
+        else:
+            children = self._run_properties()
+        self._inspector.ui_children = children
+        self._inspector_view = self.active_section
+
+    def _run_properties(self):
+        children = [_section_title("Run history", "Mesh and study outputs are saved in NGSolve_results.")]
+        if not self.runs:
+            children.append(Div("No mesh or solver runs yet.", ui_style="font-size:12px; color:var(--fg-muted);"))
+            return children
+        for run in reversed(self.runs):
+            status = run.get("status", "Complete")
+            status_color = (
+                "var(--negative)" if status == "Failed"
+                else "var(--warning)" if status in {"Cancelled", "Interrupted"}
+                else "var(--positive)"
+            )
+            children.append(Div(
+                Div(
+                    Div(run["name"], ui_style="font-weight:600; font-size:12px; overflow-wrap:anywhere;"),
+                    Div(status, ui_style=f"color:{status_color}; font-size:11px; font-weight:600;"),
+                    ui_style="display:flex; justify-content:space-between; gap:8px;",
+                ),
+                Div(run["finished"], ui_style="font-size:10px; color:var(--fg-muted); margin-top:4px;"),
+                Div(run["output_path"], ui_style="font-size:10px; line-height:1.35; color:var(--fg-muted); overflow-wrap:anywhere; margin-top:4px;"),
+                ui_style="padding:9px; border:1px solid var(--border); border-radius:6px;",
+            ))
+            fields_dir = Path(run.get("output_path", "")) / "ngsolve_gui" / "fields"
+            try:
+                field_files = sorted(fields_dir.glob("*.pkl")) if fields_dir.is_dir() else []
+            except OSError:
+                field_files = []
+            frequency_by_file = {}
+            for field_file in field_files:
+                match = _FREQUENCY_RESULT_SUFFIX.search(field_file.stem)
+                if match:
+                    frequency_by_file[field_file] = match.group(1)
+            frequencies = sorted(
+                set(frequency_by_file.values()),
+                key=lambda value: (float(value), value),
+            )
+            selected_frequency = str(
+                run.get("selected_frequency_hz")
+                or (frequencies[0] if frequencies else "")
+            )
+            if frequencies:
+                run["selected_frequency_hz"] = selected_frequency
+            if len(frequencies) > 1:
+                frequency_select = QSelect(
+                    ui_label="Frequency",
+                    ui_options=[
+                        {"label": f"{frequency} Hz", "value": frequency}
+                        for frequency in frequencies
+                    ],
+                    ui_option_label="label",
+                    ui_option_value="value",
+                    ui_model_value=selected_frequency,
+                    ui_emit_value=True,
+                    ui_map_options=True,
+                    ui_dense=True,
+                    ui_filled=True,
+                )
+                frequency_select.on_update_model_value(
+                    lambda event, selected_run=run: self._set_run_frequency(
+                        selected_run, event.value
+                    )
+                )
+                children.append(frequency_select)
+            for field_file in field_files:
+                frequency = frequency_by_file.get(field_file)
+                if frequency and len(frequencies) > 1 and frequency != selected_frequency:
+                    continue
+                if self.on_open_file:
+                    children.append(Div(
+                        Div(field_file.name, ui_style="font-size:11px; overflow-wrap:anywhere; flex:1;"),
+                        _button("Open in Post Process", "mdi-open-in-app", lambda *a, path=str(field_file): self.on_open_file(path)),
+                        ui_style="display:flex; align-items:center; gap:6px; padding:3px 6px 3px 12px;",
+                    ))
+        return children
+
+    def _set_run_frequency(self, run, frequency):
+        run["selected_frequency_hz"] = str(frequency)
+        if self.active_section == "runs":
+            self._render_inspector()
+
+    def _geometry_properties(self):
+        region = self._selected_region()
+        edge = self._selected_edge()
+        selected_edges = self._selected_edges()
+        if len(selected_edges) > 1:
+            conditions = {item["id"]: item for item in self.model.get("boundary_conditions", [])}
+            assignments = [_edge_condition_ids(item) for item in selected_edges]
+            em_values = [next((cid for cid in ids if conditions.get(cid, {}).get("type") in {"axis_of_symmetry", "magnetic_potential_zero", "natural"}), None) for ids in assignments]
+            mech_values = [next((cid for cid in ids if conditions.get(cid, {}).get("type", "").startswith("mechanical_")), None) for ids in assignments]
+            em_value = em_values[0] if all(value == em_values[0] for value in em_values) else None
+            mech_value = mech_values[0] if all(value == mech_values[0] for value in mech_values) else None
+            em_options = [{"label": "Natural / material interface", "value": None}] + [
+                {"label": item["name"], "value": item["id"]}
+                for item in self.model.get("boundary_conditions", [])
+                if item.get("type") in {"axis_of_symmetry", "magnetic_potential_zero", "natural"}
+            ]
+            mech_options = [{"label": "No mechanical condition", "value": None}] + [
+                {"label": item["name"], "value": item["id"]}
+                for item in self.model.get("boundary_conditions", [])
+                if item.get("type", "").startswith("mechanical_")
+            ]
+            edge_ids = [item["id"] for item in selected_edges]
+            em_select = QSelect(ui_label="Electromagnetic condition", ui_options=em_options, ui_option_label="label", ui_option_value="value", ui_model_value=em_value, ui_emit_value=True, ui_map_options=True, ui_dense=True, ui_filled=True)
+            em_select.on_update_model_value(lambda event, ids=edge_ids: self._set_edge_conditions(ids, "electromagnetic", event.value))
+            mech_select = QSelect(ui_label="Mechanical condition", ui_options=mech_options, ui_option_label="label", ui_option_value="value", ui_model_value=mech_value, ui_emit_value=True, ui_map_options=True, ui_dense=True, ui_filled=True)
+            mech_select.on_update_model_value(lambda event, ids=edge_ids: self._set_edge_conditions(ids, "mechanical", event.value))
+            return [
+                _section_title(f"{len(selected_edges)} edges selected", "Shift-click more edges; condition changes apply to this selection."),
+                em_select,
+                mech_select,
+            ]
+        if edge:
+            selected_ids = _edge_condition_ids(edge)
+            conditions = {item["id"]: item for item in self.model.get("boundary_conditions", [])}
+            em_condition = next((cid for cid in selected_ids if conditions.get(cid, {}).get("type") in {"axis_of_symmetry", "magnetic_potential_zero", "natural"}), None)
+            mech_condition = next((cid for cid in selected_ids if conditions.get(cid, {}).get("type", "").startswith("mechanical_")), None)
+            has_auto_transmission = any(
+                conditions.get(cid, {}).get("automatic_for_mechanics")
+                and conditions.get(cid, {}).get("type") == "transmission_interface"
+                for cid in selected_ids
+            )
+            em_options = [{"label": "Natural / material interface", "value": None}] + [
+                {"label": item["name"], "value": item["id"]}
+                for item in self.model.get("boundary_conditions", [])
+                if item.get("type") in {"axis_of_symmetry", "magnetic_potential_zero", "natural"}
+            ]
+            mech_options = [{"label": "No mechanical condition", "value": None}] + [
+                {"label": item["name"], "value": item["id"]}
+                for item in self.model.get("boundary_conditions", [])
+                if item.get("type", "").startswith("mechanical_")
+            ]
+            on_axis = all(abs(float(point[0])) <= 1e-12 for point in edge.get("vertices", []))
+            if on_axis:
+                mech_options = mech_options[:1]
+            em_select = QSelect(ui_label="Electromagnetic condition", ui_options=em_options, ui_option_label="label", ui_option_value="value", ui_model_value=em_condition, ui_emit_value=True, ui_map_options=True, ui_dense=True, ui_filled=True)
+            em_select.on_update_model_value(lambda event, eid=edge["id"]: self._set_edge_condition(eid, "electromagnetic", event.value))
+            mech_select = QSelect(ui_label="Mechanical condition", ui_options=mech_options, ui_option_label="label", ui_option_value="value", ui_model_value=mech_condition, ui_emit_value=True, ui_map_options=True, ui_dense=True, ui_filled=True, ui_disable=on_axis)
+            mech_select.on_update_model_value(lambda event, eid=edge["id"]: self._set_edge_condition(eid, "mechanical", event.value))
+            name_input = _input("Edge name", edge.get("name", ""), lambda event, eid=edge["id"]: self._set_edge_name(eid, event.value))
+            return [
+                _section_title(edge.get("name", "Edge"), "Boundary assignment"),
+                name_input,
+                em_select,
+                mech_select,
+                *([Div("Transmission interface · automatic", ui_style="font-size:11px; color:var(--fg-muted);")] if has_auto_transmission else []),
+                Div("Electromagnetic and mechanical conditions are assigned independently, so one edge can participate in both physics." + (" The axis is excluded from mechanical support assignments in this version." if on_axis else ""), ui_style="font-size:11px; color:var(--fg-muted); line-height:1.45;"),
+            ]
+        if region:
+            name = _input("Region name", region["name"], lambda event, rid=region["id"]: self._set_region_value(rid, "name", event.value))
+            material = QSelect(
+                ui_label="Material",
+                ui_options=self._material_options(),
+                ui_option_label="label",
+                ui_option_value="value",
+                ui_model_value=region.get("material_id"),
+                ui_emit_value=True,
+                ui_map_options=True,
+                ui_dense=True,
+                ui_filled=True,
+            )
+            material.on_update_model_value(lambda event, rid=region["id"]: self._set_region_value(rid, "material_id", event.value))
+            mechanical = QCheckbox(ui_label="Include in mechanics", ui_model_value=bool(region.get("mechanical", False)), ui_dense=True)
+            mechanical.on_update_model_value(lambda event, rid=region["id"]: self._set_region_value(rid, "mechanical", bool(event.value)))
+            shape_fields = []
+            shape = region.get("shape", {})
+            if shape.get("type") == "rectangle":
+                expressions = shape.get("dimension_expressions", {})
+                for key, label in (("r_min", "Inner radius"), ("z_min", "Bottom"), ("width", "Radial width"), ("height", "Axial height")):
+                    value = expressions.get(key, str(float(shape[key])))
+                    shape_fields.append(_input(label, value, lambda event, rid=region["id"], k=key: self._set_region_dimension(rid, k, event.value), suffix="m", hint="Enter lengths in SI metres."))
+            elif shape.get("type") == "circle":
+                expressions = shape.get("dimension_expressions", {})
+                for key, label in (("r_center", "Centre radius"), ("z_center", "Centre height"), ("radius", "Radius")):
+                    value = expressions.get(key, str(float(shape[key])))
+                    shape_fields.append(_input(label, value, lambda event, rid=region["id"], k=key: self._set_region_dimension(rid, k, event.value), suffix="m", hint="Enter lengths in SI metres."))
+            delete_button = _button("Delete region", "mdi-delete-outline", lambda *a, rid=region["id"]: self.delete_region(rid), color="negative")
+            constraints = [Div(f"{constraint['type'].replace('_', ' ').title()}  ·  {'driving' if constraint.get('driving') else 'reference'}", ui_style="font-size:11px; padding:3px 0; color:var(--fg-muted);") for constraint in region.get("constraints", [])]
+            parent = next((item["name"] for item in self.model["geometry"]["regions"] if item["id"] == region.get("parent_id")), "Exterior")
+            return [
+                _section_title("Region properties", f"{region.get('shape', {}).get('type', 'polygon').title()} · parent: {parent}"),
+                Div("GEOMETRY", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted);"),
+                name,
+                Div("Driving dimensions", ui_style="font-size:11px; font-weight:700; letter-spacing:.05em; padding-top:4px;"),
+                Div("Dimensions are shown in SI metres (m). The sketch updates while preserving the current rectangle or circle shape.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+                *shape_fields,
+                Div("ASSIGNMENTS", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:6px;"),
+                material,
+                mechanical,
+                Div("SKETCH CONSTRAINTS", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:6px;"),
+                Div("These are built-in relationships for the rectangle and circle tools. This version does not solve general user-defined sketch constraints.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+                *constraints,
+                delete_button,
+            ]
+        return [
+            _section_title("Geometry", "Click a region or edge to edit it."),
+            Div("Choose Rectangle or Circle in the viewport toolbar. Select a region to edit its dimensions and assignments; select an edge to set boundary conditions.", ui_style="font-size:12px; line-height:1.5; color:var(--fg-muted);"),
+            Div("r ≥ 0 is enforced for axisymmetric geometry. Nested regions must be strictly contained or disjoint.", ui_style="font-size:11px; color:var(--fg-muted); line-height:1.45;"),
+        ]
+
+    def _parameter_properties(self):
+        children = [_section_title("Parameters", "Named values you can reuse throughout this model.")]
+        parameter_map = {item["name"]: item for item in self.model.get("parameters", [])}
+        if not parameter_map:
+            children.append(Div(
+                "No parameters yet. Add a named value such as coil_radius, then reuse it in dimensions, material properties, sources, or study frequencies.",
+                ui_style="font-size:12px; line-height:1.5; color:var(--fg-muted); padding:4px 0 8px;",
+            ))
+        for parameter in self.model.get("parameters", []):
+            try:
+                value = f"{evaluate_expression(parameter['expression'], parameter_map):.6g}"
+                evaluated_color = "var(--fg-muted);"
+            except (ValueError, TypeError, SyntaxError, OverflowError):
+                value = "Invalid"
+                evaluated_color = "var(--negative);"
+            selected = parameter["id"] == self.selected_parameter_id
+            unit_select = QSelect(
+                ui_label="Dimension",
+                ui_options=list(UNIT_OPTIONS),
+                ui_option_label="label",
+                ui_option_value="value",
+                ui_model_value=parameter.get("unit", "m"),
+                ui_emit_value=True,
+                ui_map_options=True,
+                ui_dense=True,
+                ui_filled=True,
+            )
+            unit_select.on_update_model_value(
+                lambda event, pid=parameter["id"]: self._set_parameter(pid, "unit", event.value)
+            )
+            children.append(Div(
+                Div(
+                    _input("Name", parameter["name"], lambda event, pid=parameter["id"]: self._set_parameter(pid, "name", event.value)),
+                    unit_select,
+                    ui_style="display:grid; grid-template-columns:minmax(0,1fr) minmax(70px,.45fr); gap:7px;",
+                ),
+                _input("Expression", parameter["expression"], lambda event, pid=parameter["id"]: self._set_parameter(pid, "expression", event.value)),
+                Div(
+                    Div("Evaluated value", ui_style="font-size:10px; color:var(--fg-muted);"),
+                    Div(f"{value} {parameter.get('unit', '')}".strip(), ui_style=f"font-size:12px; font-weight:600; color:{evaluated_color}"),
+                    ui_style="min-width:0;",
+                ),
+                _button(
+                    "Remove parameter",
+                    "mdi-delete-outline",
+                    lambda *a, pid=parameter["id"]: self.remove_parameter(pid),
+                    color="negative",
+                    style="align-self:flex-start;",
+                ),
+                ui_style=(
+                    "display:flex; flex-direction:column; gap:8px; padding:9px; border:1px solid "
+                    + ("var(--primary);" if selected else "var(--border);")
+                    + " border-radius:6px;"
+                ),
+            ))
+        children.extend([
+            _button("Add parameter", "mdi-plus", self.add_parameter, color="primary"),
+            Div(
+                "Choose the parameter's physical dimension. Compatible expressions can reuse it; Check setup rejects using it in a field with a different SI unit. Bare numbers are interpreted in the destination field's unit.",
+                ui_style="font-size:11px; line-height:1.45; color:var(--fg-muted);",
+            ),
+        ])
+        return children
+
+    def _material_properties(self):
+        children = [_section_title("Materials", "Enter material properties in SI units, then assign them to regions.")]
+        if not self.model["materials"]:
+            return children + [
+                Div("Choose a built-in or saved material from a region's Material list, or add a custom material here. Custom entries are stored in local settings and remain available after app updates.", ui_style="font-size:12px; color:var(--fg-muted); line-height:1.45;"),
+                _button("Add material", "mdi-plus", self.add_material),
+            ]
+        valid_ids = {item["id"] for item in self.model["materials"]}
+        if self.selected_material_id not in valid_ids:
+            self.selected_material_id = self.model["materials"][0]["id"]
+        children.append(Div(
+            Div("Material", ui_style="font-size:10px; font-weight:700; color:var(--fg-muted);"),
+            Div("Assigned regions", ui_style="font-size:10px; font-weight:700; color:var(--fg-muted); text-align:right;"),
+            ui_style="display:grid; grid-template-columns:1fr 110px; gap:8px; padding:4px 7px;",
+        ))
+        for material in self.model["materials"]:
+            assigned = sum(region.get("material_id") == material["id"] for region in self.model["geometry"]["regions"])
+            row = _button(
+                f"{material['name']}  ·  {assigned} assigned",
+                "mdi-cube-outline",
+                lambda *a, mid=material["id"]: self.select_material(mid),
+                color="primary" if material["id"] == self.selected_material_id else None,
+                style="width:100%; justify-content:flex-start; text-align:left;",
+                align="left",
+            )
+            children.append(row)
+        material = next(item for item in self.model["materials"] if item["id"] == self.selected_material_id)
+        properties = material.get("properties", {})
+        children.extend([
+            Div(ui_style="height:1px; background:var(--border); margin:5px 0;"),
+            _input("Material name", material["name"], lambda event, mid=material["id"]: self._set_material_name(mid, event.value)),
+            Div("ELECTROMAGNETIC", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:4px;"),
+            _input("Relative permeability", properties.get("relative_permeability", ""), lambda event, mid=material["id"]: self._set_material_property(mid, "relative_permeability", event.value)),
+            _input("Electrical conductivity", properties.get("electrical_conductivity", ""), lambda event, mid=material["id"]: self._set_material_property(mid, "electrical_conductivity", event.value), suffix="S/m"),
+            Div("MECHANICAL", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:4px;"),
+            _input("Young's modulus", properties.get("youngs_modulus", ""), lambda event, mid=material["id"]: self._set_material_property(mid, "youngs_modulus", event.value), suffix="Pa"),
+            _input("Poisson's ratio", properties.get("poissons_ratio", ""), lambda event, mid=material["id"]: self._set_material_property(mid, "poissons_ratio", event.value)),
+            _input("Density", properties.get("density", ""), lambda event, mid=material["id"]: self._set_material_property(mid, "density", event.value), suffix="kg/m³"),
+            _button("Add material", "mdi-plus", self.add_material),
+        ])
+        children.append(_button("Remove material", "mdi-delete-outline", lambda *a, mid=material["id"]: self.remove_material(mid)))
+        if any(item["id"] == material["id"] for item in self._user_materials):
+            children.append(Div(
+                "This custom material is stored in local app settings, outside the installed release.",
+                ui_style="font-size:11px; color:var(--fg-muted); line-height:1.4;",
+            ))
+            children.append(_button(
+                "Remove from local library",
+                "mdi-bookmark-remove-outline",
+                lambda *a, mid=material["id"]: self.remove_material_from_library(mid),
+            ))
+        return children
+
+    def _boundary_properties(self):
+        children = [_section_title("Boundary conditions", "Enter displacements in m, tractions in N/m², and stiffnesses in N/m³.")]
+        kinds = [
+            ("axis_of_symmetry", "Axis of symmetry"),
+            ("magnetic_potential_zero", "Magnetic potential = 0"),
+            ("natural", "Natural / free boundary"),
+            ("mechanical_fixed", "Fixed displacement"),
+            ("mechanical_prescribed", "Prescribed displacement"),
+            ("mechanical_traction", "Vector traction"),
+            ("mechanical_robin", "Robin support"),
+        ]
+        conditions = self.model.get("boundary_conditions", [])
+        valid_ids = {item["id"] for item in conditions}
+        if self.selected_boundary_id not in valid_ids:
+            self.selected_boundary_id = conditions[0]["id"] if conditions else None
+        if conditions:
+            children.append(Div("Condition definitions · assigned edges", ui_style="font-size:10px; font-weight:700; color:var(--fg-muted); padding:3px 6px;"))
+        else:
+            children.append(Div("No boundary conditions yet. Add a condition, then assign it to one or more sketch edges.", ui_style="font-size:12px; color:var(--fg-muted); line-height:1.45;"))
+        for condition in conditions:
+            assigned = sum(condition["id"] in _edge_condition_ids(edge) for edge in self.model["geometry"].get("edges", []))
+            children.append(_button(
+                f"{condition['name']}  ·  {assigned} edges",
+                "mdi-vector-link",
+                lambda *a, bid=condition["id"]: self.select_boundary(bid),
+                color="primary" if condition["id"] == self.selected_boundary_id else None,
+                style="width:100%; justify-content:flex-start; text-align:left;",
+                align="left",
+            ))
+        condition = next((item for item in conditions if item["id"] == self.selected_boundary_id), None)
+        if condition:
+            if condition.get("type") == "transmission_interface":
+                kinds.append(("transmission_interface", "Transmission interface"))
+            type_select = QSelect(
+                ui_label="Condition type",
+                ui_options=[{"label": label, "value": value} for value, label in kinds],
+                ui_option_label="label",
+                ui_option_value="value",
+                ui_model_value=condition.get("type"),
+                ui_disable=bool(condition.get("automatic_for_axis") or condition.get("automatic_for_mechanics")),
+                ui_emit_value=True,
+                ui_map_options=True,
+                ui_dense=True,
+                ui_filled=True,
+            )
+            type_select.on_update_model_value(lambda event, bid=condition["id"]: self._set_boundary_value(bid, "type", event.value))
+            children.extend([
+                Div(ui_style="height:1px; background:var(--border); margin:5px 0;"),
+                _input("Condition name", condition["name"], lambda event, bid=condition["id"]: self._set_boundary_value(bid, "name", event.value)),
+                type_select,
+            ])
+            if condition.get("type") == "mechanical_prescribed":
+                children.extend([
+                    _input("Radial displacement", condition.get("displacement_r", "0"), lambda event, bid=condition["id"]: self._set_boundary_value(bid, "displacement_r", event.value), suffix="m"),
+                    _input("Axial displacement", condition.get("displacement_z", "0"), lambda event, bid=condition["id"]: self._set_boundary_value(bid, "displacement_z", event.value), suffix="m"),
+                ])
+            elif condition.get("type") == "mechanical_traction":
+                children.extend([
+                    _input("Radial traction", condition.get("traction_r", "0"), lambda event, bid=condition["id"]: self._set_boundary_value(bid, "traction_r", event.value), suffix="N/m²"),
+                    _input("Axial traction", condition.get("traction_z", "0"), lambda event, bid=condition["id"]: self._set_boundary_value(bid, "traction_z", event.value), suffix="N/m²"),
+                ])
+            elif condition.get("type") == "mechanical_robin":
+                children.extend([
+                    _input("Normal stiffness", condition.get("stiffness_normal", "0"), lambda event, bid=condition["id"]: self._set_boundary_value(bid, "stiffness_normal", event.value), suffix="N/m³"),
+                    _input("Tangential stiffness", condition.get("stiffness_tangential", "0"), lambda event, bid=condition["id"]: self._set_boundary_value(bid, "stiffness_tangential", event.value), suffix="N/m³"),
+                ])
+            children.append(Div("Highlighted orange edges use this condition. Select edges in Geometry to assign or change their conditions.", ui_style="font-size:11px; line-height:1.45; color:var(--fg-muted);"))
+            if condition.get("automatic_for_mechanics"):
+                children.append(Div(
+                    "Assigned automatically where a mechanical region meets non-mechanical material. Shared mechanical interfaces use the default condition.",
+                    ui_style="font-size:11px; line-height:1.45; color:var(--fg-muted);",
+                ))
+            if not condition.get("automatic_for_axis") and not condition.get("automatic_for_mechanics"):
+                children.append(_button("Remove condition", "mdi-delete-outline", lambda *a, bid=condition["id"]: self.remove_boundary(bid)))
+        children.append(_button("Add boundary condition", "mdi-plus", self.add_boundary))
+        return children
+
+    def _physics_properties(self):
+        physics = self.model["physics"]
+        children = [_section_title("Physics & coupling", "Choose which equations the study will solve.")]
+        options = [
+            ("dc_magnetic", "Static magnetic field", "DC magnetic solution"),
+            ("harmonic_electromagnetic", "Time-harmonic EM", "Complex-valued EM field"),
+            ("mechanics", "Time-harmonic mechanics", "Elastic displacement response"),
+            ("coupling", "EM-mechanical coupling", "Coupled electromagnetic and mechanical solve"),
+        ]
+        for key, label, hint in options:
+            toggle = QCheckbox(ui_model_value=bool(physics[key].get("enabled")), ui_label=label, ui_dense=True)
+            toggle.on_update_model_value(lambda event, selected=key: self._set_physics(selected, "enabled", bool(event.value)))
+            children.append(Div(toggle, Div(hint, ui_style="font-size:11px; color:var(--fg-muted); margin-left:30px; margin-top:-5px;"), ui_style="padding:7px 0; border-bottom:1px solid var(--border);"))
+        children.extend([
+            Div("Set frequency points and sweep values in Study.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted); padding-top:8px;"),
+            _button("Configure study frequencies", "mdi-play-box-outline", lambda *a: self.select_section("studies")),
+            Div("Regional current densities and mechanical body forces are configured separately under Sources & loads.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+        ])
+        children.append(Div("Coupling requires DC magnetic, time-harmonic EM and mechanics to be enabled.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted); padding-top:5px;"))
+        return children
+
+    def _sources_properties(self):
+        children = [_section_title("Sources & loads", "Enter current density in A/m² and body force in N/m³; values use SI units.")]
+        regions = self.model["geometry"]["regions"]
+        selected_region = next((item for item in regions if item["id"] == self.selected_region_id), None)
+        if regions:
+            region_select = QSelect(
+                ui_label="Region sources apply to",
+                ui_options=[{"label": item["name"], "value": item["id"]} for item in regions],
+                ui_option_label="label",
+                ui_option_value="value",
+                ui_model_value=selected_region["id"] if selected_region else regions[0]["id"],
+                ui_emit_value=True,
+                ui_map_options=True,
+                ui_dense=True,
+                ui_filled=True,
+            )
+            region_select.on_update_model_value(lambda event: self.select_source_region(event.value))
+            source_region = selected_region or regions[0]
+            sources = source_region.setdefault("sources", {})
+            body_force = sources.setdefault("mechanical_body_force", {"r": "0", "z": "0"})
+            children.extend([
+                region_select,
+                _input("DC current density", sources.get("dc_current_density", "0"), lambda event, rid=source_region["id"]: self._set_region_source(rid, "dc_current_density", event.value), suffix="A/m²"),
+                _input("AC current density (real)", sources.get("ac_current_density_real", "0"), lambda event, rid=source_region["id"]: self._set_region_source(rid, "ac_current_density_real", event.value), suffix="A/m²"),
+                _input("AC current density (imaginary)", sources.get("ac_current_density_imaginary", "0"), lambda event, rid=source_region["id"]: self._set_region_source(rid, "ac_current_density_imaginary", event.value), suffix="A/m²"),
+                Div("MECHANICAL BODY FORCE", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:4px;"),
+                _input("Radial body force", body_force.get("r", "0"), lambda event, rid=source_region["id"]: self._set_region_body_force(rid, "r", event.value), suffix="N/m³"),
+                _input("Axial body force", body_force.get("z", "0"), lambda event, rid=source_region["id"]: self._set_region_body_force(rid, "z", event.value), suffix="N/m³"),
+            ])
+        else:
+            children.extend([
+                Div("Create a geometry region before setting regional sources.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+                _button("Open Geometry", "mdi-vector-square-outline", lambda *a: self.select_section("geometry")),
+            ])
+        return children
+
+    def _mesh_properties(self):
+        mesh = self.model["mesh"]
+        order = QSelect(ui_label="Polynomial order", ui_options=[1, 2, 3, 4, 5, 6], ui_model_value=mesh["polynomial_order"], ui_dense=True, ui_filled=True)
+        order.on_update_model_value(lambda event: self._set_mesh("polynomial_order", int(event.value)))
+        children = [
+            _section_title("Mesh", "Control mesh density and approximation order."),
+            _input("Target element size", mesh["element_size"], lambda event: self._set_mesh("element_size", event.value), suffix="m"),
+            order,
+            Div("Regional sizing", ui_style="font-size:11px; font-weight:700; letter-spacing:.05em; color:var(--fg-muted); padding-top:7px;"),
+            Div("Set a local target size for any subdomain. Leave it blank to use the global target.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+        ]
+        regions = self.model.get("geometry", {}).get("regions", [])
+        region_sizes = mesh.setdefault("region_element_sizes", {})
+        if regions:
+            for region in regions:
+                children.append(_input(
+                    region.get("name", "Region") + " mesh size",
+                    region_sizes.get(region["id"], ""),
+                    lambda event, rid=region["id"]: self._set_region_mesh_size(rid, event.value),
+                    suffix="m",
+                    hint="Blank uses the global target size",
+                ))
+        else:
+            children.append(Div("Add geometry regions to configure subdomain mesh sizes.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"))
+
+        children.extend([
+            Div("Geometric hp layers", ui_style="font-size:11px; font-weight:700; letter-spacing:.05em; color:var(--fg-muted); padding-top:10px;"),
+            Div("Choose boundaries or whole regions to mark. NGSolve will create graded refinement layers around those marks.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+        ])
+        layer_count = QSelect(
+            ui_label="Number of hp layers",
+            ui_options=list(range(0, 9)),
+            ui_model_value=mesh.get("hp_layers", 0),
+            ui_dense=True,
+            ui_filled=True,
+        )
+        layer_count.on_update_model_value(lambda event: self._set_mesh("hp_layers", int(event.value)))
+        grading = _input(
+            "Layer grading factor",
+            mesh.get("hp_grading_factor", 0.3),
+            lambda event: self._set_mesh("hp_grading_factor", event.value),
+            number=True,
+            hint="Between 0 and 1; smaller values make tighter layers",
+        )
+        children.extend([layer_count, grading])
+        if regions:
+            children.append(Div("Whole region boundaries", ui_style="font-size:11px; font-weight:600; padding-top:4px;"))
+            for region in regions:
+                target = QCheckbox(
+                    ui_label=region.get("name", "Region"),
+                    ui_model_value=region["id"] in mesh.get("hp_region_ids", []),
+                    ui_dense=True,
+                )
+                target.on_update_model_value(
+                    lambda event, rid=region["id"]: self._set_hp_layer_target("hp_region_ids", rid, bool(event.value))
+                )
+                children.append(target)
+
+            children.append(Div("Individual boundaries", ui_style="font-size:11px; font-weight:600; padding-top:4px;"))
+            edge_owner = {}
+            for region in regions:
+                for edge_id in region.get("edge_ids", []):
+                    edge_owner.setdefault(edge_id, region.get("name", "Region"))
+            for edge in self.model.get("geometry", {}).get("edges", []):
+                label = edge.get("name", "Boundary")
+                owner = edge_owner.get(edge.get("id"))
+                if owner:
+                    label = f"{owner} · {label}"
+                target = QCheckbox(
+                    ui_label=label,
+                    ui_model_value=edge["id"] in mesh.get("hp_edge_ids", []),
+                    ui_dense=True,
+                )
+                target.on_update_model_value(
+                    lambda event, eid=edge["id"]: self._set_hp_layer_target("hp_edge_ids", eid, bool(event.value))
+                )
+                children.append(target)
+        children.append(Div("The sketch must contain valid, non-overlapping regions before mesh generation.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted); padding-top:5px;"))
+        return children
+
+    def _solver_properties(self):
+        solver = self.model["solver"]
+        anderson = QCheckbox(ui_label="Use Anderson acceleration", ui_model_value=solver["anderson"], ui_dense=True)
+        anderson.on_update_model_value(lambda event: self._set_solver("anderson", bool(event.value)))
+        depth = QInput(ui_label="Anderson depth", ui_type="number", ui_model_value=solver["anderson_depth"], ui_dense=True, ui_filled=True)
+        depth.on_update_model_value(lambda event: self._set_solver("anderson_depth", int(event.value)))
+        beta = QInput(ui_label="Anderson relaxation", ui_type="number", ui_model_value=solver["anderson_beta"], ui_dense=True, ui_filled=True)
+        beta.on_update_model_value(lambda event: self._set_solver("anderson_beta", float(event.value)))
+        tolerance = QInput(ui_label="Relative tolerance", ui_type="number", ui_model_value=solver["relative_tolerance"], ui_dense=True, ui_filled=True)
+        tolerance.on_update_model_value(lambda event: self._set_solver("relative_tolerance", float(event.value)))
+        iterations = QInput(ui_label="Maximum iterations", ui_type="number", ui_model_value=solver["maximum_iterations"], ui_dense=True, ui_filled=True)
+        iterations.on_update_model_value(lambda event: self._set_solver("maximum_iterations", int(event.value)))
+        return [
+            _section_title("Solver settings", "Controls for nonlinear and fixed-point iterations."),
+            Div("Nonlinear / fixed-point solver", ui_style="font-weight:600; font-size:12px; padding-top:6px;"),
+            anderson,
+            depth,
+            beta,
+            tolerance,
+            iterations,
+            Div("Direct sparse linear solver", ui_style="font-size:12px; padding:5px 0;"),
+            Div("The axisymmetric solver currently uses its sparse direct backend.", ui_style="font-size:11px; color:var(--fg-muted); line-height:1.4;"),
+        ]
+
+    def _study_properties(self):
+        studies = self.studies.get("studies", [])
+        children = [_section_title("Study", "One DC + time-harmonic study; enter a single frequency or a comma-separated sweep.")]
+        for study in studies:
+            children.append(Div(
+                _input("Study name", study.get("name", ""), lambda event, sid=study["id"]: self._set_study(sid, "name", event.value)),
+                _input("Frequency points (comma separated)", ", ".join(str(v) for v in study.get("frequency_hz", [])), lambda event, sid=study["id"]: self._set_study_frequencies(sid, event.value), suffix="Hz"),
+                ui_style="display:flex; flex-direction:column; gap:7px; padding:8px; border:1px solid var(--border); border-radius:6px;",
+            ))
+        children.append(Div("Transient and time-integration studies are not supported in this workflow yet.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"))
+        return children
+
+    def _render_canvas(self):
+        return self.render_canvas()
+
+    def _canvas_projection(self):
+        plot = self._canvas_plot_bounds()
+        center, world_width, world_height = self._current_canvas_world_view()
+        rmin, rmax = center[0] - world_width / 2, center[0] + world_width / 2
+        zmin, zmax = center[1] - world_height / 2, center[1] + world_height / 2
+
+        def xy(point):
+            r, z = point
+            x = plot[0] + (r - rmin) / (rmax - rmin) * (plot[2] - plot[0])
+            y = plot[3] - (z - zmin) / (zmax - zmin) * (plot[3] - plot[1])
+            return x, y
+
+        def rz(point):
+            x, y = point
+            r = rmin + (x - plot[0]) / (plot[2] - plot[0]) * (rmax - rmin)
+            z = zmin + (plot[3] - y) / (plot[3] - plot[1]) * (zmax - zmin)
+            return r, z
+
+        return xy, rz
+
+    @staticmethod
+    def _coordinate_step(raw_step):
+        if not math.isfinite(raw_step) or raw_step <= 0:
+            return 1.0
+        power = 10 ** math.floor(math.log10(raw_step))
+        fraction = raw_step / power
+        multiplier = 1 if fraction <= 1 else 2 if fraction <= 2 else 5 if fraction <= 5 else 10
+        return multiplier * power
+
+    @classmethod
+    def _coordinate_ticks(cls, minimum, maximum, target_count=10):
+        span = maximum - minimum
+        if not math.isfinite(span) or span <= 0:
+            return []
+        raw_step = span / max(target_count, 1)
+        step = cls._coordinate_step(raw_step)
+        return cls._ticks_for_step(minimum, maximum, step)
+
+    @staticmethod
+    def _ticks_for_step(minimum, maximum, step):
+        span = maximum - minimum
+        if not all(math.isfinite(value) for value in (minimum, maximum, step)) or span <= 0 or step <= 0:
+            return []
+        first = math.ceil((minimum - step * 1e-10) / step) * step
+        count = min(200, max(0, int(math.floor((maximum - first) / step)) + 1))
+        return [first + index * step for index in range(count)]
+
+    def _canvas_grid_step(self):
+        _, world_width, _ = self._current_canvas_world_view()
+        plot = self._canvas_plot_bounds()
+        return self._coordinate_step(world_width * 80.0 / (plot[2] - plot[0]))
+
+    def _canvas_snap_step(self):
+        """Return the sketch snap interval for a five-by-five grid subdivision."""
+        return self._canvas_grid_step() / _CANVAS_GRID_SUBDIVISIONS
+
+    def _snap_canvas_point(self, point):
+        if not self.snap_to_grid:
+            return point
+        project, unproject = self._canvas_projection()
+        radial, axial = unproject(point)
+        step = self._canvas_snap_step()
+        radial = max(0.0, round(radial / step) * step)
+        axial = round(axial / step) * step
+        return project((radial, axial))
+
+    def _schedule_canvas_interaction_reset(self):
+        """Clear temporary SVG transforms after the committed scene is patched."""
+        try:
+            self.js.eval(
+                "(() => { const reset = window.__ngsolveResetSketchPreview; "
+                "if (!reset) return; "
+                "requestAnimationFrame(() => requestAnimationFrame(reset)); })()"
+            )
+        except Exception:
+            # Standalone tests and non-browser frontends do not expose JS.
+            pass
+
+    def render_canvas(self):
+        width, height = self._canvas_width, self._canvas_height
+        _update_svg_props(self._canvas, **{"viewBox": f"0 0 {width} {height}"})
+        _update_svg_props(self._canvas_background, width=width, height=height)
+        plot = self._canvas_plot_bounds()
+        xy, unproject = self._canvas_projection()
+        regions = self.model["geometry"]["regions"]
+        lower_left = unproject((plot[0], plot[3]))
+        upper_right = unproject((plot[2], plot[1]))
+        grid_step = self._canvas_grid_step()
+        radial_ticks = self._ticks_for_step(max(0.0, lower_left[0]), max(0.0, upper_right[0]), grid_step)
+        axial_ticks = self._ticks_for_step(lower_left[1], upper_right[1], grid_step)
+        snap_step = self._canvas_snap_step()
+        radial_subticks = self._ticks_for_step(max(0.0, lower_left[0]), max(0.0, upper_right[0]), snap_step)
+        axial_subticks = self._ticks_for_step(lower_left[1], upper_right[1], snap_step)
+        grid_signature = (
+            tuple(plot), tuple(lower_left), tuple(upper_right), grid_step, snap_step,
+            tuple(radial_ticks), tuple(axial_ticks), tuple(radial_subticks), tuple(axial_subticks),
+        )
+        grid_text_style = "pointer-events:none; user-select:none; -webkit-user-select:none;"
+        grid_children = []
+        scene_children = []
+        # Keep the existing labelled grid cadence, then add four quieter lines
+        # between each pair of labelled lines for a five-by-five sketch grid.
+        for value in radial_subticks:
+            multiple = value / grid_step
+            if abs(multiple - round(multiple)) <= 1e-8 or abs(value) <= snap_step * 1e-10:
+                continue
+            x = xy((value, 0))[0]
+            grid_children.append(_svg("line", x1=x, y1=plot[1], x2=x, y2=plot[3], stroke="var(--grid-minor, #e8edf2)", stroke_width="0.75"))
+        for value in axial_subticks:
+            multiple = value / grid_step
+            if abs(multiple - round(multiple)) <= 1e-8 or abs(value) <= snap_step * 1e-10:
+                continue
+            y = xy((0, value))[1]
+            grid_children.append(_svg("line", x1=plot[0], y1=y, x2=plot[2], y2=y, stroke="var(--grid-minor, #e8edf2)", stroke_width="0.75"))
+        for value in radial_ticks:
+            if abs(value) <= grid_step * 1e-10:
+                continue
+            x = xy((value, 0))[0]
+            grid_children.append(_svg("line", x1=x, y1=plot[1], x2=x, y2=plot[3], stroke="var(--border, #d9dfe7)", stroke_width="1"))
+            label_x = min(max(x, plot[0] + 22), plot[2] - 22)
+            grid_children.append(_svg("text", x=label_x, y=plot[3] - 5, fill="var(--fg-muted, #697586)", font_size="10", text_anchor="middle", style=grid_text_style, children=f"{value:.5g}"))
+        for value in axial_ticks:
+            if abs(value) <= grid_step * 1e-10:
+                continue
+            y = xy((0, value))[1]
+            grid_children.append(_svg("line", x1=plot[0], y1=y, x2=plot[2], y2=y, stroke="var(--border, #d9dfe7)", stroke_width="1"))
+            label_y = min(max(y + 4, plot[1] + 12), plot[3] - 3)
+            grid_children.append(_svg("text", x=plot[0] + 6, y=label_y, fill="var(--fg-muted, #697586)", font_size="10", text_anchor="start", style=grid_text_style, children=f"{value:.5g}"))
+        if lower_left[0] <= 0 <= upper_right[0]:
+            xaxis = xy((0, 0))[0]
+            grid_children.append(_svg("line", x1=xaxis, y1=plot[1], x2=xaxis, y2=plot[3], stroke="#557187", stroke_width="2", stroke_dasharray="6 4"))
+            grid_children.append(_svg("text", x=xaxis + 7, y=plot[1] + 15, fill="#405e75", font_size="12", font_weight="600", style=grid_text_style, children="Axis of rotation  ·  r = 0"))
+        if lower_left[1] <= 0 <= upper_right[1]:
+            zaxis = xy((0, 0))[1]
+            grid_children.append(_svg("line", x1=plot[0], y1=zaxis, x2=plot[2], y2=zaxis, stroke="#557187", stroke_width="1.5"))
+            grid_children.append(_svg("text", x=plot[2] - 4, y=zaxis - 5, fill="#405e75", font_size="10", text_anchor="end", style=grid_text_style, children="z = 0"))
+        grid_children.append(_svg("text", x=plot[2] - 6, y=height - 8, fill="var(--fg-muted, #697586)", font_size="12", text_anchor="end", style=grid_text_style, children="r  [m]"))
+        grid_children.append(_svg("text", x=plot[0] + 8, y=plot[1] + 15, fill="var(--fg-muted, #697586)", font_size="12", style=grid_text_style, children="z  [m]"))
+
+        material_index = {item["id"]: index for index, item in enumerate(self.model["materials"])}
+        live_region_ids = set()
+        for region in regions:
+            region_id = region["id"]
+            live_region_ids.add(region_id)
+            polygon = " ".join(f"{x:.3f},{y:.3f}" for x, y in (xy(point) for point in region["vertices"]))
+            color = _MATERIAL_COLORS[material_index.get(region.get("material_id"), 0) % len(_MATERIAL_COLORS)]
+            selected = region_id == self.selected_region_id
+            props = {
+                "points": polygon,
+                "fill": color,
+                "fill_opacity": "0.33" if not selected else "0.48",
+                "stroke": "#344658" if not selected else "#1b73ae",
+                "stroke_width": "2.2" if selected else "1.6",
+                "data_sketch_region_id": region_id,
+                "tabindex": "0",
+                "style": "cursor:pointer;",
+            }
+            shape = self._canvas_region_nodes.get(region_id)
+            if shape is None:
+                shape = _svg("polygon", **props)
+                shape.on("click", lambda event, rid=region_id: self.select_region(rid))
+                self._canvas_region_nodes[region_id] = shape
+            else:
+                _update_svg_props(shape, **props)
+            scene_children.append(shape)
+        for region_id in self._canvas_region_nodes.keys() - live_region_ids:
+            del self._canvas_region_nodes[region_id]
+
+        if self.mesh_preview_visible and self.mesh_preview_edges:
+            mesh_path = " ".join(
+                f"M{x1:.2f},{y1:.2f} L{x2:.2f},{y2:.2f}"
+                for start, end in self.mesh_preview_edges
+                for x1, y1 in (xy(start),)
+                for x2, y2 in (xy(end),)
+            )
+            _update_svg_props(
+                self._canvas_mesh_path,
+                d=mesh_path,
+                display="inline",
+            )
+            scene_children.append(self._canvas_mesh_path)
+        else:
+            _update_svg_props(self._canvas_mesh_path, d="", display="none")
+
+        region_for_edge = {
+            edge_id: region["id"]
+            for region in regions
+            for edge_id in region.get("edge_ids", [])
+        }
+        live_edge_ids = set()
+        for edge in self.model["geometry"].get("edges", []):
+            edge_id = edge["id"]
+            live_edge_ids.add(edge_id)
+            start, end = edge["vertices"]
+            x1, y1 = xy(start)
+            x2, y2 = xy(end)
+            selected = edge_id in self.selected_edge_ids
+            edge_color = "#0877b9" if selected else "#263746"
+            region_id = region_for_edge.get(edge_id)
+            visible_props = {
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "stroke": edge_color,
+                "stroke_width": "2.2" if selected else "1.6",
+                "data_sketch_edge_id": edge_id,
+                "data_sketch_region_id": region_id,
+                "style": "pointer-events:none;",
+            }
+            hit_props = {
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "stroke": "transparent", "stroke_width": "12",
+                "data_sketch_edge_id": edge_id,
+                "data_sketch_region_id": region_id,
+                "style": "cursor:pointer; pointer-events:stroke;",
+            }
+            nodes = self._canvas_edge_nodes.get(edge_id)
+            if nodes is None:
+                visible = _svg("line", **visible_props)
+                hit = _svg("line", **hit_props)
+                hit.on("click", lambda event, eid=edge_id: self.select_edge(
+                    eid, additive=bool((getattr(event, "value", None) or {}).get("shiftKey", False)
+                        or (getattr(event, "value", None) or {}).get("ctrlKey", False))
+                ))
+                nodes = (visible, hit)
+                self._canvas_edge_nodes[edge_id] = nodes
+            else:
+                visible, hit = nodes
+                _update_svg_props(visible, **visible_props)
+                _update_svg_props(hit, **hit_props)
+            scene_children.extend([visible, hit])
+        for edge_id in self._canvas_edge_nodes.keys() - live_edge_ids:
+            del self._canvas_edge_nodes[edge_id]
+
+        if grid_signature != self._canvas_grid_signature:
+            self._canvas_grid.ui_children = grid_children
+            self._canvas_grid_signature = grid_signature
+        scene_component_ids = tuple(id(component) for component in scene_children)
+        if scene_component_ids != self._canvas_scene_component_ids:
+            self._canvas_scene.ui_children = scene_children
+            self._canvas_scene_component_ids = scene_component_ids
+        self._render_canvas_dimensions()
+        self._sync_canvas_interaction_settings()
+        self._schedule_canvas_interaction_reset()
+
+    def _build_3d_preview_component(self):
+        """Revolve the current meridian regions for the modal read-only preview."""
+        from netgen.occ import (
+            Axis, Circle, Compound, Dir, Face, MakePolygon, OCCGeometry, Pnt,
+            Revolve, Vec, Vertex, Wire,
+        )
+        from ngapp.components import WebgpuComponent
+        from ngsolve_webgpu import GeometryRenderer
+        from webgpu import CoordinateAxes
+
+        regions = self.model.get("geometry", {}).get("regions", [])
+        live_region_ids = {region.get("id") for region in regions if region.get("id")}
+        self._preview_region_visibility = {
+            region_id: self._preview_region_visibility.get(region_id, "opaque")
+            for region_id in live_region_ids
+        }
+        material_names = {
+            material.get("id"): material.get("name", "")
+            for material in self.model.get("materials", [])
+        }
+        revolved = {}
+        for region in regions:
+            vertices = region.get("vertices", [])
+            if len(vertices) < 3:
+                raise ValueError(f"Region '{region.get('name', 'unnamed')}' needs at least three vertices.")
+            shape = region.get("shape", {})
+            if shape.get("type") == "circle":
+                # The editable sketch stores circles as a 48-sided polygon for
+                # the solver. Revolving that polygon creates dozens of tiny
+                # OCC edges, which render as distracting rings on the torus.
+                # Use an exact circular profile in the read-only preview.
+                profile = Face(Wire(Circle(
+                    Pnt(
+                        float(shape["r_center"]),
+                        0.0,
+                        float(shape["z_center"]),
+                    ),
+                    Dir(0.0, 1.0, 0.0),
+                    float(shape["radius"]),
+                )))
+            else:
+                profile_vertices = [
+                    Vertex(Pnt(float(radius), 0.0, float(axial)))
+                    for radius, axial in vertices
+                ]
+                profile_vertices.append(profile_vertices[0])
+                profile = Face(MakePolygon(profile_vertices))
+            revolved[region["id"]] = Revolve(
+                profile,
+                Axis(Pnt(0.0, 0.0, 0.0), Vec(0.0, 0.0, 1.0)),
+                360.0,
+            )
+
+        # A nested 2D region denotes a separate material domain. Cut its
+        # immediate children from the parent before combining the solids so
+        # that both the outer boundary and the inner domain can be seen.
+        preview_solids = []
+        for region in regions:
+            solid = revolved[region["id"]]
+            for child in regions:
+                if child.get("parent_id") == region["id"]:
+                    solid = solid - revolved[child["id"]]
+            solid = solid.mat(material_names.get(region.get("material_id")) or region.get("name", "Region"))
+            preview_solids.append(solid)
+
+        renderers = []
+        self._preview_3d_renderer = None
+        self._preview_3d_scene = None
+        self._preview_face_region_ids = {}
+        self._preview_edge_region_ids = {}
+        if preview_solids:
+            geometry = OCCGeometry(Compound(preview_solids))
+            renderer = GeometryRenderer(geometry)
+            renderer.faces.active = True
+            # Show the geometric boundaries while keeping circle profiles
+            # analytic above, so a torus has a small number of clean OCC edges
+            # instead of a wire cage made from the sketch polygon.
+            renderer.edges.active = True
+
+            material_index = {
+                material.get("id"): index
+                for index, material in enumerate(self.model.get("materials", []))
+            }
+            for region, solid in zip(regions, preview_solids):
+                for face in solid.faces:
+                    self._preview_face_region_ids.setdefault(hash(face), []).append(region["id"])
+                for edge in solid.edges:
+                    self._preview_edge_region_ids.setdefault(hash(edge), set()).add(region["id"])
+            self._preview_3d_renderer = renderer
+            renderers.append(renderer)
+        axes = CoordinateAxes()
+        renderers.append(axes)
+
+        preview = WebgpuComponent(
+            ui_style="display:block; flex:1 1 auto; width:100%; height:100%; min-width:0; min-height:0;",
+        )
+        preview.ui_class = "fit"
+        preview.on_mounted(lambda *_: self._resize_3d_preview(preview))
+        scene = preview.draw(renderers)
+        self._preview_3d_scene = scene
+        if preview_solids:
+            scene.options.camera.reset(*scene.bounding_box)
+            scene.render()
+            self._apply_3d_preview_visibility(render=False)
+            scene.render()
+        return preview
+
+    def _render_3d_preview_region_table(self):
+        """Refresh the per-region visibility controls in the preview sidebar."""
+        self._preview_visibility_controls = {}
+        rows = []
+        regions = self.model.get("geometry", {}).get("regions", [])
+        for region_index, region in enumerate(regions):
+            region_id = region.get("id")
+            state = self._preview_region_visibility.get(region_id, "opaque")
+            toggle = QBtnToggle(
+                QTooltip("Opaque: fully visible · Translucent: see through · Hidden: invisible"),
+                ui_model_value=state,
+                ui_options=[
+                    {"value": "opaque", "icon": "mdi-eye", "title": "Opaque"},
+                    {"value": "translucent", "icon": "mdi-circle-opacity", "title": "Translucent"},
+                    {"value": "hidden", "icon": "mdi-eye-off", "title": "Hidden"},
+                ],
+                ui_color="grey-8",
+                ui_toggle_color="primary",
+                ui_toggle_text_color="white",
+                ui_outline=True,
+                ui_dense=True,
+                ui_no_caps=True,
+                ui_no_wrap=True,
+                ui_size="sm",
+                ui_padding="xs",
+                ui_class="full-width",
+                ui_style="width:132px; flex:none;",
+            )
+            toggle._props["aria-label"] = f"Visibility for {region.get('name') or 'unnamed region'}"
+            toggle.on(
+                "update:model-value",
+                lambda event, rid=region_id: self._set_3d_region_visibility(
+                    rid, getattr(event, "value", event)
+                ),
+            )
+            self._preview_visibility_controls[region_id] = toggle
+            rows.append(
+                Div(
+                    Div(
+                        Div(
+                            ui_style=(
+                                "width:9px; height:24px; flex:none; border-radius:5px; "
+                                f"background:{_MATERIAL_COLORS[region_index % len(_MATERIAL_COLORS)]};"
+                            ),
+                        ),
+                        Div(
+                            region.get("name") or f"Region {region_index + 1}",
+                            ui_style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
+                        ),
+                        ui_style="display:flex; align-items:center; gap:9px; min-width:0;",
+                    ),
+                    toggle,
+                    ui_style=(
+                        "display:grid; grid-template-columns:minmax(0, 1fr) 132px; "
+                        "align-items:center; gap:8px; min-height:42px; padding:5px 0; "
+                        "border-bottom:1px solid var(--border); font-size:12px;"
+                    ),
+                )
+            )
+
+        self._preview_3d_region_rows.ui_children = rows or [
+            Div("No regions defined", ui_style="padding:10px 0; color:var(--fg-muted); font-size:12px;")
+        ]
+
+    def _set_3d_region_visibility(self, region_id, state):
+        """Update one preview-only visibility state and redraw its region."""
+        if state not in _PREVIEW_VISIBILITY_ALPHA or region_id not in self._preview_region_visibility:
+            return
+        self._preview_region_visibility[region_id] = state
+        control = self._preview_visibility_controls.get(region_id)
+        if control is not None and control.ui_model_value != state:
+            control.ui_model_value = state
+        self._apply_3d_preview_visibility()
+
+    def _apply_3d_preview_visibility(self, *, render=True):
+        """Apply region alpha and line visibility to the active 3D renderer."""
+        renderer = self._preview_3d_renderer
+        if renderer is None:
+            return
+        import numpy as np
+
+        geometry = renderer.geo
+        faces = list(geometry.faces)
+        face_colors = np.tile(
+            np.array([0.42, 0.55, 0.68, 1.0], dtype=np.float32), len(faces)
+        )
+        face_alphas = []
+        material_index = {
+            material.get("id"): index
+            for index, material in enumerate(self.model.get("materials", []))
+        }
+        regions_by_id = {
+            region.get("id"): region
+            for region in self.model.get("geometry", {}).get("regions", [])
+        }
+        for face_index, face in enumerate(faces):
+            region_ids = self._preview_face_region_ids.get(hash(face), ())
+            visible_regions = [
+                region_id for region_id in region_ids
+                if region_id in regions_by_id
+            ]
+            if not visible_regions:
+                face_alphas.append(1.0)
+                continue
+            region_id = max(
+                visible_regions,
+                key=lambda rid: _PREVIEW_VISIBILITY_ALPHA[
+                    self._preview_region_visibility.get(rid, "opaque")
+                ],
+            )
+            region = regions_by_id[region_id]
+            palette = _MATERIAL_COLORS[
+                material_index.get(region.get("material_id"), 0) % len(_MATERIAL_COLORS)
+            ]
+            rgb = tuple(int(palette[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+            alpha = max(
+                _PREVIEW_VISIBILITY_ALPHA[
+                    self._preview_region_visibility.get(rid, "opaque")
+                ]
+                for rid in visible_regions
+            )
+            face_colors[4 * face_index:4 * face_index + 4] = (*rgb, alpha)
+            face_alphas.append(alpha)
+        renderer.faces.set_colors(face_colors)
+        renderer.faces.transparent = any(0.0 < alpha < 1.0 for alpha in face_alphas)
+
+        edges = list(geometry.edges)
+        edge_colors = getattr(renderer.edges, "colors", None)
+        if edge_colors is None or len(edge_colors) != 4 * len(edges):
+            edge_colors = np.tile(
+                np.array([0.12, 0.16, 0.21, 1.0], dtype=np.float32), len(edges)
+            )
+        else:
+            edge_colors = np.asarray(edge_colors, dtype=np.float32).copy()
+        for edge_index, edge in enumerate(edges):
+            region_ids = self._preview_edge_region_ids.get(hash(edge), ())
+            if region_ids:
+                alpha = max(
+                    _PREVIEW_VISIBILITY_ALPHA[
+                        self._preview_region_visibility.get(rid, "opaque")
+                    ]
+                    for rid in region_ids
+                )
+                edge_colors[4 * edge_index + 3] = 0.0 if alpha == 0.0 else 1.0
+        renderer.edges.set_colors(edge_colors)
+        if render and self._preview_3d_scene is not None:
+            self._preview_3d_scene.render()
+
+    @staticmethod
+    def _resize_3d_preview(preview):
+        """Resize after the canvas has entered the visible flex viewport."""
+        try:
+            if preview.canvas is not None:
+                preview.canvas.resize()
+            if preview.scene is not None:
+                preview.scene.render()
+        except Exception:
+            # Browser resize/render can race component mount in some frontends.
+            pass
+
+    def toggle_3d_preview(self, *args):
+        """Open or close the large read-only 3D preview window."""
+        if self._preview_3d_active:
+            self._preview_3d_active = False
+            self._preview_3d_dialog.ui_model_value = False
+            self._preview_3d_viewport.ui_children = []
+            self._preview_3d_component = None
+            self._preview_3d_scene = None
+            self._preview_3d_renderer = None
+            self._preview_face_region_ids = {}
+            self._preview_edge_region_ids = {}
+            self._preview_visibility_controls = {}
+            self._preview_3d_button.ui_label = "Preview in 3D"
+            self._preview_3d_button.ui_icon = "mdi-cube-scan"
+            self._preview_3d_button.ui_color = None
+            self._preview_3d_button.ui_flat = True
+            self._preview_3d_tooltip.ui_children = ["Preview the axisymmetric regions revolved into 3D."]
+            self._message("Returned to the editable meridian sketch.")
+            return
+
+        try:
+            preview = self._build_3d_preview_component()
+        except Exception as error:
+            self._message(f"Could not create the 3D preview: {error}", error=True)
+            return
+
+        self._preview_3d_component = preview
+        self._preview_3d_viewport.ui_children = [preview]
+        self._render_3d_preview_region_table()
+        self._preview_3d_dialog.ui_model_value = True
+        self._preview_3d_active = True
+        self._preview_3d_button.ui_label = "Exit 3D Preview"
+        self._preview_3d_button.ui_icon = "mdi-cube-outline"
+        self._preview_3d_button.ui_color = "primary"
+        self._preview_3d_button.ui_flat = False
+        self._preview_3d_tooltip.ui_children = ["Return to the editable meridian sketch."]
+        self._message("3D preview: left-drag to rotate, middle-drag or Shift+left-drag to pan, scroll to zoom.")
+
+    @_history_tracked
+    def _set_region_value(self, region_id, key, value):
+        region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
+        if region is None:
+            return
+        if key == "material_id" and value:
+            material = next((item for item in self.model["materials"] if item["id"] == value), None)
+            if material is None:
+                material = next((item for item in [*builtin_materials(), *self._user_materials] if item["id"] == value), None)
+                if material is None:
+                    self._message("Choose a material from the available list.", error=True)
+                    return
+                self.model["materials"].append(copy.deepcopy(material))
+        region[key] = str(value).strip() if key == "name" else value
+        if key == "mechanical":
+            self._rebuild_edges()
+        self._refresh_model_tree()
+        if key in {"material_id", "mechanical"}:
+            self._render_inspector()
+        self.render_canvas()
+
+    @_history_tracked
+    def _set_region_dimension(self, region_id, key, value):
+        region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
+        if region is None:
+            return
+        self._preserve_canvas_view()
+        old_shape = copy.deepcopy(region["shape"])
+        old_vertices = copy.deepcopy(region["vertices"])
+        old_parents = {item["id"]: item.get("parent_id") for item in self.model["geometry"]["regions"]}
+        try:
+            expression = str(value).strip()
+            parameters = {item["name"]: item for item in self.model.get("parameters", [])}
+            dimension = evaluate_expression(expression, parameters)
+            if not math.isfinite(dimension) or dimension <= 0 and key not in {"r_min", "z_min", "r_center", "z_center"}:
+                raise ValueError("Dimensions must be finite and positive.")
+            shape = region["shape"]
+            shape[key] = dimension
+            shape.setdefault("dimension_expressions", {})[key] = expression
+            if shape["type"] == "rectangle":
+                r0, z0, width, height = shape["r_min"], shape["z_min"], shape["width"], shape["height"]
+                if r0 < 0 or width <= 0 or height <= 0:
+                    raise ValueError("Radius must be non-negative and dimensions positive.")
+                region["vertices"] = [[r0, z0], [r0 + width, z0], [r0 + width, z0 + height], [r0, z0 + height]]
+            else:
+                radius, rcenter, zcenter = shape["radius"], shape["r_center"], shape["z_center"]
+                if radius <= 0 or rcenter < radius:
+                    raise ValueError("Circle must remain at r ≥ 0.")
+                region["vertices"] = [
+                    [rcenter + radius * math.cos(2 * math.pi * i / 48), zcenter + radius * math.sin(2 * math.pi * i / 48)]
+                    for i in range(48)
+                ]
+            self._recompute_parent_links()
+            self._rebuild_edges()
+            # A dimension edit can move a region onto or off r = 0, which
+            # changes the automatically managed axis boundary in the model tree.
+            self._refresh_model_tree()
+            self._render_inspector()
+            self._message("Updated sketch dimension.")
+        except (ValueError, TypeError, OverflowError) as error:
+            region["shape"] = old_shape
+            region["vertices"] = old_vertices
+            for item in self.model["geometry"]["regions"]:
+                item["parent_id"] = old_parents[item["id"]]
+            self._message(str(error), error=True)
+        self.render_canvas()
+
+    @_history_tracked
+    def _set_edge_name(self, edge_id, value):
+        edge = next((item for item in self.model["geometry"]["edges"] if item["id"] == edge_id), None)
+        if edge:
+            edge["name"] = str(value).strip()
+
+    def _set_edge_condition(self, edge_id, physics, value):
+        self._set_edge_conditions([edge_id], physics, value)
+
+    @_history_tracked
+    def _set_edge_conditions(self, edge_ids, physics, value):
+        selected = set(edge_ids)
+        edges = [edge for edge in self.model["geometry"]["edges"] if edge["id"] in selected]
+        if not edges:
+            return
+        conditions = {item["id"]: item for item in self.model.get("boundary_conditions", [])}
+        condition = conditions.get(value) if value else None
+        if value and condition is None:
+            return
+        if condition:
+            kind = condition.get("type", "")
+            is_mechanical = str(kind).startswith("mechanical_")
+            if is_mechanical != (physics == "mechanical"):
+                self._message("Choose a condition for the selected physics.", error=True)
+                return
+            if physics == "mechanical" and any(
+                all(abs(float(point[0])) <= 1e-12 for point in edge.get("vertices", []))
+                for edge in edges
+            ):
+                self._message("Mechanical support conditions on the r=0 axis are not supported yet.", error=True)
+                return
+        for edge in edges:
+            condition_ids = [
+                condition_id for condition_id in _edge_condition_ids(edge)
+                if conditions.get(condition_id, {}).get("type", "").startswith("mechanical_") != (physics == "mechanical")
+            ]
+            if value:
+                condition_ids.append(value)
+            edge["boundary_condition_ids"] = condition_ids
+        self._rebuild_edges()
+        self._refresh_model_tree()
+        self._render_inspector()
+        self.render_canvas()
+
+    @_history_tracked
+    def delete_region(self, region_id):
+        region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
+        if region is None:
+            return
+        self._preserve_canvas_view()
+        with self._batch_frontend_updates():
+            for child in self.model["geometry"]["regions"]:
+                if child.get("parent_id") == region_id:
+                    child["parent_id"] = region.get("parent_id")
+            self.model["geometry"]["regions"] = [item for item in self.model["geometry"]["regions"] if item["id"] != region_id]
+            self.selected_region_id = None
+            self.selected_edge_id = None
+            self.selected_edge_ids = []
+            self._recompute_parent_links()
+            self._rebuild_edges()
+            self._message(f"Deleted {region['name']}.")
+            self._refresh_model_tree()
+            self._render_inspector()
+            self.render_canvas()
+
+    @_history_tracked
+    def add_parameter(self, *args):
+        index = len(self.model["parameters"]) + 1
+        parameter = {"id": new_id("parameter"), "name": f"length_{index}", "expression": "0.01", "unit": "m"}
+        self.model["parameters"].append(parameter)
+        self.selected_parameter_id = parameter["id"]
+        self._message("Added a parameter with the dimension Length (m). Choose a different dimension if needed.")
+        self._refresh_model_tree()
+        self._render_inspector()
+
+    @_history_tracked
+    def remove_parameter(self, parameter_id):
+        parameter = next((item for item in self.model["parameters"] if item["id"] == parameter_id), None)
+        if parameter is None:
+            return
+        references = self._parameter_reference_locations(parameter)
+        if references:
+            shown = "; ".join(references[:3])
+            if len(references) > 3:
+                shown += f"; and {len(references) - 3} more"
+            message = f"Cannot remove '{parameter['name']}'; it is used by {shown}. Update those expressions first."
+            self._show_validation_issues([message])
+            self._message(message, error=True)
+            return
+        self.model["parameters"] = [item for item in self.model["parameters"] if item["id"] != parameter_id]
+        if self.selected_parameter_id == parameter_id:
+            self.selected_parameter_id = None
+        self._refresh_model_tree()
+        self._render_inspector()
+        self._message(f"Removed parameter '{parameter['name']}'.")
+
+    def _parameter_reference_locations(self, parameter):
+        name = parameter.get("name", "")
+        if not name:
+            return []
+        token = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])")
+        references = []
+
+        def check(label, expression):
+            if isinstance(expression, str) and token.search(expression):
+                references.append(label)
+
+        for other in self.model.get("parameters", []):
+            if other.get("id") != parameter.get("id"):
+                check(f"parameter '{other.get('name', 'unnamed')}'", other.get("expression"))
+        for region in self.model.get("geometry", {}).get("regions", []):
+            shape = region.get("shape", {})
+            for dimension, expression in shape.get("dimension_expressions", {}).items():
+                check(f"region '{region.get('name', 'unnamed')}' {dimension}", expression)
+            sources = region.get("sources", {})
+            for key in ("dc_current_density", "ac_current_density_real", "ac_current_density_imaginary"):
+                check(f"region '{region.get('name', 'unnamed')}' {key.replace('_', ' ')}", sources.get(key))
+            for component, expression in sources.get("mechanical_body_force", {}).items():
+                check(f"region '{region.get('name', 'unnamed')}' {component} body force", expression)
+        for material in self.model.get("materials", []):
+            for key, expression in material.get("properties", {}).items():
+                check(f"material '{material.get('name', 'unnamed')}' {key.replace('_', ' ')}", expression)
+        for condition in self.model.get("boundary_conditions", []):
+            for key in ("displacement_r", "displacement_z", "traction_r", "traction_z", "stiffness_normal", "stiffness_tangential"):
+                check(f"boundary '{condition.get('name', 'unnamed')}' {key.replace('_', ' ')}", condition.get(key))
+        for study in self.studies.get("studies", []):
+            points = study.get("frequency_hz", [])
+            if isinstance(points, str):
+                points = [part.strip() for part in points.split(",") if part.strip()]
+            for index, expression in enumerate(points, start=1):
+                check(f"study '{study.get('name', 'unnamed')}' frequency {index}", expression)
+        check("default harmonic frequency", self.model.get("physics", {}).get("harmonic_electromagnetic", {}).get("frequency_hz"))
+        check("target mesh size", self.model.get("mesh", {}).get("element_size"))
+        return list(dict.fromkeys(references))
+
+    @_history_tracked
+    def _set_parameter(self, parameter_id, key, value):
+        parameter = next((item for item in self.model["parameters"] if item["id"] == parameter_id), None)
+        if parameter:
+            parameter[key] = str(value).strip()
+            self._refresh_expression_geometry()
+
+    def _refresh_expression_geometry(self):
+        old_geometry = copy.deepcopy(self.model["geometry"])
+        parameters = {item["name"]: item for item in self.model.get("parameters", [])}
+        try:
+            for region in self.model["geometry"]["regions"]:
+                shape = region.get("shape", {})
+                expressions = shape.get("dimension_expressions", {})
+                for key, expression in expressions.items():
+                    shape[key] = evaluate_expression(expression, parameters)
+                if shape.get("type") == "rectangle":
+                    r0, z0, width, height = (float(shape[key]) for key in ("r_min", "z_min", "width", "height"))
+                    if r0 < 0 or width <= 0 or height <= 0:
+                        raise ValueError(f"Region '{region['name']}' dimensions must keep r ≥ 0 and have positive width and height.")
+                    region["vertices"] = [[r0, z0], [r0 + width, z0], [r0 + width, z0 + height], [r0, z0 + height]]
+                elif shape.get("type") == "circle":
+                    radius, rcenter, zcenter = (float(shape[key]) for key in ("radius", "r_center", "z_center"))
+                    if radius <= 0 or rcenter < radius:
+                        raise ValueError(f"Region '{region['name']}' must have positive radius and stay at r ≥ 0.")
+                    region["vertices"] = [
+                        [rcenter + radius * math.cos(2 * math.pi * index / 48), zcenter + radius * math.sin(2 * math.pi * index / 48)]
+                        for index in range(48)
+                    ]
+            self._recompute_parent_links()
+            self._rebuild_edges()
+            self._refresh_model_tree()
+            self._render_inspector()
+            self.render_canvas()
+            self._message("Updated geometry from parameter expressions.")
+        except (ValueError, TypeError, OverflowError) as error:
+            self.model["geometry"] = old_geometry
+            self._rebuild_edges()
+            self._render_inspector()
+            self._message(f"Geometry was not updated: {error}", error=True)
+
+    @_history_tracked
+    def add_material(self, *args):
+        index = len(self._user_materials) + 1
+        material = builtin_materials()[0]
+        material.update({"id": new_id("material"), "name": f"Material {index}"})
+        self.model["materials"].append(copy.deepcopy(material))
+        self._user_materials.append(copy.deepcopy(material))
+        self.selected_material_id = material["id"]
+        if self._save_user_materials():
+            self._message(f"Added {material['name']} to this model and the local material library.")
+        self._refresh_model_tree()
+        self._render_inspector()
+
+    @_history_tracked
+    def remove_material(self, material_id):
+        if any(region.get("material_id") == material_id for region in self.model["geometry"]["regions"]):
+            self._message("This material is assigned to a region. Reassign the region before deleting it.", error=True)
+            return
+        self.model["materials"] = [item for item in self.model["materials"] if item["id"] != material_id]
+        if self.selected_material_id == material_id:
+            self.selected_material_id = self.model["materials"][0]["id"] if self.model["materials"] else None
+        self._refresh_model_tree()
+        self._render_inspector()
+
+    def _save_user_materials(self):
+        try:
+            self._material_library.save(self._user_materials)
+        except OSError as error:
+            self._message(f"Could not save the local material library: {error}", error=True)
+            return False
+        return True
+
+    def remove_material_from_library(self, material_id):
+        material = next((item for item in self._user_materials if item["id"] == material_id), None)
+        if material is None:
+            return False
+        remaining = [item for item in self._user_materials if item["id"] != material_id]
+        try:
+            self._material_library.save(remaining)
+        except OSError as error:
+            self._message(f"Could not update the local material library: {error}", error=True)
+            return False
+        self._user_materials = remaining
+        self._message(f"Removed {material['name']} from the local library. Its copy in this model is unchanged.")
+        self._render_inspector()
+        self._update_geometry_inspector()
+        return True
+
+    @_history_tracked
+    def _set_material_name(self, material_id, value):
+        material = next((item for item in self.model["materials"] if item["id"] == material_id), None)
+        if material:
+            material["name"] = str(value).strip()
+            library_material = next((item for item in self._user_materials if item["id"] == material_id), None)
+            if library_material is not None:
+                library_material["name"] = material["name"]
+                self._save_user_materials()
+            self._refresh_model_tree()
+
+    @_history_tracked
+    def _set_material_property(self, material_id, key, value):
+        material = next((item for item in self.model["materials"] if item["id"] == material_id), None)
+        if material:
+            material.setdefault("properties", {})[key] = str(value).strip()
+            library_material = next((item for item in self._user_materials if item["id"] == material_id), None)
+            if library_material is not None:
+                library_material.setdefault("properties", {})[key] = str(value).strip()
+                self._save_user_materials()
+
+    @_history_tracked
+    def add_boundary(self, *args):
+        index = len(self.model.get("boundary_conditions", [])) + 1
+        condition = {"id": new_id("boundary"), "name": f"Boundary {index}", "type": "natural"}
+        self.model.setdefault("boundary_conditions", []).append(condition)
+        self.selected_boundary_id = condition["id"]
+        self._selected_condition_id = condition["id"]
+        self.active_section = "boundaries"
+        self.layout["active_section"] = self.active_section
+        self._refresh_model_tree()
+        self._render_inspector()
+        self._sync_canvas_selection()
+
+    @_history_tracked
+    def remove_boundary(self, boundary_id):
+        if any(boundary_id in _edge_condition_ids(edge) for edge in self.model["geometry"].get("edges", [])):
+            self._message("This condition is assigned to an edge. Reassign the edge before deleting it.", error=True)
+            return
+        self.model["boundary_conditions"] = [item for item in self.model.get("boundary_conditions", []) if item["id"] != boundary_id]
+        if self.selected_boundary_id == boundary_id:
+            self.selected_boundary_id = self.model["boundary_conditions"][0]["id"] if self.model["boundary_conditions"] else None
+        if self._selected_condition_id == boundary_id:
+            self._selected_condition_id = None
+        self._refresh_model_tree()
+        self._render_inspector()
+        self._sync_canvas_selection()
+
+    @_history_tracked
+    def _set_boundary_value(self, boundary_id, key, value):
+        condition = next((item for item in self.model.get("boundary_conditions", []) if item["id"] == boundary_id), None)
+        if condition:
+            if key == "type" and (condition.get("automatic_for_axis") or condition.get("automatic_for_mechanics")):
+                return
+            if key == "type" and value == "transmission_interface":
+                return
+            condition[key] = str(value).strip() if key != "type" else value
+            self._refresh_model_tree()
+            if key == "type":
+                self._render_inspector()
+                self._sync_canvas_selection()
+
+    @_history_tracked
+    def _set_region_source(self, region_id, key, value):
+        region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
+        if region:
+            region.setdefault("sources", {})[key] = str(value).strip()
+
+    @_history_tracked
+    def _set_region_body_force(self, region_id, component, value):
+        region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
+        if region:
+            region.setdefault("sources", {}).setdefault("mechanical_body_force", {"r": "0", "z": "0"})[component] = str(value).strip()
+
+    @_history_tracked
+    def _set_physics(self, physics, key, value):
+        self.model["physics"].setdefault(physics, {})[key] = value
+
+    @_history_tracked
+    def _set_mesh(self, key, value):
+        self.model["mesh"][key] = value
+        self._refresh_model_tree()
+
+    @_history_tracked
+    def _set_region_mesh_size(self, region_id, value):
+        region_ids = {region.get("id") for region in self.model.get("geometry", {}).get("regions", [])}
+        if region_id not in region_ids:
+            return
+        region_sizes = self.model.setdefault("mesh", {}).setdefault("region_element_sizes", {})
+        expression = str(value or "").strip()
+        if expression:
+            region_sizes[region_id] = expression
+        else:
+            region_sizes.pop(region_id, None)
+
+    @_history_tracked
+    def _set_hp_layer_target(self, key, target_id, enabled):
+        if key not in {"hp_region_ids", "hp_edge_ids"}:
+            raise ValueError(f"Unsupported hp-layer target list: {key}")
+        live_ids = {
+            region.get("id") for region in self.model.get("geometry", {}).get("regions", [])
+        } if key == "hp_region_ids" else {
+            edge.get("id") for edge in self.model.get("geometry", {}).get("edges", [])
+        }
+        if target_id not in live_ids:
+            return
+        selected = list(self.model.setdefault("mesh", {}).get(key, []))
+        if enabled and target_id not in selected:
+            selected.append(target_id)
+        elif not enabled:
+            selected = [item for item in selected if item != target_id]
+        self.model["mesh"][key] = selected
+
+    @_history_tracked
+    def _set_solver(self, key, value):
+        self.model["solver"][key] = value
+
+    @_history_tracked
+    def _set_study(self, study_id, key, value):
+        study = next((item for item in self.studies["studies"] if item["id"] == study_id), None)
+        if study:
+            study[key] = str(value).strip()
+
+    @_history_tracked
+    def _set_study_frequencies(self, study_id, value):
+        study = next((item for item in self.studies["studies"] if item["id"] == study_id), None)
+        if study:
+            study["frequency_hz"] = [part.strip() for part in str(value).split(",") if part.strip()]
+
+    def _mechanical_components(self):
+        """Return each connected mechanical body and the edges on its boundary."""
+        regions = self.model.get("geometry", {}).get("regions", [])
+        mechanical = {
+            region.get("id"): region
+            for region in regions
+            if isinstance(region, dict) and region.get("id") and region.get("mechanical")
+        }
+        parent = {region_id: region_id for region_id in mechanical}
+
+        def find(region_id):
+            while parent[region_id] != region_id:
+                parent[region_id] = parent[parent[region_id]]
+                region_id = parent[region_id]
+            return region_id
+
+        for region_id, region in mechanical.items():
+            parent_id = region.get("parent_id")
+            if parent_id in mechanical:
+                first, second = find(region_id), find(parent_id)
+                if first != second:
+                    parent[first] = second
+
+        groups = {}
+        for region_id in mechanical:
+            groups.setdefault(find(region_id), set()).add(region_id)
+
+        components = []
+        for region_ids in groups.values():
+            # A nested child's outline is also a boundary of its immediate
+            # parent material. This includes cavity walls when the child is
+            # not itself selected for mechanics.
+            edge_ids = set()
+            for region in regions:
+                if not isinstance(region, dict):
+                    continue
+                if region.get("id") in region_ids or region.get("parent_id") in region_ids:
+                    edge_ids.update(item for item in region.get("edge_ids", []) if isinstance(item, str))
+            components.append((region_ids, edge_ids))
+        return list(mechanical.values()), components
+
+    def _robin_edge_supports_axial_translation(self, edge, condition, parameters):
+        """Check whether a non-negative Robin spring restrains axial motion.
+
+        The axisymmetric displacement has radial and axial components. A free
+        body's remaining rigid mode is axial translation; for an edge with
+        unit tangent (dr, dz), its Robin energy for that mode is proportional
+        to k_normal*dr² + k_tangential*dz².
+        """
+        vertices = edge.get("vertices", [])
+        if len(vertices) != 2:
+            return False, ""
+        try:
+            (r0, z0), (r1, z1) = [tuple(float(value) for value in point) for point in vertices]
+            dr, dz = r1 - r0, z1 - z0
+            length_squared = dr * dr + dz * dz
+            if not math.isfinite(length_squared) or length_squared <= 0:
+                return False, ""
+            # Three-point Gauss locations catch ordinary coordinate-dependent
+            # stiffness profiles while avoiding endpoint-only support claims.
+            samples = (0.1127016653792583, 0.5, 0.8872983346207417)
+            axial_support = False
+            for t in samples:
+                values = dict(parameters)
+                values.update({"r": r0 + t * dr, "z": z0 + t * dz})
+                normal_stiffness = evaluate_expression(condition.get("stiffness_normal", "0"), values)
+                tangential_stiffness = evaluate_expression(condition.get("stiffness_tangential", "0"), values)
+                if normal_stiffness < 0 or tangential_stiffness < 0:
+                    return False, "Robin support stiffnesses must be non-negative."
+                axial_stiffness = (
+                    normal_stiffness * dr * dr + tangential_stiffness * dz * dz
+                ) / length_squared
+                axial_support = axial_support or axial_stiffness > 0
+            if axial_support:
+                return True, ""
+        except (TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError):
+            # Model validation reports malformed expressions separately.
+            return False, ""
+        return False, ""
+
+    def validation_errors(self):
+        errors = validate_model(self.model)
+        if not self.model["geometry"]["regions"]:
+            errors.append("Create at least one material region.")
+        physics = self.model.get("physics", {})
+        if not any(item.get("enabled") for item in physics.values() if isinstance(item, dict)):
+            errors.append("Select at least one physics problem.")
+        mechanics = physics.get("mechanics", {}).get("enabled", False)
+        harmonic = physics.get("harmonic_electromagnetic", {}).get("enabled", False)
+        coupling = physics.get("coupling", {}).get("enabled", False)
+        electromagnetic = physics.get("dc_magnetic", {}).get("enabled", False) or harmonic
+        if electromagnetic:
+            condition_types = {
+                condition.get("id"): condition.get("type")
+                for condition in self.model.get("boundary_conditions", [])
+                if isinstance(condition, dict)
+            }
+            exterior_regions = [
+                region
+                for region in self.model["geometry"].get("regions", [])
+                if isinstance(region, dict) and region.get("parent_id") is None
+            ]
+            edges_by_id = {
+                edge.get("id"): edge
+                for edge in self.model["geometry"].get("edges", [])
+                if isinstance(edge, dict) and edge.get("id")
+            }
+            missing_references = []
+            for region in exterior_regions:
+                has_reference = any(
+                    condition_types.get(condition_id) == "magnetic_potential_zero"
+                    for edge_id in region.get("edge_ids", [])
+                    for condition_id in _edge_condition_ids(edges_by_id.get(edge_id, {}))
+                )
+                if not has_reference:
+                    missing_references.append(region.get("name", region.get("id", "unnamed")))
+            if missing_references:
+                names = ", ".join(f"'{name}'" for name in missing_references)
+                errors.append(
+                    "Assign magnetic potential = 0 to an exterior edge of each disconnected "
+                    f"region to anchor the electromagnetic solution. Missing: {names}."
+                )
+        if mechanics and not harmonic:
+            errors.append("Time-harmonic mechanics currently requires Time-harmonic EM.")
+        mechanical_regions, mechanical_components = self._mechanical_components()
+        if mechanics and not mechanical_regions:
+            errors.append("Choose at least one region to include in mechanics.")
+        if mechanics:
+            parameter_map = {
+                item.get("name"): item
+                for item in self.model.get("parameters", [])
+                if isinstance(item, dict) and item.get("name")
+            }
+            materials = {
+                item.get("id"): item
+                for item in self.model.get("materials", [])
+                if isinstance(item, dict) and item.get("id")
+            }
+            for region in mechanical_regions:
+                material = materials.get(region.get("material_id"))
+                if material is None:
+                    continue
+                try:
+                    youngs_modulus = evaluate_expression(
+                        material.get("properties", {}).get("youngs_modulus", "0"),
+                        parameter_map,
+                    )
+                except (AttributeError, TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError):
+                    continue
+                if youngs_modulus <= 0:
+                    errors.append(
+                        f"Material '{material.get('name', 'unnamed')}' needs positive Young's modulus "
+                        f"for mechanical region '{region.get('name', 'unnamed')}'."
+                    )
+        if coupling and not (physics.get("dc_magnetic", {}).get("enabled") and harmonic and mechanics):
+            errors.append("Coupling requires DC magnetic, time-harmonic EM, and mechanics.")
+        if mechanics and mechanical_regions:
+            condition_by_id = {
+                item.get("id"): item
+                for item in self.model.get("boundary_conditions", [])
+                if isinstance(item, dict) and item.get("id")
+            }
+            parameter_map = {
+                item.get("name"): item
+                for item in self.model.get("parameters", [])
+                if isinstance(item, dict) and item.get("name")
+            }
+            edges_by_id = {
+                edge.get("id"): edge
+                for edge in self.model["geometry"].get("edges", [])
+                if isinstance(edge, dict) and edge.get("id")
+            }
+            for region_ids, edge_ids in mechanical_components:
+                direct_support = False
+                robin_error_reported = set()
+                robin_support = False
+                for edge_id in edge_ids:
+                    edge = edges_by_id.get(edge_id)
+                    if edge is None:
+                        continue
+                    for condition_id in _edge_condition_ids(edge):
+                        condition = condition_by_id.get(condition_id, {})
+                        kind = condition.get("type")
+                        if kind in {"mechanical_fixed", "mechanical_prescribed"}:
+                            direct_support = True
+                        elif kind == "mechanical_robin":
+                            supports, issue = self._robin_edge_supports_axial_translation(
+                                edge, condition, parameter_map
+                            )
+                            robin_support = robin_support or supports
+                            if issue and condition_id not in robin_error_reported:
+                                errors.append(f"Boundary '{condition.get('name', condition_id)}': {issue}")
+                                robin_error_reported.add(condition_id)
+                if not direct_support and not robin_support:
+                    region_names = ", ".join(
+                        region.get("name", region.get("id", "unnamed"))
+                        for region in mechanical_regions
+                        if region.get("id") in region_ids
+                    )
+                    subject = (
+                        f"Mechanical region '{region_names}' needs"
+                        if len(region_ids) == 1
+                        else f"Mechanical regions '{region_names}' need"
+                    )
+                    errors.append(
+                        f"{subject} a fixed or prescribed displacement, or a positive Robin support that "
+                        "restrains axial motion, on their boundary."
+                    )
+        parameter_map = {
+            item.get("name"): item
+            for item in self.model.get("parameters", [])
+            if isinstance(item, dict) and item.get("name")
+        }
+        errors.extend(validate_studies(self.studies, parameter_map))
+        return errors
+
+    def mesh_validation_errors(self):
+        errors = validate_model(self.model)
+        if not self.model["geometry"].get("regions"):
+            errors.append("Create at least one material region before generating a mesh.")
+        return errors
+
+    def validate_action(self, *args):
+        errors = self.validation_errors()
+        self._show_validation_issues(errors)
+        if errors:
+            self._message(f"Setup check found {len(errors)} issue{'s' if len(errors) != 1 else ''}. Select a message for guidance.", error=True)
+        else:
+            self._message("Setup checks passed. Mesh and solver results are reported separately.")
+        self._flash_status_bar()
+
+    def run_mesh_action(self, *args):
+        errors = self.mesh_validation_errors()
+        if errors:
+            self._show_validation_issues(errors)
+            self._message(f"Mesh setup found {len(errors)} issue{'s' if len(errors) != 1 else ''}.", error=True)
+            return
+        if self.on_mesh:
+            if not self.begin_solver_job("Mesh"):
+                return
+            self._mesh_button.ui_loading = True
+            try:
+                self.on_mesh()
+            except Exception as error:
+                self.finish_solver_job(f"Could not start mesh generation: {error}", error=True)
+        else:
+            self._message("Mesh generation is unavailable in this environment.", error=True)
+
+    def toggle_mesh_preview(self, *args):
+        if not self.mesh_preview_edges:
+            self._message("Generate a mesh before opening the mesh preview.", error=True)
+            return
+        self.mesh_preview_visible = not self.mesh_preview_visible
+        self._mesh_preview_button.ui_label = "Hide mesh" if self.mesh_preview_visible else "Show mesh"
+        self._mesh_preview_button.ui_color = "primary" if self.mesh_preview_visible else None
+        self._mesh_preview_button.ui_flat = not self.mesh_preview_visible
+        self.render_canvas()
+
+    def _clear_mesh_preview(self):
+        had_preview = bool(self.mesh_preview_edges) or self.mesh_preview_visible
+        self.mesh_preview_edges = []
+        self.mesh_preview_visible = False
+        self._mesh_preview_signature = None
+        button = getattr(self, "_mesh_preview_button", None)
+        if button is not None:
+            button.ui_label = "Mesh preview"
+            button.ui_color = None
+            button.ui_flat = True
+            button.ui_disable = True
+        if had_preview and hasattr(self, "_canvas_scene"):
+            self.render_canvas()
+
+    def set_mesh_preview(self, edges):
+        """Show mesh segments returned by a completed solver mesh build."""
+        self.mesh_preview_edges = [
+            ((float(start[0]), float(start[1])), (float(end[0]), float(end[1])))
+            for start, end in edges
+            if len(start) >= 2 and len(end) >= 2
+        ]
+        self.mesh_preview_visible = bool(self.mesh_preview_edges)
+        self._mesh_preview_signature = _mesh_signature(self.model) if self.mesh_preview_edges else None
+        self._mesh_preview_button.ui_disable = not self.mesh_preview_edges
+        self._mesh_preview_button.ui_label = "Hide mesh" if self.mesh_preview_visible else "Mesh preview"
+        self._mesh_preview_button.ui_color = "primary" if self.mesh_preview_visible else None
+        self._mesh_preview_button.ui_flat = not self.mesh_preview_visible
+        self.render_canvas()
+
+    def run_study_action(self, *args):
+        errors = self.validation_errors()
+        if errors:
+            self._show_validation_issues(errors)
+            self._message(f"Study setup found {len(errors)} issue{'s' if len(errors) != 1 else ''}.", error=True)
+            return
+        if self.on_run:
+            if not self.begin_solver_job("Study"):
+                return
+            self._run_button.ui_loading = True
+            try:
+                self.on_run()
+            except Exception as error:
+                self.finish_solver_job(f"Could not start the study: {error}", error=True)
+        else:
+            self._message("The solver is unavailable in this environment.", error=True)
+
+    def begin_solver_job(self, kind):
+        """Mark the mesh/study job active and expose cancellation controls."""
+        if self._job_active:
+            self._message("A mesh or solver job is already running.", error=True)
+            return False
+        self._job_active = True
+        self._active_job_kind = str(kind)
+        self._cancel_button.ui_hidden = False
+        self._cancel_button.ui_disable = False
+        self._cancel_button.ui_label = "Cancel run"
+        self.show_log()
+        return True
+
+    def _cancel_solver_job(self, *args):
+        if not self._job_active or not self.on_cancel:
+            return
+        self.mark_solver_cancel_requested()
+        self.on_cancel()
+
+    def mark_solver_cancel_requested(self):
+        if not self._job_active:
+            return
+        self._cancel_button.ui_label = "Stopping…"
+        self._cancel_button.ui_disable = True
+        self._message("Stopping the active solver job…")
+
+    def finish_solver_job(self, message, error=False, *, cancelled=False, run_kind=None, output_path=None, run_name=None, mesh_preview_edges=None):
+        self._mesh_button.ui_loading = False
+        self._run_button.ui_loading = False
+        self._job_active = False
+        self._active_job_kind = None
+        self._cancel_button.ui_hidden = True
+        self._cancel_button.ui_disable = False
+        self._cancel_button.ui_label = "Cancel run"
+        self._message(message, error=error)
+        if not error and mesh_preview_edges is not None:
+            self.set_mesh_preview(mesh_preview_edges)
+        if run_kind:
+            status = "Failed" if error else "Cancelled" if cancelled else "Complete"
+            run_output_path = str(output_path or "")
+            self.runs.append({
+                "id": _run_history_path_key(run_output_path) if run_output_path else new_id("run"),
+                "name": run_name or run_kind,
+                "kind": run_kind,
+                "status": status,
+                "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "output_path": run_output_path,
+            })
+            self._refresh_model_tree()
+            if self.active_section == "runs":
+                self._render_inspector()
+
+
+def _bounds(points):
+    return min(p[0] for p in points), max(p[0] for p in points), min(p[1] for p in points), max(p[1] for p in points)
+
+
+def _point_in_box(point, box):
+    left, right, top, bottom = box
+    return left <= point[0] <= right and top <= point[1] <= bottom
+
+
+def _segment_intersects_box(start, end, box):
+    left, right, top, bottom = box
+    corners = ((left, top), (right, top), (right, bottom), (left, bottom))
+    if _point_in_box(start, box) or _point_in_box(end, box):
+        return True
+    return any(
+        _segments_intersect(start, end, corners[index], corners[(index + 1) % 4])
+        for index in range(4)
+    )
+
+
+def _polygon_area(points):
+    return 0.5 * sum(points[i][0] * points[(i + 1) % len(points)][1] - points[(i + 1) % len(points)][0] * points[i][1] for i in range(len(points)))
+
+
+def _point_in_polygon(point, polygon):
+    x, y = point
+    inside = False
+    j = len(polygon) - 1
+    for i, (xi, yi) in enumerate(polygon):
+        xj, yj = polygon[j]
+        if (yi > y) != (yj > y):
+            xcross = (xj - xi) * (y - yi) / ((yj - yi) or 1e-300) + xi
+            if x < xcross:
+                inside = not inside
+        j = i
+    return inside
+
+
+def _point_on_segment(point, start, end, tolerance=1e-12):
+    px, py = point
+    ax, ay = start
+    bx, by = end
+    cross = (px - ax) * (by - ay) - (py - ay) * (bx - ax)
+    scale = max(abs(bx - ax), abs(by - ay), 1.0)
+    if abs(cross) > tolerance * scale:
+        return False
+    return (
+        min(ax, bx) - tolerance <= px <= max(ax, bx) + tolerance
+        and min(ay, by) - tolerance <= py <= max(ay, by) + tolerance
+    )
+
+
+def _point_in_or_on_polygon(point, polygon):
+    return _point_in_polygon(point, polygon) or any(
+        _point_on_segment(point, polygon[index], polygon[(index + 1) % len(polygon)])
+        for index in range(len(polygon))
+    )
+
+
+def _segments_intersect(a, b, c, d, tolerance=1e-12):
+    def orient(p, q, r):
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+    o1, o2, o3, o4 = orient(a, b, c), orient(a, b, d), orient(c, d, a), orient(c, d, b)
+    if ((o1 > tolerance and o2 < -tolerance) or (o1 < -tolerance and o2 > tolerance)) and ((o3 > tolerance and o4 < -tolerance) or (o3 < -tolerance and o4 > tolerance)):
+        return True
+    return (
+        (abs(o1) <= tolerance and _point_on_segment(c, a, b, tolerance))
+        or (abs(o2) <= tolerance and _point_on_segment(d, a, b, tolerance))
+        or (abs(o3) <= tolerance and _point_on_segment(a, c, d, tolerance))
+        or (abs(o4) <= tolerance and _point_on_segment(b, c, d, tolerance))
+    )
+
+
+def _strictly_contains(outer, inner):
+    if len(outer) < 3 or len(inner) < 3:
+        return False
+    if not all(_point_in_polygon(point, outer) for point in inner):
+        return False
+    return not any(
+        _segments_intersect(outer[i], outer[(i + 1) % len(outer)], inner[j], inner[(j + 1) % len(inner)])
+        for i in range(len(outer))
+        for j in range(len(inner))
+    )
+
+
+def _polygons_overlap(first, second):
+    a, b = _bounds(first), _bounds(second)
+    if a[1] < b[0] or b[1] < a[0] or a[3] < b[2] or b[3] < a[2]:
+        return False
+    if any(_point_in_or_on_polygon(point, second) for point in first):
+        return True
+    if any(_point_in_or_on_polygon(point, first) for point in second):
+        return True
+    return any(
+        _segments_intersect(first[i], first[(i + 1) % len(first)], second[j], second[(j + 1) % len(second)])
+        for i in range(len(first))
+        for j in range(len(second))
+    )
+
+
+def _edge_key(points):
+    coords = [tuple(round(float(value), 12) for value in point) for point in points]
+    return tuple(sorted(coords))
+
+
+def _edge_condition_ids(edge):
+    values = edge.get("boundary_condition_ids")
+    if values is None:
+        legacy = edge.get("boundary_condition_id")
+        return [legacy] if legacy else []
+    if isinstance(values, str):
+        return [values]
+    return [value for value in values if value]
+
+
+def _edge_is_on_rotation_axis(edge):
+    """Return whether a straight sketch edge lies on the r = 0 axis."""
+    if not isinstance(edge, dict):
+        return False
+    vertices = edge.get("vertices", [])
+    if not isinstance(vertices, (list, tuple)) or len(vertices) != 2:
+        return False
+    try:
+        return all(abs(float(point[0])) <= 1e-12 for point in vertices)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return False
+
+
+def _sync_axis_boundary_conditions(model):
+    """Keep the axis-of-symmetry condition attached to exactly the r=0 edges.
+
+    The GUI's axis condition represents the electromagnetic regularity boundary
+    used by the axisymmetric solver. It is geometry-managed: creating, editing,
+    moving, or deleting a region updates the assignment automatically.
+    """
+    if not isinstance(model, dict):
+        return
+    geometry = model.get("geometry")
+    if not isinstance(geometry, dict):
+        return
+    edges = geometry.get("edges", [])
+    if not isinstance(edges, list):
+        return
+    conditions = model.setdefault("boundary_conditions", [])
+    if not isinstance(conditions, list):
+        return
+
+    condition_by_id = {
+        item.get("id"): item
+        for item in conditions
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    axis_condition = next(
+        (item for item in conditions if isinstance(item, dict)
+         and item.get("type") == "axis_of_symmetry"
+         and item.get("automatic_for_axis")),
+        None,
+    )
+    if axis_condition is None:
+        axis_condition = next(
+            (item for item in conditions if isinstance(item, dict)
+             and item.get("type") == "axis_of_symmetry"),
+            None,
+        )
+    axis_edges_exist = any(_edge_is_on_rotation_axis(edge) for edge in edges)
+    if axis_edges_exist and (
+        axis_condition is None or not isinstance(axis_condition.get("id"), str)
+    ):
+        axis_condition = {
+            "id": new_id("boundary"),
+            "name": "Axis of symmetry",
+            "type": "axis_of_symmetry",
+            "automatic_for_axis": True,
+        }
+        conditions.append(axis_condition)
+    if axis_edges_exist:
+        axis_condition["automatic_for_axis"] = True
+        axis_condition_id = axis_condition["id"]
+        condition_by_id[axis_condition_id] = axis_condition
+    else:
+        axis_condition_id = None
+
+    electromagnetic_types = {"axis_of_symmetry", "magnetic_potential_zero", "natural"}
+
+    def condition_type(condition_id):
+        if not isinstance(condition_id, str):
+            return None
+        return condition_by_id.get(condition_id, {}).get("type")
+
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        on_axis = _edge_is_on_rotation_axis(edge)
+        try:
+            condition_ids = list(_edge_condition_ids(edge))
+        except TypeError:
+            # Let model validation report malformed assignment containers.
+            continue
+        if on_axis:
+            # Axis regularity takes precedence over user-selectable EM edge
+            # conditions; a single edge cannot carry two EM conditions.
+            condition_ids = [
+                condition_id for condition_id in condition_ids
+                if condition_type(condition_id) not in electromagnetic_types
+            ]
+            if axis_condition_id:
+                condition_ids.append(axis_condition_id)
+        else:
+            # Axis regularity is only meaningful on the rotational axis.
+            condition_ids = [
+                condition_id for condition_id in condition_ids
+                if condition_type(condition_id) != "axis_of_symmetry"
+            ]
+        edge["boundary_condition_ids"] = condition_ids
+        edge.pop("boundary_condition_id", None)
+
+    # Generated definitions disappear when the last axis edge moves away or
+    # is deleted, keeping the boundary tree free of stale automatic entries.
+    if axis_condition_id is None:
+        conditions[:] = [
+            item for item in conditions
+            if not (isinstance(item, dict) and item.get("automatic_for_axis"))
+        ]
+
+
+def _sync_mechanical_boundary_conditions(model):
+    """Mark contours between mechanical and non-mechanical material automatically.
+
+    In the axisymmetric sketch each region contour separates that region from
+    its nearest containing region (or the exterior). A contour is a
+    transmission interface when exactly one of those two materials participates
+    in mechanics. A contour between two mechanical materials stays on the
+    default condition, so the solver treats it as an internal mechanical
+    interface.
+    """
+    if not isinstance(model, dict):
+        return
+    geometry = model.get("geometry")
+    if not isinstance(geometry, dict):
+        return
+    regions = geometry.get("regions", [])
+    edges = geometry.get("edges", [])
+    conditions = model.setdefault("boundary_conditions", [])
+    if not isinstance(regions, list) or not isinstance(edges, list) or not isinstance(conditions, list):
+        return
+
+    regions_by_id = {
+        item.get("id"): item
+        for item in regions
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    condition_by_id = {
+        item.get("id"): item
+        for item in conditions
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    edge_by_id = {
+        item.get("id"): item
+        for item in edges
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+
+    desired_edge_ids = set()
+    for region in regions_by_id.values():
+        parent = regions_by_id.get(region.get("parent_id"))
+        region_is_mechanical = bool(region.get("mechanical"))
+        parent_is_mechanical = bool(parent and parent.get("mechanical"))
+        if region_is_mechanical == parent_is_mechanical:
+            continue
+        region_edge_ids = region.get("edge_ids", [])
+        if not isinstance(region_edge_ids, list):
+            continue
+        desired_edge_ids.update(
+            edge_id for edge_id in region_edge_ids
+            if isinstance(edge_id, str) and edge_id in edge_by_id
+        )
+
+    interface_condition = next(
+        (
+            item for item in conditions
+            if isinstance(item, dict)
+            and item.get("type") == "transmission_interface"
+            and item.get("automatic_for_mechanics")
+        ),
+        None,
+    )
+    if desired_edge_ids and interface_condition is None:
+        interface_condition = {
+            "id": new_id("boundary"),
+            "name": "Transmission interface",
+            "type": "transmission_interface",
+            "automatic_for_mechanics": True,
+        }
+        conditions.append(interface_condition)
+        condition_by_id[interface_condition["id"]] = interface_condition
+
+    interface_condition_id = interface_condition.get("id") if interface_condition else None
+    for edge_id, edge in edge_by_id.items():
+        try:
+            condition_ids = _edge_condition_ids(edge)
+        except TypeError:
+            # Keep malformed values intact for validate_model() to explain.
+            continue
+        if any(not isinstance(condition_id, str) for condition_id in condition_ids):
+            continue
+        condition_ids = [
+            condition_id for condition_id in condition_ids
+            if not (
+                isinstance(condition_id, str)
+                and condition_id in condition_by_id
+                and condition_by_id[condition_id].get("automatic_for_mechanics")
+                and condition_by_id[condition_id].get("type") == "transmission_interface"
+            )
+        ]
+        if edge_id in desired_edge_ids and interface_condition_id:
+            condition_ids.append(interface_condition_id)
+        edge["boundary_condition_ids"] = list(dict.fromkeys(condition_ids))
+        edge.pop("boundary_condition_id", None)
+
+    if not desired_edge_ids:
+        conditions[:] = [
+            item for item in conditions
+            if not (
+                isinstance(item, dict)
+                and item.get("automatic_for_mechanics")
+                and item.get("type") == "transmission_interface"
+            )
+        ]

@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import threading
@@ -33,28 +34,29 @@ def _build_loader_snippet(filename: str, name: str) -> tuple[str, str]:
     """
     path = Path(filename)
     ext = path.suffix.lower()
+    filename_literal = repr(filename)
 
     if _file_extension_matches(path, (".vol", ".vol.gz")):
         return f"""import ngsolve
-mesh = ngsolve.Mesh('{filename}')
+mesh = ngsolve.Mesh({filename_literal})
 ngsolve.Draw(mesh, '{name}')""", "<ngsolve_gui:mesh>"
 
     if ext in {".step", ".iges", ".stp", ".brep"}:
         return f"""import netgen.occ
 import ngsolve
-geometry = netgen.occ.OCCGeometry("{filename}")
+geometry = netgen.occ.OCCGeometry({filename_literal})
 ngsolve.Draw(geometry, name='{name}')""", "<ngsolve_gui:geometry>"
 
     if ext == ".pkl":
         return f"""import netgen.occ
 import ngsolve, pickle
-import netgen.occ
-obj = pickle.load(open("{filename}", "rb"))
+obj = pickle.load(open({filename_literal}, "rb"))
 print("Loaded object of type", type(obj))
 if isinstance(obj, netgen.occ.TopoDS_Shape):
     obj = netgen.occ.OCCGeometry(obj)
 print("Loaded object of type", type(obj))
-ngsolve.Draw(obj, name='{name}')""", "<ngsolve_gui:pickle>"
+from ngsolve_gui.file_loader import _draw_pickle_object
+_draw_pickle_object(obj, '{name}', field_path={filename_literal})""", "<ngsolve_gui:pickle>"
 
     if ext == ".py":
         import tokenize
@@ -367,7 +369,12 @@ def DrawImpl(
         data["obj"] = obj
         return _appdata.add_tab(name or "Plot", PlotComponent, data, _appdata)
 
-    if type(obj) not in _DRAW_DISPATCH:
+    if isinstance(obj, ngs.GridFunction):
+        # Keep the GridFunction object intact. Besides retaining its FESpace
+        # for result-specific display handling, the FunctionComponent uses it
+        # for pick evaluation and volume-side traces.
+        default_name, comp = "Function", FunctionComponent
+    elif type(obj) not in _DRAW_DISPATCH:
         try:
             # try to convert to CoefficientFunction
             obj = ngs.CF(obj)
@@ -378,6 +385,118 @@ def DrawImpl(
         default_name, comp = _DRAW_DISPATCH[type(obj)]
     data["obj"] = obj
     return _appdata.add_tab(name or default_name, comp, data, _appdata)
+
+
+def _pickle_metadata_for_path(filename):
+    """Return adjacent solver metadata and the matching field descriptor."""
+    if not filename:
+        return None, None
+    source_path = Path(filename).resolve()
+    for directory in (source_path.parent, *source_path.parents):
+        metadata_path = directory / "metadata.json"
+        if not metadata_path.is_file():
+            continue
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for item in metadata.get("field_files", []):
+            if not isinstance(item, dict) or not item.get("file"):
+                continue
+            try:
+                expected = (metadata_path.parent / item["file"]).resolve()
+                if os.path.normcase(str(expected)) == os.path.normcase(str(source_path)):
+                    return metadata, item
+            except (OSError, TypeError, ValueError):
+                continue
+        if metadata.get("default_solution_file"):
+            try:
+                expected = (
+                    metadata_path.parent / metadata["default_solution_file"]
+                ).resolve()
+                if os.path.normcase(str(expected)) == os.path.normcase(str(source_path)):
+                    return metadata, metadata.get("default_field", {})
+            except (OSError, TypeError, ValueError):
+                continue
+    return None, None
+
+
+def _is_axisymmetric_pickle(filename) -> bool:
+    """Check adjacent solver metadata rather than guessing from a 2D mesh."""
+    metadata, _field = _pickle_metadata_for_path(filename)
+    return bool(metadata and metadata.get("problem_domain") == "axisymmetric")
+
+
+def _draw_pickle_object(obj, name: str, field_path=None):
+    """Draw a pickled NGSolve field with clean, fast result-view defaults."""
+    if not isinstance(obj, ngs.GridFunction):
+        return DrawImpl(obj, name=name)
+
+    mesh = obj.space.mesh
+    if mesh.dim == 3:
+        saved_curve_order = int(mesh.GetCurveOrder())
+        display_curve_order = min(saved_curve_order, 4)
+        if display_curve_order < saved_curve_order:
+            mesh.Curve(display_curve_order)
+            print(
+                "Saved mesh curve order:", saved_curve_order,
+                "| viewer curve order:", display_curve_order,
+            )
+
+    field_name = name.lower()
+    is_mechanical_field = any(
+        key in field_name for key in ("displacement", "velocity")
+    )
+    material_names = {str(material) for material in mesh.GetMaterials()}
+    seed_material = (
+        "Air"
+        if mesh.dim == 3 and obj.dim == 3 and "Air" in material_names
+        and not is_mechanical_field
+        else None
+    )
+    draw_options = {
+        "wireframe": False,
+        "subdivision": -1,
+        "fieldlines_num_lines": 20,
+        "fieldlines_thickness": 0.0001,
+    }
+    _metadata, field_metadata = _pickle_metadata_for_path(field_path)
+    if mesh.dim == 3:
+        field_description = " ".join(
+            str(value)
+            for value in (
+                name,
+                (field_metadata or {}).get("field_key", ""),
+                (field_metadata or {}).get("label", ""),
+            )
+        ).lower()
+        magnetic_field_markers = (
+            "magnetic flux density",
+            "magnetic induction",
+            "magnetic field",
+            "gfbdc",
+            "gfbac",
+            "b_dc",
+            "b_ac",
+            "h_dc",
+            "h_ac",
+        )
+        draw_options["_ngsolve_gui_symmetry_vector_kind"] = (
+            "axial"
+            if any(marker in field_description for marker in magnetic_field_markers)
+            else "polar"
+        )
+    if _is_axisymmetric_pickle(field_path):
+        draw_options["_ngsolve_gui_axisymmetric"] = True
+        if obj.dim == 2:
+            # Axisymmetric vector pickles store the meridian components in
+            # (r, z) order. Keep the serialized object a normal NGSolve
+            # GridFunction; this only changes the GUI's selector labels.
+            draw_options["_ngsolve_gui_component_names"] = ("r", "z")
+    if mesh.dim == 3 and obj.dim == 3:
+        draw_options["_ngsolve_gui_fast_fieldlines"] = True
+        draw_options["_ngsolve_gui_fieldline_seed_material"] = seed_material
+    return DrawImpl(obj, name=name, **draw_options)
 
 
 def RedrawImpl(*args, **kwargs):

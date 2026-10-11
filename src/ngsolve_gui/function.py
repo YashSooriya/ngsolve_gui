@@ -3,8 +3,49 @@ from ngsolve_webgpu import *
 from .webgpu_tab import WebgpuTab, _usersettings
 from .region_state import RegionState
 from . import cerbsim_style as cb
+from ._visualization import visualization_cf
 import ngsolve as ngs
 import math
+
+from .slice_view import (
+    ALL_REGIONS,
+    material_element_mask,
+    material_region,
+    plane_normal,
+    position_on_plane,
+)
+
+
+class _MMFEMColormap(Colormap):
+    """Keep autoscale meaningful for physically small engineering fields.
+
+    ``webgpu.Colormap`` treats every range below 1e-12 as numerical zero.
+    That erases valid SI displacement fields, which can be much smaller than
+    that threshold. Scale only the range passed through its cleanup logic,
+    then put the displayed bounds back in the field's original units.
+    """
+
+    def widen_range(self, minval, maxval, timestamp=None):
+        if not (math.isfinite(minval) and math.isfinite(maxval)) or minval > maxval:
+            return super().widen_range(minval, maxval, timestamp=timestamp)
+
+        if timestamp != getattr(self, "_mmfem_scale_timestamp", object()):
+            magnitude = max(abs(minval), abs(maxval))
+            if 0.0 < magnitude < 1e-12:
+                exponent = min(308, max(0, math.ceil(-math.log10(magnitude))))
+                self._mmfem_autoscale_factor = 10.0 ** exponent
+            else:
+                self._mmfem_autoscale_factor = 1.0
+            self._mmfem_scale_timestamp = timestamp
+
+        factor = self._mmfem_autoscale_factor
+        super().widen_range(minval * factor, maxval * factor, timestamp=timestamp)
+        if factor != 1.0:
+            self.set_min_max(
+                self.minval / factor,
+                self.maxval / factor,
+                set_autoscale=False,
+            )
 
 
 def _fmt_value(v):
@@ -56,6 +97,12 @@ class FunctionComponent(WebgpuTab):
         self.name = name
         self.mdata = None
         self.cf = cf
+        component_names = data.get("_ngsolve_gui_component_names")
+        if component_names is not None and len(component_names) == getattr(cf, "dim", 1):
+            self.component_names = tuple(str(name) for name in component_names)
+        else:
+            self.component_names = None
+        self.visualization_cf = visualization_cf(cf)
         self.region_or_mesh = data["mesh"]
         self.draw_vol = data.get("draw_vol", True)
         self.draw_surf = data.get("draw_surf", True)
@@ -64,6 +111,17 @@ class FunctionComponent(WebgpuTab):
             self.region_or_mesh.mesh
             if isinstance(self.region_or_mesh, ngs.Region)
             else self.region_or_mesh
+        )
+        self.slice_available = self.mesh.dim == 3 and bool(self.draw_vol)
+        self.slice_region_options = (
+            [ALL_REGIONS] + [str(name) for name in self.mesh.GetMaterials()]
+            if self.slice_available
+            else []
+        )
+        self.fieldline_seed_region_options = (
+            [ALL_REGIONS] + [str(name) for name in self.mesh.GetMaterials()]
+            if self.cf.dim == self.mesh.dim
+            else []
         )
         self.order = data.get("order", None)
         if self.order is None:
@@ -100,6 +158,89 @@ class FunctionComponent(WebgpuTab):
         ):
             self.deformation = self._resolve_deformation(True)
 
+        self.axisymmetric_revolution_available = bool(
+            data.get("_ngsolve_gui_axisymmetric", False)
+            and self.mesh.dim == 2
+            and isinstance(cf, ngs.GridFunction)
+        )
+        self.axisymmetric_revolved = Observable(False, "axisymmetric_revolved")
+        self._axisymmetric_revolution_mesh = None
+        self._axisymmetric_revolution_field = None
+        self._axisymmetric_original_state = None
+        self._axisymmetric_camera_state = None
+        if self.axisymmetric_revolution_available:
+            from .sections.axisymmetric_revolution import AxisymmetricRevolutionSection
+
+            sections = list(type(self).property_sections)
+            sections.insert(1, AxisymmetricRevolutionSection)
+            self.property_sections = sections
+            self._axisymmetric_original_state = {
+                "mesh": self.mesh,
+                "region_or_mesh": self.region_or_mesh,
+                "cf": self.cf,
+                "visualization_cf": self.visualization_cf,
+                "deformation": self.deformation,
+            }
+
+        self._quarter_symmetry_planes = ()
+        self.quarter_symmetry_expansion_available = False
+        self.symmetry_expanded = Observable(False, "symmetry_expanded")
+        self._symmetry_expanded_mesh = None
+        self._symmetry_expanded_field = None
+        self._symmetry_original_state = None
+        self._symmetry_camera_state = None
+        if self.mesh.dim == 3 and isinstance(cf, ngs.GridFunction):
+            from .quarter_symmetry import find_quarter_symmetry_planes
+
+            self._quarter_symmetry_planes = tuple(
+                data.get("_ngsolve_gui_symmetry_planes")
+                or find_quarter_symmetry_planes(self.mesh)
+            )
+            self.quarter_symmetry_expansion_available = (
+                len(self._quarter_symmetry_planes) == 2
+            )
+            if self.quarter_symmetry_expansion_available:
+                from .sections.quarter_symmetry import QuarterSymmetrySection
+
+                sections = list(type(self).property_sections)
+                sections.insert(1, QuarterSymmetrySection)
+                self.property_sections = sections
+                self._symmetry_original_state = {
+                    "mesh": self.mesh,
+                    "region_or_mesh": self.region_or_mesh,
+                    "cf": self.cf,
+                    "visualization_cf": self.visualization_cf,
+                    "deformation": self.deformation,
+                }
+                field_name = str(name).lower()
+                self._symmetry_vector_kind = data.get(
+                    "_ngsolve_gui_symmetry_vector_kind",
+                    "axial"
+                    if any(
+                        marker in field_name
+                        for marker in (
+                            "magnetic flux density",
+                            "magnetic induction",
+                            "magnetic field",
+                            "gfbdc",
+                            "gfbac",
+                            "b_dc",
+                            "b_ac",
+                            "h_dc",
+                            "h_ac",
+                        )
+                    )
+                    else "polar",
+                )
+
+        if self.slice_available:
+            sections = list(
+                getattr(self, "property_sections", type(self).property_sections)
+            )
+            if SliceViewSection not in sections:
+                sections.insert(1, SliceViewSection)
+            self.property_sections = sections
+
         cv = data.get("clipping_vectors", False)
         sv = data.get("surface_vectors", False)
         fl = data.get("field_lines", False)
@@ -108,14 +249,14 @@ class FunctionComponent(WebgpuTab):
         # -- Observable properties ------------------------------------------
         s = saved
         self.wireframe_visible = Observable(
-            s.get("wireframe_visible", data.get("wireframe", True)), "wireframe_visible"
+            data.get("wireframe", s.get("wireframe_visible", True)), "wireframe_visible"
         )
         self.elements2d_visible = Observable(
             s.get("elements2d_visible", True), "elements2d_visible"
         )
         self.subdivision = Observable(
-            s.get("subdivision",
-                  data.get("subdivision",
+            data.get("subdivision",
+                     s.get("subdivision",
                            int(_usersettings.get("default_subdivision", -1)))),
             "subdivision", converter=int,
         )
@@ -198,16 +339,29 @@ class FunctionComponent(WebgpuTab):
             s.get("contact_enabled", True), "contact_enabled"
         )
         self.fieldlines_num_lines = Observable(
-            s.get("fieldlines_num_lines", data.get("fieldlines_num_lines", 100)), "fieldlines_num_lines", converter=int
+            data.get("fieldlines_num_lines", s.get("fieldlines_num_lines", 20)), "fieldlines_num_lines", converter=int
         )
         self.fieldlines_length = Observable(
             s.get("fieldlines_length", data.get("fieldlines_length", 0.5)), "fieldlines_length", converter=float
         )
         self.fieldlines_thickness = Observable(
-            s.get("fieldlines_thickness", data.get("fieldlines_thickness", 0.0015)), "fieldlines_thickness", converter=float
+            data.get("fieldlines_thickness", s.get("fieldlines_thickness", 0.0001)), "fieldlines_thickness", converter=float
         )
         self.fieldlines_direction = Observable(
             s.get("fieldlines_direction", 0), "fieldlines_direction", converter=int
+        )
+        default_fieldline_seed_region = data.get(
+            "_ngsolve_gui_fieldline_seed_material", ALL_REGIONS
+        )
+        if default_fieldline_seed_region not in self.fieldline_seed_region_options:
+            default_fieldline_seed_region = ALL_REGIONS
+        saved_fieldline_seed_region = s.get(
+            "fieldline_seed_region", default_fieldline_seed_region
+        )
+        if saved_fieldline_seed_region not in self.fieldline_seed_region_options:
+            saved_fieldline_seed_region = default_fieldline_seed_region
+        self.fieldline_seed_region = Observable(
+            saved_fieldline_seed_region, "fieldline_seed_region"
         )
 
         self.hidden_regions = Observable(
@@ -216,6 +370,52 @@ class FunctionComponent(WebgpuTab):
         self.boundary_overrides = Observable(
             dict(s.get("boundary_overrides", {})), "boundary_overrides"
         )
+
+        default_slice_region = (
+            self.slice_region_options[1]
+            if len(self.slice_region_options) > 1
+            else ALL_REGIONS
+        )
+        saved_slice_region = s.get("slice_region", default_slice_region)
+        if saved_slice_region not in self.slice_region_options:
+            saved_slice_region = default_slice_region
+        self.slice_enabled = Observable(
+            bool(s.get("slice_enabled", False)) and self.slice_available,
+            "slice_enabled",
+        )
+        self.slice_axis = Observable(
+            str(s.get("slice_axis", "z")).lower(), "slice_axis"
+        )
+        if self.slice_axis.value not in ("x", "y", "z", "custom"):
+            self.slice_axis.value = "z"
+        self.slice_position = Observable(
+            min(1.0, max(0.0, float(s.get("slice_position", 0.5)))),
+            "slice_position",
+            converter=float,
+        )
+        self.slice_region = Observable(saved_slice_region, "slice_region")
+        custom_normal = s.get("slice_custom_normal", (0.0, 0.0, 1.0))
+        try:
+            if len(custom_normal) != 3:
+                custom_normal = (0.0, 0.0, 1.0)
+        except TypeError:
+            custom_normal = (0.0, 0.0, 1.0)
+        self.slice_custom_normal = []
+        for index, axis in enumerate(("x", "y", "z")):
+            normal_value = Observable(
+                float(s.get(f"slice_normal_{axis}", custom_normal[index])),
+                f"slice_normal_{axis}",
+                converter=float,
+            )
+            setattr(self, f"slice_normal_{axis}", normal_value)
+            self.slice_custom_normal.append(normal_value)
+        self.slice_renderer = None
+        self._slice_function_data = None
+        self._slice_clipping = None
+        self._slice_overlay = None
+        self._slice_position_slider = None
+        self._slice_position_label = None
+        self._slice_bounds_cache = None
 
         if self.cf.is_complex:
             self.complex_mode = Observable(
@@ -251,6 +451,7 @@ class FunctionComponent(WebgpuTab):
         self.clipping_vectors_visible.on_change(self._apply_clipping_vectors)
         self.surface_vectors_visible.on_change(self._apply_surface_vectors)
         self.field_lines_visible.on_change(self._apply_fieldlines)
+        self.fieldline_seed_region.on_change(self._apply_fieldline_seed_region)
         self.clipping_visible.on_change(self._apply_clipping_function)
         self.lic_visible.on_change(self._apply_lic)
         self.lic_kernel_length.on_change(self._apply_lic_kernel_length)
@@ -278,6 +479,17 @@ class FunctionComponent(WebgpuTab):
         self.numbers_one_based.on_change(self._apply_numbers_one_based)
         self.hidden_regions.on_change(self._apply_region_change)
         self.boundary_overrides.on_change(self._apply_region_change)
+        if self.slice_available:
+            self.slice_enabled.on_change(self._apply_slice_enabled)
+            self.slice_axis.on_change(self._apply_slice_plane)
+            self.slice_position.on_change(self._apply_slice_plane)
+            self.slice_region.on_change(self._apply_slice_region)
+            for normal_value in self.slice_custom_normal:
+                normal_value.on_change(self._apply_slice_plane)
+        if self.axisymmetric_revolution_available:
+            self.axisymmetric_revolved.on_change(self._apply_axisymmetric_revolved)
+        if self.quarter_symmetry_expansion_available:
+            self.symmetry_expanded.on_change(self._apply_symmetry_expanded)
 
     # -- GPU side-effect handlers -------------------------------------------
 
@@ -396,10 +608,261 @@ class FunctionComponent(WebgpuTab):
             self.surface_vectors.active = val
         self.wgpu.scene.render()
 
+    def _selected_fieldline_seed_region(self):
+        """Return the selected streamline seed region, including the all option."""
+        selected = getattr(self, "fieldline_seed_region", None)
+        if selected is not None:
+            return selected.value
+        data = self.data if isinstance(getattr(self, "data", None), dict) else {}
+        name = getattr(
+            getattr(self, "fieldlines", None),
+            "_ngsolve_gui_start_region_name",
+            None,
+        )
+        if name is None:
+            if data.get("_ngsolve_gui_fast_fieldlines", False):
+                name = data.get("_ngsolve_gui_fieldline_seed_material")
+        if name is None:
+            return None
+        return name if name in {str(m) for m in self.mesh.GetMaterials()} else None
+
+    def _sync_fieldline_seed_visibility(self, active):
+        """Hide active streamline/slice seed materials without changing user state."""
+        region_state = getattr(self, "region_state", None)
+        if region_state is None:
+            return False
+        auto_hidden = set()
+        fieldlines_active = (
+            bool(active)
+            if active is not None
+            else bool(self.field_lines_visible.value)
+        )
+        seed = self._selected_fieldline_seed_region() if fieldlines_active else None
+        if seed == ALL_REGIONS:
+            auto_hidden.update(region_state.unique_materials)
+        elif seed is not None:
+            auto_hidden.add(seed)
+        if getattr(self, "slice_available", False) and self.slice_enabled.value:
+            if self.slice_region.value == ALL_REGIONS:
+                auto_hidden.update(region_state.unique_materials)
+            else:
+                auto_hidden.add(self.slice_region.value)
+        if region_state.auto_hidden == auto_hidden:
+            return False
+        region_state.auto_hidden = auto_hidden
+        return True
+
     def _apply_fieldlines(self, val, _old):
-        if self.fieldlines is not None:
+        if getattr(self, "fieldlines", None) is not None:
             self.fieldlines.active = val
-        self.wgpu.scene.render()
+        if self._sync_fieldline_seed_visibility(bool(val)):
+            self._apply_region_change()
+        else:
+            self.wgpu.scene.render()
+
+    def _apply_fieldline_seed_region(self, value, _old):
+        """Update the streamline start region and refresh its cached trace."""
+        renderer = getattr(self, "fieldlines", None)
+        if renderer is None:
+            return
+        region_name = str(value)
+        renderer.start_region = material_region(self.mesh, region_name)
+        renderer._ngsolve_gui_start_region_name = region_name
+        renderer.set_needs_update()
+        if self._sync_fieldline_seed_visibility(None):
+            self._apply_region_change()
+        else:
+            self.wgpu.scene.render()
+
+    def _build_additional_viewport_overlays(self):
+        """Add the tall slice-position scrollbar beside a 3-D result view."""
+        if not self.slice_available:
+            return []
+        self._slice_position_slider = QSlider(
+            ui_model_value=self.slice_position.value,
+            ui_min=0.0,
+            ui_max=1.0,
+            ui_step=0.001,
+            ui_vertical=True,
+            ui_dense=True,
+            ui_color="primary",
+            ui_track_size="4px",
+            ui_thumb_size="16px",
+            ui_style="flex:1; min-height:0; width:28px;",
+        )
+        self._slice_position_slider.on_update_model_value(
+            self._on_slice_position_update
+        )
+        self._slice_position_label = Div(
+            "0 m", ui_style="font-size:10px; color:var(--fg-muted);"
+        )
+        self._slice_overlay = Div(
+            Div(
+                QIcon(ui_name="mdi-layers-triple-outline"),
+                "Slice",
+                ui_class="row items-center justify-center no-wrap q-gutter-x-xs",
+                ui_style="font-size:11px; font-weight:600;",
+            ),
+            Div("max", ui_style="font-size:9px; color:var(--fg-muted);"),
+            self._slice_position_slider,
+            Div("min", ui_style="font-size:9px; color:var(--fg-muted);"),
+            self._slice_position_label,
+            ui_style=(
+                "position:absolute; z-index:12; left:12px; top:7%; height:86%; "
+                "width:48px; display:flex; flex-direction:column; align-items:center; "
+                "justify-content:space-between; padding:8px 4px; border-radius:10px; "
+                "background:color-mix(in srgb, var(--surface) 92%, transparent); "
+                "border:1px solid var(--border); box-shadow:0 2px 12px #0002;"
+            ),
+        )
+
+        self._slice_overlay.ui_hidden = not self.slice_enabled.value
+        self._sync_slice_position_overlay()
+        return [self._slice_overlay]
+
+    def _slice_bounds(self):
+        if self._slice_bounds_cache is None:
+            import numpy as np
+
+            coordinates = np.asarray(self.mesh.ngmesh.Coordinates(), dtype=float)
+            if (
+                coordinates.ndim != 2
+                or coordinates.shape[1] < 3
+                or not len(coordinates)
+            ):
+                raise ValueError("Could not determine the 3-D mesh bounds")
+            xyz = coordinates[:, :3]
+            self._slice_bounds_cache = (xyz.min(axis=0), xyz.max(axis=0))
+        return self._slice_bounds_cache
+
+    def _slice_normal(self):
+        return plane_normal(
+            self.slice_axis.value,
+            [value.value for value in self.slice_custom_normal],
+        )
+
+    def _slice_plane_data(self):
+        return position_on_plane(
+            self._slice_bounds(), self._slice_normal(), self.slice_position.value
+        )
+
+    def _sync_slice_position_overlay(self):
+        if self._slice_position_slider is not None:
+            self._slice_position_slider.ui_model_value = self.slice_position.value
+        if self._slice_position_label is None:
+            return
+        try:
+            _center, _offset, distance = self._slice_plane_data()
+            self._slice_position_label.ui_children = [f"{distance:.4g} m"]
+        except (ValueError, TypeError):
+            self._slice_position_label.ui_children = ["—"]
+
+    def _on_slice_position_update(self, event):
+        try:
+            value = float(getattr(event, "value", event))
+            self.slice_position.value = min(1.0, max(0.0, value))
+        except (TypeError, ValueError):
+            pass
+
+    def _apply_slice_plane(self, _value=None, _old=None):
+        if self._slice_clipping is None:
+            self._sync_slice_position_overlay()
+            return
+        try:
+            center, offset, _distance = self._slice_plane_data()
+            self._slice_clipping.center = [float(v) for v in center]
+            self._slice_clipping.normal = [float(v) for v in self._slice_normal()]
+            self._slice_clipping.offset = float(offset)
+        except (ValueError, TypeError):
+            # A custom zero normal is temporarily invalid while the user edits
+            # its three components; keep the last valid plane until corrected.
+            return
+        self._sync_slice_position_overlay()
+        self._invalidate_slice_renderer()
+        if getattr(self, "wgpu", None) is not None and self.wgpu.scene is not None:
+            self.wgpu.scene.render()
+
+    def _invalidate_slice_renderer(self):
+        if self.slice_renderer is None:
+            return
+        # Plane movement only changes clipping uniforms. Invalidate the render
+        # object without forcing the potentially expensive field interpolation
+        # data to be evaluated again.
+        from webgpu.renderer import Renderer
+
+        Renderer.set_needs_update(self.slice_renderer)
+
+    def _apply_slice_enabled(self, value, _old):
+        if self.slice_renderer is not None:
+            self.slice_renderer.active = bool(value)
+            if value:
+                self._invalidate_slice_renderer()
+        if self._slice_overlay is not None:
+            self._slice_overlay.ui_hidden = not bool(value)
+        changed = self._sync_fieldline_seed_visibility(None)
+        if changed:
+            self._apply_region_change()
+        elif self.wgpu.scene is not None:
+            self.wgpu.scene.render()
+
+    def _apply_slice_region(self, _value, _old):
+        self._sync_fieldline_seed_visibility(None)
+        if getattr(self, "wgpu", None) is not None and self.wgpu.scene is not None:
+            self.draw()
+
+    def _create_slice_renderer(self):
+        """Create the cross-section field pass for the selected volume region."""
+        if not self.slice_available:
+            return None
+        import numpy as np
+        from webgpu.clipping import Clipping
+
+        from ngsolve_webgpu import ClippingIsolineRenderer, FunctionData, MeshData
+
+        material = self.slice_region.value
+        mask = material_element_mask(self.mesh, material)
+        mesh_scope = (
+            self.mesh
+            if material == ALL_REGIONS
+            else self.mesh.Materials(material)
+        )
+        mesh_data = MeshData(mesh_scope, el3d_bitarray=mask)
+        function_data = FunctionData(
+            mesh_data, self.visualization_cf, order=self.order
+        )
+        try:
+            center, offset, _distance = self._slice_plane_data()
+            normal = self._slice_normal()
+        except ValueError:
+            # Keep a valid last-resort plane while the user is editing a
+            # temporarily zero custom normal.
+            normal = np.asarray((0.0, 0.0, 1.0), dtype=float)
+            center, offset, _distance = position_on_plane(
+                self._slice_bounds(), normal, self.slice_position.value
+            )
+        clipping = Clipping(
+            mode=Clipping.Mode.PLANE,
+            center=np.asarray(center, dtype=float).tolist(),
+            normal=np.asarray(normal, dtype=float).tolist(),
+            offset=float(offset),
+        )
+        renderer = ClippingIsolineRenderer(
+            function_data,
+            clipping=clipping,
+            n_lines=0,
+            show_field=True,
+            colormap=self.colormap,
+        )
+        # The selected region is temporarily hidden in the regular mesh render;
+        # don't apply that alpha override to the slice's own cut-face renderer.
+        renderer.region_visibility = None
+        renderer.active = self.slice_enabled.value
+        if self.cf.is_complex:
+            renderer.set_complex_mode(self.complex_mode.value)
+        self._slice_function_data = function_data
+        self._slice_clipping = clipping
+        self.slice_renderer = renderer
+        return renderer
 
     def _apply_clipping_function(self, val, _old):
         if self.clippingcf is not None:
@@ -524,6 +987,151 @@ class FunctionComponent(WebgpuTab):
             r.set_needs_update()
         self.wgpu.scene.render()
 
+    def _apply_axisymmetric_revolved(self, enabled, _old):
+        if not self.axisymmetric_revolution_available:
+            return
+
+        if enabled:
+            if self._axisymmetric_revolution_mesh is None:
+                from .axisymmetric_revolution import revolve_gridfunction
+
+                try:
+                    (
+                        self._axisymmetric_revolution_mesh,
+                        self._axisymmetric_revolution_field,
+                    ) = revolve_gridfunction(self._axisymmetric_original_state["cf"])
+                except Exception as error:
+                    print(f"Could not create axisymmetric 3D view: {error}")
+                    self.axisymmetric_revolved.value = False
+                    return
+
+            camera = self.camera
+            self._axisymmetric_camera_state = {
+                "shared": bool(self.camera_shared.value),
+                "transform": camera.transform.copy(),
+                "orthographic": camera.orthographic,
+            }
+            if self.camera_shared.value:
+                self.camera_shared.value = False
+
+            self.mesh = self._axisymmetric_revolution_mesh
+            self.region_or_mesh = self._axisymmetric_revolution_mesh
+            self.cf = self._axisymmetric_revolution_field
+            self.visualization_cf = visualization_cf(self.cf)
+            self.deformation = None
+        else:
+            original = self._axisymmetric_original_state
+            self.mesh = original["mesh"]
+            self.region_or_mesh = original["region_or_mesh"]
+            self.cf = original["cf"]
+            self.visualization_cf = original["visualization_cf"]
+            self.deformation = original["deformation"]
+
+        self.region_state = None
+        self.region_visibility = None
+        self._full_range = None
+        self._mesh_data = None
+        self.mdata = None
+        self._slice_bounds_cache = None
+        self._facet_supported = bool(self.draw_vol) and self.mesh.dim in (2, 3)
+        self.draw()
+        self._rebuild_dimension_controls()
+
+        if enabled:
+            self.reset_camera()
+        elif self._axisymmetric_camera_state is not None:
+            camera_state = self._axisymmetric_camera_state
+            if camera_state["shared"]:
+                self.camera_shared.value = True
+            else:
+                camera = self.camera
+                camera.transform = camera_state["transform"]
+                camera.orthographic = camera_state["orthographic"]
+                self.scene.render()
+            self._axisymmetric_camera_state = None
+
+    def _apply_symmetry_expanded(self, enabled, _old):
+        if not self.quarter_symmetry_expansion_available:
+            return
+
+        if enabled:
+            if self._symmetry_expanded_mesh is None:
+                from .quarter_symmetry import mirror_quarter_gridfunction
+
+                try:
+                    (
+                        self._symmetry_expanded_mesh,
+                        self._symmetry_expanded_field,
+                    ) = mirror_quarter_gridfunction(
+                        self._symmetry_original_state["cf"],
+                        self._quarter_symmetry_planes,
+                        vector_kind=self._symmetry_vector_kind,
+                    )
+                except Exception as error:
+                    print(f"Could not create full symmetry view: {error}")
+                    self.symmetry_expanded.value = False
+                    return
+
+            camera = self.camera
+            self._symmetry_camera_state = {
+                "shared": bool(self.camera_shared.value),
+                "transform": camera.transform.copy(),
+                "orthographic": camera.orthographic,
+            }
+            if self.camera_shared.value:
+                self.camera_shared.value = False
+
+            self.mesh = self._symmetry_expanded_mesh
+            self.region_or_mesh = self._symmetry_expanded_mesh
+            self.cf = self._symmetry_expanded_field
+            self.visualization_cf = visualization_cf(self.cf)
+            self.deformation = None
+        else:
+            original = self._symmetry_original_state
+            self.mesh = original["mesh"]
+            self.region_or_mesh = original["region_or_mesh"]
+            self.cf = original["cf"]
+            self.visualization_cf = original["visualization_cf"]
+            self.deformation = original["deformation"]
+
+        self.region_state = None
+        self.region_visibility = None
+        self._full_range = None
+        self._mesh_data = None
+        self.mdata = None
+        self._slice_bounds_cache = None
+        self._facet_supported = bool(self.draw_vol) and self.mesh.dim in (2, 3)
+        self.draw()
+        self._rebuild_dimension_controls()
+
+        if enabled:
+            self.reset_camera()
+        elif self._symmetry_camera_state is not None:
+            camera_state = self._symmetry_camera_state
+            if camera_state["shared"]:
+                self.camera_shared.value = True
+            else:
+                camera = self.camera
+                camera.transform = camera_state["transform"]
+                camera.orthographic = camera_state["orthographic"]
+                self.scene.render()
+            self._symmetry_camera_state = None
+
+    def _rebuild_dimension_controls(self):
+        """Rebuild viewport controls whose availability depends on mesh dimension."""
+        self._tool_dock = self._build_tool_dock()
+        self._clip_toolbar = self._build_clip_toolbar()
+        overlays = [self.wgpu, self._tool_dock, self.pick_overlay]
+        if self._clip_toolbar is not None:
+            overlays.insert(2, self._clip_toolbar)
+        if self._legend is not None:
+            overlays.append(self._legend)
+        if self._probe_panel is not None:
+            overlays.extend((self._probe_preview, self._probe_panel))
+        self._sync_viewport_layout(overlays)
+        self._sync_clip_ui(self.clipping_enabled.value, None)
+        self._sync_camera_link_ui(self.camera_shared.value, None)
+
     def _sync_region_state(self):
         self.region_state.hidden = set(self.hidden_regions.value)
         self.region_state.overrides = dict(self.boundary_overrides.value)
@@ -606,7 +1214,7 @@ class FunctionComponent(WebgpuTab):
             doms = st.fd_doms[result.region_index]
             names = [st.material_name(d - 1) for d in doms if d >= 1]
             names = [n for n in names if n is not None]
-            visible = [n for n in names if n not in st.hidden]
+            visible = [n for n in names if st.material_visible(n)]
             return (visible or names or [None])[0]
         return None
 
@@ -659,7 +1267,7 @@ class FunctionComponent(WebgpuTab):
         import re
 
         st = self.region_state
-        visible_mats = [m for m in st.unique_materials if m not in st.hidden]
+        visible_mats = [m for m in st.unique_materials if st.material_visible(m)]
         if not visible_mats:
             return None
         regions = []
@@ -896,7 +1504,18 @@ class FunctionComponent(WebgpuTab):
 
     @property
     def _complex_renderers(self):
-        return [r for r in [self.elements2d, self.clippingcf, self.clipping_vectors, self.surface_vectors, self.lic] if r is not None]
+        return [
+            r
+            for r in [
+                self.elements2d,
+                self.clippingcf,
+                self.slice_renderer,
+                self.clipping_vectors,
+                self.surface_vectors,
+                self.lic,
+            ]
+            if r is not None
+        ]
 
     @property
     def _vector_renderers(self):
@@ -968,18 +1587,19 @@ class FunctionComponent(WebgpuTab):
     def draw(self):
         # Per-tab region visibility: shared alpha buffer (like clipping /
         # colormap), fed from the saved hidden-regions state.
-        if not hasattr(self, "region_state"):
+        if getattr(self, "region_state", None) is None:
             self.region_state = RegionState(self.mesh)
             self.region_visibility = RegionVisibility()
             self._full_range = None
         self._sync_region_state()
+        self._sync_fieldline_seed_visibility(self.field_lines_visible.value)
         self.region_visibility.set_alphas(
             vol=self.region_state.vol_alphas(),
             surf=self.region_state.surf_alphas(),
         )
 
         func_data = self.app_data.get_function_gpu_data(
-            self.cf, self.region_or_mesh, order=self.order
+            self.visualization_cf, self.region_or_mesh, order=self.order
         )
         mdata = func_data.mesh_data
 
@@ -1015,7 +1635,9 @@ class FunctionComponent(WebgpuTab):
         discrete = self.colormap_discrete.value
         minval = self.colormap_min.value
         maxval = self.colormap_max.value
-        self.colormap = Colormap(minval=minval, maxval=maxval, colormap=self.colormap_name.value)
+        self.colormap = _MMFEMColormap(
+            minval=minval, maxval=maxval, colormap=self.colormap_name.value
+        )
         self.colormap.autoscale = autoscale
         self.colormap.discrete = discrete
         self.clipping_vectors = None
@@ -1024,9 +1646,9 @@ class FunctionComponent(WebgpuTab):
         # field, vs a ClippingLIC (3D) that overlays the cutting plane.
         self._lic_is_surface = False
         if self.cf.dim == self.mesh.dim:
-            vec3 = self.cf
+            vec3 = self.visualization_cf
             if self.cf.dim == 2:
-                vec3 = ngs.CF((self.cf[0], self.cf[1], 0))
+                vec3 = ngs.CF((self.visualization_cf[0], self.visualization_cf[1], 0))
             vec_data = self.app_data.get_function_gpu_data(
                 vec3, self.region_or_mesh, order=self.order
             )
@@ -1073,6 +1695,16 @@ class FunctionComponent(WebgpuTab):
                 colormap=self.colormap,
                 clipping=self.clipping,
             )
+            seed_region = self.fieldline_seed_region.value
+            self.fieldlines.start_region = material_region(self.mesh, seed_region)
+            self.fieldlines._ngsolve_gui_start_region_name = seed_region
+            draw_data = self.data if isinstance(self.data, dict) else {}
+            if self.mesh.dim == 3 and draw_data.get(
+                "_ngsolve_gui_fast_fieldlines", False
+            ):
+                from .fast_fieldlines import install_fast_fieldline_update
+
+                install_fast_fieldline_update(self.fieldlines)
             self.fieldlines.active = self.field_lines_visible.value
         if self.mesh.dim == 3 and self.draw_vol:
             self.clippingcf = ClippingIsolineRenderer(func_data, clipping=self.clipping,
@@ -1101,6 +1733,7 @@ class FunctionComponent(WebgpuTab):
                 self.lic.active = self.lic_visible.value
         else:
             self.clippingcf = None
+        self.slice_renderer = self._create_slice_renderer()
         if self.draw_surf:
             self.elements2d = IsolineRenderer(
                 func_data, n_lines=0, show_field=True,
@@ -1154,6 +1787,7 @@ class FunctionComponent(WebgpuTab):
             obj
             for obj in [
                 self.clippingcf,
+                self.slice_renderer,
                 self.lic,
                 self.elements2d,
                 self.facet_renderer,
@@ -1176,6 +1810,7 @@ class FunctionComponent(WebgpuTab):
             self._entity_number_renderers[entity] = r
         render_objects += list(self._entity_number_renderers.values())
         self.wgpu.draw(render_objects, camera=self.camera)
+        self._sync_slice_position_overlay()
 
         pickable = [(r, k) for r, k in [
             (self.elements2d, "surface"),
@@ -1183,6 +1818,7 @@ class FunctionComponent(WebgpuTab):
             # working on it too (it's a CFRenderer with a select pipeline).
             (self.lic if self._lic_is_surface else None, "surface"),
             (self.clippingcf, "clipping"),
+            (self.slice_renderer, "clipping"),
         ] if r is not None]
         self.setup_picking(pickable, self.mesh)
 
@@ -1205,6 +1841,7 @@ from .sections import (
     ComplexSection,
     EntityNumbersSection,
     RegionsSection,
+    SliceViewSection,
 )
 
 # Colormap/colorbar lives in the always-visible FieldSummary (property_summary),

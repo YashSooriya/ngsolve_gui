@@ -79,6 +79,13 @@ class VectorsFlowSection(Section):
 
     def _build_streamlines(self, comp):
         """Streamlines (field-line) sub-feature for the grouped flow card."""
+        self.seed_region = QSelect(
+            ui_options=comp.fieldline_seed_region_options,
+            ui_model_value=comp.fieldline_seed_region.value,
+            ui_dense=True,
+            ui_filled=True,
+        )
+        self.seed_region.on_update_model_value(self._update_seed_region)
         self.num_lines = QInput(ui_type="number", ui_model_value=comp.fieldlines_num_lines, ui_dense=True, ui_filled=True)
         self.length = QInput(ui_type="number", ui_model_value=comp.fieldlines_length, ui_dense=True, ui_filled=True)
         self.thickness = QInput(ui_type="number", ui_model_value=comp.fieldlines_thickness, ui_dense=True, ui_filled=True)
@@ -97,6 +104,7 @@ class VectorsFlowSection(Section):
         self.recalc_btn.on_click(self._recalculate)
         return SubToggleBlock(
             "Streamlines", comp.field_lines_visible,
+            field("Seed region", self.seed_region),
             Row(field("Lines", self.num_lines), field("Length", self.length),
                 field("Thick.", self.thickness), ui_class="items-end no-wrap " + str(gap_xs)),
             field("Direction", self.direction),
@@ -154,6 +162,11 @@ class VectorsFlowSection(Section):
             self.comp.fieldlines_direction.value = direction_map[event.value]
         except KeyError:
             pass
+
+    def _update_seed_region(self, event):
+        value = str(getattr(event, "value", event))
+        if value in self.comp.fieldline_seed_region_options:
+            self.comp.fieldline_seed_region.value = value
 
     def _recalculate(self, event):
         comp = self.comp

@@ -1,0 +1,103 @@
+from types import SimpleNamespace
+
+import pytest
+
+from ngsolve_gui.app import NGSolveGui, WorkspaceModeToggle
+
+
+def test_workspace_mode_toggle_updates_selection_and_notifies(monkeypatch):
+    selected = []
+    toggle = WorkspaceModeToggle("post_process", on_change=selected.append)
+    for button in toggle._buttons.values():
+        monkeypatch.setattr(button, "_update_frontend", lambda payload: None)
+
+    assert toggle.value == "post_process"
+    assert [button.ui_children[0] for button in toggle.ui_children] == [
+        "Solve", "Post Process"
+    ]
+    assert all(
+        "font-size:15px" in button.ui_style for button in toggle._buttons.values()
+    )
+    assert "background:var(--accent-subtle)" in toggle._buttons["post_process"].ui_style
+    assert "background:var(--surface)" in toggle._buttons["solve"].ui_style
+
+    toggle._buttons["solve"]._callbacks["click"][0](None)
+
+    assert toggle.value == "solve"
+    assert selected == ["solve"]
+    assert "background:var(--accent-subtle)" in toggle._buttons["solve"].ui_style
+    assert "background:var(--surface)" in toggle._buttons["post_process"].ui_style
+
+
+def test_workspace_mode_toggle_defaults_to_solve():
+    toggle = WorkspaceModeToggle()
+
+    assert toggle.value == "solve"
+    assert "background:var(--accent-subtle)" in toggle._buttons["solve"].ui_style
+    assert "background:var(--surface)" in toggle._buttons["post_process"].ui_style
+
+
+def test_workspace_mode_switch_changes_workspace_and_keeps_header_visible():
+    post_process = SimpleNamespace(ui_hidden=False)
+    solve = SimpleNamespace(ui_hidden=True)
+    brand, files, actions, monitor, separator, mode_bar = [
+        SimpleNamespace(ui_hidden=False) for _ in range(6)
+    ]
+    header_components = [brand, files, actions, monitor, separator, mode_bar]
+    app = SimpleNamespace(
+        _post_process_workspace=post_process,
+        _solve_workspace=solve,
+        # These stand in for fixed app-bar controls and the mode row beneath it.
+        _brand=brand,
+        _file_group=files,
+        _view_group=actions,
+        system_monitor=monitor,
+        _system_monitor_separator=separator,
+        _workspace_mode_bar=mode_bar,
+    )
+
+    NGSolveGui._set_workspace_mode(app, "solve")
+    assert app._workspace_mode == "solve"
+    assert post_process.ui_hidden
+    assert not solve.ui_hidden
+    assert all(not item.ui_hidden for item in header_components)
+
+    NGSolveGui._set_workspace_mode(app, "post_process")
+    assert app._workspace_mode == "post_process"
+    assert not post_process.ui_hidden
+    assert solve.ui_hidden
+    assert all(not item.ui_hidden for item in header_components)
+
+
+def test_opening_a_run_result_keeps_the_mode_toggle_in_sync(monkeypatch):
+    loaded = []
+    app = SimpleNamespace(
+        _workspace_mode="solve",
+        _post_process_workspace=SimpleNamespace(ui_hidden=True),
+        _solve_workspace=SimpleNamespace(ui_hidden=False),
+        _load_with_status=loaded.append,
+    )
+    toggle = WorkspaceModeToggle(
+        "solve", on_change=lambda mode: NGSolveGui._set_workspace_mode(app, mode)
+    )
+    for button in toggle._buttons.values():
+        monkeypatch.setattr(button, "_update_frontend", lambda _payload: None)
+    app._workspace_mode_toggle = toggle
+    monkeypatch.setattr("ngsolve_gui.app.os.path.isfile", lambda _filename: True)
+
+    NGSolveGui._open_run_result(app, "B_DC.pkl")
+
+    assert toggle.value == "post_process"
+    assert app._workspace_mode == "post_process"
+    assert app._post_process_workspace.ui_hidden is False
+    assert app._solve_workspace.ui_hidden is True
+    assert loaded == ["B_DC.pkl"]
+
+
+def test_workspace_mode_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="Unknown workspace mode"):
+        WorkspaceModeToggle("solver")
+
+    app = SimpleNamespace()
+    with pytest.raises(ValueError, match="Unknown workspace mode"):
+        NGSolveGui._set_workspace_mode(app, "solver")
