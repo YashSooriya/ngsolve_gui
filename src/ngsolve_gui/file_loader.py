@@ -540,6 +540,39 @@ def load_file(filename, app):
             return None
 
     path = Path(filename).resolve()
+    if path.suffix.lower() == ".mmfem-solutions":
+        from .result_files import extract_solution_bundle
+
+        directory, field_paths = extract_solution_bundle(path.read_bytes())
+        import json
+
+        retained = getattr(app, "_solution_import_dirs", None)
+        if retained is None:
+            retained = []
+            app._solution_import_dirs = retained
+        retained.append(directory)
+        encoded_paths = json.dumps(field_paths)
+        source = (
+            "import pickle\n"
+            "from pathlib import Path\n"
+            "from ngsolve_gui.file_loader import _draw_pickle_object\n"
+            f"_mmfem_field_paths = {encoded_paths}\n"
+            "for _mmfem_field_path in _mmfem_field_paths:\n"
+            "    with open(_mmfem_field_path, 'rb') as _mmfem_field_stream:\n"
+            "        _mmfem_field = pickle.load(_mmfem_field_stream)\n"
+            "    _draw_pickle_object(\n"
+            "        _mmfem_field, Path(_mmfem_field_path).stem,\n"
+            "        field_path=_mmfem_field_path,\n"
+            "    )\n"
+        )
+        script_globals = {
+            "__name__": "__main__",
+            "__file__": str(path),
+            "__builtins__": __builtins__,
+        }
+        code = compile(source, str(path), "exec")
+        return _run_script(code, script_globals, app)
+
     name = path.stem
     source, compile_name = _build_loader_snippet(str(path), name)
 

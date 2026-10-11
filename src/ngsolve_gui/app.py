@@ -26,6 +26,14 @@ from .system_monitor import SystemMonitor, available as system_monitor_available
 from .footer import StatusFooter
 from .solve_workspace import SolveWorkspace
 from .axisymmetric_model import unpack_model, package_model
+from .result_files import (
+    MESH_SUFFIX,
+    SOLUTION_SUFFIX,
+    make_mesh_bundle,
+    make_solution_bundle,
+    problem_fingerprint,
+    read_mesh_bundle,
+)
 
 
 def _inject_solve_status_styles(js):
@@ -53,6 +61,17 @@ def _inject_solve_status_styles(js):
     animation-iteration-count: 1;
   }
 }
+.mmfem-compact-app-bar .cb-monitor-stat {
+  box-sizing: border-box;
+  flex: 1 1 0;
+  min-width: 0;
+  width: 68px;
+  gap: 3px;
+  padding-left: 3px;
+  padding-right: 3px;
+}
+.mmfem-compact-app-bar .cb-monitor-value { font-size: 9px; }
+.mmfem-compact-app-bar .cb-monitor-subvalue { font-size: 8px; }
 """
     js.document.head.appendChild(style)
 
@@ -189,7 +208,7 @@ class WorkspaceModeToggle(Div):
         super().__init__(
             self._buttons["solve"], self._buttons["post_process"],
             ui_style=(
-                "display:flex; width:264px; height:36px; flex:none; "
+                "display:flex; width:174px; height:34px; flex:none; "
                 "overflow:hidden; border:1px solid var(--border-strong); "
                 "border-radius:var(--r-sm); background:var(--surface);"
             ),
@@ -199,7 +218,7 @@ class WorkspaceModeToggle(Div):
         active = mode == self._value
         style = (
             "display:flex; flex:1; align-items:center; justify-content:center; "
-            "height:36px; padding:0 14px; white-space:nowrap; cursor:pointer; "
+            "height:34px; padding:0 5px; white-space:nowrap; cursor:pointer; "
             "user-select:none; font-size:15px; transition:background-color 100ms ease, color 100ms ease;"
         )
         if mode == "post_process":
@@ -410,6 +429,9 @@ class NGSolveGui(App):
         self._solver_job_active = False
         self._solver_cancel_requested = False
         self._solver_run_context = None
+        self._loaded_mesh_path = None
+        self._loaded_mesh_problem_sha256 = None
+        self._solution_import_dirs = []
 
         # -- Toolbar buttons (compact flat icon buttons, muted like the designer) --
         def _tbtn(icon, tip, handler=None):
@@ -421,17 +443,69 @@ class NGSolveGui(App):
                 btn.on_click(handler)
             return btn
 
-        # File actions
-        upload_file = _tbtn(
-            "mdi-file-plus-outline", "Load file  ·  geometry / mesh / .py", self._load_file
+        # Each artifact category has visible Save and Load actions, with its
+        # category label directly above the pair.
+        def _file_action(label, tip, handler):
+            button = QBtn(
+                QTooltip(tip), ui_label=label,
+                ui_flat=True, ui_dense=True, ui_no_caps=True,
+                ui_class="mmfem-file-action",
+                ui_style=(
+                    "height:24px; min-height:24px; padding:0 3px; "
+                    "font-size:9px; min-width:34px; white-space:nowrap;"
+                ),
+            )
+            button.on_click(handler)
+            return button
+
+        def _artifact_group(name, save_handler, load_handler):
+            return Div(
+                Div(
+                    name,
+                    ui_style=(
+                        "font-size:8px; line-height:10px; font-weight:700; "
+                        "letter-spacing:.04em; text-transform:uppercase; "
+                        "text-align:center; color:var(--fg-subtle);"
+                    ),
+                ),
+                Div(
+                    _file_action("Save", f"Save {name.lower()}", save_handler),
+                    _file_action("Load", f"Load {name.lower()}", load_handler),
+                    ui_style="display:flex; align-items:center; justify-content:center; gap:1px;",
+                ),
+                ui_style=(
+                    "display:flex; flex-direction:column; align-items:center; "
+                    "justify-content:center; gap:1px; padding:0 3px;"
+                ),
+            )
+
+        problem_actions = _artifact_group(
+            "Problem", self.save_problem_file, self.load_problem_file
         )
-        savebtn = _tbtn("mdi-content-save-outline", "Save Project", self.save_project)
-        loadbtn = _tbtn("mdi-folder-open-outline", "Load Project", self.load_project)
+        mesh_actions = _artifact_group("Mesh", self.save_mesh_file, self.load_mesh_file)
+        solution_actions = _artifact_group(
+            "Solutions", self.save_solutions_file, self.load_solutions_file
+        )
+        import_file_btn = _tbtn(
+            "mdi-file-import-outline",
+            "Import external geometry, mesh, Python script, or solution .pkl",
+            self._load_file,
+        )
         self._undo_button = _tbtn("mdi-undo", "Undo model change", self._undo_solve_action)
         self._redo_button = _tbtn("mdi-redo", "Redo model change", self._redo_solve_action)
         self._undo_button.ui_disable = True
         self._redo_button.ui_disable = True
-        file_group = Div(upload_file, savebtn, loadbtn, self._undo_button, self._redo_button, ui_class=cb.tb_group)
+        file_group = Div(
+            problem_actions, mesh_actions, solution_actions,
+            ui_style=(
+                "display:flex; flex:0 1 auto; align-items:center; "
+                "gap:2px; min-width:0;"
+            ),
+        )
+        history_group = Div(
+            import_file_btn, self._undo_button, self._redo_button,
+            ui_class=cb.tb_group,
+        )
 
         # Settings + quit (panel toggles removed — sidebars are draggable;
         # theme lives in the settings menu).
@@ -447,8 +521,8 @@ class NGSolveGui(App):
         ngs_logo = Div(
             QImg(
                 ui_src=self.load_asset("mm-fem-logo.png"),
-                ui_height="55.5px",
-                ui_width="207px",
+                ui_height="42px",
+                ui_width="158px",
                 ui_fit="contain",
             ),
             ui_class=cb.brand,
@@ -466,26 +540,19 @@ class NGSolveGui(App):
         self._last_redraw_time = 0.0
         self._redraw_interval = max(0, int(self.usersettings.get("redraw_interval_ms", 50))) / 1000.0
 
-        # Keep this app bar's established layout stable: brand and file actions
-        # stay at the left, system status and settings/quit stay at the right.
+        # Keep the full app header on one compact row: brand and workspace mode
+        # lead into explicit file actions; system status and app controls stay
+        # on the right.
         bar = QBar(
             ngs_logo,
+            self._workspace_mode_toggle,
             file_group,
+            history_group,
             QSpace(),
             *([self.system_monitor, Div(ui_class=cb.tb_sep)] if self.system_monitor is not None else []),
             view_group,
-            ui_class=cb.app_bar,
-            # Keep the enlarged logo fully visible and vertically centered.
+            ui_class=str(cb.app_bar) + " mmfem-compact-app-bar",
             ui_style="height:60px; min-height:60px;",
-        )
-        workspace_mode_bar = Div(
-            self._workspace_mode_toggle,
-            ui_style=(
-                "display:flex; flex:0 0 52px; height:52px; width:100%; "
-                "box-sizing:border-box; align-items:center; justify-content:center; "
-                "padding:8px 12px; background:var(--panel-header); "
-                "border-bottom:1px solid var(--border);"
-            ),
         )
 
         # Three-column layout using flex
@@ -573,7 +640,7 @@ class NGSolveGui(App):
         ))
 
         super().__init__(
-            bar, workspace_mode_bar, self._post_process_workspace,
+            bar, self._post_process_workspace,
             self._solve_workspace, self._timer_dialog,
             self.kb.indicator, self.kb.help_overlay,
             ui_class=str(cb.app_root),
@@ -678,12 +745,60 @@ class NGSolveGui(App):
         if refresh_history_controls:
             refresh_history_controls()
 
-    def save_project(self):
-        """Save a declarative axisymmetric project in Solve, or the GUI state otherwise."""
-        if self._workspace_mode != "solve":
-            return self.save_local()
+    def _save_artifact(self, data, filename):
         from ngapp.utils import get_environment
 
+        write = get_environment().begin_save_file_local(filename)
+        if write is None:
+            return False
+        write(data)
+        return True
+
+    def _pick_artifact(self, *, title, description, extension, additional_extensions=()):
+        """Return ``(path, bytes)`` for a native or browser file selection."""
+        from ngapp.utils import EnvironmentType, get_environment
+
+        env = get_environment()
+        use_browser_picker = os.environ.get("NGSOLVE_GUI_FILE_PICKER", "").strip().lower() == "browser"
+        if env.type == EnvironmentType.LOCAL_APP and not use_browser_picker:
+            from .native_dialog import open_file_dialog
+
+            path = open_file_dialog(
+                title=title,
+                initialdir=self._local_path or self.usersettings.get("load_dir", "") or os.path.expanduser("~"),
+                filters=[(description, " ".join(f"*{suffix}" for suffix in (extension, *additional_extensions)))],
+            )
+            if not path:
+                return None, None
+            self._local_path = os.path.dirname(path)
+            self.usersettings.set("load_dir", self._local_path)
+            with open(path, "rb") as source:
+                return path, source.read()
+
+        handles = self.js.showOpenFilePicker({
+            "multiple": False,
+            "types": [{
+                "description": description,
+                "accept": {
+                    "application/zip": [extension],
+                    **({"application/octet-stream": list(additional_extensions)} if additional_extensions else {}),
+                },
+            }],
+        })
+        if not handles:
+            return None, None
+        js_file = handles[0].getFile()
+        data = bytes(js_file.arrayBuffer())
+        import tempfile
+
+        directory = tempfile.mkdtemp(prefix="mmfem_open_")
+        path = os.path.join(directory, js_file.name)
+        with open(path, "wb") as target:
+            target.write(data)
+        return path, data
+
+    def save_problem_file(self):
+        """Save the problem definition and its study settings."""
         model = self.solve_workspace.model
         errors = self.solve_workspace.validation_errors()
         # Empty sketches are useful drafts; structural errors still prevent
@@ -692,58 +807,146 @@ class NGSolveGui(App):
             data = package_model(model, self.solve_workspace.studies, self.solve_workspace.layout)
             title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in model.get("name", "axisymmetric-model")).strip()
             filename = (title or "axisymmetric-model") + ".ngsmodel"
-            write = get_environment().begin_save_file_local(filename)
-            if write is None:
+            if not self._save_artifact(data, filename):
                 return
-            write(data)
-            self._notify("Axisymmetric model saved.", type="positive", timeout=2500)
+            self._notify("Problem file saved.", type="positive", timeout=2500)
             self.solve_workspace._message(f"Saved {filename}.")
             if errors:
                 self._notify("Model saved as a draft. Review Geometry and Physics before running.", type="warning", timeout=5000)
         except Exception as error:
-            self._notify(f"Could not save model: {error}", type="negative", timeout=7000)
+            self._notify(f"Could not save problem file: {error}", type="negative", timeout=7000)
             self.solve_workspace._message(f"Save failed: {error}", error=True)
 
-    def load_project(self):
-        """Load the active workspace's native project format."""
-        if self._workspace_mode != "solve":
-            return self.load_local()
-        from ngapp.utils import EnvironmentType, get_environment
+    def save_project(self):
+        """Compatibility alias for the former Save Project action."""
+        return self.save_problem_file()
 
-        env = get_environment()
-        use_browser_picker = os.environ.get("NGSOLVE_GUI_FILE_PICKER", "").strip().lower() == "browser"
+    def load_problem_file(self):
+        """Load a declarative axisymmetric problem file."""
         try:
-            if env.type == EnvironmentType.LOCAL_APP and not use_browser_picker:
-                from .native_dialog import open_file_dialog
-
-                path = open_file_dialog(
-                    title="Open NGSolve axisymmetric model",
-                    initialdir=self._local_path or self.usersettings.get("load_dir", "") or os.path.expanduser("~"),
-                    filters=[("NGSolve model", "*.ngsmodel")],
-                )
-                if not path:
-                    return
-                self._local_path = os.path.dirname(path)
-                self.usersettings.set("load_dir", self._local_path)
-                with open(path, "rb") as model_file:
-                    data = model_file.read()
-            else:
-                handles = self.js.showOpenFilePicker({
-                    "multiple": False,
-                    "types": [{"description": "NGSolve axisymmetric model", "accept": {"application/zip": [".ngsmodel"]}}],
-                })
-                if not handles:
-                    return
-                js_file = handles[0].getFile()
-                data = js_file.arrayBuffer()
+            path, data = self._pick_artifact(
+                title="Open MM-FEM problem file",
+                description="MM-FEM problem file",
+                extension=".ngsmodel",
+            )
+            if not path:
+                return
             model, studies, layout = unpack_model(data)
             self.solve_workspace.set_model(model, studies, layout)
+            self._loaded_mesh_path = None
+            self._loaded_mesh_problem_sha256 = None
             if self._workspace_mode != "solve":
                 self._workspace_mode_toggle.select("solve")
-            self._notify("Axisymmetric model loaded.", type="positive", timeout=2500)
+            self._notify("Problem file loaded.", type="positive", timeout=2500)
         except Exception as error:
-            self._notify(f"Could not load model: {error}", type="negative", timeout=7000)
+            self._notify(f"Could not load problem file: {error}", type="negative", timeout=7000)
             self.solve_workspace._message(f"Load failed: {error}", error=True)
+
+    def load_project(self):
+        """Compatibility alias for the former Load Project action."""
+        return self.load_problem_file()
+
+    def _matching_mesh_path(self):
+        problem_hash = problem_fingerprint(self.solve_workspace.model)
+        if (
+            self._loaded_mesh_path
+            and self._loaded_mesh_problem_sha256 == problem_hash
+            and Path(self._loaded_mesh_path).is_file()
+        ):
+            return Path(self._loaded_mesh_path)
+        for run in reversed(self.solve_workspace.runs):
+            if run.get("status") != "Complete":
+                continue
+            output = Path(run.get("output_path", ""))
+            mesh_path = output / "mesh.vol"
+            if not mesh_path.is_file():
+                continue
+            manifest = self._read_run_manifest(output)
+            if manifest.get("problem_sha256") == problem_hash:
+                return mesh_path
+            # Runs created before mesh bundles carried a digest can still be
+            # matched through their saved problem snapshot.
+            try:
+                saved_model = json.loads((output / "problem.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if problem_fingerprint(saved_model) == problem_hash:
+                return mesh_path
+        return None
+
+    def save_mesh_file(self):
+        """Save the latest mesh generated for the current problem."""
+        try:
+            mesh_path = self._matching_mesh_path()
+            if mesh_path is None:
+                raise ValueError("Generate a mesh for this problem before saving it.")
+            data = make_mesh_bundle(mesh_path.read_bytes(), self.solve_workspace.model)
+            title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in self.solve_workspace.model.get("name", "axisymmetric-model")).strip()
+            filename = (title or "axisymmetric-model") + MESH_SUFFIX
+            if self._save_artifact(data, filename):
+                self._notify("Mesh saved with its matching problem definition.", type="positive", timeout=3000)
+        except Exception as error:
+            self._notify(f"Could not save mesh: {error}", type="negative", timeout=7000)
+
+    def load_mesh_file(self):
+        """Load a mesh only when its problem fingerprint matches the editor."""
+        try:
+            path, data = self._pick_artifact(
+                title="Load mesh for the current problem",
+                description="MM-FEM mesh bundle",
+                extension=MESH_SUFFIX,
+            )
+            if not path:
+                return
+            mesh_data = read_mesh_bundle(data, self.solve_workspace.model)
+            import tempfile
+
+            directory = tempfile.mkdtemp(prefix="mmfem_mesh_")
+            mesh_path = Path(directory) / "mesh.vol"
+            mesh_path.write_bytes(mesh_data)
+            self._loaded_mesh_path = str(mesh_path)
+            self._loaded_mesh_problem_sha256 = problem_fingerprint(self.solve_workspace.model)
+            self.solve_workspace._message("Matching mesh loaded. The next run will reuse it.")
+            self._notify("Mesh loaded for this problem.", type="positive", timeout=3000)
+        except Exception as error:
+            self._notify(f"Could not load mesh: {error}", type="negative", timeout=7000)
+            self.solve_workspace._message(f"Mesh load failed: {error}", error=True)
+
+    def save_solutions_file(self):
+        """Save all GUI fields from the latest completed matching study."""
+        try:
+            model_hash = problem_fingerprint(self.solve_workspace.model)
+            for run in reversed(self.solve_workspace.runs):
+                if run.get("kind") != "Study" or run.get("status") != "Complete":
+                    continue
+                output = Path(run.get("output_path", ""))
+                manifest = self._read_run_manifest(output)
+                if manifest.get("problem_sha256") != model_hash:
+                    continue
+                data, filename = make_solution_bundle(output, self.solve_workspace.model)
+                if self._save_artifact(data, filename):
+                    self._notify("Solution bundle saved.", type="positive", timeout=3000)
+                return
+            raise ValueError("Run a study for the current problem before saving its solutions.")
+        except Exception as error:
+            self._notify(f"Could not save solutions: {error}", type="negative", timeout=7000)
+
+    def load_solutions_file(self):
+        """Open a saved solution bundle in Post Process."""
+        try:
+            path, _data = self._pick_artifact(
+                title="Open MM-FEM solution bundle",
+                description="MM-FEM solution bundle or field pickle",
+                extension=SOLUTION_SUFFIX,
+                additional_extensions=(".pkl",),
+            )
+            if not path:
+                return
+            if self._workspace_mode != "post_process":
+                self._workspace_mode_toggle.select("post_process")
+            self._load_with_status(path)
+        except Exception as error:
+            self._notify(f"Could not load solutions: {error}", type="negative", timeout=7000)
 
     def _run_axisymmetric_solver(self, *, mesh_only=False):
         """Run a saved model in a cancellable child process on this computer."""
@@ -761,6 +964,20 @@ class NGSolveGui(App):
         model = copy.deepcopy(workspace.model)
         studies = copy.deepcopy(workspace.studies)
         layout = copy.deepcopy(workspace.layout)
+        model_hash = problem_fingerprint(model)
+        loaded_mesh_path = None
+        if self._loaded_mesh_path:
+            if (
+                self._loaded_mesh_problem_sha256 == model_hash
+                and Path(self._loaded_mesh_path).is_file()
+            ):
+                loaded_mesh_path = self._loaded_mesh_path
+            else:
+                self._loaded_mesh_path = None
+                self._loaded_mesh_problem_sha256 = None
+                workspace._message(
+                    "The loaded mesh no longer matches this problem; generating a fresh mesh."
+                )
         model_name = re.sub(
             r"[^A-Za-z0-9_-]+", "_", model.get("name", "axisymmetric_model")
         ).strip("_") or "axisymmetric_model"
@@ -785,6 +1002,7 @@ class NGSolveGui(App):
                 "model_archive": model_path.name,
                 "output_path": str(output_dir),
                 "model_name": model.get("name", "axisymmetric model"),
+                "problem_sha256": model_hash,
                 "physics": copy.deepcopy(model.get("physics", {})),
                 "mesh_settings": copy.deepcopy(model.get("mesh", {})),
                 "solver_settings": copy.deepcopy(model.get("solver", {})),
@@ -823,6 +1041,8 @@ class NGSolveGui(App):
                     "--kind",
                     "mesh" if mesh_only else "study",
                 ]
+                if loaded_mesh_path:
+                    command.extend(["--mesh", loaded_mesh_path])
                 popen_options = {
                     "cwd": str(solver_root),
                     "stdin": subprocess.DEVNULL,

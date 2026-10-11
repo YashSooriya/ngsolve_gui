@@ -1,5 +1,7 @@
 """Tests for direct NGSolve pickle loading."""
 
+from types import SimpleNamespace
+
 import ngsolve as ngs
 from netgen.csg import unit_cube
 
@@ -203,3 +205,39 @@ def test_axisymmetric_pickle_detection_requires_matching_solver_metadata(tmp_pat
 
     assert file_loader._is_axisymmetric_pickle(field_path)
     assert not file_loader._is_axisymmetric_pickle(unrelated)
+
+
+def test_solution_bundle_loader_draws_all_fields_in_one_script(monkeypatch, tmp_path):
+    bundle = tmp_path / "saved.mmfem-solutions"
+    bundle.write_bytes(b"bundle")
+    fields_dir = tmp_path / "extracted" / "ngsolve_gui" / "fields"
+    fields_dir.mkdir(parents=True)
+    field_path = fields_dir / "B_DC.pkl"
+    field_path.write_bytes(b"field")
+    captured = {}
+
+    monkeypatch.setattr(
+        "ngsolve_gui.result_files.extract_solution_bundle",
+        lambda _data: (str(fields_dir.parent.parent), [str(field_path)]),
+    )
+    monkeypatch.setattr(
+        file_loader,
+        "_run_script",
+        lambda code, globals_, app: captured.update(
+            code=code, globals=globals_, app=app
+        ) or ("thread", "done"),
+    )
+    app = SimpleNamespace(
+        app_data=object(),
+        redraw=lambda: None,
+        script_args=[],
+        _solution_import_dirs=[],
+    )
+
+    result = file_loader.load_file(bundle, app)
+
+    assert result == ("thread", "done")
+    assert str(field_path) in repr(captured["code"].co_consts)
+    assert "_draw_pickle_object" in captured["code"].co_names
+    assert app._solution_import_dirs == [str(fields_dir.parent.parent)]
+    assert captured["code"].co_filename == str(bundle.resolve())
