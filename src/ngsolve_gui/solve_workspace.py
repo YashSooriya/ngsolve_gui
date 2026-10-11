@@ -1775,9 +1775,12 @@ class SolveWorkspace(Div):
   const removeViewCommitSnapshot = (svg = currentSvg()) => {
     const snapshot = svg && svg.querySelector('[data-sketch-view-commit-snapshot="true"]');
     if (!snapshot) return;
+    if (snapshot.__ngsolveLayerObserver) snapshot.__ngsolveLayerObserver.disconnect();
     for (const entry of snapshot.__ngsolveHiddenLayers || []) {
-      const layer = entry.layer;
-      if (!layer || !layer.isConnected) continue;
+      // The renderer may replace a layer while the snapshot is covering the
+      // canvas. Restore the current DOM node by id, not a detached old node.
+      const layer = svg.querySelector('#' + entry.id);
+      if (!layer) continue;
       if (entry.visibility === null) layer.removeAttribute('visibility');
       else layer.setAttribute('visibility', entry.visibility);
     }
@@ -1804,9 +1807,27 @@ class SolveWorkspace(Div):
       copy.removeAttribute('id');
       copy.querySelectorAll('[id]').forEach(node => node.removeAttribute('id'));
       snapshot.appendChild(copy);
-      snapshot.__ngsolveHiddenLayers.push({layer, visibility});
+      snapshot.__ngsolveHiddenLayers.push({id, layer, visibility});
       layer.setAttribute('visibility', 'hidden');
     }
+    // A framework patch can replace one of the SVG groups during the redraw.
+    // Keep any replacement hidden so it cannot show through beside the frozen
+    // frame, and restore the current nodes atomically when the commit is ready.
+    snapshot.__ngsolveLayerObserver = new MutationObserver(() => {
+      if (!snapshot.isConnected) return;
+      for (const entry of snapshot.__ngsolveHiddenLayers) {
+        const layer = svg.querySelector('#' + entry.id);
+        if (layer && layer.getAttribute('visibility') !== 'hidden') {
+          layer.setAttribute('visibility', 'hidden');
+        }
+      }
+    });
+    snapshot.__ngsolveLayerObserver.observe(svg, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ['visibility'],
+    });
     svg.appendChild(snapshot);
     return true;
   };
