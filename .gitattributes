@@ -2,3 +2,4 @@
 # Keep this modest application logo as a regular Git blob so package builds and
 # checkouts do not depend on Git LFS for it.
 src/ngsolve_gui/assets/mm-fem-logo.png -filter -diff -merge -text
+src/ngsolve_gui/assets/mm-fem-app-icon.png -filter -diff -merge -text
