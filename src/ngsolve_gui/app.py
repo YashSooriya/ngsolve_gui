@@ -63,15 +63,16 @@ def _inject_solve_status_styles(js):
 }
 .mmfem-compact-app-bar .cb-monitor-stat {
   box-sizing: border-box;
-  flex: 1 1 0;
-  min-width: 0;
-  width: 68px;
+  flex: 0 0 72px;
+  min-width: 72px;
+  width: 72px;
   gap: 3px;
   padding-left: 3px;
   padding-right: 3px;
 }
-.mmfem-compact-app-bar .cb-monitor-value { font-size: 9px; }
-.mmfem-compact-app-bar .cb-monitor-subvalue { font-size: 8px; }
+.mmfem-compact-app-bar .cb-monitor { flex: 0 0 288px; width: 288px; }
+.mmfem-compact-app-bar .cb-monitor-value { font-size: 9.5px; }
+.mmfem-compact-app-bar .cb-monitor-subvalue { font-size: 9px; }
 """
     js.document.head.appendChild(style)
 
@@ -451,8 +452,8 @@ class NGSolveGui(App):
                 ui_flat=True, ui_dense=True, ui_no_caps=True,
                 ui_class="mmfem-file-action",
                 ui_style=(
-                    "height:24px; min-height:24px; padding:0 3px; "
-                    "font-size:9px; min-width:34px; white-space:nowrap;"
+                    "height:27px; min-height:27px; padding:0 4px; "
+                    "font-size:10.5px; min-width:38px; white-space:nowrap;"
                 ),
             )
             button.on_click(handler)
@@ -463,7 +464,7 @@ class NGSolveGui(App):
                 Div(
                     name,
                     ui_style=(
-                        "font-size:8px; line-height:10px; font-weight:700; "
+                        "font-size:9px; line-height:11px; font-weight:700; "
                         "letter-spacing:.04em; text-transform:uppercase; "
                         "text-align:center; color:var(--fg-subtle);"
                     ),
@@ -475,7 +476,7 @@ class NGSolveGui(App):
                 ),
                 ui_style=(
                     "display:flex; flex-direction:column; align-items:center; "
-                    "justify-content:center; gap:1px; padding:0 3px;"
+                    "justify-content:center; gap:2px; padding:0 4px;"
                 ),
             )
 
