@@ -1701,6 +1701,24 @@ def test_region_click_updates_selection_without_rebuilding_sketch_scene(standalo
     assert not workspace._edge_panel.ui_hidden
 
 
+def test_drawing_tool_cursor_remains_crosshair_over_existing_geometry(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    region_node = workspace._canvas_region_nodes[region["id"]]
+    edge_hit = workspace._canvas_edge_nodes[region["edge_ids"][0]][-1]
+
+    workspace.set_sketch_tool("rectangle", announce=False)
+
+    assert region_node._props["style"] == "cursor:crosshair;"
+    assert edge_hit._props["style"].startswith("cursor:crosshair;")
+
+    workspace.set_sketch_tool("select", announce=False)
+
+    assert region_node._props["style"] == "cursor:pointer;"
+    assert edge_hit._props["style"].startswith("cursor:pointer;")
+
+
 def test_selecting_geometry_restores_its_inspector_after_another_section(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")

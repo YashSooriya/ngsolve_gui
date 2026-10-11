@@ -1165,6 +1165,15 @@ class SolveWorkspace(Div):
             + ("crosshair;" if tool != "select" else "default;")
             + " user-select:none; -webkit-user-select:none;"
         )
+        region_cursor = "pointer" if tool == "select" else "crosshair"
+        for shape in self._canvas_region_nodes.values():
+            _update_svg_props(shape, style=f"cursor:{region_cursor};")
+        for edge_nodes in self._canvas_edge_nodes.values():
+            hit_target = edge_nodes[-1]
+            _update_svg_props(
+                hit_target,
+                style=f"cursor:{region_cursor}; pointer-events:stroke;",
+            )
         self._refresh_sketch_tool_buttons()
         self._sync_canvas_interaction_settings()
         if announce:
@@ -4320,6 +4329,7 @@ class SolveWorkspace(Div):
         grid_children.append(_svg("text", x=plot[0] + 8, y=plot[1] + 15, fill="var(--fg-muted, #697586)", font_size="12", style=grid_text_style, children="z  [m]"))
 
         material_index = {item["id"]: index for index, item in enumerate(self.model["materials"])}
+        region_cursor = "pointer" if self.sketch_tool == "select" else "crosshair"
         live_region_ids = set()
         for region in regions:
             region_id = region["id"]
@@ -4335,7 +4345,7 @@ class SolveWorkspace(Div):
                 "stroke_width": "2.2" if selected else "1.6",
                 "data_sketch_region_id": region_id,
                 "tabindex": "0",
-                "style": "cursor:pointer;",
+                "style": f"cursor:{region_cursor};",
             }
             shape = self._canvas_region_nodes.get(region_id)
             if shape is None:
@@ -4392,7 +4402,7 @@ class SolveWorkspace(Div):
                 "stroke": "transparent", "stroke_width": "12",
                 "data_sketch_edge_id": edge_id,
                 "data_sketch_region_id": region_id,
-                "style": "cursor:pointer; pointer-events:stroke;",
+                "style": f"cursor:{region_cursor}; pointer-events:stroke;",
             }
             nodes = self._canvas_edge_nodes.get(edge_id)
             if nodes is None:
