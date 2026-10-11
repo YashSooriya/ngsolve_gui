@@ -61,18 +61,51 @@ def _inject_solve_status_styles(js):
     animation-iteration-count: 1;
   }
 }
+.mmfem-compact-app-bar .cb-monitor {
+  box-sizing: border-box;
+  flex: 0 0 464px;
+  width: 464px;
+}
 .mmfem-compact-app-bar .cb-monitor-stat {
   box-sizing: border-box;
-  flex: 0 0 72px;
-  min-width: 72px;
-  width: 72px;
-  gap: 3px;
-  padding-left: 3px;
-  padding-right: 3px;
+  flex: 0 0 116px;
+  min-width: 116px;
+  width: 116px;
+  gap: 6px;
+  padding-left: 8px;
+  padding-right: 8px;
 }
-.mmfem-compact-app-bar .cb-monitor { flex: 0 0 288px; width: 288px; }
 .mmfem-compact-app-bar .cb-monitor-value { font-size: 9.5px; }
-.mmfem-compact-app-bar .cb-monitor-subvalue { font-size: 9px; }
+.mmfem-compact-app-bar .cb-monitor-subvalue,
+.mmfem-compact-app-bar .cb-monitor-subbar { display: none; }
+@media (max-width: 1600px) {
+  .mmfem-compact-app-bar .cb-monitor { flex-basis: 420px; width: 420px; }
+  .mmfem-compact-app-bar .cb-monitor-stat {
+    flex-basis: 105px;
+    min-width: 105px;
+    width: 105px;
+    gap: 5px;
+    padding-left: 6px;
+    padding-right: 6px;
+  }
+  .mmfem-compact-app-bar .cb-monitor-icon { display: none; }
+}
+@media (max-width: 1280px) {
+  .mmfem-compact-app-bar .cb-monitor { flex-basis: 336px; width: 336px; }
+  .mmfem-compact-app-bar .cb-monitor-stat {
+    flex-basis: 84px;
+    min-width: 84px;
+    width: 84px;
+    gap: 4px;
+    padding-left: 4px;
+    padding-right: 4px;
+  }
+  .mmfem-compact-app-bar .cb-monitor-label {
+    font-size: 8px;
+    letter-spacing: 0;
+  }
+  .mmfem-compact-app-bar .cb-monitor-value { font-size: 9px; }
+}
 """
     js.document.head.appendChild(style)
 
