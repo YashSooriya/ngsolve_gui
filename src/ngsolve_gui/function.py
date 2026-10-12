@@ -479,7 +479,7 @@ class FunctionComponent(WebgpuTab):
 
         if self.cf.is_complex:
             self.complex_mode = Observable(
-                s.get("complex_mode", "real"), "complex_mode"
+                s.get("complex_mode", "abs"), "complex_mode"
             )
             self.complex_animate = Observable(False, "complex_animate")
             self.complex_speed = Observable(

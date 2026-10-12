@@ -189,6 +189,26 @@ def test_function_fieldlines_2d(page: Page, app) -> None:
     click_in_section(page, "Vectors & Flow", "Streamlines")
     assert_matches_baseline(page, comp.wgpu, "func_fieldlines_2d.png")
 
+@app_test("ngsolve_gui.appconfig")
+def test_complex_field_defaults_to_absolute_and_allows_component_selection(
+    page: Page, app
+) -> None:
+    """Complex fields default to magnitude while retaining real/imaginary modes."""
+    mesh = make_mesh_2d()
+    field = ngs.GridFunction(ngs.H1(mesh, order=1, complex=True), name="Complex field")
+    field.Set(ngs.CF(ngs.x + 1j * ngs.y))
+    _draw(app, field, name="ComplexField")
+
+    component = app.tab_panel.comp
+    assert component.cf.is_complex
+    assert component.complex_mode.value == "abs"
+
+    component.complex_mode.value = "real"
+    assert component.complex_mode.value == "real"
+    component.complex_mode.value = "imag"
+    assert component.complex_mode.value == "imag"
+
+
 def test_complex_vector_deformation_extracts_real_and_imaginary_components() -> None:
     mesh = make_mesh_3d()
     displacement = ngs.GridFunction(
