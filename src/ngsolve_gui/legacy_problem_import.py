@@ -217,8 +217,12 @@ def legacy_problem_to_model(problem, *, name="Imported legacy problem", element_
             "This importer cannot yet preserve different magnetic Dirichlet "
             "boundary selections between DC and time-harmonic problems."
         )
-    dir_em_is_active = "DirEM" in adc_dirichlet
-    legacy_zero_on_all_exterior_edges = not adc_dirichlet
+    # The legacy axisymmetric solvers use zero magnetic potential on the
+    # exterior boundary when the Dirichlet key list is empty. Preserve that
+    # fallback explicitly in the GUI model, but leave r=0 unconstrained so
+    # the regular axis limit can produce a nonzero axial magnetic field.
+    legacy_zero_on_exterior = not adc_dirichlet
+    dir_em_is_active = "DirEM" in adc_dirichlet or legacy_zero_on_exterior
 
     domain_ids = sorted(geometry.materials)
     polygons = {domain: _domain_polygon(geometry, domain) for domain in domain_ids}
@@ -357,7 +361,7 @@ def legacy_problem_to_model(problem, *, name="Imported legacy problem", element_
             edge_id = f"legacy-edge-{len(model['geometry']['edges']) + 1}"
             condition_ids = []
             tag = segment.get("bc")
-            if tag and not (legacy_zero_on_all_exterior_edges and str(tag) == "Neu_0"):
+            if tag:
                 condition_id = _make_boundary_condition(
                     str(tag),
                     condition_ids_by_type,
@@ -366,15 +370,14 @@ def legacy_problem_to_model(problem, *, name="Imported legacy problem", element_
                 )
                 if condition_id is not None:
                     condition_ids.append(condition_id)
-            # In the legacy solver, empty dirkeysADC/dirkeysAAC do not mean
-            # "no magnetic Dirichlet condition": both solvers fall back to
-            # BND, constraining every exterior mesh edge to zero. Store that
-            # behavior explicitly in JSON, including the axis edge; interior
-            # material interfaces are excluded by the domain IDs.
-            if (
-                legacy_zero_on_all_exterior_edges
-                and ((segment["leftdomain"] == 0) != (segment["rightdomain"] == 0))
-            ):
+            is_exterior_segment = (
+                (segment["leftdomain"] == 0) != (segment["rightdomain"] == 0)
+            )
+            lies_on_axis = (
+                abs(float(start[0])) <= 1e-12
+                and abs(float(end[0])) <= 1e-12
+            )
+            if legacy_zero_on_exterior and is_exterior_segment and not lies_on_axis:
                 condition_id = _make_boundary_condition(
                     "DirEM",
                     condition_ids_by_type,
@@ -409,9 +412,11 @@ def legacy_problem_to_model(problem, *, name="Imported legacy problem", element_
             if max(maxh_values) - min(maxh_values) > max(1e-12, abs(max(maxh_values)) * 1e-9):
                 raise ValueError(f"Domain {domain} uses nonuniform local mesh sizes, which this importer cannot preserve yet.")
             local_size = maxh_values[0]
-            global_size = _number(element_size, "Target element size")
-            if not math.isclose(local_size, global_size, rel_tol=1e-9, abs_tol=1e-12):
-                mesh["region_element_sizes"][region["id"]] = _expression(local_size)
+            # Preserve explicit legacy maxh/domain-maxh values as local
+            # region controls even when they happen to equal the import-time
+            # global default. The user may later increase the global target;
+            # explicit fine-region sizing must remain in force.
+            mesh["region_element_sizes"][region["id"]] = _expression(local_size)
 
     if used_segment_keys != set(segment_by_key):
         raise ValueError("The legacy geometry has boundary segments outside the supported rectangular region contours.")
@@ -488,8 +493,8 @@ def legacy_problem_to_model(problem, *, name="Imported legacy problem", element_
         raise ValueError(f"Legacy linear solver {solver_name!r} is not supported by the GUI yet.")
     model["solver"]["linear_solver"] = "direct" if solver_name == "direct" else "iterative"
     model["legacy_import"] = {"source_name": str(name)}
-    if legacy_zero_on_all_exterior_edges:
-        model["legacy_import"]["magnetic_dirichlet_fallback"] = "all_exterior"
+    if legacy_zero_on_exterior:
+        model["legacy_import"]["magnetic_dirichlet_fallback"] = "all_exterior_except_axis"
     model["geometry"]["dimension_expression_unit"] = "m"
 
     errors = validate_model(model)

@@ -107,33 +107,62 @@ def test_legacy_problem_conversion_preserves_supported_model_data(standalone_com
     assert all(edge["boundary_condition_ids"] for edge in coil_edges.values())
 
 
-def test_empty_legacy_dirichlet_keys_preserve_zero_condition_on_all_exterior_edges(standalone_components):
+def test_empty_legacy_dirichlet_keys_anchor_outer_boundary_except_axis(standalone_components):
     problem = _legacy_test_problem()
     problem["dirkeysADC"] = ""
     problem["dirkeysAAC"] = ""
-    problem["dirconditionADC"] = {}
-    problem["dirconditionAAC"] = {}
-
     model, _studies, _layout = legacy_problem_to_model(problem)
 
-    assert model["legacy_import"]["magnetic_dirichlet_fallback"] == "all_exterior"
-    magnetic_zero = next(
-        condition for condition in model["boundary_conditions"]
+    assert model["legacy_import"]["magnetic_dirichlet_fallback"] == "all_exterior_except_axis"
+    conditions = {condition["id"]: condition for condition in model["boundary_conditions"]}
+    magnetic_zero_ids = {
+        condition_id
+        for condition_id, condition in conditions.items()
         if condition["type"] == "magnetic_potential_zero"
-    )
+    }
+    assert len(magnetic_zero_ids) == 1
+
     outer = model["geometry"]["regions"][0]
     outer_edges = [
         edge for edge in model["geometry"]["edges"]
         if edge["id"] in outer["edge_ids"]
     ]
     assert len(outer_edges) == 4
-    assert all(magnetic_zero["id"] in edge["boundary_condition_ids"] for edge in outer_edges)
+    axis_edges = [
+        edge for edge in outer_edges
+        if all(abs(point[0]) <= 1e-12 for point in edge["vertices"])
+    ]
+    assert len(axis_edges) == 1
+    assert [
+        conditions[condition_id]["type"]
+        for condition_id in axis_edges[0]["boundary_condition_ids"]
+    ] == ["axis_of_symmetry"]
+    non_axis_edges = [edge for edge in outer_edges if edge not in axis_edges]
+    assert len(non_axis_edges) == 3
+    assert all(
+        magnetic_zero_ids & set(edge["boundary_condition_ids"])
+        for edge in non_axis_edges
+    )
+
     coil = model["geometry"]["regions"][1]
     coil_edges = [
         edge for edge in model["geometry"]["edges"]
         if edge["id"] in coil["edge_ids"]
     ]
-    assert all(magnetic_zero["id"] not in edge["boundary_condition_ids"] for edge in coil_edges)
+    assert all(
+        not (magnetic_zero_ids & set(edge["boundary_condition_ids"]))
+        for edge in coil_edges
+    )
+
+def test_explicit_legacy_local_mesh_size_survives_global_target_changes(standalone_components):
+    problem = _legacy_test_problem()
+    problem["geometry"].SetDomainMaxH(2, 0.01)
+
+    model, _studies, _layout = legacy_problem_to_model(problem, element_size=0.01)
+
+    coil = model["geometry"]["regions"][1]
+    assert model["mesh"]["element_size"] == "0.01"
+    assert model["mesh"]["region_element_sizes"][coil["id"]] == "0.01"
 
 
 def test_legacy_dc_and_ac_dirichlet_selections_must_match(standalone_components):
