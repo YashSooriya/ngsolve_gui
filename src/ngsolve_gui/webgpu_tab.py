@@ -811,14 +811,38 @@ class WebgpuTab(PropertyPanelMixin, Div):
         if btn is not None:
             btn.ui_class = str(cb.vp_tool) + (" " + str(cb.vp_tool_on) if on else "")
 
+    def _is_3d_view(self):
+        """Whether the current viewport is showing a 3D mesh."""
+        mesh = getattr(self, "mesh", None)
+        return mesh is None or getattr(mesh, "dim", None) == 3
+
     def _supports_clipping(self):
-        return not hasattr(self, "mesh") or self.mesh.dim == 3
+        mesh = getattr(self, "mesh", None)
+        return (
+            mesh is None
+            or getattr(mesh, "dim", None) == 3
+            or bool(getattr(self, "axisymmetric_revolution_available", False))
+        )
 
     def _supports_camera_view_buttons(self):
-        """Show standard camera controls for 3D post-processing views only."""
-        return (
-            getattr(self, "_page_toolbar_enabled", False)
-            and getattr(getattr(self, "mesh", None), "dim", None) == 3
+        """Build camera controls for 3D views and axisymmetric results that can be revolved."""
+        mesh = getattr(self, "mesh", None)
+        return bool(getattr(self, "_page_toolbar_enabled", False)) and (
+            getattr(mesh, "dim", None) == 3
+            or bool(getattr(self, "axisymmetric_revolution_available", False))
+        )
+
+    def _sync_dynamic_3d_toolbar_state(self):
+        """Reveal 3D-only controls when a 2D axisymmetric view is revolved."""
+        is_3d = self._is_3d_view()
+        camera_group = getattr(self, "_camera_view_group", None)
+        if camera_group is not None:
+            camera_group.ui_hidden = not is_3d
+        clip_group = getattr(self, "_clip_tool_group", None)
+        if clip_group is not None:
+            clip_group.ui_hidden = not is_3d
+        self._sync_clip_ui(
+            getattr(getattr(self, "clipping_enabled", None), "value", False), None
         )
 
     def toggle_wireframe(self):
@@ -828,6 +852,8 @@ class WebgpuTab(PropertyPanelMixin, Div):
     def _build_tool_dock(self):
         self._wf_tool = None
         self._clip_tool = None
+        self._clip_tool_group = None
+        self._camera_view_group = None
         self._camera_view_tools = {}
         self._projection_tool = None
         self._projection_tooltip = None
@@ -837,17 +863,25 @@ class WebgpuTab(PropertyPanelMixin, Div):
         if self._link_tool is not None:
             tools.append(self._link_tool)
         if self._supports_camera_view_buttons():
-            tools.append(Div(ui_class=str(cb.vp_sep)))
-            tools.append(Div(
-                "View:",
-                ui_style=(
-                    "font-size:12px; font-weight:600; color:var(--text-secondary); "
-                    "white-space:nowrap; padding:0 2px;"
-                ),
-            ))
-            tools.extend(self._build_camera_view_buttons())
             self._projection_tool = self._build_projection_tool()
-            tools.append(self._projection_tool)
+            self._camera_view_group = Div(
+                Div(ui_class=str(cb.vp_sep)),
+                Div(
+                    "View:",
+                    ui_style=(
+                        "font-size:12px; font-weight:600; color:var(--text-secondary); "
+                        "white-space:nowrap; padding:0 2px;"
+                    ),
+                ),
+                *self._build_camera_view_buttons(),
+                self._projection_tool,
+                ui_style=(
+                    "display:flex; flex:0 0 auto; flex-wrap:wrap; align-items:center; "
+                    "gap:8px;"
+                ),
+            )
+            self._camera_view_group.ui_hidden = not self._is_3d_view()
+            tools.append(self._camera_view_group)
         if hasattr(self, "wireframe_visible"):
             self._wf_tool = self._vtool(
                 "mdi-grid", "Toggle wireframe edges  ·  w", self.toggle_wireframe,
@@ -856,12 +890,17 @@ class WebgpuTab(PropertyPanelMixin, Div):
             self._set_tool_active(self._wf_tool, self.wireframe_visible.value)
             tools.append(self._wf_tool)
         if self._supports_clipping():
-            tools.append(Div(ui_class=str(cb.vp_sep)))
             self._clip_tool = self._vtool(
                 "mdi-content-cut", "Show or hide the clipping plane  ·  c",
                 self.toggle_clipping, label="Clipping",
             )
-            tools.append(self._clip_tool)
+            self._clip_tool_group = Div(
+                Div(ui_class=str(cb.vp_sep)),
+                self._clip_tool,
+                ui_style="display:flex; flex:0 0 auto; align-items:center; gap:8px;",
+            )
+            self._clip_tool_group.ui_hidden = not self._is_3d_view()
+            tools.append(self._clip_tool_group)
         self._probe_tool = None
         if self._supports_probe():
             tools.append(Div(ui_class=str(cb.vp_sep)))
@@ -1075,10 +1114,13 @@ class WebgpuTab(PropertyPanelMixin, Div):
         return toolbar
 
     def _sync_clip_ui(self, val, _old):
-        """Reflect clipping_enabled on the dock button + toolbar visibility."""
+        """Reflect clipping state while keeping clipping controls 3D-only."""
         self._set_tool_active(self._clip_tool, val)
+        is_3d = self._is_3d_view()
+        if self._clip_tool_group is not None:
+            self._clip_tool_group.ui_hidden = not is_3d
         if self._clip_toolbar is not None:
-            self._clip_toolbar.ui_hidden = not val
+            self._clip_toolbar.ui_hidden = not (is_3d and bool(val))
 
     def _current_clip_axis(self):
         n = [abs(self.clipping.normal[i]) for i in range(3)]

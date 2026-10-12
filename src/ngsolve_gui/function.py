@@ -1328,9 +1328,11 @@ class FunctionComponent(WebgpuTab):
             self._symmetry_camera_state = None
 
     def _rebuild_dimension_controls(self):
-        """Rebuild viewport controls whose availability depends on mesh dimension."""
-        self._tool_dock = self._build_tool_dock()
-        self._clip_toolbar = self._build_clip_toolbar()
+        """Update dimension-gated controls without replacing the page toolbar."""
+        # Axisymmetric post-processing builds its page-level toolbar while the
+        # mesh is still 2D. Keep the same toolbar objects mounted and reveal the
+        # camera/clipping controls when revolution switches the mesh to 3D.
+        self._sync_dynamic_3d_toolbar_state()
         overlays = [self.wgpu, self._tool_dock, self.pick_overlay]
         if self._clip_toolbar is not None:
             overlays.insert(2, self._clip_toolbar)
@@ -1341,6 +1343,7 @@ class FunctionComponent(WebgpuTab):
         self._sync_viewport_layout(overlays)
         self._sync_clip_ui(self.clipping_enabled.value, None)
         self._sync_camera_link_ui(self.camera_shared.value, None)
+        self._sync_projection_tool()
 
     def _sync_region_state(self):
         self.region_state.hidden = set(self.hidden_regions.value)

@@ -14,6 +14,7 @@ import ngsolve_gui.app as app_module
 from ngsolve_gui.app import NGSolveGui
 from ngsolve_gui.axisymmetric_model import builtin_materials
 from ngsolve_gui.solve_workspace import SolveWorkspace, _load_saved_run_history
+from ngsolve_gui.webgpu_tab import WebgpuTab
 
 
 @pytest.fixture
@@ -541,6 +542,33 @@ def test_3d_preview_opens_large_modal_and_exit_restores_editable_sketch(standalo
     assert all(not control.ui_hidden for control in workspace._sketch_view_controls)
 
 
+def test_axisymmetric_revolution_toolbar_controls_follow_mesh_dimension(standalone_components):
+    tab = object.__new__(WebgpuTab)
+    tab._page_toolbar_enabled = True
+    tab.mesh = SimpleNamespace(dim=2)
+    tab.axisymmetric_revolution_available = True
+
+    assert tab._supports_camera_view_buttons()
+    assert tab._supports_clipping()
+
+    tab._camera_view_group = SimpleNamespace(ui_hidden=True)
+    tab._clip_tool_group = SimpleNamespace(ui_hidden=True)
+    tab._clip_tool = SimpleNamespace(ui_class="")
+    tab._clip_toolbar = SimpleNamespace(ui_hidden=False)
+    tab.clipping_enabled = SimpleNamespace(value=True)
+
+    tab._sync_dynamic_3d_toolbar_state()
+    assert tab._camera_view_group.ui_hidden is True
+    assert tab._clip_tool_group.ui_hidden is True
+    assert tab._clip_toolbar.ui_hidden is True
+
+    tab.mesh.dim = 3
+    tab._sync_dynamic_3d_toolbar_state()
+    assert tab._camera_view_group.ui_hidden is False
+    assert tab._clip_tool_group.ui_hidden is False
+    assert tab._clip_toolbar.ui_hidden is False
+
+
 def test_3d_preview_region_table_lists_each_region_with_three_visibility_states(standalone_components):
     workspace = SolveWorkspace()
     workspace.model["geometry"]["regions"] = [
@@ -555,6 +583,10 @@ def test_3d_preview_region_table_lists_each_region_with_three_visibility_states(
     assert len(workspace._preview_3d_region_rows.ui_children) == 2
     assert workspace._preview_visibility_controls["outer"].ui_model_value == "opaque"
     assert workspace._preview_visibility_controls["coil"].ui_model_value == "translucent"
+    toggle_props = workspace._preview_visibility_controls["outer"]._props
+    assert toggle_props["outline"] is False
+    assert toggle_props["toggle-color"] == "blue-9"
+    assert toggle_props["toggle-text-color"] == "white"
     assert [
         option["value"]
         for option in workspace._preview_visibility_controls["outer"]._props["options"]
@@ -573,9 +605,7 @@ def test_3d_preview_supports_opaque_translucent_and_hidden_regions_with_axis(
     import netgen
 
     axis_indicator = object()
-    geometry_renderer = None
-    face_colors = None
-    edge_colors = None
+    geometry_renderers = []
     circle_profiles = []
 
     class Solid:
@@ -590,25 +620,25 @@ def test_3d_preview_supports_opaque_translucent_and_hidden_regions_with_axis(
             return self
 
     class Renderer:
-        def __init__(self, _geometry):
-            self.geo = _geometry
-            self.faces = SimpleNamespace(active=None, transparent=False, set_colors=self.set_face_colors)
-            self.edges = SimpleNamespace(active=None, colors=None, set_colors=self.set_edge_colors)
+        def __init__(self, geometry):
+            self.geo = geometry
+            self.faces = SimpleNamespace(active=None, transparent=False, colors=None)
+            self.faces.set_colors = lambda colors: setattr(
+                self.faces, "colors", colors.copy()
+            )
+            self.edges = SimpleNamespace(active=None, colors=None)
+            self.edges.set_colors = lambda colors: setattr(
+                self.edges, "colors", colors.copy()
+            )
+            self.update_requests = 0
 
-        @staticmethod
-        def set_face_colors(colors):
-            nonlocal face_colors
-            face_colors = colors.copy()
-
-        @staticmethod
-        def set_edge_colors(colors):
-            nonlocal edge_colors
-            edge_colors = colors.copy()
+        def set_needs_update(self):
+            self.update_requests += 1
 
     def make_geometry_renderer(geometry):
-        nonlocal geometry_renderer
-        geometry_renderer = Renderer(geometry)
-        return geometry_renderer
+        renderer = Renderer(geometry)
+        geometry_renderers.append(renderer)
+        return renderer
 
     def make_circle(center, normal, radius):
         profile = object()
@@ -638,14 +668,11 @@ def test_3d_preview_supports_opaque_translucent_and_hidden_regions_with_axis(
     occ = ModuleType("netgen.occ")
     occ.Axis = lambda *_args: object()
     occ.Circle = make_circle
-    occ.Compound = lambda solids: list(solids)
     occ.Dir = lambda *args: args
     occ.Face = lambda profile: profile
     occ.MakePolygon = lambda _vertices: object()
-    occ.OCCGeometry = lambda compound: SimpleNamespace(
-        faces=[face for solid in compound for face in solid.faces],
-        edges=[edge for solid in compound for edge in solid.edges],
-        shape=SimpleNamespace(solids=compound),
+    occ.OCCGeometry = lambda solid: SimpleNamespace(
+        faces=list(solid.faces), edges=list(solid.edges), shape=solid
     )
     occ.Pnt = lambda *args: args
     occ.Revolve = lambda profile, *_args: Solid(profile)
@@ -684,8 +711,13 @@ def test_3d_preview_supports_opaque_translucent_and_hidden_regions_with_axis(
     ]
     preview = workspace._build_3d_preview_component()
 
-    assert geometry_renderer.faces.active is True
-    assert geometry_renderer.edges.active is True
+    assert len(geometry_renderers) == 2
+    outer = workspace._preview_3d_renderers["circle-outer"]
+    inner = workspace._preview_3d_renderers["circle-inner"]
+    assert outer.faces.active is True
+    assert inner.faces.active is True
+    assert outer.edges.active is True
+    assert inner.edges.active is True
     assert [center for center, _normal, _radius, _profile in circle_profiles] == [
         (0.02, 0.0, 0.0), (0.02, 0.0, 0.0),
     ]
@@ -693,21 +725,39 @@ def test_3d_preview_supports_opaque_translucent_and_hidden_regions_with_axis(
         (0.0, 1.0, 0.0), (0.0, 1.0, 0.0),
     ]
     assert [radius for _center, _normal, radius, _profile in circle_profiles] == pytest.approx([0.01, 0.002])
-    assert face_colors is not None
-    assert face_colors[3::4].tolist() == [1.0, 1.0]
-    assert edge_colors is not None
-    assert edge_colors[3::4].tolist() == [1.0, 1.0]
-    assert preview.renderers == [geometry_renderer, axis_indicator]
+    assert outer.faces.colors[3::4].tolist() == [1.0]
+    assert inner.faces.colors[3::4].tolist() == [1.0]
+    assert outer.faces.transparent is False
+    assert inner.faces.transparent is False
+    assert preview.renderers == [outer, inner, axis_indicator]
 
     workspace._set_3d_region_visibility("circle-inner", "translucent")
-    assert face_colors[3::4].tolist() == pytest.approx([1.0, 0.38])
-    assert geometry_renderer.faces.transparent is True
-    assert edge_colors[3::4].tolist() == [1.0, 1.0]
+    assert outer.faces.colors[3::4].tolist() == [1.0]
+    assert inner.faces.colors[3::4].tolist() == pytest.approx([0.38])
+    assert outer.faces.transparent is False
+    assert inner.faces.transparent is True
+
+    # The exterior and each child retain independent alpha in their own passes.
+    workspace._set_3d_region_visibility("circle-inner", "opaque")
+    workspace._set_3d_region_visibility("circle-outer", "translucent")
+    assert outer.faces.colors[3::4].tolist() == pytest.approx([0.38])
+    assert inner.faces.colors[3::4].tolist() == [1.0]
+    assert outer.faces.transparent is True
+    assert inner.faces.transparent is False
+
+    workspace._set_3d_region_visibility("circle-inner", "translucent")
+    assert outer.faces.colors[3::4].tolist() == pytest.approx([0.38])
+    assert inner.faces.colors[3::4].tolist() == pytest.approx([0.38])
+    assert outer.faces.transparent is True
+    assert inner.faces.transparent is True
 
     workspace._set_3d_region_visibility("circle-inner", "hidden")
-    assert face_colors[3::4].tolist() == [1.0, 0.0]
-    assert edge_colors[3::4].tolist() == [1.0, 0.0]
-    assert geometry_renderer.faces.transparent is False
+    assert outer.faces.colors[3::4].tolist() == pytest.approx([0.38])
+    assert inner.faces.colors[3::4].tolist() == [0.0]
+    assert outer.faces.active is True
+    assert inner.faces.active is False
+    assert outer.edges.active is True
+    assert inner.edges.active is False
 
 
 def test_3d_preview_failure_keeps_editable_sketch_active(standalone_components):

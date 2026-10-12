@@ -410,9 +410,7 @@ class SolveWorkspace(Div):
         self._preview_3d_active = False
         self._preview_3d_component = None
         self._preview_3d_scene = None
-        self._preview_3d_renderer = None
-        self._preview_face_region_ids = {}
-        self._preview_edge_region_ids = {}
+        self._preview_3d_renderers = {}
         self._preview_region_visibility = {}
         self._preview_visibility_controls = {}
 
@@ -5139,7 +5137,7 @@ class SolveWorkspace(Div):
     def _build_3d_preview_component(self):
         """Revolve the current meridian regions for the modal read-only preview."""
         from netgen.occ import (
-            Axis, Circle, Compound, Dir, Face, MakePolygon, OCCGeometry, Pnt,
+            Axis, Circle, Dir, Face, MakePolygon, OCCGeometry, Pnt,
             Revolve, Vec, Vertex, Wire,
         )
         from ngapp.components import WebgpuComponent
@@ -5202,30 +5200,30 @@ class SolveWorkspace(Div):
             preview_solids.append(solid)
 
         renderers = []
-        self._preview_3d_renderer = None
+        self._preview_3d_renderers = {}
         self._preview_3d_scene = None
         self._preview_face_region_ids = {}
         self._preview_edge_region_ids = {}
         if preview_solids:
-            geometry = OCCGeometry(Compound(preview_solids))
-            renderer = GeometryRenderer(geometry)
-            renderer.faces.active = True
-            # Show the geometric boundaries while keeping circle profiles
-            # analytic above, so a torus has a small number of clean OCC edges
-            # instead of a wire cage made from the sketch polygon.
-            renderer.edges.active = True
-
-            material_index = {
-                material.get("id"): index
-                for index, material in enumerate(self.model.get("materials", []))
-            }
+            # Keep each region in its own renderer. The WebGPU renderer has a
+            # renderer-wide opaque/transparent pass switch; combining all
+            # regions made one translucent exterior force opaque interiors
+            # through the transparent pass too.
             for region, solid in zip(regions, preview_solids):
                 for face in solid.faces:
                     self._preview_face_region_ids.setdefault(hash(face), []).append(region["id"])
                 for edge in solid.edges:
                     self._preview_edge_region_ids.setdefault(hash(edge), set()).add(region["id"])
-            self._preview_3d_renderer = renderer
-            renderers.append(renderer)
+
+            for region, solid in zip(regions, preview_solids):
+                geometry = OCCGeometry(solid)
+                renderer = GeometryRenderer(geometry)
+                renderer.faces.active = True
+                # Keep true geometric edges, while exact circle profiles avoid
+                # the artificial segmented wire cage on toroidal surfaces.
+                renderer.edges.active = True
+                self._preview_3d_renderers[region["id"]] = renderer
+                renderers.append(renderer)
         axes = CoordinateAxes()
         renderers.append(axes)
 
@@ -5259,17 +5257,18 @@ class SolveWorkspace(Div):
                     {"value": "translucent", "icon": "mdi-circle-opacity", "title": "Translucent"},
                     {"value": "hidden", "icon": "mdi-eye-off", "title": "Hidden"},
                 ],
-                ui_color="grey-8",
-                ui_toggle_color="primary",
+                ui_color="grey-3",
+                ui_text_color="grey-9",
+                ui_toggle_color="blue-9",
                 ui_toggle_text_color="white",
-                ui_outline=True,
+                ui_outline=False,
                 ui_dense=True,
                 ui_no_caps=True,
                 ui_no_wrap=True,
                 ui_size="sm",
                 ui_padding="xs",
                 ui_class="full-width",
-                ui_style="width:132px; flex:none;",
+                ui_style="width:144px; flex:none;",
             )
             toggle._props["aria-label"] = f"Visibility for {region.get('name') or 'unnamed region'}"
             toggle.on(
@@ -5296,7 +5295,7 @@ class SolveWorkspace(Div):
                     ),
                     toggle,
                     ui_style=(
-                        "display:grid; grid-template-columns:minmax(0, 1fr) 132px; "
+                        "display:grid; grid-template-columns:minmax(0, 1fr) 144px; "
                         "align-items:center; gap:8px; min-height:42px; padding:5px 0; "
                         "border-bottom:1px solid var(--border); font-size:12px;"
                     ),
@@ -5318,68 +5317,66 @@ class SolveWorkspace(Div):
         self._apply_3d_preview_visibility()
 
     def _apply_3d_preview_visibility(self, *, render=True):
-        """Apply region alpha and line visibility to the active 3D renderer."""
-        renderer = self._preview_3d_renderer
-        if renderer is None:
+        """Apply opacity independently so opaque child regions keep the opaque pass."""
+        renderers = getattr(self, "_preview_3d_renderers", {})
+        if not renderers:
             return
         import numpy as np
 
-        geometry = renderer.geo
-        faces = list(geometry.faces)
-        face_colors = np.tile(
-            np.array([0.42, 0.55, 0.68, 1.0], dtype=np.float32), len(faces)
-        )
-        face_alphas = []
         material_index = {
             material.get("id"): index
             for index, material in enumerate(self.model.get("materials", []))
+        }
+        region_order = {
+            region.get("id"): index
+            for index, region in enumerate(self.model.get("geometry", {}).get("regions", []))
         }
         regions_by_id = {
             region.get("id"): region
             for region in self.model.get("geometry", {}).get("regions", [])
         }
-        for face_index, face in enumerate(faces):
-            region_ids = self._preview_face_region_ids.get(hash(face), ())
-            visible_regions = [
-                region_id for region_id in region_ids
-                if region_id in regions_by_id
-            ]
-            if not visible_regions:
-                face_alphas.append(1.0)
-                continue
-            region_id = max(
-                visible_regions,
-                key=lambda rid: _PREVIEW_VISIBILITY_ALPHA[
-                    self._preview_region_visibility.get(rid, "opaque")
-                ],
-            )
-            region = regions_by_id[region_id]
-            palette = _MATERIAL_COLORS[
-                material_index.get(region.get("material_id"), 0) % len(_MATERIAL_COLORS)
-            ]
-            rgb = tuple(int(palette[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
-            alpha = max(
-                _PREVIEW_VISIBILITY_ALPHA[
-                    self._preview_region_visibility.get(rid, "opaque")
-                ]
-                for rid in visible_regions
-            )
-            face_colors[4 * face_index:4 * face_index + 4] = (*rgb, alpha)
-            face_alphas.append(alpha)
-        renderer.faces.set_colors(face_colors)
-        renderer.faces.transparent = any(0.0 < alpha < 1.0 for alpha in face_alphas)
 
-        edges = list(geometry.edges)
-        edge_colors = getattr(renderer.edges, "colors", None)
-        if edge_colors is None or len(edge_colors) != 4 * len(edges):
+        for own_region_id, renderer in renderers.items():
+            faces = list(renderer.geo.faces)
+            face_colors = np.tile(
+                np.array([0.42, 0.55, 0.68, 1.0], dtype=np.float32), len(faces)
+            )
+            face_alphas = []
+            for face_index, face in enumerate(faces):
+                region_ids = self._preview_face_region_ids.get(hash(face), (own_region_id,))
+                visible_regions = [rid for rid in region_ids if rid in regions_by_id]
+                if not visible_regions:
+                    visible_regions = [own_region_id]
+                region_id = max(
+                    visible_regions,
+                    key=lambda rid: _PREVIEW_VISIBILITY_ALPHA[
+                        self._preview_region_visibility.get(rid, "opaque")
+                    ],
+                )
+                region = regions_by_id[region_id]
+                palette_index = material_index.get(
+                    region.get("material_id"), region_order.get(region_id, 0)
+                )
+                palette = _MATERIAL_COLORS[palette_index % len(_MATERIAL_COLORS)]
+                rgb = tuple(int(palette[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+                alpha = max(
+                    _PREVIEW_VISIBILITY_ALPHA[
+                        self._preview_region_visibility.get(rid, "opaque")
+                    ]
+                    for rid in visible_regions
+                )
+                face_colors[4 * face_index:4 * face_index + 4] = (*rgb, alpha)
+                face_alphas.append(alpha)
+            renderer.faces.set_colors(face_colors)
+            renderer.faces.transparent = any(0.0 < alpha < 1.0 for alpha in face_alphas)
+            renderer.faces.active = any(alpha > 0.0 for alpha in face_alphas)
+
+            edges = list(renderer.geo.edges)
             edge_colors = np.tile(
                 np.array([0.12, 0.16, 0.21, 1.0], dtype=np.float32), len(edges)
             )
-        else:
-            edge_colors = np.asarray(edge_colors, dtype=np.float32).copy()
-        for edge_index, edge in enumerate(edges):
-            region_ids = self._preview_edge_region_ids.get(hash(edge), ())
-            if region_ids:
+            for edge_index, edge in enumerate(edges):
+                region_ids = self._preview_edge_region_ids.get(hash(edge), {own_region_id})
                 alpha = max(
                     _PREVIEW_VISIBILITY_ALPHA[
                         self._preview_region_visibility.get(rid, "opaque")
@@ -5387,7 +5384,13 @@ class SolveWorkspace(Div):
                     for rid in region_ids
                 )
                 edge_colors[4 * edge_index + 3] = 0.0 if alpha == 0.0 else 1.0
-        renderer.edges.set_colors(edge_colors)
+            renderer.edges.set_colors(edge_colors)
+            renderer.edges.active = bool(edges) and any(edge_colors[3::4] > 0.0)
+            # Alpha changes select a different GPU render pipeline. Invalidate
+            # the cached pass so a formerly opaque shell cannot keep writing
+            # depth over the opaque child renderers.
+            renderer.set_needs_update()
+
         if render and self._preview_3d_scene is not None:
             self._preview_3d_scene.render()
 
@@ -5411,7 +5414,7 @@ class SolveWorkspace(Div):
             self._preview_3d_viewport.ui_children = []
             self._preview_3d_component = None
             self._preview_3d_scene = None
-            self._preview_3d_renderer = None
+            self._preview_3d_renderers = {}
             self._preview_face_region_ids = {}
             self._preview_edge_region_ids = {}
             self._preview_visibility_controls = {}
