@@ -93,9 +93,7 @@ def test_region_scoped_field_data_matches_slice_mesh_elements():
 
 
 @app_test("ngsolve_gui.appconfig")
-def test_slice_control_adds_viewport_slider_and_hides_only_selected_region(
-    page: Page, app
-) -> None:
+def test_slice_feature_is_not_available_in_postprocess_ui(page: Page, app) -> None:
     import ngsolve_gui.function as function_module
     from ngsolve import x, y, z
 
@@ -114,45 +112,28 @@ def test_slice_control_adds_viewport_slider_and_hides_only_selected_region(
         app._set_workspace_mode("post_process")
         app._update()
         component = app.tab_panel.comp
-
-        assert component.slice_available
-        assert ALL_REGIONS in component.slice_region_options
-        assert any(
-            section.__name__ == "SliceViewSection"
-            for section in component.property_sections
-        )
-        assert component._slice_position_slider.ui_vertical
-        assert component._slice_overlay.ui_hidden
-
-        selected_material = component.slice_region.value
-        component.slice_enabled.value = True
-        assert component.slice_renderer.active
-        assert not component._slice_overlay.ui_hidden
-        assert component.region_state.auto_hidden == {selected_material}
-        assert component.slice_renderer.data.mesh_data.on_region
-
-        component.slice_axis.value = "x"
-        assert component._slice_clipping.normal == pytest.approx([1, 0, 0])
-        component.slice_position.value = 0.75
-        assert component._slice_position_slider.ui_model_value == pytest.approx(0.75)
-
-        component.slice_axis.value = "custom"
-        component.slice_custom_normal[0].value = 1.0
-        component.slice_custom_normal[1].value = 1.0
-        component.slice_custom_normal[2].value = 0.0
-        assert component._slice_clipping.normal == pytest.approx(
-            [1 / np.sqrt(2), 1 / np.sqrt(2), 0]
-        )
-
-        component.slice_region.value = ALL_REGIONS
-        assert component.region_state.auto_hidden == set(
-            component.region_state.unique_materials
-        )
-        component.slice_enabled.value = False
-        assert not component.slice_renderer.active
-        assert component._slice_overlay.ui_hidden
+        assert not component.slice_available
+        assert not component.slice_feature_available
+        assert all(section.__name__ != "SliceViewSection" for section in component.property_sections)
+        assert all(all(section is None or section.__name__ != "SliceViewSection" for section in sections) for _, _, sections in component._postprocess_toolbar_groups)
     finally:
         if previous is missing:
             del function_module.RegionVisibility
         else:
             function_module.RegionVisibility = previous
+
+def test_slice_section_header_uses_standard_switch_handler():
+    from types import SimpleNamespace
+
+    from ngsolve_gui.sections.slice_view import SliceViewSection
+
+    section = object.__new__(SliceViewSection)
+    section.comp = SimpleNamespace(slice_available=True)
+    section._switchable = True
+    section._obs = SimpleNamespace(value=False)
+    section._open = False
+    section._render = lambda: None
+
+    section._on_head_click()
+
+    assert section._obs.value is True

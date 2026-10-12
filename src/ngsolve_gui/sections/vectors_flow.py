@@ -27,7 +27,7 @@ class VectorsFlowSection(Section):
             raise ValueError("Not applicable for scalar functions")
 
         has_streamlines = comp.cf.dim == comp.mesh.dim
-        has_clip = comp.clipping_vectors is not None
+        has_clip = getattr(comp, "clipping_vectors", None) is not None
 
         # -- Header target toggles: where to draw the arrows (surface / clip). --
         head_actions = [

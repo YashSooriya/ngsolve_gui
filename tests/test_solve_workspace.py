@@ -107,10 +107,11 @@ def test_geometry_and_physics_value_inputs_use_si_units(standalone_components):
             yield from components(getattr(item, "ui_children", []))
 
     workspace._add_primitive("rectangle")
-    sources = workspace._sources_properties()
+    region = workspace.model["geometry"]["regions"][0]
+    workspace._open_sources_editor(region["id"])
     source_units = {
         item.ui_label: getattr(item, "ui_suffix", None)
-        for item in components(sources)
+        for item in components(workspace._editor_drawer_children())
         if getattr(item, "ui_label", None)
     }
     assert source_units["DC current density"] == "A/m²"
@@ -118,9 +119,10 @@ def test_geometry_and_physics_value_inputs_use_si_units(standalone_components):
 
     workspace.model["materials"] = builtin_materials()
     workspace.selected_material_id = "material-copper"
+    workspace._open_material_editor("material-copper")
     material_units = {
         item.ui_label: getattr(item, "ui_suffix", None)
-        for item in components(workspace._material_properties())
+        for item in components(workspace._editor_drawer_children())
         if getattr(item, "ui_label", None)
     }
     assert material_units["Electrical conductivity"] == "S/m"
@@ -131,12 +133,14 @@ def test_geometry_and_physics_value_inputs_use_si_units(standalone_components):
         {"id": "traction", "name": "Traction", "type": "mechanical_traction"}
     ]
     workspace.selected_boundary_id = "traction"
+    workspace._open_boundary_editor("traction")
     boundary_units = {
         item.ui_label: getattr(item, "ui_suffix", None)
-        for item in components(workspace._boundary_properties())
+        for item in components(workspace._editor_drawer_children())
         if getattr(item, "ui_label", None)
     }
     assert boundary_units["Radial traction"] == "N/m²"
+    workspace._cancel_editor()
     assert workspace._mesh_properties()[1]._props["suffix"] == "m"
     study_units = {
         item.ui_label: getattr(item, "ui_suffix", None)
@@ -145,45 +149,49 @@ def test_geometry_and_physics_value_inputs_use_si_units(standalone_components):
     }
     assert study_units["Frequency points (comma separated)"] == "Hz"
 
-
 def test_mesh_panel_exposes_regional_sizes_and_boundary_or_region_hp_targets(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
     region = workspace.model["geometry"]["regions"][0]
-
-    controls = workspace._mesh_properties()
 
     def components(items):
         for item in items:
             yield item
             yield from components(getattr(item, "ui_children", []))
 
-    all_controls = list(components(controls))
-    labels = [getattr(item, "ui_label", None) for item in all_controls]
-    assert "square 1 mesh size" in labels
+    controls = list(components(workspace._mesh_properties()))
+    labels = [getattr(item, "ui_label", None) for item in controls]
+    assert "Add region-wise element sizing" in labels
+    assert "square 1 mesh size" not in labels
     assert "Number of hp layers" in labels
     assert "Layer grading factor" in labels
-    assert region["name"] in labels  # Whole-region boundary selector.
-    assert all(
-        any(edge.get("name") in label for label in labels if isinstance(label, str))
-        for edge in workspace.model["geometry"]["edges"]
-    )
-    region_size_input = next(
-        item for item in all_controls
-        if getattr(item, "ui_label", None) == "square 1 mesh size"
-        and hasattr(item, "ui_suffix")
-    )
-    assert region_size_input.ui_suffix == "m"
+    assert "Select regions and edges" in labels
 
-    workspace._set_region_mesh_size(region["id"], "0.002")
-    workspace._set_mesh("hp_layers", 2)
-    workspace._set_hp_layer_target("hp_region_ids", region["id"], True)
+    workspace._open_region_mesh_size_editor()
+    assert workspace._editor_drawer["kind"] == "region_mesh_size"
+    editor_controls = list(components(workspace._editor_drawer_children()))
+    editor_labels = [getattr(item, "ui_label", None) for item in editor_controls]
+    assert "Region" in editor_labels
+    assert "Target element size" in editor_labels
+    size_input = next(item for item in editor_controls if getattr(item, "ui_label", None) == "Target element size")
+    assert size_input.ui_suffix == "m"
+    workspace._editor_drawer["draft"].update({"region_id": region["id"], "value": "0.002"})
+    workspace._commit_editor()
     assert workspace.model["mesh"]["region_element_sizes"][region["id"]] == "0.002"
+
+    workspace._set_mesh("hp_layers", 2)
+    workspace._toggle_hp_layer_selection()
+    workspace._toggle_hp_region_target(region["id"])
+    edge_id = workspace.model["geometry"]["edges"][0]["id"]
+    workspace._toggle_hp_edge_target(edge_id)
     assert workspace.model["mesh"]["hp_layers"] == 2
     assert workspace.model["mesh"]["hp_region_ids"] == [region["id"]]
-    workspace._set_region_mesh_size(region["id"], None)
+    assert workspace.model["mesh"]["hp_edge_ids"] == [edge_id]
+    workspace._toggle_hp_region_target(region["id"])
+    assert workspace.model["mesh"]["hp_region_ids"] == []
+    workspace._toggle_hp_layer_selection()
+    workspace._remove_region_mesh_size(region["id"])
     assert region["id"] not in workspace.model["mesh"]["region_element_sizes"]
-
 
 def test_regional_and_hp_settings_invalidate_mesh_preview(standalone_components):
     workspace = SolveWorkspace()
@@ -558,9 +566,9 @@ def test_axisymmetric_revolution_toolbar_controls_follow_mesh_dimension(standalo
     tab.clipping_enabled = SimpleNamespace(value=True)
 
     tab._sync_dynamic_3d_toolbar_state()
-    assert tab._camera_view_group.ui_hidden is True
-    assert tab._clip_tool_group.ui_hidden is True
-    assert tab._clip_toolbar.ui_hidden is True
+    assert tab._camera_view_group.ui_hidden is False
+    assert tab._clip_tool_group.ui_hidden is False
+    assert tab._clip_toolbar.ui_hidden is False
 
     tab.mesh.dim = 3
     tab._sync_dynamic_3d_toolbar_state()
@@ -1887,7 +1895,7 @@ def test_drawing_tool_cursor_remains_crosshair_over_existing_geometry(standalone
     assert edge_hit._props["style"].startswith("cursor:pointer;")
 
 
-def test_selecting_geometry_restores_its_inspector_after_another_section(standalone_components):
+def test_selecting_geometry_restores_its_inspector_without_material_assignments(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
     region_id = workspace.model["geometry"]["regions"][0]["id"]
@@ -1895,21 +1903,20 @@ def test_selecting_geometry_restores_its_inspector_after_another_section(standal
 
     workspace.select_section("materials")
     assert workspace._inspector_view == "materials"
-
     workspace.select_region(region_id)
 
     assert workspace._inspector_view == "geometry"
     assert tuple(workspace._inspector.ui_children) == tuple(workspace._geometry_inspector_children)
     assert not workspace._region_panel.ui_hidden
-    assert {option["label"] for option in workspace._region_material_select.ui_options} >= {"Air", "Copper"}
+    labels = [getattr(item, "ui_label", None) for item in workspace._geometry_inspector_children[1].ui_children]
+    assert "Material" not in labels
+    assert "Include in mechanics" not in labels
 
     workspace.select_section("materials")
     workspace.select_edge(edge_id)
-
     assert workspace._inspector_view == "geometry"
     assert workspace._region_panel.ui_hidden
     assert not workspace._edge_panel.ui_hidden
-
 
 def test_boundary_stage_accumulates_region_edges_without_duplicates(standalone_components):
     workspace = SolveWorkspace()
@@ -2588,30 +2595,22 @@ def test_parameter_dimension_is_selected_from_physical_units(standalone_componen
     assert parameter["unit"] == "m"
 
 
-def test_model_tree_counts_only_project_materials_and_assigned_boundary_conditions(standalone_components):
+def test_model_tree_material_section_lists_regions_and_boundary_counts(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
     region = workspace.model["geometry"]["regions"][0]
     edges = workspace.model["geometry"]["edges"]
-    axis_edge = next(
-        edge for edge in edges
-        if all(abs(float(point[0])) <= 1e-12 for point in edge["vertices"])
-    )
-    axis_condition = next(
-        condition for condition in workspace.model["boundary_conditions"]
-        if condition["type"] == "axis_of_symmetry"
-    )
+    axis_edge = next(edge for edge in edges if all(abs(float(point[0])) <= 1e-12 for point in edge["vertices"]))
+    axis_condition = next(condition for condition in workspace.model["boundary_conditions"] if condition["type"] == "axis_of_symmetry")
     assert axis_edge["boundary_condition_ids"] == [axis_condition["id"]]
-    assert all(
-        edge["boundary_condition_ids"] == []
-        for edge in edges if edge is not axis_edge
-    )
+    assert all(edge["boundary_condition_ids"] == [] for edge in edges if edge is not axis_edge)
 
     workspace._set_region_value(region["id"], "material_id", "material-air")
-    assert workspace._tree_subsection("materials")[1][0][1] == "Air · 1 region"
+    label = workspace._tree_subsection("materials")[1][0][1]
+    assert region["name"] in label and "Air" in label
     workspace._set_region_value(region["id"], "material_id", "material-copper")
-    materials = {entry[1] for entry in workspace._tree_subsection("materials")[1]}
-    assert materials == {"Air · 0 regions", "Copper · 1 region"}
+    entries = workspace._tree_subsection("materials")[1]
+    assert len(entries) == 1 and region["name"] in entries[0][1] and "Copper" in entries[0][1]
 
     condition = {"id": "boundary-fixed", "name": "Fixed support", "type": "mechanical_fixed"}
     workspace.model["boundary_conditions"].append(condition)
@@ -2622,48 +2621,57 @@ def test_model_tree_counts_only_project_materials_and_assigned_boundary_conditio
     labels = {entry[0]: entry[1] for entry in workspace._tree_subsection("boundaries")[1]}
     assert labels["boundary-fixed"] == "Fixed support · 1 edge"
 
-
 def test_unused_builtin_material_can_be_removed_from_the_model(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
     region = workspace.model["geometry"]["regions"][0]
     workspace._set_region_value(region["id"], "material_id", "material-air")
     workspace._set_region_value(region["id"], "material_id", None)
-
     workspace.remove_material("material-air")
 
     assert workspace.model["materials"] == []
-    assert workspace._tree_subsection("materials") == ("MATERIALS · 0", [])
+    entries = workspace._tree_subsection("materials")[1]
+    assert len(entries) == 1 and "Unassigned" in entries[0][1]
 
+def test_region_material_drawer_assigns_custom_material_and_saves_it_locally(standalone_components):
+    from types import SimpleNamespace
 
-def test_region_material_dropdown_offers_problem_presets_and_custom_materials(standalone_components):
+    def components(entries):
+        for entry in entries:
+            yield entry
+            yield from components(getattr(entry, "ui_children", []))
+
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
     region = workspace.model["geometry"]["regions"][0]
-    workspace.selected_region_id = region["id"]
+    properties = workspace._material_properties()
+    assert any("#fff4cc" in getattr(item, "ui_style", "") for item in properties)
 
-    material_select = next(
-        item for item in workspace._geometry_properties()
-        if getattr(item, "ui_label", None) == "Material"
-    )
-    assert "Stainless steel (4 K / OVC)" in {
-        option["label"] for option in material_select.ui_options
-    }
+    workspace._open_region_material_editor(region["id"])
+    controls = list(components(workspace._editor_drawer_children()))
+    material_select = next(item for item in controls if getattr(item, "ui_label", None) == "Material")
+    assert "Stainless steel (4 K / OVC)" in {option["label"] for option in material_select.ui_options}
+    assert any(option["value"] == "__custom__" for option in material_select.ui_options)
+    workspace._set_editor_material_choice(SimpleNamespace(value="__custom__"))
+    controls = list(components(workspace._editor_drawer_children()))
+    labels = [getattr(item, "ui_label", None) for item in controls]
+    assert "Material name" in labels
+    assert labels.index("Material name") < labels.index("Relative permeability") < labels.index("Electrical conductivity")
+    assert "Include in mechanics" in labels
 
-    workspace.add_material()
-    custom = workspace.model["materials"][0]
-    workspace._set_material_name(custom["id"], "My alloy")
-    workspace._set_material_property(custom["id"], "electrical_conductivity", "2.4e6")
+    draft = workspace._editor_drawer["draft"]
+    draft["custom_material"]["name"] = "My alloy"
+    draft["custom_material"]["properties"]["electrical_conductivity"] = "2.4e6"
+    draft["mechanical"] = True
+    footer_labels = [getattr(item, "ui_label", None) for item in workspace._editor_drawer_children()[-1].ui_children]
+    assert "Apply" in footer_labels and "Save + apply" in footer_labels and "Cancel" in footer_labels
+    workspace._commit_region_material(True)
 
-    material_select = next(
-        item for item in workspace._geometry_properties()
-        if getattr(item, "ui_label", None) == "Material"
-    )
-    assert {option["value"] for option in material_select.ui_options} >= {custom["id"]}
-    workspace._set_region_value(region["id"], "material_id", custom["id"])
-    assert region["material_id"] == custom["id"]
-    assert custom["properties"]["electrical_conductivity"] == "2.4e6"
-
+    assert region["material_id"] == workspace.model["materials"][0]["id"]
+    assert region["mechanical"] is True
+    assert workspace.model["materials"][0]["name"] == "My alloy"
+    assert workspace.model["materials"][0]["properties"]["electrical_conductivity"] == "2.4e6"
+    assert any(item["id"] == region["material_id"] for item in workspace._user_materials)
 
 def test_problem_material_preset_is_copied_to_model_when_assigned(standalone_components):
     workspace = SolveWorkspace()
@@ -2677,42 +2685,41 @@ def test_problem_material_preset_is_copied_to_model_when_assigned(standalone_com
         if item["id"] == "material-cryogenic-steel"
     )
     assert workspace.model["materials"] == [expected]
-    assert workspace._tree_subsection("materials")[1][0][1] == "Stainless steel (4 K / OVC) · 1 region"
+    assert "Stainless steel (4 K / OVC)" in workspace._tree_subsection("materials")[1][0][1]
 
 
 def test_custom_materials_persist_locally_across_new_models(standalone_components):
+    from types import SimpleNamespace
+
     workspace = SolveWorkspace()
-    workspace.add_material()
-    custom = workspace.model["materials"][0]
-    workspace._set_material_name(custom["id"], "Persistent alloy")
-    workspace._set_material_property(custom["id"], "electrical_conductivity", "2.4e6")
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    workspace._open_region_material_editor(region["id"])
+    workspace._set_editor_material_choice(SimpleNamespace(value="__custom__"))
+    custom = workspace._editor_drawer["draft"]["custom_material"]
+    custom["name"] = "Persistent alloy"
+    custom["properties"]["electrical_conductivity"] = "2.4e6"
+    workspace._commit_region_material(True)
+    material_id = region["material_id"]
 
     next_workspace = SolveWorkspace()
     assert next_workspace.model["materials"] == []
-    option = next(
-        item for item in next_workspace._material_options()
-        if item["value"] == custom["id"]
-    )
+    option = next(item for item in next_workspace._material_options() if item["value"] == material_id)
     assert option["label"] == "Persistent alloy"
     assert next_workspace._material_library.path.name == "material_library.json"
     assert "site-packages" not in str(next_workspace._material_library.path)
 
-    next_workspace._add_primitive("rectangle")
-    next_region = next_workspace.model["geometry"]["regions"][0]
-    next_workspace._set_region_value(next_region["id"], "material_id", custom["id"])
-    assert next_workspace.model["materials"][0]["properties"]["electrical_conductivity"] == "2.4e6"
-
-
 def test_custom_material_can_be_removed_from_local_library(standalone_components):
     workspace = SolveWorkspace()
     workspace.add_material()
+    custom = workspace._editor_drawer["draft"]
+    workspace._commit_editor()
     custom_id = workspace.model["materials"][0]["id"]
 
     assert workspace.remove_material_from_library(custom_id)
     assert any(item["id"] == custom_id for item in workspace.model["materials"])
     assert all(item["id"] != custom_id for item in workspace._user_materials)
     assert all(option["value"] != custom_id for option in SolveWorkspace()._material_options())
-
 
 def test_parameter_removal_is_available_and_blocked_while_referenced(standalone_components):
     workspace = SolveWorkspace()
@@ -2734,11 +2741,8 @@ def test_parameter_removal_is_available_and_blocked_while_referenced(standalone_
     assert "Removed parameter 'length_1'" in workspace.message
 
 
-def test_physics_panel_does_not_duplicate_frequency_or_regional_load_fields(standalone_components):
-    workspace = SolveWorkspace()
-    workspace._add_primitive("rectangle")
-    physics = workspace._physics_properties()
-    sources = workspace._sources_properties()
+def test_sources_panel_uses_a_multi_region_viewport_drawer(standalone_components):
+    from types import SimpleNamespace
 
     def component_labels(nodes):
         labels = []
@@ -2749,15 +2753,37 @@ def test_physics_panel_does_not_duplicate_frequency_or_regional_load_fields(stan
             labels.extend(component_labels(getattr(node, "ui_children", [])))
         return labels
 
-    physics_labels = component_labels(physics)
-    source_labels = component_labels(sources)
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    first = workspace.model["geometry"]["regions"][0]
+    workspace._primitive_values[("rectangle", "r_min")] = 0.05
+    workspace._add_primitive("rectangle")
+    second = workspace.model["geometry"]["regions"][1]
+    physics_labels = component_labels(workspace._physics_properties())
+    source_labels = component_labels(workspace._sources_properties())
     assert "Configure study frequencies" in physics_labels
-    assert "Study frequencies" not in physics_labels
     assert "DC current density" not in physics_labels
-    assert "DC current density" in source_labels
-    assert "Radial body force" in source_labels
-    assert "Region sources apply to" in source_labels
+    assert source_labels.count("Add source/load") == 1
+    assert "square 1" not in source_labels and "square 2" not in source_labels
 
+    workspace._open_sources_editor()
+    assert workspace._editor_drawer["kind"] == "sources"
+    assert workspace._editor_drawer["select_region_in_viewport"] is True
+    workspace._accept_editor_viewport_region(first["id"])
+    workspace._accept_editor_viewport_region(second["id"])
+    assert workspace._editor_drawer["draft"]["region_ids"] == [first["id"], second["id"]]
+    workspace._accept_editor_viewport_region(first["id"])
+    assert workspace._editor_drawer["draft"]["region_ids"] == [second["id"]]
+    workspace._accept_editor_viewport_region(first["id"])
+    workspace._editor_drawer["draft"].update({"dc_current_density": "1000", "ac_current_density_real": "2000"})
+    labels = component_labels(workspace._editor_drawer_children())
+    assert "DC current density" in labels
+    assert "Radial body force" in labels
+    assert "Select region in viewport" not in labels
+    assert "Finish selection" in labels
+    workspace._commit_editor()
+    assert first["sources"]["dc_current_density"] == "1000"
+    assert second["sources"]["dc_current_density"] == "1000"
 
 def test_model_and_properties_panels_can_be_collapsed_and_restored(standalone_components):
     workspace = SolveWorkspace()
@@ -2805,6 +2831,7 @@ def test_setup_issue_navigation_selects_the_named_model_item(standalone_componen
     region = workspace.model["geometry"]["regions"][0]
     workspace.model["materials"] = builtin_materials()
     copper = next(item for item in workspace.model["materials"] if item["name"] == "Copper")
+    region["material_id"] = copper["id"]
     condition = {"id": "condition-fixed", "name": "Fixed support", "type": "mechanical_fixed"}
     workspace.model["boundary_conditions"] = [condition]
     edge = workspace.model["geometry"]["edges"][0]
@@ -2812,7 +2839,8 @@ def test_setup_issue_navigation_selects_the_named_model_item(standalone_componen
 
     workspace._navigate_to_validation_issue("Material 'Copper' electrical_conductivity must be positive")
     assert workspace.active_section == "materials"
-    assert workspace.selected_material_id == copper["id"]
+    assert workspace.selected_region_id == region["id"]
+    assert workspace._editor_drawer["kind"] == "region_material"
 
     workspace._navigate_to_validation_issue("Boundary 'Fixed support' has an invalid value")
     assert workspace.active_section == "boundaries"
@@ -2829,7 +2857,6 @@ def test_setup_issue_navigation_selects_the_named_model_item(standalone_componen
     workspace._navigate_to_validation_issue("Region 'square 1' has invalid geometry")
     assert workspace.active_section == "geometry"
     assert workspace.selected_region_id == region["id"]
-
 
 def test_canvas_event_reads_pointer_cache_when_ngapp_omits_coordinates(standalone_components):
     workspace = SolveWorkspace()

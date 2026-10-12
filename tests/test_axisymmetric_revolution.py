@@ -131,19 +131,16 @@ def test_axisymmetric_revolution_control_switches_viewport_dimension(
         assert component.axisymmetric_revolution_available
         assert component.mesh.dim == 2
         assert not component.slice_available
-        assert component.slice_feature_available
+        assert not component.slice_feature_available
         assert any(
             section.__name__ == "AxisymmetricRevolutionSection"
             for section in component.property_sections
         )
-        assert any(
-            section.__name__ == "SliceViewSection"
-            for section in component.property_sections
-        )
+        assert all(section.__name__ != "SliceViewSection" for section in component.property_sections)
         section_names = [section.__name__ for section in component.property_sections]
-        assert section_names.index("RegionsSection") < section_names.index(
-            "AxisymmetricRevolutionSection"
-        ) < section_names.index("SliceViewSection")
+        assert section_names.index("RegionsSection") < section_names.index("AxisymmetricRevolutionSection")
+        assert component._camera_view_group.ui_hidden is False
+        assert component._clip_tool_group.ui_hidden is False
         section_ui = AxisymmetricRevolutionSection(component)
         assert section_ui._caret in section_ui._head_main.ui_children
         assert section_ui._head_main.ui_children[2].ui_children == [
@@ -158,19 +155,17 @@ def test_axisymmetric_revolution_control_switches_viewport_dimension(
         assert component._camera_view_group.ui_hidden is False
         assert component._clip_tool_group.ui_hidden is False
         assert component.cf.dim == 1
-        assert component.slice_available
-        assert component.slice_region_options[0] == "All regions"
-        assert component.slice_renderer is not None
+        assert not component.slice_available
+        assert not component.slice_feature_available
+        assert component._camera_view_group.ui_hidden is False
+        assert component._clip_tool_group.ui_hidden is False
         assert component._clip_toolbar is not None
-        component.slice_enabled.value = True
-        assert component.slice_renderer.active
-
         component.axisymmetric_revolved.value = False
         assert component.mesh.dim == 2
         assert not component.slice_available
-        assert not component.slice_enabled.value
-        assert component._camera_view_group.ui_hidden is True
-        assert component._clip_tool_group.ui_hidden is True
+        assert not component.slice_feature_available
+        assert component._camera_view_group.ui_hidden is False
+        assert component._clip_tool_group.ui_hidden is False
         assert component._clip_toolbar.ui_hidden is True
         assert component._tool_dock in app._post_process_toolbar.ui_children
     finally:

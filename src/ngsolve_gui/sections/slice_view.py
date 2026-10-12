@@ -87,7 +87,7 @@ class SliceViewSection(Section):
     def _on_head_click(self, event=None):
         if not self.comp.slice_available:
             return
-        super()._on_head_click(event)
+        super()._on_head_click()
 
     def _set_axis(self, event):
         value = str(getattr(event, "value", event)).lower()

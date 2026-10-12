@@ -837,10 +837,10 @@ class WebgpuTab(PropertyPanelMixin, Div):
         is_3d = self._is_3d_view()
         camera_group = getattr(self, "_camera_view_group", None)
         if camera_group is not None:
-            camera_group.ui_hidden = not is_3d
+            camera_group.ui_hidden = False
         clip_group = getattr(self, "_clip_tool_group", None)
         if clip_group is not None:
-            clip_group.ui_hidden = not is_3d
+            clip_group.ui_hidden = False
         self._sync_clip_ui(
             getattr(getattr(self, "clipping_enabled", None), "value", False), None
         )
@@ -857,8 +857,7 @@ class WebgpuTab(PropertyPanelMixin, Div):
         self._camera_view_tools = {}
         self._projection_tool = None
         self._projection_tooltip = None
-        tools = [self._vtool("mdi-overscan", "Fit view  ·  r", self.reset_camera,
-                             label="Fit view")]
+        tools = [self._vtool("mdi-overscan", "Fit view  ·  r", self.reset_camera, label="Fit view")]
         self._link_tool = self._build_camera_link_tool()
         if self._link_tool is not None:
             tools.append(self._link_tool)
@@ -866,22 +865,20 @@ class WebgpuTab(PropertyPanelMixin, Div):
             self._projection_tool = self._build_projection_tool()
             self._camera_view_group = Div(
                 Div(ui_class=str(cb.vp_sep)),
-                Div(
-                    "View:",
-                    ui_style=(
-                        "font-size:12px; font-weight:600; color:var(--text-secondary); "
-                        "white-space:nowrap; padding:0 2px;"
-                    ),
-                ),
+                Div("View:", ui_style=(
+                    "font-size:12px; font-weight:600; color:var(--text-secondary); "
+                    "white-space:nowrap; padding:0 2px;"
+                )),
                 *self._build_camera_view_buttons(),
                 self._projection_tool,
-                ui_style=(
-                    "display:flex; flex:0 0 auto; flex-wrap:wrap; align-items:center; "
-                    "gap:8px;"
-                ),
+                ui_style=("display:flex; flex:0 0 auto; flex-wrap:wrap; align-items:center; gap:8px;"),
             )
-            self._camera_view_group.ui_hidden = not self._is_3d_view()
+            self._camera_view_group.ui_hidden = False
             tools.append(self._camera_view_group)
+        postprocess_controls = self._build_postprocess_toolbar_controls()
+        if postprocess_controls:
+            tools.append(Div(ui_class=str(cb.vp_sep)))
+            tools.extend(postprocess_controls)
         if hasattr(self, "wireframe_visible"):
             self._wf_tool = self._vtool(
                 "mdi-grid", "Toggle wireframe edges  ·  w", self.toggle_wireframe,
@@ -895,11 +892,10 @@ class WebgpuTab(PropertyPanelMixin, Div):
                 self.toggle_clipping, label="Clipping",
             )
             self._clip_tool_group = Div(
-                Div(ui_class=str(cb.vp_sep)),
-                self._clip_tool,
+                Div(ui_class=str(cb.vp_sep)), self._clip_tool,
                 ui_style="display:flex; flex:0 0 auto; align-items:center; gap:8px;",
             )
-            self._clip_tool_group.ui_hidden = not self._is_3d_view()
+            self._clip_tool_group.ui_hidden = False
             tools.append(self._clip_tool_group)
         self._probe_tool = None
         if self._supports_probe():
@@ -909,7 +905,6 @@ class WebgpuTab(PropertyPanelMixin, Div):
                 self.toggle_probe, label="Probe",
             )
             tools.append(self._probe_tool)
-        # View tools: fullscreen + view bookmarks.
         tools.append(Div(ui_class=str(cb.vp_sep)))
         tools.append(self._vtool(
             "mdi-fullscreen", "Expand the viewport to fullscreen",
@@ -924,12 +919,44 @@ class WebgpuTab(PropertyPanelMixin, Div):
                     "position:relative; top:auto; left:auto; transform:none; z-index:auto; "
                     "display:flex; flex:0 0 auto; flex-wrap:wrap; align-items:center; "
                     "justify-content:flex-start; gap:8px; width:100%; min-height:46px; "
-                    "box-sizing:border-box; overflow:visible; "
-                    "border-radius:0; border-width:0 0 1px; box-shadow:none; "
-                    "backdrop-filter:none; background:var(--panel-header); padding:5px 12px;"
+                    "box-sizing:border-box; overflow:visible; border-radius:0; "
+                    "border-width:0 0 1px; box-shadow:none; backdrop-filter:none; "
+                    "background:var(--panel-header); padding:5px 12px;"
                 ),
             )
         return Div(*tools, ui_class=str(cb.vp_dock))
+
+    def _build_postprocess_toolbar_controls(self):
+        groups = getattr(self, "_postprocess_toolbar_groups", ())
+        controls = []
+        for label, icon, section_classes in groups:
+            sections = []
+            for section_class in section_classes:
+                if section_class is None:
+                    continue
+                try:
+                    sections.append(section_class(self))
+                except ValueError:
+                    continue
+            if not sections:
+                continue
+            content = Div(
+                Div(label, ui_style="font-size:12px; font-weight:700; padding:7px 8px 4px;"),
+                QSeparator(),
+                *sections,
+                ui_style=(
+                    "width:min(390px, calc(100vw - 24px)); max-width:calc(100vw - 24px); "
+                    "max-height:min(76vh, 720px); overflow:auto; padding:7px 9px 10px; "
+                    "box-sizing:border-box; background:var(--panel-bg, white);"
+                ),
+            )
+            menu = QMenu(content, ui_anchor="bottom left", ui_self="top left", ui_auto_close=False)
+            controls.append(QBtn(
+                QTooltip(label), menu, ui_icon=icon, ui_label=label,
+                ui_flat=True, ui_dense=True, ui_no_caps=True,
+                ui_class=str(cb.topbar_icon), ui_style="white-space:nowrap;",
+            ))
+        return controls
 
     def _build_camera_link_tool(self):
         """Toggle between the mesh/geometry-wide camera and one just for this view."""
@@ -1118,9 +1145,9 @@ class WebgpuTab(PropertyPanelMixin, Div):
         self._set_tool_active(self._clip_tool, val)
         is_3d = self._is_3d_view()
         if self._clip_tool_group is not None:
-            self._clip_tool_group.ui_hidden = not is_3d
+            self._clip_tool_group.ui_hidden = False
         if self._clip_toolbar is not None:
-            self._clip_toolbar.ui_hidden = not (is_3d and bool(val))
+            self._clip_toolbar.ui_hidden = not bool(val)
 
     def _current_clip_axis(self):
         n = [abs(self.clipping.normal[i]) for i in range(3)]

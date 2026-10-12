@@ -49,6 +49,10 @@ def _inject_solve_status_styles(js):
   0%, 100% { background-color: var(--surface); box-shadow: inset 0 0 0 0 transparent; }
   35%, 65% { background-color: var(--accent-subtle); box-shadow: inset 0 0 0 2px var(--accent); }
 }
+@keyframes mmfem-condition-edge-pulse {
+  0%, 100% { stroke-opacity: .72; stroke-width: 3.1px; }
+  50% { stroke-opacity: 1; stroke-width: 4px; }
+}
 .mmfem-solve-status-flash-a {
   animation: mmfem-solve-status-flash-a 0.68s ease-in-out 3;
 }
@@ -60,6 +64,9 @@ def _inject_solve_status_styles(js):
   .mmfem-solve-status-flash-b {
     animation-duration: 0.12s;
     animation-iteration-count: 1;
+  }
+  [style*="mmfem-condition-edge-pulse"] {
+    animation: none !important;
   }
 }
 .mmfem-compact-app-bar .cb-monitor {

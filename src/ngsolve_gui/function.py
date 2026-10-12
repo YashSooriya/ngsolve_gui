@@ -144,10 +144,9 @@ class FunctionComponent(WebgpuTab):
             and self.mesh.dim == 2
             and isinstance(cf, ngs.GridFunction)
         )
-        self.slice_available = self.mesh.dim == 3 and bool(self.draw_vol)
-        self.slice_feature_available = bool(
-            self.slice_available or self.axisymmetric_revolution_available
-        )
+        # Slice controls are temporarily removed from the product UI.
+        self.slice_available = False
+        self.slice_feature_available = False
         self.slice_region_options = (
             [ALL_REGIONS] + [str(name) for name in self.mesh.GetMaterials()]
             if self.slice_feature_available and bool(self.draw_vol)
@@ -298,23 +297,27 @@ class FunctionComponent(WebgpuTab):
                     else "polar",
                 )
 
-        if self.slice_feature_available:
-            sections = list(
-                getattr(self, "property_sections", type(self).property_sections)
-            )
-            if SliceViewSection not in sections:
-                from .sections.regions import RegionsSection
-                from .sections.axisymmetric_revolution import (
-                    AxisymmetricRevolutionSection,
-                )
-                from .sections.quarter_symmetry import QuarterSymmetrySection
 
-                _insert_property_section_after(
-                    sections, SliceViewSection,
-                    (RegionsSection, AxisymmetricRevolutionSection,
-                     QuarterSymmetrySection),
-                )
-            self.property_sections = sections
+        # The solve/results controls belong in the full-width page toolbar.
+        # Leave only Regions in the narrow properties sidebar.
+        from .sections.colorbar import ColorbarSection
+        from .sections.regions import RegionsSection
+        section_by_name = {section.__name__: section for section in self.property_sections}
+        self._postprocess_toolbar_groups = [
+            ("Field", "mdi-palette", [ColorbarSection, section_by_name.get("ComplexSection")]),
+            ("Display & view", "mdi-cube-scan", [
+                section_by_name.get("FunctionDisplaySection"),
+                section_by_name.get("DeformationSection"),
+                section_by_name.get("AxisymmetricRevolutionSection"),
+                section_by_name.get("QuarterSymmetrySection"),
+                section_by_name.get("EntityNumbersSection"),
+            ]),
+            ("Vectors & flow", "mdi-vector-triangle", [section_by_name.get("VectorsFlowSection")]),
+        ]
+        self.hidden_sections = tuple(
+            section for section in self.property_sections
+            if section is not RegionsSection
+        )
 
         cv = data.get("clipping_vectors", False)
         sv = data.get("surface_vectors", False)
@@ -993,6 +996,9 @@ class FunctionComponent(WebgpuTab):
             if material == ALL_REGIONS
             else self.mesh.Materials(material)
         )
+        # The element mask uses full-mesh element indices. Keep the selected
+        # Region wrapper as well so surface filtering and region-aware field
+        # evaluation remain scoped to the requested material.
         mesh_data = MeshData(mesh_scope, el3d_bitarray=mask)
         function_data = FunctionData(
             mesh_data, self.visualization_cf, order=self.order
@@ -2064,7 +2070,6 @@ from .sections import (
     ComplexSection,
     EntityNumbersSection,
     RegionsSection,
-    SliceViewSection,
 )
 
 # Colormap/colorbar lives in the always-visible FieldSummary (property_summary),
