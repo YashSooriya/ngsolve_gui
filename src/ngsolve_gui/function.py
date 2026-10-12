@@ -1260,6 +1260,13 @@ class FunctionComponent(WebgpuTab):
                 self.scene.render()
             self._axisymmetric_camera_state = None
 
+        # The page-level toolbar is hosted by the app, not by this viewport.
+        # Refresh it after changing mesh dimension so 3D camera/clipping controls
+        # appear or disappear in the same interaction as the revolution toggle.
+        refresh_app = getattr(self.app_data, "_update", None)
+        if callable(refresh_app):
+            refresh_app()
+
     def _apply_symmetry_expanded(self, enabled, _old):
         if not self.quarter_symmetry_expansion_available:
             return
@@ -1328,11 +1335,13 @@ class FunctionComponent(WebgpuTab):
             self._symmetry_camera_state = None
 
     def _rebuild_dimension_controls(self):
-        """Update dimension-gated controls without replacing the page toolbar."""
-        # Axisymmetric post-processing builds its page-level toolbar while the
-        # mesh is still 2D. Keep the same toolbar objects mounted and reveal the
-        # camera/clipping controls when revolution switches the mesh to 3D.
-        self._sync_dynamic_3d_toolbar_state()
+        """Rebuild controls whose availability depends on the displayed mesh dimension."""
+        # The page-level toolbar is hosted by the app. Mutating ui_hidden on a
+        # nested button group does not reliably reach the mounted toolbar, so
+        # create fresh controls for the new dimension and let the app remount
+        # them after this callback.
+        self._tool_dock = self._build_tool_dock()
+        self._clip_toolbar = self._build_clip_toolbar()
         overlays = [self.wgpu, self._tool_dock, self.pick_overlay]
         if self._clip_toolbar is not None:
             overlays.insert(2, self._clip_toolbar)

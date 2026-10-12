@@ -42,7 +42,7 @@ def test_2d_pickle_draw_caps_cubic_geometry_for_viewer(monkeypatch):
     mesh.Curve(3)
     grid_function = ngs.GridFunction(ngs.H1(mesh, order=1))
     captured = {}
-    monkeypatch.setattr(file_loader, "_is_axisymmetric_pickle", lambda _path: False)
+    monkeypatch.setattr(file_loader, "_is_axisymmetric_pickle", lambda _path, _mesh=None: False)
     monkeypatch.setattr(
         file_loader,
         "DrawImpl",
@@ -63,7 +63,7 @@ def test_axisymmetric_pickle_draw_enables_revolution_from_metadata(monkeypatch):
     grid_function = ngs.GridFunction(ngs.H1(mesh, order=1))
     captured = {}
 
-    monkeypatch.setattr(file_loader, "_is_axisymmetric_pickle", lambda _path: True)
+    monkeypatch.setattr(file_loader, "_is_axisymmetric_pickle", lambda _path, _mesh=None: True)
     monkeypatch.setattr(
         file_loader,
         "DrawImpl",
@@ -84,7 +84,7 @@ def test_axisymmetric_vector_pickle_uses_radial_and_axial_component_names(monkey
     mesh = ngs.Mesh(OCCGeometry(Rectangle(1, 1).Face(), dim=2).GenerateMesh(maxh=0.8))
     grid_function = ngs.GridFunction(ngs.VectorH1(mesh, order=1))
     captured = {}
-    monkeypatch.setattr(file_loader, "_is_axisymmetric_pickle", lambda _path: True)
+    monkeypatch.setattr(file_loader, "_is_axisymmetric_pickle", lambda _path, _mesh=None: True)
     monkeypatch.setattr(
         file_loader,
         "DrawImpl",
@@ -225,6 +225,79 @@ def test_axisymmetric_pickle_detection_requires_matching_solver_metadata(tmp_pat
     assert file_loader._is_axisymmetric_pickle(field_path)
     assert not file_loader._is_axisymmetric_pickle(unrelated)
 
+
+
+def test_metadata_less_nonnegative_2d_pickle_is_axisymmetric_candidate(tmp_path):
+    from types import SimpleNamespace
+
+    mesh = SimpleNamespace(
+        dim=2,
+        vertices=[
+            SimpleNamespace(point=(0.0, -1.0)),
+            SimpleNamespace(point=(0.5, 0.0)),
+            SimpleNamespace(point=(1.0, 1.0)),
+        ],
+    )
+    field_path = tmp_path / "standalone.pkl"
+    field_path.write_bytes(b"field")
+
+    assert file_loader._is_axisymmetric_pickle(field_path, mesh)
+
+
+def test_explicit_non_axisymmetric_metadata_overrides_mesh_inference(tmp_path):
+    from types import SimpleNamespace
+
+    mesh = SimpleNamespace(
+        dim=2,
+        vertices=[
+            SimpleNamespace(point=(0.0, -1.0)),
+            SimpleNamespace(point=(1.0, 1.0)),
+        ],
+    )
+    fields = tmp_path / "fields"
+    fields.mkdir()
+    field_path = fields / "field.pkl"
+    field_path.write_bytes(b"field")
+    (tmp_path / "metadata.json").write_text(
+        '{"problem_domain":"planar","field_files":[{"file":"fields/field.pkl"}]}',
+        encoding="utf-8",
+    )
+
+    assert not file_loader._is_axisymmetric_pickle(field_path, mesh)
+
+
+
+def test_standalone_nonnegative_gridfunction_enables_axisymmetric_revolution(monkeypatch, tmp_path):
+    from netgen.occ import OCCGeometry, Rectangle
+
+    mesh = ngs.Mesh(OCCGeometry(Rectangle(1, 1).Face(), dim=2).GenerateMesh(maxh=0.8))
+    grid_function = ngs.GridFunction(ngs.H1(mesh, order=1))
+    captured = {}
+    monkeypatch.setattr(
+        file_loader,
+        "DrawImpl",
+        lambda obj, **options: captured.update(object=obj, **options),
+    )
+
+    file_loader._draw_pickle_object(
+        grid_function, "standalone field", field_path=tmp_path / "standalone.pkl"
+    )
+
+    assert captured["object"] is grid_function
+    assert captured["_ngsolve_gui_axisymmetric"] is True
+
+def test_negative_first_coordinate_does_not_infer_axisymmetry():
+    from types import SimpleNamespace
+
+    mesh = SimpleNamespace(
+        dim=2,
+        vertices=[
+            SimpleNamespace(point=(-1.0, -1.0)),
+            SimpleNamespace(point=(1.0, 1.0)),
+        ],
+    )
+
+    assert not file_loader._mesh_has_nonnegative_radial_coordinate(mesh)
 
 def test_solution_bundle_loader_draws_all_fields_in_one_script(monkeypatch, tmp_path):
     bundle = tmp_path / "saved.mmfem-solutions"

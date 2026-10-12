@@ -421,10 +421,34 @@ def _pickle_metadata_for_path(filename):
     return None, None
 
 
-def _is_axisymmetric_pickle(filename) -> bool:
-    """Check adjacent solver metadata rather than guessing from a 2D mesh."""
+def _mesh_has_nonnegative_radial_coordinate(mesh) -> bool:
+    """Recognize a metadata-less meridian mesh from its nonnegative radius axis.
+
+    A browser file picker uploads only the selected pickle, not the adjacent
+    solver metadata.json. Axisymmetric meridian meshes use coordinate 0 as
+    radius and therefore cannot extend into negative values. Explicit metadata
+    remains authoritative where it is available.
+    """
+    if getattr(mesh, "dim", None) != 2:
+        return False
+    try:
+        radii = [float(vertex.point[0]) for vertex in mesh.vertices]
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return False
+    if not radii:
+        return False
+    scale = max(abs(radius) for radius in radii)
+    tolerance = max(scale * 1e-9, 1e-14)
+    return min(radii) >= -tolerance and max(radii) - min(radii) > tolerance
+
+
+def _is_axisymmetric_pickle(filename, mesh=None) -> bool:
+    """Use solver metadata, or infer axisymmetry for a standalone 2D pickle."""
     metadata, _field = _pickle_metadata_for_path(filename)
-    return bool(metadata and metadata.get("problem_domain") == "axisymmetric")
+    domain = metadata.get("problem_domain") if metadata else None
+    if domain is not None:
+        return str(domain).strip().lower() == "axisymmetric"
+    return _mesh_has_nonnegative_radial_coordinate(mesh)
 
 
 def _draw_pickle_object(obj, name: str, field_path=None):
@@ -493,7 +517,7 @@ def _draw_pickle_object(obj, name: str, field_path=None):
             if any(marker in field_description for marker in magnetic_field_markers)
             else "polar"
         )
-    if _is_axisymmetric_pickle(field_path):
+    if _is_axisymmetric_pickle(field_path, mesh):
         draw_options["_ngsolve_gui_axisymmetric"] = True
         if obj.dim == 2:
             # Axisymmetric vector pickles store the meridian components in

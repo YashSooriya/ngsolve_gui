@@ -150,8 +150,13 @@ def test_axisymmetric_revolution_control_switches_viewport_dimension(
             "Revolved 3D View"
         ]
 
+        original_tool_dock = component._tool_dock
         component.axisymmetric_revolved.value = True
         assert component.mesh.dim == 3
+        assert component._tool_dock is not original_tool_dock
+        assert component._tool_dock in app._post_process_toolbar.ui_children
+        assert component._camera_view_group.ui_hidden is False
+        assert component._clip_tool_group.ui_hidden is False
         assert component.cf.dim == 1
         assert component.slice_available
         assert component.slice_region_options[0] == "All regions"
@@ -164,7 +169,10 @@ def test_axisymmetric_revolution_control_switches_viewport_dimension(
         assert component.mesh.dim == 2
         assert not component.slice_available
         assert not component.slice_enabled.value
-        assert component._clip_toolbar is None
+        assert component._camera_view_group.ui_hidden is True
+        assert component._clip_tool_group.ui_hidden is True
+        assert component._clip_toolbar.ui_hidden is True
+        assert component._tool_dock in app._post_process_toolbar.ui_children
     finally:
         if previous_region_visibility is missing_region_visibility:
             del function_module.RegionVisibility
