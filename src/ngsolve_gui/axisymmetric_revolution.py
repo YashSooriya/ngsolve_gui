@@ -88,12 +88,22 @@ def revolve_gridfunction(grid_function, sectors: int = DEFAULT_SECTORS):
         for element in source_mesh.Elements(ngs.BND)
         if len(element.vertices) == 2
     ]
-    boundary_materials = {}
     default_material = materials[0]
+    material_order = {str(name): index for index, name in enumerate(materials)}
+    boundary_regions = {}
     for vertices in boundary_edges:
         key = tuple(sorted(vertices))
-        adjacent = edge_materials.get(key, {default_material})
-        boundary_materials[key] = sorted(adjacent)[0]
+        adjacent = edge_materials.get(key) or {default_material}
+        if len(adjacent) > 2:
+            raise ValueError(
+                "A revolved meridian edge cannot border more than two regions"
+            )
+        boundary_regions[key] = tuple(
+            sorted(
+                adjacent,
+                key=lambda name: material_order.get(str(name), len(material_order)),
+            )
+        )
 
     try:
         sectors = int(sectors)
@@ -114,22 +124,31 @@ def revolve_gridfunction(grid_function, sectors: int = DEFAULT_SECTORS):
         str(name): target_ngmesh.AddRegion(str(name), 3) for name in materials
     }
     boundary_descriptors = {}
-    for material_name in dict.fromkeys(boundary_materials.values()):
+    default_material_id = next(iter(material_ids.values()))
+    for adjacent_names in dict.fromkeys(boundary_regions.values()):
         descriptor_number = len(boundary_descriptors) + 1
-        domain_number = material_ids.get(
-            material_name, next(iter(material_ids.values()))
+        dominant_name = adjacent_names[0]
+        dominant_id = material_ids.get(dominant_name, default_material_id)
+        exterior_id = (
+            material_ids.get(adjacent_names[1], default_material_id)
+            if len(adjacent_names) == 2
+            else 0
         )
-        boundary_descriptors[material_name] = target_ngmesh.Add(
+        boundary_descriptors[adjacent_names] = target_ngmesh.Add(
             ngm.FaceDescriptor(
                 surfnr=descriptor_number,
-                domin=domain_number,
-                domout=0,
+                domin=dominant_id,
+                domout=exterior_id,
                 bc=descriptor_number,
             )
         )
-        target_ngmesh.SetBCName(
-            descriptor_number - 1, f"Revolved exterior: {material_name}"
-        )
+        if exterior_id:
+            boundary_name = (
+                f"Revolved interface: {dominant_name} / {adjacent_names[1]}"
+            )
+        else:
+            boundary_name = f"Revolved exterior: {dominant_name}"
+        target_ngmesh.SetBCName(descriptor_number - 1, boundary_name)
 
     point_ids: dict[int, list] = {}
     point_coordinates: dict[int, tuple[float, float, float]] = {}
@@ -187,8 +206,8 @@ def revolve_gridfunction(grid_function, sectors: int = DEFAULT_SECTORS):
     # the outer skin, while the volume tetrahedra remain available for clipping.
     for edge_vertices in boundary_edges:
         first_vertex, second_vertex = edge_vertices
-        material_name = boundary_materials[tuple(sorted(edge_vertices))]
-        boundary_descriptor = boundary_descriptors[material_name]
+        adjacent_names = boundary_regions[tuple(sorted(edge_vertices))]
+        boundary_descriptor = boundary_descriptors[adjacent_names]
         for sector in range(sectors):
             next_sector = (sector + 1) % sectors
             first = point_ids[first_vertex][sector]

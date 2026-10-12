@@ -3,6 +3,7 @@
 import math
 
 import ngsolve as ngs
+from netgen.geom2d import SplineGeometry
 import netgen.occ as occ
 import numpy as np
 import pytest
@@ -13,6 +14,7 @@ from ngapp.e2e import app_test
 from .helpers import _draw
 
 from ngsolve_gui.axisymmetric_revolution import revolve_gridfunction
+from ngsolve_gui.region_state import RegionState
 
 
 def _meridian_mesh():
@@ -35,6 +37,43 @@ def test_scalar_field_revolves_to_a_closed_3d_volume():
 
     polygon_cylinder_volume = math.pi * math.sin(2 * math.pi / 16) / (2 * math.pi / 16)
     assert ngs.Integrate(1, mesh3d) == pytest.approx(polygon_cylinder_volume, rel=1e-9)
+
+
+def test_revolved_interface_stays_visible_when_outer_region_is_hidden():
+    geometry = SplineGeometry()
+    geometry.AddRectangle(
+        p1=(0, 0), p2=(1, 1), bc="outer", leftdomain=1, rightdomain=0
+    )
+    geometry.AddRectangle(
+        p1=(0.3, 0.3), p2=(0.7, 0.7),
+        bc="interface", leftdomain=2, rightdomain=1,
+    )
+    geometry.SetMaterial(1, "square_1")
+    geometry.SetMaterial(2, "square_2")
+    meridian = ngs.Mesh(geometry.GenerateMesh(maxh=0.25))
+    source = ngs.GridFunction(ngs.H1(meridian, order=1), name="nested")
+    source.Set(ngs.x + ngs.y)
+
+    mesh3d, _ = revolve_gridfunction(source, sectors=8)
+    assert list(mesh3d.GetMaterials()) == ["square_1", "square_2"]
+
+    descriptors = list(mesh3d.ngmesh.FaceDescriptors())
+    state = RegionState(mesh3d)
+    state.hidden = {"square_1"}
+    surface_alphas = state.surf_alphas()
+
+    outer_surfaces = [
+        index for index, descriptor in enumerate(descriptors)
+        if descriptor.domin == 1 and descriptor.domout == 0
+    ]
+    shared_interfaces = [
+        index for index, descriptor in enumerate(descriptors)
+        if {descriptor.domin, descriptor.domout} == {1, 2}
+    ]
+    assert outer_surfaces
+    assert shared_interfaces
+    assert all(surface_alphas[index] == 0.0 for index in outer_surfaces)
+    assert all(surface_alphas[index] == 1.0 for index in shared_interfaces)
 
 
 def test_radial_axial_vector_is_rotated_into_cartesian_components():
