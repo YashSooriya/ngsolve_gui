@@ -15,6 +15,7 @@ from .helpers import _draw
 
 from ngsolve_gui.axisymmetric_revolution import revolve_gridfunction
 from ngsolve_gui.region_state import RegionState
+from ngsolve_gui.sections.axisymmetric_revolution import AxisymmetricRevolutionSection
 
 
 def _meridian_mesh():
@@ -139,6 +140,15 @@ def test_axisymmetric_revolution_control_switches_viewport_dimension(
             section.__name__ == "SliceViewSection"
             for section in component.property_sections
         )
+        section_names = [section.__name__ for section in component.property_sections]
+        assert section_names.index("RegionsSection") < section_names.index(
+            "AxisymmetricRevolutionSection"
+        ) < section_names.index("SliceViewSection")
+        section_ui = AxisymmetricRevolutionSection(component)
+        assert section_ui._caret in section_ui._head_main.ui_children
+        assert section_ui._head_main.ui_children[2].ui_children == [
+            "Revolved 3D View"
+        ]
 
         component.axisymmetric_revolved.value = True
         assert component.mesh.dim == 3

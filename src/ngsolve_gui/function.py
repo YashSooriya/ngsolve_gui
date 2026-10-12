@@ -16,6 +16,14 @@ from .slice_view import (
 )
 
 
+def _insert_property_section_after(sections, section, anchors):
+    positions = [
+        sections.index(anchor) for anchor in anchors if anchor in sections
+    ]
+    insert_at = max(positions) + 1 if positions else min(1, len(sections))
+    sections.insert(insert_at, section)
+
+
 class _MMFEMColormap(Colormap):
     """Keep autoscale meaningful for physically small engineering fields.
 
@@ -212,8 +220,14 @@ class FunctionComponent(WebgpuTab):
         if self.axisymmetric_revolution_available:
             from .sections.axisymmetric_revolution import AxisymmetricRevolutionSection
 
-            sections = list(type(self).property_sections)
-            sections.insert(1, AxisymmetricRevolutionSection)
+            sections = list(
+                getattr(self, "property_sections", type(self).property_sections)
+            )
+            from .sections.regions import RegionsSection
+
+            _insert_property_section_after(
+                sections, AxisymmetricRevolutionSection, (RegionsSection,)
+            )
             self.property_sections = sections
             self._axisymmetric_original_state = {
                 "mesh": self.mesh,
@@ -243,8 +257,18 @@ class FunctionComponent(WebgpuTab):
             if self.quarter_symmetry_expansion_available:
                 from .sections.quarter_symmetry import QuarterSymmetrySection
 
-                sections = list(type(self).property_sections)
-                sections.insert(1, QuarterSymmetrySection)
+                sections = list(
+                    getattr(self, "property_sections", type(self).property_sections)
+                )
+                from .sections.regions import RegionsSection
+                from .sections.axisymmetric_revolution import (
+                    AxisymmetricRevolutionSection,
+                )
+
+                _insert_property_section_after(
+                    sections, QuarterSymmetrySection,
+                    (RegionsSection, AxisymmetricRevolutionSection),
+                )
                 self.property_sections = sections
                 self._symmetry_original_state = {
                     "mesh": self.mesh,
@@ -279,12 +303,17 @@ class FunctionComponent(WebgpuTab):
                 getattr(self, "property_sections", type(self).property_sections)
             )
             if SliceViewSection not in sections:
-                insert_at = 1
-                if self.axisymmetric_revolution_available:
-                    from .sections.axisymmetric_revolution import AxisymmetricRevolutionSection
-                    if AxisymmetricRevolutionSection in sections:
-                        insert_at = sections.index(AxisymmetricRevolutionSection) + 1
-                sections.insert(insert_at, SliceViewSection)
+                from .sections.regions import RegionsSection
+                from .sections.axisymmetric_revolution import (
+                    AxisymmetricRevolutionSection,
+                )
+                from .sections.quarter_symmetry import QuarterSymmetrySection
+
+                _insert_property_section_after(
+                    sections, SliceViewSection,
+                    (RegionsSection, AxisymmetricRevolutionSection,
+                     QuarterSymmetrySection),
+                )
             self.property_sections = sections
 
         cv = data.get("clipping_vectors", False)

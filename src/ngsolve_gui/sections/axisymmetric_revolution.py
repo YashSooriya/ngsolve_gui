@@ -17,7 +17,7 @@ class AxisymmetricRevolutionSection(Section):
                 ui_class=field_label,
             ),
             icon="mdi-rotate-3d-variant",
-            title="3D of revolution",
+            title="Revolved 3D View",
             switchable=True,
             observable=comp.axisymmetric_revolved,
             info=(

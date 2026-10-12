@@ -31,10 +31,10 @@ class Section(Div):
         self._obs = observable
 
         self._ico = Div(QIcon(ui_name=icon), ui_class=cb.psec_ico)
-        main = []
-        if not switchable:
-            main.append(Div(QIcon(ui_name="mdi-chevron-down"), ui_class=cb.psec_caret))
-        main.append(self._ico)
+        self._caret = Div(
+            QIcon(ui_name="mdi-chevron-down"), ui_class=cb.psec_caret
+        )
+        main = [self._caret, self._ico]
         main.append(Div(title, ui_class=cb.psec_title))
         if info:
             main.append(Div(
