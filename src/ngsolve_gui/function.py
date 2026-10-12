@@ -131,12 +131,21 @@ class FunctionComponent(WebgpuTab):
         self._axisymmetric_solution = bool(
             data.get("_ngsolve_gui_axisymmetric", False) and self.mesh.dim == 2
         )
+        self.axisymmetric_revolution_available = bool(
+            data.get("_ngsolve_gui_axisymmetric", False)
+            and self.mesh.dim == 2
+            and isinstance(cf, ngs.GridFunction)
+        )
         self.slice_available = self.mesh.dim == 3 and bool(self.draw_vol)
+        self.slice_feature_available = bool(
+            self.slice_available or self.axisymmetric_revolution_available
+        )
         self.slice_region_options = (
             [ALL_REGIONS] + [str(name) for name in self.mesh.GetMaterials()]
-            if self.slice_available
+            if self.slice_feature_available and bool(self.draw_vol)
             else []
         )
+        self._slice_view_section = None
         self.fieldline_seed_region_options = (
             [ALL_REGIONS] + [str(name) for name in self.mesh.GetMaterials()]
             if self.cf.dim == self.mesh.dim
@@ -195,11 +204,6 @@ class FunctionComponent(WebgpuTab):
             self._deformation_source = self.cf
             self.deformation = self._resolve_deformation(True)
 
-        self.axisymmetric_revolution_available = bool(
-            data.get("_ngsolve_gui_axisymmetric", False)
-            and self.mesh.dim == 2
-            and isinstance(cf, ngs.GridFunction)
-        )
         self.axisymmetric_revolved = Observable(False, "axisymmetric_revolved")
         self._axisymmetric_revolution_mesh = None
         self._axisymmetric_revolution_field = None
@@ -270,12 +274,17 @@ class FunctionComponent(WebgpuTab):
                     else "polar",
                 )
 
-        if self.slice_available:
+        if self.slice_feature_available:
             sections = list(
                 getattr(self, "property_sections", type(self).property_sections)
             )
             if SliceViewSection not in sections:
-                sections.insert(1, SliceViewSection)
+                insert_at = 1
+                if self.axisymmetric_revolution_available:
+                    from .sections.axisymmetric_revolution import AxisymmetricRevolutionSection
+                    if AxisymmetricRevolutionSection in sections:
+                        insert_at = sections.index(AxisymmetricRevolutionSection) + 1
+                sections.insert(insert_at, SliceViewSection)
             self.property_sections = sections
 
         cv = data.get("clipping_vectors", False)
@@ -531,7 +540,7 @@ class FunctionComponent(WebgpuTab):
         self.numbers_one_based.on_change(self._apply_numbers_one_based)
         self.hidden_regions.on_change(self._apply_region_change)
         self.boundary_overrides.on_change(self._apply_region_change)
-        if self.slice_available:
+        if self.slice_feature_available:
             self.slice_enabled.on_change(self._apply_slice_enabled)
             self.slice_axis.on_change(self._apply_slice_plane)
             self.slice_position.on_change(self._apply_slice_plane)
@@ -556,14 +565,70 @@ class FunctionComponent(WebgpuTab):
     SUBDIVISION_MAX = 40
 
     def _subdivision_override(self):
-        """UI subdivision → MeshData.subdivision. -1 = auto (None, derived from
-        the mesh curve/deformation order); 0 = linear (subdivision 1); N =
-        subdivision N+1. Raising it tessellates each element into more render
-        triangles, so a high-order function renders smoothly instead of
-        piecewise-flat."""
+        """Return a display tessellation override, or None for normal auto detail.
+
+        -1 keeps ngsolve_webgpu's order-based tessellation for ordinary meshes,
+        but caps render-only triangle counts on dense meshes. Explicit values
+        remain user-controlled: 0 = linear and N = subdivision N+1.
+        """
         v = int(self.subdivision.value)
         v = max(-1, min(self.SUBDIVISION_MAX, v))
-        return None if v < 0 else v + 1
+        if v >= 0:
+            return v + 1
+
+        from ._render_runtime import automatic_render_subdivision
+
+        mesh = self.mesh
+        try:
+            netgen_mesh = getattr(mesh, "ngmesh", mesh)
+            element_count = len(netgen_mesh.Elements2D().NumPy())
+        except Exception:
+            try:
+                element_count = int(mesh.ne)
+                if int(mesh.dim) == 3:
+                    element_count *= 4
+            except Exception:
+                return None
+
+        try:
+            effective_order = max(
+                int(mesh.GetCurveOrder()),
+                int(getattr(self, "order", 1) or 1),
+                int(getattr(self, "deformation_order", 1) or 1),
+            )
+        except Exception:
+            effective_order = max(
+                int(getattr(self, "order", 1) or 1),
+                int(getattr(self, "deformation_order", 1) or 1),
+            )
+        return automatic_render_subdivision(element_count, effective_order)
+
+    def _render_sample_order(self):
+        """Keep high-order sampling off the GPU budget for very dense views."""
+        requested_order = max(1, int(getattr(self, "order", 1) or 1))
+        if int(self.subdivision.value) >= 0:
+            return requested_order
+
+        try:
+            mesh = self.mesh
+            ngmesh = getattr(mesh, "ngmesh", mesh)
+            elements = ngmesh.Elements2D().NumPy()
+            element_count = len(elements)
+            has_quads = (
+                "np" in elements.dtype.names
+                and bool((elements["np"] == 4).any())
+            )
+        except Exception:
+            try:
+                element_count = int(self.mesh.ne)
+                has_quads = False
+            except Exception:
+                return requested_order
+
+        from ._render_runtime import automatic_render_order
+        return automatic_render_order(
+            element_count, requested_order, has_quads=has_quads
+        )
 
     def _apply_subdivision(self, val, _old):
         clamped = max(-1, min(self.SUBDIVISION_MAX, int(val)))
@@ -650,14 +715,28 @@ class FunctionComponent(WebgpuTab):
             self.facet_renderer.set_needs_update()
             self.wgpu.scene.render()
 
+    def _refresh_optional_renderer(self, renderer_name, visible):
+        """Rebuild the scene when an expensive optional renderer changes state.
+
+        Hidden renderers are omitted entirely from the WebGPU scene: the upstream
+        renderer group still calls update() for inactive children, which can run
+        costly NGSolve sampling/streamline tracing even when they are invisible.
+        Rebuilding only on an explicit toggle keeps the features available and
+        ensures their data is prepared when enabled.
+        """
+        if visible or getattr(self, renderer_name, None) is not None:
+            self.draw()
+            return True
+        return False
+
     def _apply_clipping_vectors(self, val, _old):
-        if self.clipping_vectors is not None:
-            self.clipping_vectors.active = val
+        if self._refresh_optional_renderer("clipping_vectors", bool(val)):
+            return
         self.wgpu.scene.render()
 
     def _apply_surface_vectors(self, val, _old):
-        if self.surface_vectors is not None:
-            self.surface_vectors.active = val
+        if self._refresh_optional_renderer("surface_vectors", bool(val)):
+            return
         self.wgpu.scene.render()
 
     def _selected_fieldline_seed_region(self):
@@ -705,8 +784,8 @@ class FunctionComponent(WebgpuTab):
         return True
 
     def _apply_fieldlines(self, val, _old):
-        if getattr(self, "fieldlines", None) is not None:
-            self.fieldlines.active = val
+        if self._refresh_optional_renderer("fieldlines", bool(val)):
+            return
         if self._sync_fieldline_seed_visibility(bool(val)):
             self._apply_region_change()
         else:
@@ -728,7 +807,7 @@ class FunctionComponent(WebgpuTab):
 
     def _build_additional_viewport_overlays(self):
         """Add the tall slice-position scrollbar beside a 3-D result view."""
-        if not self.slice_available:
+        if not self.slice_feature_available:
             return []
         self._slice_position_slider = QSlider(
             ui_model_value=self.slice_position.value,
@@ -803,6 +882,9 @@ class FunctionComponent(WebgpuTab):
             self._slice_position_slider.ui_model_value = self.slice_position.value
         if self._slice_position_label is None:
             return
+        if not self.slice_available:
+            self._slice_position_label.ui_children = ["3D preview"]
+            return
         try:
             _center, _offset, distance = self._slice_plane_data()
             self._slice_position_label.ui_children = [f"{distance:.4g} m"]
@@ -849,8 +931,12 @@ class FunctionComponent(WebgpuTab):
             self.slice_renderer.active = bool(value)
             if value:
                 self._invalidate_slice_renderer()
+        if value and not self.slice_available:
+            if self.slice_enabled.value:
+                self.slice_enabled.value = False
+            return
         if self._slice_overlay is not None:
-            self._slice_overlay.ui_hidden = not bool(value)
+            self._slice_overlay.ui_hidden = not (bool(value) and self.slice_available)
         changed = self._sync_fieldline_seed_visibility(None)
         if changed:
             self._apply_region_change()
@@ -922,8 +1008,8 @@ class FunctionComponent(WebgpuTab):
         self.wgpu.scene.render()
 
     def _apply_lic(self, val, _old):
-        if self.lic is not None:
-            self.lic.active = val
+        if self._refresh_optional_renderer("lic", bool(val)):
+            return
         self._sync_surface_elements()
         self.wgpu.scene.render()
 
@@ -1049,6 +1135,27 @@ class FunctionComponent(WebgpuTab):
             r.set_needs_update()
         self.wgpu.scene.render()
 
+    def _sync_slice_feature_state(self):
+        self.slice_available = bool(
+            self.mesh.dim == 3 and self.draw_vol and self.slice_feature_available
+        )
+        self.slice_region_options = (
+            [ALL_REGIONS] + [str(name) for name in self.mesh.GetMaterials()]
+            if self.slice_available
+            else []
+        )
+        section = getattr(self, "_slice_view_section", None)
+        if section is not None:
+            section.set_feature_available(
+                self.slice_available, self.slice_region_options
+            )
+        overlay = getattr(self, "_slice_overlay", None)
+        if overlay is not None:
+            overlay.ui_hidden = not (
+                self.slice_available and self.slice_enabled.value
+            )
+        self._sync_slice_position_overlay()
+
     def _apply_axisymmetric_revolved(self, enabled, _old):
         if not self.axisymmetric_revolution_available:
             return
@@ -1096,6 +1203,10 @@ class FunctionComponent(WebgpuTab):
             self.cf = original["cf"]
             self.visualization_cf = original["visualization_cf"]
             self.deformation = original["deformation"]
+
+        self._sync_slice_feature_state()
+        if not self.slice_available and self.slice_enabled.value:
+            self.slice_enabled.value = False
 
         self.region_state = None
         self.region_visibility = None
@@ -1668,8 +1779,9 @@ class FunctionComponent(WebgpuTab):
             surf=self.region_state.surf_alphas(),
         )
 
+        render_order = self._render_sample_order()
         func_data = self.app_data.get_function_gpu_data(
-            self.visualization_cf, self.region_or_mesh, order=self.order
+            self.visualization_cf, self.region_or_mesh, order=render_order
         )
         mdata = func_data.mesh_data
 
@@ -1709,31 +1821,33 @@ class FunctionComponent(WebgpuTab):
         self.colormap.autoscale = autoscale
         self.colormap.discrete = discrete
         self.clipping_vectors = None
+        self.surface_vectors = None
         self.lic = None
         # True when self.lic is a SurfaceLIC (2D) that REPLACES the flat surface
         # field, vs a ClippingLIC (3D) that overlays the cutting plane.
         self._lic_is_surface = False
-        if self.cf.dim == self.mesh.dim:
+        need_surface_vectors = bool(self.surface_vectors_visible.value)
+        need_surface_lic = self.mesh.dim == 2 and bool(self.lic_visible.value)
+        if self.cf.dim == self.mesh.dim and (need_surface_vectors or need_surface_lic):
             vec3 = self.visualization_cf
             if self.cf.dim == 2:
                 vec3 = ngs.CF((self.visualization_cf[0], self.visualization_cf[1], 0))
             vec_data = self.app_data.get_function_gpu_data(
-                vec3, self.region_or_mesh, order=self.order
+                vec3, self.region_or_mesh, order=render_order
             )
-            self.surface_vectors = SurfaceVectors(
-                vec_data,
-                clipping=self.clipping,
-                colormap=self.colormap,
-                grid_size=self.vector_grid_size.value,
-                scale_by_value=self.vector_scale_by_value.value,
-            )
-            self.surface_vectors.user_scale = self.vector_scale.value
-            self.surface_vectors.active = self.surface_vectors_visible.value
-            # Surface LIC: paint the 2D vector field's flow as streamlines on the
-            # mesh itself (replaces the flat surface field, like the 3D LIC
-            # replaces the clip-plane field). Only for a 2D vector field on a 2D
-            # mesh; the 3D case below uses ClippingLIC on the cutting plane.
-            if self.mesh.dim == 2:
+            if need_surface_vectors:
+                self.surface_vectors = SurfaceVectors(
+                    vec_data,
+                    clipping=self.clipping,
+                    colormap=self.colormap,
+                    grid_size=self.vector_grid_size.value,
+                    scale_by_value=self.vector_scale_by_value.value,
+                )
+                self.surface_vectors.user_scale = self.vector_scale.value
+                self.surface_vectors.active = True
+            # Surface LIC replaces the scalar surface with a 2D flow texture.
+            # Delay its extra vector samples until the user enables the view.
+            if need_surface_lic:
                 self.lic = SurfaceLIC(
                     vec_data,
                     clipping=self.clipping,
@@ -1744,12 +1858,10 @@ class FunctionComponent(WebgpuTab):
                     contrast=self.lic_contrast.value,
                     supersample=2 if self.lic_supersample.value else 1,
                 )
-                self.lic.active = self.lic_visible.value
+                self.lic.active = True
                 self._lic_is_surface = True
-        else:
-            self.surface_vectors = None
         self.fieldlines = None
-        if self.cf.dim == self.mesh.dim:
+        if self.cf.dim == self.mesh.dim and self.field_lines_visible.value:
             from ngsolve_webgpu.cf import FieldLines
 
             vec3 = self.cf if self.cf.dim == 3 else ngs.CF((self.cf[0], self.cf[1], 0))
@@ -1779,26 +1891,28 @@ class FunctionComponent(WebgpuTab):
                                                      n_lines=0, show_field=True, colormap=self.colormap)
             self.clippingcf.active = self.clipping_visible.value
             if self.cf.dim == 3:
-                self.clipping_vectors = ClippingVectors(
-                    func_data,
-                    clipping=self.clipping,
-                    colormap=self.colormap,
-                    grid_size=self.vector_grid_size.value,
-                    scale_by_value=self.vector_scale_by_value.value,
-                )
-                self.clipping_vectors.user_scale = self.vector_scale.value
-                self.clipping_vectors.active = self.clipping_vectors_visible.value
-                self.lic = ClippingLIC(
-                    func_data,
-                    clipping=self.clipping,
-                    colormap=self.colormap,
-                    kernel_length=self.lic_kernel_length.value,
-                    oriented=self.lic_oriented.value,
-                    thickness=self.lic_thickness.value,
-                    contrast=self.lic_contrast.value,
-                    supersample=2 if self.lic_supersample.value else 1,
-                )
-                self.lic.active = self.lic_visible.value
+                if self.clipping_vectors_visible.value:
+                    self.clipping_vectors = ClippingVectors(
+                        func_data,
+                        clipping=self.clipping,
+                        colormap=self.colormap,
+                        grid_size=self.vector_grid_size.value,
+                        scale_by_value=self.vector_scale_by_value.value,
+                    )
+                    self.clipping_vectors.user_scale = self.vector_scale.value
+                    self.clipping_vectors.active = True
+                if self.lic_visible.value:
+                    self.lic = ClippingLIC(
+                        func_data,
+                        clipping=self.clipping,
+                        colormap=self.colormap,
+                        kernel_length=self.lic_kernel_length.value,
+                        oriented=self.lic_oriented.value,
+                        thickness=self.lic_thickness.value,
+                        contrast=self.lic_contrast.value,
+                        supersample=2 if self.lic_supersample.value else 1,
+                    )
+                    self.lic.active = True
         else:
             self.clippingcf = None
         self.slice_renderer = self._create_slice_renderer()

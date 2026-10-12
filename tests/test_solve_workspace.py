@@ -723,7 +723,7 @@ def test_3d_preview_failure_keeps_editable_sketch_active(standalone_components):
     assert "invalid profile" in workspace.message
 
 
-def test_same_edge_can_have_independent_em_and_mechanical_conditions(standalone_components):
+def test_one_em_and_mechanical_condition_coexist_and_support_replaces_transmission(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
     workspace._primitive_values.update({
@@ -755,6 +755,12 @@ def test_same_edge_can_have_independent_em_and_mechanical_conditions(standalone_
     )
     workspace._set_edge_condition(outer_edge["id"], "electromagnetic", "boundary-outer")
     workspace._set_edge_condition(coil_edge["id"], "electromagnetic", "boundary-outer")
+    after_em_assignment = next(edge for edge in workspace.model["geometry"]["edges"] if edge["id"] == coil_edge["id"])
+    auto_before_support = next(
+        item for item in workspace.model["boundary_conditions"]
+        if item.get("type") == "transmission_interface" and item.get("automatic_for_mechanics")
+    )
+    assert set(after_em_assignment["boundary_condition_ids"]) == {"boundary-outer", auto_before_support["id"]}
     workspace._set_edge_condition(coil_edge["id"], "mechanical", "boundary-fixed")
 
     updated_edge = next(edge for edge in workspace.model["geometry"]["edges"] if edge["id"] == coil_edge["id"])
@@ -763,9 +769,9 @@ def test_same_edge_can_have_independent_em_and_mechanical_conditions(standalone_
         if condition.get("type") == "transmission_interface"
         and condition.get("automatic_for_mechanics")
     )
-    assert set(updated_edge["boundary_condition_ids"]) == {
-        "boundary-outer", "boundary-fixed", automatic_interface["id"]
-    }
+    assert set(updated_edge["boundary_condition_ids"]) == {"boundary-outer", "boundary-fixed"}
+    assert automatic_interface["id"] not in updated_edge["boundary_condition_ids"]
+    assert updated_edge["mechanical_boundary_override"] is True
     assert workspace.validation_errors() == []
 
 
@@ -1135,13 +1141,16 @@ def test_mechanical_region_gets_automatic_transmission_boundary(standalone_compo
         if item.get("type") == "transmission_interface"
     )
     assert condition["automatic_for_mechanics"] is True
-    assert all(
-        condition["id"] in next(
-            edge for edge in workspace.model["geometry"]["edges"]
-            if edge["id"] == edge_id
-        )["boundary_condition_ids"]
-        for edge_id in region["edge_ids"]
-    )
+    for edge_id in region["edge_ids"]:
+        edge = next(edge for edge in workspace.model["geometry"]["edges"] if edge["id"] == edge_id)
+        assigned_types = [
+            item["type"] for item in workspace.model["boundary_conditions"]
+            if item["id"] in edge["boundary_condition_ids"]
+        ]
+        if all(abs(float(point[0])) <= 1e-12 for point in edge["vertices"]):
+            assert assigned_types == ["axis_of_symmetry"]
+        else:
+            assert assigned_types == ["transmission_interface"]
 
     saved_model = copy.deepcopy(workspace.model)
     saved_model["boundary_conditions"] = [
@@ -1160,10 +1169,16 @@ def test_mechanical_region_gets_automatic_transmission_boundary(standalone_compo
         item for item in loaded.model["boundary_conditions"]
         if item.get("type") == "transmission_interface"
     )
-    assert all(
-        loaded_interface["id"] in next(edge for edge in loaded.model["geometry"]["edges"] if edge["id"] == edge_id)["boundary_condition_ids"]
-        for edge_id in loaded_region["edge_ids"]
-    )
+    for edge_id in loaded_region["edge_ids"]:
+        edge = next(edge for edge in loaded.model["geometry"]["edges"] if edge["id"] == edge_id)
+        assigned_types = [
+            item["type"] for item in loaded.model["boundary_conditions"]
+            if item["id"] in edge["boundary_condition_ids"]
+        ]
+        if all(abs(float(point[0])) <= 1e-12 for point in edge["vertices"]):
+            assert assigned_types == ["axis_of_symmetry"]
+        else:
+            assert assigned_types == ["transmission_interface"]
 
     loaded._set_region_value(loaded_region["id"], "mechanical", False)
 
@@ -1205,9 +1220,24 @@ def test_nested_mechanical_regions_use_default_shared_contour_and_update_after_m
 
     workspace._set_region_value(child["id"], "mechanical", True)
     assert all(
-        interface["id"] not in next(edge for edge in workspace.model["geometry"]["edges"] if edge["id"] == edge_id)["boundary_condition_ids"]
+        next(edge for edge in workspace.model["geometry"]["edges"] if edge["id"] == edge_id).get("mechanical_boundary_locked") is True
+        and interface["id"] not in next(edge for edge in workspace.model["geometry"]["edges"] if edge["id"] == edge_id)["boundary_condition_ids"]
         for edge_id in child["edge_ids"]
     )
+    workspace.model["boundary_conditions"].append({
+        "id": "boundary-fixed-shared", "name": "Fixed", "type": "mechanical_fixed"
+    })
+    shared_edge_id = child["edge_ids"][1]
+    workspace._set_edge_condition(shared_edge_id, "mechanical", "boundary-fixed-shared")
+    assert "boundary-fixed-shared" not in next(edge for edge in workspace.model["geometry"]["edges"] if edge["id"] == shared_edge_id)["boundary_condition_ids"]
+    assert "locked" in workspace.message.lower()
+    workspace.active_section = "geometry"
+    workspace.selected_edge_ids = [shared_edge_id]
+    workspace.selected_edge_id = shared_edge_id
+    workspace._build_geometry_inspector()
+    workspace._update_geometry_inspector()
+    assert workspace._edge_mech_select.ui_disable is True
+    assert workspace._edge_em_select.ui_disable is False
 
     project, _ = workspace._canvas_projection()
     workspace._move_region_from_canvas_drag(
@@ -1217,6 +1247,7 @@ def test_nested_mechanical_regions_use_default_shared_contour_and_update_after_m
     assert child["parent_id"] is None
     assert all(
         interface["id"] in next(edge for edge in workspace.model["geometry"]["edges"] if edge["id"] == edge_id)["boundary_condition_ids"]
+        and not next(edge for edge in workspace.model["geometry"]["edges"] if edge["id"] == edge_id).get("mechanical_boundary_locked")
         for edge_id in child["edge_ids"]
     )
 
@@ -1325,7 +1356,7 @@ def test_dragging_region_rejects_crossing_another_region(standalone_components):
 
     assert child["shape"] == before_shape
     assert child["vertices"] == before_vertices
-    assert "crossing or touching" in workspace.message
+    assert "interiors cannot overlap" in workspace.message
 
 
 def test_canvas_drag_on_region_body_moves_region_instead_of_box_selecting_edges(standalone_components):
@@ -1377,7 +1408,7 @@ def test_drag_box_selects_enclosed_or_crossed_edges_and_shift_adds(standalone_co
     workspace._select_edges_in_canvas_box(
         (narrow[1], narrow[2]), (narrow[0], narrow[3])
     )
-    assert workspace.selected_edge_ids == [edge["id"]]
+    assert set(workspace.selected_edge_ids) == set(region["edge_ids"])
     workspace._select_edges_in_canvas_box(
         (left, top), (right, bottom), additive=True
     )
@@ -1893,30 +1924,35 @@ def test_boundary_stage_edge_hit_has_priority_over_region_hit(standalone_compone
     assert workspace.selected_region_id is None
 
 
-def test_boundary_stage_applies_one_condition_to_the_unified_selection(standalone_components):
+def test_boundary_stage_assigns_active_condition_on_click_and_toggle_keeps_assignment(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
     region = workspace.model["geometry"]["regions"][0]
     condition = {"id": "boundary-test", "name": "Outer reference", "type": "magnetic_potential_zero"}
     workspace.model["boundary_conditions"].append(condition)
     workspace.select_boundary(condition["id"])
+    workspace._boundary_properties()
+
+    assert not hasattr(workspace, "_boundary_apply_selection_button")
     non_axis_edges = [
         edge["id"] for edge in workspace.model["geometry"]["edges"]
         if not all(abs(float(point[0])) <= 1e-12 for point in edge["vertices"])
     ]
-    workspace._set_boundary_stage_selection(non_axis_edges[:2])
-    workspace._boundary_properties()
+    edge_id = non_axis_edges[0]
+    workspace.toggle_boundary_stage_edge(edge_id)
+    assert workspace.selected_edge_ids == [edge_id]
+    edge = next(item for item in workspace.model["geometry"]["edges"] if item["id"] == edge_id)
+    assert condition["id"] in edge["boundary_condition_ids"]
 
-    assert workspace._boundary_apply_selection_button.ui_disable is False
-    workspace._apply_selected_boundary_condition()
+    workspace.toggle_boundary_stage_edge(edge_id)
+    assert workspace.selected_edge_ids == []
+    assert condition["id"] in edge["boundary_condition_ids"]
 
-    assigned = {
-        edge["id"] for edge in workspace.model["geometry"]["edges"]
-        if condition["id"] in edge.get("boundary_condition_ids", [])
-    }
-    assert set(non_axis_edges[:2]) <= assigned
-    assert region["id"] in {item["id"] for item in workspace.model["geometry"]["regions"]}
-
+    workspace.toggle_boundary_stage_region(region["id"])
+    assert set(workspace.selected_edge_ids) == set(region["edge_ids"])
+    assert workspace.active_section == "boundaries"
+    workspace.toggle_boundary_stage_region(region["id"])
+    assert workspace.selected_edge_ids == []
 
 def test_region_properties_explain_the_current_sketch_constraint_scope(standalone_components):
     workspace = SolveWorkspace()
@@ -2805,3 +2841,178 @@ def test_committed_pan_projection_matches_the_visible_browser_transform(standalo
     visible_after = [after(point) for point in points]
     for old, new in zip(visible_before, visible_after):
         assert new == pytest.approx((scale * old[0] + tx, scale * old[1] + ty))
+
+
+
+def test_adjacent_mechanical_regions_share_locked_default_boundary(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.0,
+        ("rectangle", "z_min"): 0.0,
+        ("rectangle", "width"): 0.01,
+        ("rectangle", "height"): 0.01,
+    })
+    workspace._add_primitive("rectangle")
+    first = workspace.model["geometry"]["regions"][0]
+
+    # This rectangle shares only part of the first region's right edge.
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.01,
+        ("rectangle", "z_min"): 0.002,
+        ("rectangle", "width"): 0.006,
+        ("rectangle", "height"): 0.004,
+    })
+    workspace._add_primitive("rectangle")
+    second = workspace.model["geometry"]["regions"][1]
+    first["mechanical"] = True
+    second["mechanical"] = True
+    workspace._rebuild_edges()
+
+    shared_ids = set(first["edge_ids"]) & set(second["edge_ids"])
+    shared = [
+        edge for edge in workspace.model["geometry"]["edges"]
+        if edge["id"] in shared_ids
+    ]
+    assert len(shared) == 1
+    assert shared[0]["vertices"] == [[0.01, 0.002], [0.01, 0.006]]
+    assert shared[0]["mechanical_boundary_locked"] is True
+    assert not any(
+        condition.get("type", "").startswith("mechanical_")
+        or condition.get("type") == "transmission_interface"
+        for condition in workspace.model["boundary_conditions"]
+        if condition.get("id") in shared[0]["boundary_condition_ids"]
+    )
+
+    workspace.model["boundary_conditions"].append({
+        "id": "manual-fixed", "name": "Fixed", "type": "mechanical_fixed"
+    })
+    workspace._set_edge_condition(shared[0]["id"], "mechanical", "manual-fixed")
+    assert not any(
+        condition_id == "manual-fixed"
+        for condition_id in shared[0]["boundary_condition_ids"]
+    )
+
+
+def test_tangent_regions_are_allowed_and_interior_overlap_is_rejected(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.0,
+        ("rectangle", "z_min"): 0.0,
+        ("rectangle", "width"): 0.01,
+        ("rectangle", "height"): 0.01,
+    })
+    workspace._add_primitive("rectangle")
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.01,
+        ("rectangle", "z_min"): 0.003,
+        ("rectangle", "width"): 0.004,
+        ("rectangle", "height"): 0.004,
+    })
+    workspace._add_primitive("rectangle")
+    first, second = workspace.model["geometry"]["regions"]
+    assert set(first["edge_ids"]) & set(second["edge_ids"])
+
+    overlapping_vertices = [
+        [0.009, 0.003], [0.013, 0.003], [0.013, 0.007], [0.009, 0.007]
+    ]
+    assert workspace._has_unsupported_overlap(overlapping_vertices, None)
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.009,
+        ("rectangle", "z_min"): 0.003,
+        ("rectangle", "width"): 0.004,
+        ("rectangle", "height"): 0.004,
+    })
+    workspace._add_primitive("rectangle")
+    assert len(workspace.model["geometry"]["regions"]) == 2
+    assert "interiors cannot overlap" in workspace.message
+
+
+def test_boundary_stage_blank_drag_is_marquee_and_shape_tool_remains_drawable(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.select_section("boundaries")
+    workspace.set_sketch_tool("rectangle", announce=False)
+    project, _ = workspace._canvas_projection()
+    start, end = project((0.003, 0.002)), project((0.008, 0.007))
+    points = iter((start, (start[0] + 20.0, start[1] + 20.0), end))
+    workspace._canvas_event_point = lambda event, refresh_transform=False: next(points)
+    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0}))
+    assert workspace._canvas_drag["operation"] == "draw"
+    workspace._on_canvas_mouse_move(SimpleNamespace(value={}))
+    workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
+    assert len(workspace.model["geometry"]["regions"]) == 1
+
+    workspace.set_sketch_tool("select", announce=False)
+    workspace._canvas_event_point = lambda event, refresh_transform=False: (10.0, 10.0)
+    workspace._on_canvas_mouse_down(SimpleNamespace(value={"button": 0}))
+    assert workspace._canvas_drag["operation"] == "marquee"
+
+
+
+def test_static_electromagnetic_study_has_no_frequency_input(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.model["physics"]["dc_magnetic"]["enabled"] = True
+    workspace.model["physics"]["harmonic_electromagnetic"]["enabled"] = False
+
+    def walk(component):
+        yield component
+        for child in getattr(component, "ui_children", []) or []:
+            yield from walk(child)
+
+    labels = [
+        str(getattr(component, "ui_label", ""))
+        for component in walk(Div(*workspace._study_properties()))
+    ]
+    assert "Frequency points (comma separated)" not in labels
+    assert any(
+        getattr(component, "ui_children", None)
+        == ["Static electromagnetic study; no frequency is required."]
+        for component in walk(Div(*workspace._study_properties()))
+    )
+
+
+
+def test_marquee_selects_multiple_regions_in_one_window(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.02,
+        ("rectangle", "z_min"): 0.02,
+        ("rectangle", "width"): 0.006,
+        ("rectangle", "height"): 0.007,
+    })
+    workspace._add_primitive("rectangle")
+    regions = workspace.model["geometry"]["regions"]
+    project, _ = workspace._canvas_projection()
+    projected = [
+        project(point)
+        for region in regions
+        for point in region["vertices"]
+    ]
+    box = (
+        min(point[0] for point in projected) - 2,
+        min(point[1] for point in projected) - 2,
+        max(point[0] for point in projected) + 2,
+        max(point[1] for point in projected) + 2,
+    )
+
+    workspace._select_edges_in_canvas_box(
+        (box[0], box[1]), (box[2], box[3])
+    )
+
+    assert set(workspace.selected_region_ids) == {
+        region["id"] for region in regions
+    }
+    assert len(workspace.selected_edge_ids) == 8
+    assert len(workspace.selected_edge_ids) == len(set(workspace.selected_edge_ids))
+
+
+def test_boundary_condition_add_button_is_at_the_top_of_properties(standalone_components):
+    workspace = SolveWorkspace()
+    properties = workspace._boundary_properties()
+    add_button = next(
+        component for component in properties
+        if getattr(component, "ui_label", None) == "Add boundary condition"
+    )
+
+    assert properties.index(add_button) <= 1
+    assert not hasattr(workspace, "_boundary_apply_selection_button")

@@ -593,16 +593,30 @@ def validate_model(model: dict) -> list[str]:
             valid_regions.append((region, points))
     for index, (first, first_points) in enumerate(valid_regions):
         for second, second_points in valid_regions[index + 1:]:
-            if not _strictly_contains(first_points, second_points) and not _strictly_contains(second_points, first_points) and _polygons_overlap(first_points, second_points):
-                errors.append(f"Regions '{first.get('name')}' and '{second.get('name')}' cross or touch; only strictly nested or disjoint regions are supported.")
+            first_area = abs(_signed_area(first_points))
+            second_area = abs(_signed_area(second_points))
+            tolerance = _area_tolerance(first_points, second_points)
+            nested = (
+                first_area > second_area + tolerance
+                and _contains_or_touches(first_points, second_points)
+            ) or (
+                second_area > first_area + tolerance
+                and _contains_or_touches(second_points, first_points)
+            )
+            if not nested and _polygons_overlap_interior(first_points, second_points):
+                errors.append(
+                    f"Regions '{first.get('name')}' and '{second.get('name')}' overlap; "
+                    "boundaries may touch, but region interiors must not overlap."
+                )
     for region, points in valid_regions:
         child_area = abs(_signed_area(points))
         containers = [
             (abs(_signed_area(outer_points)), outer.get("id"))
             for outer, outer_points in valid_regions
             if outer.get("id") != region.get("id")
-            and abs(_signed_area(outer_points)) > child_area
-            and _strictly_contains(outer_points, points)
+            and abs(_signed_area(outer_points))
+                > child_area + _area_tolerance(outer_points, points)
+            and _contains_or_touches(outer_points, points)
         ]
         expected_parent = min(containers)[1] if containers else None
         if region.get("parent_id") != expected_parent:
@@ -745,19 +759,66 @@ def validate_model(model: dict) -> list[str]:
                 errors.append(f"Edge '{edge.get('name', edge_id)}' references a missing boundary condition.")
 
     expected_edge_keys = set()
-    for region in valid_regions:
-        region_data, points = region
-        keys = {
-            _coordinate_edge_key([points[index], points[(index + 1) % len(points)]])
-            for index in range(len(points))
-        }
-        expected_edge_keys.update(keys)
+    outline_tolerance = 1e-9
+    for region_data, points in valid_regions:
+        expected_region_ids = set()
+        for index, start_point in enumerate(points):
+            end_point = points[(index + 1) % len(points)]
+            dx = end_point[0] - start_point[0]
+            dy = end_point[1] - start_point[1]
+            length_squared = dx * dx + dy * dy
+            if length_squared <= 1e-30:
+                continue
+            candidates = []
+            for edge in edge_list:
+                edge_id = edge.get("id")
+                edge_points = edge.get("vertices")
+                if not isinstance(edge_points, list) or len(edge_points) != 2:
+                    continue
+                try:
+                    first_point = (float(edge_points[0][0]), float(edge_points[0][1]))
+                    second_point = (float(edge_points[1][0]), float(edge_points[1][1]))
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    continue
+                if not (
+                    _point_on_segment(first_point, start_point, end_point, outline_tolerance)
+                    and _point_on_segment(second_point, start_point, end_point, outline_tolerance)
+                ):
+                    continue
+                first_t = (
+                    (first_point[0] - start_point[0]) * dx
+                    + (first_point[1] - start_point[1]) * dy
+                ) / length_squared
+                second_t = (
+                    (second_point[0] - start_point[0]) * dx
+                    + (second_point[1] - start_point[1]) * dy
+                ) / length_squared
+                lower, upper = sorted((first_t, second_t))
+                if upper - lower > outline_tolerance:
+                    candidates.append((lower, upper, edge_id, edge_key_by_id.get(edge_id)))
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            cursor = 0.0
+            for lower, upper, edge_id, key in candidates:
+                if lower > cursor + outline_tolerance:
+                    break
+                if upper > cursor + outline_tolerance:
+                    cursor = upper
+                    if isinstance(edge_id, str):
+                        expected_region_ids.add(edge_id)
+                    if key is not None:
+                        expected_edge_keys.add(key)
+            if cursor < 1.0 - outline_tolerance:
+                errors.append(
+                    f"Region '{region_data.get('name')}' has a sketch edge without complete boundary coverage."
+                )
         region_edge_ids = region_data.get("edge_ids")
-        if not isinstance(region_edge_ids, list) or len(region_edge_ids) != len(keys):
-            errors.append(f"Region '{region_data.get('name')}' does not have an id for each sketch edge.")
+        if not isinstance(region_edge_ids, list):
+            errors.append(f"Region '{region_data.get('name')}' must reference its sketch edges.")
+        elif len(region_edge_ids) != len(set(region_edge_ids)):
+            errors.append(f"Region '{region_data.get('name')}' repeats a sketch edge id.")
         elif any(edge_id not in edge_ids for edge_id in region_edge_ids):
             errors.append(f"Region '{region_data.get('name')}' references a missing sketch edge.")
-        elif {edge_key_by_id[edge_id] for edge_id in region_edge_ids if edge_id in edge_key_by_id} != keys:
+        elif set(region_edge_ids) != expected_region_ids:
             errors.append(f"Region '{region_data.get('name')}' edge ids do not match its sketch geometry.")
     if set(edge_keys) != expected_edge_keys:
         errors.append("Geometry edge list does not match the region outlines.")
@@ -804,7 +865,7 @@ def validate_model(model: dict) -> list[str]:
         if not isinstance(section, dict) or not isinstance(section.get("enabled", False), bool):
             errors.append(f"Physics setting '{key}' must contain an enabled boolean.")
     harmonic = physics.get("harmonic_electromagnetic", {})
-    if isinstance(harmonic, dict):
+    if isinstance(harmonic, dict) and harmonic.get("enabled", False):
         check_unit("Default frequency", harmonic.get("frequency_hz", "500"), "Hz")
         try:
             frequency = evaluate_expression(harmonic.get("frequency_hz", "500"), parameter_map)
@@ -899,9 +960,10 @@ def validate_model(model: dict) -> list[str]:
         errors.append(f"Solver settings: {error}.")
 
     studies = model.get("studies", [])
+    harmonic_enabled = bool(physics.get("harmonic_electromagnetic", {}).get("enabled", False))
     if studies is not None and not isinstance(studies, list):
         errors.append("Studies must be a list.")
-    elif isinstance(studies, list):
+    elif isinstance(studies, list) and harmonic_enabled:
         for study in studies:
             if not isinstance(study, dict):
                 errors.append("Each study must be an object.")
@@ -1024,6 +1086,90 @@ def _strictly_contains(outer, inner):
     )
 
 
+
+def _area_tolerance(first, second):
+    first_width = max(p[0] for p in first) - min(p[0] for p in first)
+    first_height = max(p[1] for p in first) - min(p[1] for p in first)
+    second_width = max(p[0] for p in second) - min(p[0] for p in second)
+    second_height = max(p[1] for p in second) - min(p[1] for p in second)
+    scale = max(first_width, first_height, second_width, second_height, 1e-12)
+    return max(abs(_signed_area(first)), abs(_signed_area(second)), 1e-30) * 1e-12
+
+
+def _contains_or_touches(outer, inner):
+    if len(outer) < 3 or len(inner) < 3:
+        return False
+    return all(
+        _point_in_polygon(point, outer)
+        or any(
+            _point_on_segment(
+                point,
+                outer[index],
+                outer[(index + 1) % len(outer)],
+            )
+            for index in range(len(outer))
+        )
+        for point in inner
+    )
+
+
+def _polygons_overlap_interior(first, second):
+    if len(first) < 3 or len(second) < 3:
+        return False
+    first_bounds = (
+        min(p[0] for p in first), max(p[0] for p in first),
+        min(p[1] for p in first), max(p[1] for p in first),
+    )
+    second_bounds = (
+        min(p[0] for p in second), max(p[0] for p in second),
+        min(p[1] for p in second), max(p[1] for p in second),
+    )
+    if (
+        first_bounds[1] <= second_bounds[0]
+        or second_bounds[1] <= first_bounds[0]
+        or first_bounds[3] <= second_bounds[2]
+        or second_bounds[3] <= first_bounds[2]
+    ):
+        return False
+    if any(_point_in_polygon(point, second) for point in first):
+        return True
+    if any(_point_in_polygon(point, first) for point in second):
+        return True
+
+    scale = max(
+        first_bounds[1] - first_bounds[0],
+        first_bounds[3] - first_bounds[2],
+        second_bounds[1] - second_bounds[0],
+        second_bounds[3] - second_bounds[2],
+        1e-12,
+    )
+    tolerance = scale * scale * 1e-12
+
+    def orient(p, q, r):
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+    for i, p in enumerate(first):
+        q = first[(i + 1) % len(first)]
+        for j, r in enumerate(second):
+            t = second[(j + 1) % len(second)]
+            o1, o2 = orient(p, q, r), orient(p, q, t)
+            o3, o4 = orient(r, t, p), orient(r, t, q)
+            if (
+                ((o1 > tolerance and o2 < -tolerance) or (o1 < -tolerance and o2 > tolerance))
+                and ((o3 > tolerance and o4 < -tolerance) or (o3 < -tolerance and o4 > tolerance))
+            ):
+                return True
+
+    first_center = (
+        sum(p[0] for p in first) / len(first),
+        sum(p[1] for p in first) / len(first),
+    )
+    second_center = (
+        sum(p[0] for p in second) / len(second),
+        sum(p[1] for p in second) / len(second),
+    )
+    return _point_in_polygon(first_center, second) or _point_in_polygon(second_center, first)
+
 def _polygons_overlap(first, second):
     first_bounds = (min(p[0] for p in first), max(p[0] for p in first), min(p[1] for p in first), max(p[1] for p in first))
     second_bounds = (min(p[0] for p in second), max(p[0] for p in second), min(p[1] for p in second), max(p[1] for p in second))
@@ -1053,7 +1199,7 @@ def _simple_polygon(points):
     return True
 
 
-def validate_studies(studies: dict, parameters=None) -> list[str]:
+def validate_studies(studies: dict, parameters=None, *, physics=None) -> list[str]:
     """Validate the initially supported DC/time-harmonic sweep definition."""
     errors = []
     if not isinstance(studies, dict) or studies.get("schema") != SCHEMA:
@@ -1069,6 +1215,12 @@ def validate_studies(studies: dict, parameters=None) -> list[str]:
         return ["The study definition must be an object."]
     if not str(study.get("id", "")).strip() or not str(study.get("name", "")).strip():
         errors.append("The study needs an id and a name.")
+    harmonic_enabled = (
+        True if physics is None
+        else bool((physics.get("harmonic_electromagnetic") or {}).get("enabled", False))
+    )
+    if not harmonic_enabled:
+        return errors
     points = study.get("frequency_hz", [])
     if isinstance(points, str):
         points = [part.strip() for part in points.split(",") if part.strip()]
@@ -1102,7 +1254,7 @@ def package_model(model: dict, studies: dict | None = None, layout: dict | None 
         for item in model.get("parameters", [])
         if isinstance(item, dict) and item.get("name")
     }
-    study_errors = validate_studies(studies, parameter_map)
+    study_errors = validate_studies(studies, parameter_map, physics=model.get("physics"))
     if study_errors:
         raise ValueError("Cannot save studies: " + " ".join(study_errors))
     layout = layout or {"schema_version": 1, "active_section": "geometry", "camera": "fit"}
@@ -1128,7 +1280,7 @@ def serialize_model_json(model: dict, studies: dict | None = None, layout: dict 
         for item in model.get("parameters", [])
         if isinstance(item, dict) and item.get("name")
     }
-    study_errors = validate_studies(studies, parameter_map)
+    study_errors = validate_studies(studies, parameter_map, physics=model.get("physics"))
     if study_errors:
         raise ValueError("Cannot save studies: " + " ".join(study_errors))
     layout = layout or {"schema_version": 1, "active_section": "geometry", "camera": "fit"}
@@ -1162,7 +1314,7 @@ def _validate_unpacked_model(model, studies, layout):
         for item in model.get("parameters", [])
         if isinstance(item, dict) and item.get("name")
     }
-    study_errors = validate_studies(studies, parameter_map)
+    study_errors = validate_studies(studies, parameter_map, physics=model.get("physics"))
     if study_errors:
         raise ValueError("Invalid studies: " + " ".join(study_errors))
     if not isinstance(layout, dict):

@@ -15,7 +15,7 @@ import netgen.meshing as ngm
 import ngsolve as ngs
 
 
-DEFAULT_SECTORS = 32
+DEFAULT_SECTORS = 24
 MAX_TETRAHEDRA = 900_000
 MIN_SECTORS = 8
 

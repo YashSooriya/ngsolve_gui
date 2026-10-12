@@ -74,6 +74,20 @@ class SliceViewSection(Section):
                 "visible while the selected region is temporarily hidden."
             ),
         )
+        comp._slice_view_section = self
+        self.set_feature_available(comp.slice_available, comp.slice_region_options)
+
+    def set_feature_available(self, available, region_options):
+        available = bool(available)
+        self.ui_hidden = not available
+        self._switch.ui_disable = not available
+        self.region.ui_options = list(region_options)
+        self.region.ui_model_value = self.comp.slice_region.value
+
+    def _on_head_click(self, event=None):
+        if not self.comp.slice_available:
+            return
+        super()._on_head_click(event)
 
     def _set_axis(self, event):
         value = str(getattr(event, "value", event)).lower()

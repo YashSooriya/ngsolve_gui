@@ -12,6 +12,7 @@ from ngsolve_gui.axisymmetric_model import (
     package_model,
     unpack_model,
     validate_model,
+    validate_studies,
 )
 
 
@@ -220,7 +221,7 @@ def test_overlapping_domains_and_wrong_parent_are_rejected():
     model = _nested_model()
     model["geometry"]["regions"][1]["vertices"][0][0] = 0.021
     errors = validate_model(model)
-    assert any("cross or touch" in error for error in errors)
+    assert any("region interiors must not overlap" in error for error in errors)
 
     model = _nested_model()
     model["geometry"]["regions"][1]["parent_id"] = None
@@ -262,3 +263,86 @@ def test_sweeps_are_single_study_frequency_lists():
     studies["studies"].append(dict(studies["studies"][0], id="second"))
     with pytest.raises(ValueError, match="Exactly one"):
         package_model(new_model(), studies)
+
+
+def test_static_only_study_does_not_require_frequency():
+    model = new_model()
+    model["physics"]["dc_magnetic"]["enabled"] = True
+    model["physics"]["harmonic_electromagnetic"]["enabled"] = False
+    model["physics"]["harmonic_electromagnetic"]["frequency_hz"] = "invalid-unused-frequency"
+    studies = new_studies()
+    studies["studies"][0]["frequency_hz"] = []
+
+    assert validate_studies(studies, physics=model["physics"]) == []
+    assert not any("Default frequency" in error for error in validate_model(model))
+    package_model(model, studies)
+
+
+
+
+
+def _rebuild_test_edges(model):
+    edge_by_key = {}
+    edges = []
+    for region in model["geometry"]["regions"]:
+        region["edge_ids"] = []
+        points = region["vertices"]
+        for index, first in enumerate(points):
+            second = points[(index + 1) % len(points)]
+            key = tuple(sorted((
+                tuple(round(float(value), 12) for value in first),
+                tuple(round(float(value), 12) for value in second),
+            )))
+            edge = edge_by_key.get(key)
+            if edge is None:
+                edge = {
+                    "id": f"edge-{len(edges) + 1}",
+                    "name": f"Edge {len(edges) + 1}",
+                    "vertices": [list(first), list(second)],
+                    "boundary_condition_ids": [],
+                }
+                edge_by_key[key] = edge
+                edges.append(edge)
+            region["edge_ids"].append(edge["id"])
+    axis_id = next(
+        item["id"] for item in model["boundary_conditions"]
+        if item["type"] == "axis_of_symmetry"
+    )
+    for edge in edges:
+        if all(abs(float(point[0])) <= 1e-12 for point in edge["vertices"]):
+            edge["boundary_condition_ids"] = [axis_id]
+    model["geometry"]["edges"] = edges
+
+def test_tangent_adjacent_regions_validate_with_no_parent():
+    model = _nested_model()
+    coil = model["geometry"]["regions"][1]
+    coil["vertices"] = [
+        [0.02, 0.003], [0.024, 0.003], [0.024, 0.008], [0.02, 0.008]
+    ]
+    coil["shape"].update({
+        "r_min": 0.02, "z_min": 0.003, "width": 0.004, "height": 0.005
+    })
+    coil["shape"]["dimension_expressions"] = {
+        "r_min": "0.02", "z_min": "0.003", "width": "0.004", "height": "0.005"
+    }
+    coil["parent_id"] = None
+    _rebuild_test_edges(model)
+
+    assert validate_model(model) == []
+
+
+def test_tangent_nested_region_may_touch_its_container():
+    model = _nested_model()
+    coil = model["geometry"]["regions"][1]
+    coil["vertices"] = [
+        [0.0, 0.003], [0.004, 0.003], [0.004, 0.008], [0.0, 0.008]
+    ]
+    coil["shape"].update({
+        "r_min": 0.0, "z_min": 0.003, "width": 0.004, "height": 0.005
+    })
+    coil["shape"]["dimension_expressions"] = {
+        "r_min": "0", "z_min": "0.003", "width": "0.004", "height": "0.005"
+    }
+    _rebuild_test_edges(model)
+
+    assert validate_model(model) == []

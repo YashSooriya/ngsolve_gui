@@ -90,17 +90,31 @@ def test_axisymmetric_revolution_control_switches_viewport_dimension(
 
         assert component.axisymmetric_revolution_available
         assert component.mesh.dim == 2
+        assert not component.slice_available
+        assert component.slice_feature_available
         assert any(
             section.__name__ == "AxisymmetricRevolutionSection"
             for section in component.property_sections
         )
+        assert any(
+            section.__name__ == "SliceViewSection"
+            for section in component.property_sections
+        )
+
         component.axisymmetric_revolved.value = True
         assert component.mesh.dim == 3
         assert component.cf.dim == 1
+        assert component.slice_available
+        assert component.slice_region_options[0] == "All regions"
+        assert component.slice_renderer is not None
         assert component._clip_toolbar is not None
+        component.slice_enabled.value = True
+        assert component.slice_renderer.active
 
         component.axisymmetric_revolved.value = False
         assert component.mesh.dim == 2
+        assert not component.slice_available
+        assert not component.slice_enabled.value
         assert component._clip_toolbar is None
     finally:
         if previous_region_visibility is missing_region_visibility:

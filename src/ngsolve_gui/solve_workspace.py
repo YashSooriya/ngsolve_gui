@@ -364,6 +364,7 @@ class SolveWorkspace(Div):
         self._history_limit = 100
         self.active_section = "geometry"
         self.selected_region_id = None
+        self.selected_region_ids = []
         self.selected_edge_id = None
         self.selected_edge_ids = []
         self.message = "Choose Rectangle or Circle in the viewport toolbar to begin. Enter lengths in SI metres (m)."
@@ -998,7 +999,7 @@ class SolveWorkspace(Div):
             for item in model.get("parameters", [])
             if isinstance(item, dict) and item.get("name")
         }
-        study_errors = validate_studies(studies, parameter_map)
+        study_errors = validate_studies(studies, parameter_map, physics=model.get("physics"))
         if study_errors:
             raise ValueError("Invalid studies: " + " ".join(study_errors))
         self._cancel_model_rename()
@@ -1017,6 +1018,7 @@ class SolveWorkspace(Div):
         requested_section = self.layout.get("active_section", "geometry")
         self.active_section = requested_section if requested_section in {key for key, _, _ in _SECTIONS} else "geometry"
         self.selected_region_id = None
+        self.selected_region_ids = []
         self.selected_edge_id = None
         self.selected_edge_ids = []
         self._canvas_drag = None
@@ -1864,7 +1866,7 @@ class SolveWorkspace(Div):
     if (pointerEvents.length > 256) pointerEvents.splice(0, pointerEvents.length - 256);
   };
   const updateHover = (event, svg) => {
-    if (!svg || !window.__ngsolveSketchBoundarySelection) return;
+    if (!svg || !window.__ngsolveSketchBoundarySelection || (window.__ngsolveSketchTool || 'select') !== 'select') return;
     const target = document.elementFromPoint(event.clientX, event.clientY);
     const edgeHit = target && target.closest ? target.closest('[data-sketch-edge-role="hit"]') : null;
     const regionHit = !edgeHit && target && target.closest ? target.closest('[data-sketch-region-role="shape"]') : null;
@@ -1878,7 +1880,7 @@ class SolveWorkspace(Div):
       const highlighted = line.getAttribute('data-sketch-condition-highlight') === 'true';
       const hovered = line.getAttribute('data-sketch-edge-id') === edgeId;
       line.setAttribute('stroke', selected ? '#0877b9' : (hovered ? '#e29a12' : (highlighted ? '#c66f16' : '#263746')));
-      line.setAttribute('stroke-width', selected ? '3.2' : (hovered ? '3.1' : (highlighted ? '2.2' : '1.6')));
+      line.setAttribute('stroke-width', selected ? '4.6' : (hovered ? '4.4' : (highlighted ? '4.2' : '1.6')));
     });
     svg.querySelectorAll('[data-sketch-region-role="shape"]').forEach((shape) => {
       const selected = shape.getAttribute('data-sketch-selected') === 'true';
@@ -2060,8 +2062,7 @@ class SolveWorkspace(Div):
     const edge = event.target && event.target.closest
       ? event.target.closest('[data-sketch-edge-id]')
       : null;
-    const selectionEnabled = (window.__ngsolveSketchTool || 'select') === 'select'
-      || Boolean(window.__ngsolveSketchBoundarySelection);
+    const selectionEnabled = (window.__ngsolveSketchTool || 'select') === 'select';
     dragRegionId = selectionEnabled && region
       ? region.getAttribute('data-sketch-region-id')
       : null;
@@ -2072,10 +2073,10 @@ class SolveWorkspace(Div):
     const tool = window.__ngsolveSketchTool || 'select';
     dragMode = middlePan
       ? 'pan'
-      : tool !== 'select' && !window.__ngsolveSketchBoundarySelection
+      : tool !== 'select'
         ? 'draw'
         : window.__ngsolveSketchBoundarySelection
-          ? (dragEdgeId ? 'edge' : (dragRegionId ? 'region' : 'boundary'))
+          ? (dragEdgeId ? 'edge' : (dragRegionId ? 'region' : 'marquee'))
           : (event.shiftKey || event.ctrlKey)
             ? 'marquee'
             : dragEdgeId
@@ -2481,7 +2482,7 @@ class SolveWorkspace(Div):
             return
         if button not in {0, 1}:
             return
-        tool = "select" if self.active_section == "boundaries" else self.sketch_tool
+        tool = self.sketch_tool
         middle_pan = button == 1
         # Resolve the hit target before _canvas_event_point consumes the
         # matching browser pointer record to obtain clientX/clientY.
@@ -2506,7 +2507,7 @@ class SolveWorkspace(Div):
         elif tool != "select":
             operation = "draw"
         elif self.active_section == "boundaries":
-            operation = "edge" if edge_id else ("region" if region_id else "boundary")
+            operation = "edge" if edge_id else ("region" if region_id else "marquee")
         elif value.get("shiftKey") or value.get("ctrlKey"):
             operation = "marquee"
         elif edge_id:
@@ -2611,15 +2612,25 @@ class SolveWorkspace(Div):
                     view_changed = self._commit_browser_canvas_view(
                         view, render=False, clamp_negative_r=True
                     )
-                    if not moved:
+                    if moved and operation == "draw":
+                        before = len(self.model["geometry"].get("regions", []))
+                        self._create_region_from_canvas_drag(tool, start, end)
+                        if len(self.model["geometry"].get("regions", [])) == before and view_changed:
+                            self._render_canvas_after_interaction()
+                    elif moved and operation == "marquee":
+                        self._select_edges_in_canvas_box(start, end, additive=additive, boundary_stage=True)
+                    elif moved and operation == "pan":
+                        if view_changed:
+                            self._render_canvas_after_interaction()
+                        else:
+                            self._schedule_canvas_interaction_reset()
+                    elif not moved:
                         if edge_id:
                             self.toggle_boundary_stage_edge(edge_id)
                         elif region_id:
-                            self.add_boundary_stage_region(region_id)
-                    if view_changed:
+                            self.toggle_boundary_stage_region(region_id)
+                    if view_changed and operation not in {"pan", "draw"}:
                         self._render_canvas_after_interaction()
-                    elif moved and operation == "pan":
-                        self._schedule_canvas_interaction_reset()
                     return
                 self._canvas_drag = None
                 self._screen_to_svg = None
@@ -2674,11 +2685,17 @@ class SolveWorkspace(Div):
         self._canvas_drag = None
         self._screen_to_svg = None
         if self.active_section == "boundaries":
-            if not moved:
+            if moved and drag["operation"] == "draw":
+                self._create_region_from_canvas_drag(drag["tool"], start, end)
+            elif moved and drag["operation"] == "marquee":
+                self._select_edges_in_canvas_box(start, end, additive=drag["additive"], boundary_stage=True)
+            elif not moved:
                 if drag.get("edge_id"):
                     self.toggle_boundary_stage_edge(drag["edge_id"])
                 elif drag.get("region_id"):
-                    self.add_boundary_stage_region(drag["region_id"])
+                    self.toggle_boundary_stage_region(drag["region_id"])
+            elif moved and drag["operation"] == "pan":
+                self._pan_canvas_by_pixels(start, end)
             return
         if moved and drag["operation"] in {"region", "edge"} and drag.get("region_id"):
             self._move_region_from_canvas_drag(drag["region_id"], start, end)
@@ -2741,35 +2758,63 @@ class SolveWorkspace(Div):
             for component, data, method, blocking in queued.values():
                 send_update(component, data, method, blocking=blocking)
 
-    def _select_edges_in_canvas_box(self, start, end, *, additive=False):
-        project, _ = self._canvas_projection()
+    def _select_edges_in_canvas_box(self, start, end, *, additive=False, boundary_stage=False):
+        project, unproject = self._canvas_projection()
         box = (min(start[0], end[0]), max(start[0], end[0]), min(start[1], end[1]), max(start[1], end[1]))
         window_selection = end[0] >= start[0]
         selected = []
-        for edge in self.model["geometry"].get("edges", []):
-            points = [project(point) for point in edge.get("vertices", [])]
-            if len(points) != 2:
+        selected_regions = []
+        box_corners = [unproject((x, y)) for x in (box[0], box[1]) for y in (box[2], box[3])]
+        for region in self.model["geometry"].get("regions", []):
+            vertices = region.get("vertices", [])
+            points = [project(point) for point in vertices]
+            if len(points) < 3:
                 continue
             if window_selection:
                 matches = all(_point_in_box(point, box) for point in points)
             else:
-                matches = _segment_intersects_box(points[0], points[1], box)
+                matches = (
+                    any(_point_in_box(point, box) for point in points)
+                    or any(_segment_intersects_box(points[i], points[(i + 1) % len(points)], box) for i in range(len(points)))
+                    or any(_point_in_or_on_polygon(corner, vertices) for corner in box_corners)
+                )
+            if matches:
+                selected_regions.append(region["id"])
+                selected.extend(region.get("edge_ids", []))
+        for edge in self.model["geometry"].get("edges", []):
+            points = [project(point) for point in edge.get("vertices", [])]
+            if len(points) != 2:
+                continue
+            matches = (
+                all(_point_in_box(point, box) for point in points)
+                if window_selection
+                else _segment_intersects_box(points[0], points[1], box)
+            )
             if matches:
                 selected.append(edge["id"])
+        selected = list(dict.fromkeys(selected))
         if additive:
             selected = list(dict.fromkeys([*self.selected_edge_ids, *selected]))
+            selected_regions = list(dict.fromkeys([*getattr(self, "selected_region_ids", []), *selected_regions]))
         self.selected_edge_ids = selected
         self.selected_edge_id = selected[-1] if selected else None
-        self.selected_region_id = None
-        self._selected_condition_id = None
-        self.active_section = "geometry"
+        self.selected_region_ids = selected_regions
+        self.selected_region_id = selected_regions[0] if len(selected_regions) == 1 else None
+        self._selected_condition_id = self.selected_boundary_id if boundary_stage else None
+        self.active_section = "boundaries" if boundary_stage else "geometry"
         self.layout["active_section"] = self.active_section
         kind = "enclosed" if window_selection else "crossed"
-        self._message(f"Selected {len(selected)} {kind} edge{'s' if len(selected) != 1 else ''}.")
+        self._message(f"Selected {len(selected_regions)} region(s) and {len(selected)} unique edge(s) ({kind} selection).")
         self._update_model_tree_selection()
-        self._update_geometry_inspector()
+        if boundary_stage:
+            self._render_inspector()
+            self._sync_boundary_selection_controls()
+            self._assign_active_boundary_to_edges(selected)
+        else:
+            self._update_geometry_inspector()
         self._sync_canvas_selection()
         self._render_canvas_dimensions()
+        return selected
 
     def _create_region_from_canvas_drag(self, tool, start, end):
         if self.snap_to_grid:
@@ -3164,7 +3209,7 @@ class SolveWorkspace(Div):
                 label = "circle"
             parent_id = self._find_containing_region(vertices)
             if self._has_unsupported_overlap(vertices, parent_id):
-                raise ValueError("Regions must be nested or disjoint; crossing material boundaries are not supported yet.")
+                raise ValueError("Regions may touch, but their interiors cannot overlap.")
             used_indices = []
             for existing in self.model["geometry"]["regions"]:
                 if existing.get("shape", {}).get("type") != primitive_data["type"]:
@@ -3238,19 +3283,27 @@ class SolveWorkspace(Div):
 
     def _find_containing_region(self, vertices):
         candidates = []
+        child_area = abs(_polygon_area(vertices))
         for region in self.model["geometry"]["regions"]:
             polygon = region["vertices"]
-            if _strictly_contains(polygon, vertices):
-                area = abs(_polygon_area(polygon))
-                candidates.append((area, region["id"]))
+            outer_area = abs(_polygon_area(polygon))
+            if outer_area > child_area + _area_tolerance(polygon, vertices) and _contains_or_touches(polygon, vertices):
+                candidates.append((outer_area, region["id"]))
         return min(candidates)[1] if candidates else None
 
     def _has_unsupported_overlap(self, vertices, parent_id):
+        candidate_area = abs(_polygon_area(vertices))
         for region in self.model["geometry"]["regions"]:
             existing = region["vertices"]
-            if _strictly_contains(existing, vertices) or _strictly_contains(vertices, existing):
+            existing_area = abs(_polygon_area(existing))
+            area_tolerance = _area_tolerance(existing, vertices)
+            strictly_larger_existing = existing_area > candidate_area + area_tolerance
+            strictly_larger_candidate = candidate_area > existing_area + area_tolerance
+            if strictly_larger_existing and _contains_or_touches(existing, vertices):
                 continue
-            if _polygons_overlap(vertices, existing):
+            if strictly_larger_candidate and _contains_or_touches(vertices, existing):
+                continue
+            if _polygons_overlap_interior(vertices, existing):
                 return True
         return False
 
@@ -3259,10 +3312,19 @@ class SolveWorkspace(Div):
         for index, first in enumerate(regions):
             for second in regions[index + 1:]:
                 a, b = first["vertices"], second["vertices"]
-                if _strictly_contains(a, b) or _strictly_contains(b, a):
+                area_a, area_b = abs(_polygon_area(a)), abs(_polygon_area(b))
+                area_tolerance = _area_tolerance(a, b)
+                nested = (
+                    area_a > area_b + area_tolerance and _contains_or_touches(a, b)
+                ) or (
+                    area_b > area_a + area_tolerance and _contains_or_touches(b, a)
+                )
+                if nested:
                     continue
-                if _polygons_overlap(a, b):
-                    raise ValueError("Regions must be strictly nested or disjoint; crossing or touching material boundaries are not supported.")
+                if _polygons_overlap_interior(a, b):
+                    raise ValueError(
+                        "Regions may touch, but their interiors cannot overlap."
+                    )
         parents = {}
         for child in regions:
             child_area = abs(_polygon_area(child["vertices"]))
@@ -3270,44 +3332,177 @@ class SolveWorkspace(Div):
                 (abs(_polygon_area(outer["vertices"])), outer["id"])
                 for outer in regions
                 if outer["id"] != child["id"]
-                and abs(_polygon_area(outer["vertices"])) > child_area
-                and _strictly_contains(outer["vertices"], child["vertices"])
+                and abs(_polygon_area(outer["vertices"]))
+                    > child_area + _area_tolerance(outer["vertices"], child["vertices"])
+                and _contains_or_touches(outer["vertices"], child["vertices"])
             ]
             parents[child["id"]] = min(containers)[1] if containers else None
         for region in regions:
             region["parent_id"] = parents[region["id"]]
 
     def _rebuild_edges(self):
-        old_edges = self.model["geometry"].get("edges", [])
-        old_by_key = {_edge_key(edge["vertices"]): edge for edge in old_edges}
+        geometry = self.model["geometry"]
+        old_edges = geometry.get("edges", [])
+        selected_before = set(getattr(self, "selected_edge_ids", []))
+        old_selected = {
+            edge["id"]: edge.get("vertices")
+            for edge in old_edges
+            if edge.get("id") in selected_before
+        }
+        all_points = []
+        for region in geometry.get("regions", []):
+            all_points.extend(
+                tuple(float(value) for value in point)
+                for point in region.get("vertices", [])
+                if isinstance(point, (list, tuple)) and len(point) >= 2
+            )
+
         edges = []
-        for region in self.model["geometry"]["regions"]:
-            region_edges = []
-            points = region["vertices"]
-            for index, start in enumerate(points):
-                end = points[(index + 1) % len(points)]
-                key = _edge_key([start, end])
-                edge = old_by_key.get(key)
-                if edge is None:
-                    edge = {
-                        "id": new_id("edge"),
-                        "vertices": [list(start), list(end)],
-                        "name": f"Edge {len(edges) + 1}",
-                        "boundary_condition_ids": [],
-                    }
-                else:
-                    edge = copy.deepcopy(edge)
-                    if "boundary_condition_ids" not in edge:
-                        legacy_condition = edge.pop("boundary_condition_id", None)
-                        edge["boundary_condition_ids"] = [legacy_condition] if legacy_condition else []
-                if all(existing["id"] != edge["id"] for existing in edges):
+        edges_by_key = {}
+        used_old_ids = set()
+        source_part_counts = {}
+        condition_by_id = {
+            item.get("id"): item
+            for item in self.model.get("boundary_conditions", [])
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+
+        def source_edges_for(start, end, key):
+            matches = []
+            for old in old_edges:
+                old_points = old.get("vertices", [])
+                if len(old_points) != 2:
+                    continue
+                if (
+                    _point_on_segment(start, old_points[0], old_points[1], 1e-10)
+                    and _point_on_segment(end, old_points[0], old_points[1], 1e-10)
+                ):
+                    matches.append(old)
+            matches.sort(key=lambda old: (
+                _edge_key(old["vertices"]) != key,
+                not bool(_edge_condition_ids(old)),
+            ))
+            return matches
+
+        def merged_condition_ids(candidates):
+            by_physics = {}
+            other_ids = []
+            for old in candidates:
+                for condition_id in _edge_condition_ids(old):
+                    condition = condition_by_id.get(condition_id, {})
+                    kind = str(condition.get("type", ""))
+                    physics = (
+                        "mechanical"
+                        if kind.startswith("mechanical_") or kind == "transmission_interface"
+                        else "electromagnetic"
+                        if kind in {"axis_of_symmetry", "magnetic_potential_zero", "natural"}
+                        else "other"
+                    )
+                    if physics == "other":
+                        other_ids.append(condition_id)
+                    else:
+                        by_physics[physics] = condition_id
+            return list(dict.fromkeys([
+                *by_physics.values(),
+                *other_ids[-1:],
+            ]))
+
+        for region in geometry.get("regions", []):
+            region_edge_ids = []
+            points = region.get("vertices", [])
+            for index, raw_start in enumerate(points):
+                raw_end = points[(index + 1) % len(points)]
+                start = tuple(float(value) for value in raw_start)
+                end = tuple(float(value) for value in raw_end)
+                dx, dy = end[0] - start[0], end[1] - start[1]
+                length_squared = dx * dx + dy * dy
+                if length_squared <= 1e-30:
+                    continue
+
+                split_points = [(0.0, start), (1.0, end)]
+                min_x, max_x = sorted((start[0], end[0]))
+                min_y, max_y = sorted((start[1], end[1]))
+                for point in all_points:
+                    if (
+                        point[0] < min_x - 1e-10 or point[0] > max_x + 1e-10
+                        or point[1] < min_y - 1e-10 or point[1] > max_y + 1e-10
+                        or not _point_on_segment(point, start, end, 1e-10)
+                    ):
+                        continue
+                    t = ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / length_squared
+                    if -1e-10 <= t <= 1.0 + 1e-10:
+                        split_points.append((min(1.0, max(0.0, t)), point))
+                split_points.sort(key=lambda item: item[0])
+                ordered = []
+                seen_points = set()
+                for _t, point in split_points:
+                    point_key = tuple(round(value, 12) for value in point)
+                    if point_key not in seen_points:
+                        seen_points.add(point_key)
+                        ordered.append(point)
+
+                for first, second in zip(ordered, ordered[1:]):
+                    key = _edge_key([first, second])
+                    if key in edges_by_key:
+                        edge = edges_by_key[key]
+                        region_edge_ids.append(edge["id"])
+                        continue
+
+                    candidates = source_edges_for(first, second, key)
+                    source_edge = candidates[0] if candidates else None
+                    edge = copy.deepcopy(source_edge) if source_edge else {}
+                    old_id = source_edge.get("id") if source_edge else None
+                    if old_id and old_id not in used_old_ids:
+                        edge_id = old_id
+                        used_old_ids.add(old_id)
+                    else:
+                        edge_id = new_id("edge")
+                    edge["id"] = edge_id
+                    edge["vertices"] = [list(first), list(second)]
+                    if source_edge is None:
+                        edge["name"] = f"Edge {len(edges) + 1}"
+                        edge["boundary_condition_ids"] = []
+                    else:
+                        source_key = _edge_key(source_edge["vertices"])
+                        if source_key != key:
+                            part = source_part_counts.get(old_id, 0) + 1
+                            source_part_counts[old_id] = part
+                            edge["name"] = f"{source_edge.get('name', 'Edge')} (part {part})"
+                        edge["boundary_condition_ids"] = merged_condition_ids(candidates)
+                        edge.pop("boundary_condition_id", None)
+                    edges_by_key[key] = edge
                     edges.append(edge)
-                region_edges.append(edge["id"])
-            region["edge_ids"] = region_edges
-        self.model["geometry"]["edges"] = edges
+                    region_edge_ids.append(edge_id)
+            region["edge_ids"] = list(dict.fromkeys(region_edge_ids))
+
+        geometry["edges"] = edges
+
+        # Keep a selected old edge selected across each of its split segments.
+        if hasattr(self, "selected_edge_ids"):
+            selected_ids = set()
+            for edge in edges:
+                if edge["id"] in old_selected:
+                    selected_ids.add(edge["id"])
+                    continue
+                for old_vertices in old_selected.values():
+                    if (
+                        _point_on_segment(edge["vertices"][0], old_vertices[0], old_vertices[1], 1e-10)
+                        and _point_on_segment(edge["vertices"][1], old_vertices[0], old_vertices[1], 1e-10)
+                    ):
+                        selected_ids.add(edge["id"])
+                        break
+            self.selected_edge_ids = [
+                edge_id for edge_id in self.selected_edge_ids if edge_id in selected_ids
+            ] + [
+                edge["id"] for edge in edges
+                if edge["id"] in selected_ids and edge["id"] not in self.selected_edge_ids
+            ]
+            if self.selected_edge_id not in selected_ids:
+                self.selected_edge_id = self.selected_edge_ids[-1] if self.selected_edge_ids else None
+
         # Remove sizing and refinement assignments whose geometry was deleted.
         mesh = self.model.setdefault("mesh", {})
-        live_region_ids = {region["id"] for region in self.model["geometry"]["regions"]}
+        live_region_ids = {region["id"] for region in geometry.get("regions", [])}
         live_edge_ids = {edge["id"] for edge in edges}
         region_sizes = mesh.get("region_element_sizes", {})
         if isinstance(region_sizes, dict):
@@ -3327,7 +3522,9 @@ class SolveWorkspace(Div):
         _sync_mechanical_boundary_conditions(self.model)
         if hasattr(self, "selected_edge_ids"):
             live_ids = {edge["id"] for edge in edges}
-            self.selected_edge_ids = [edge_id for edge_id in self.selected_edge_ids if edge_id in live_ids]
+            self.selected_edge_ids = [
+                edge_id for edge_id in self.selected_edge_ids if edge_id in live_ids
+            ]
             if self.selected_edge_id not in live_ids:
                 self.selected_edge_id = self.selected_edge_ids[-1] if self.selected_edge_ids else None
 
@@ -3551,6 +3748,7 @@ class SolveWorkspace(Div):
 
     def select_source_region(self, region_id):
         self.selected_region_id = region_id
+        self.selected_region_ids = [region_id]
         self.selected_edge_id = None
         self.selected_edge_ids = []
         self._selected_condition_id = None
@@ -3604,6 +3802,7 @@ class SolveWorkspace(Div):
             self.selected_edge_ids = [edge_id]
         self.selected_edge_id = self.selected_edge_ids[-1] if self.selected_edge_ids else None
         self.selected_region_id = None
+        self.selected_region_ids = []
         self._selected_condition_id = None
         self.active_section = "geometry"
         self.layout["active_section"] = self.active_section
@@ -3620,6 +3819,7 @@ class SolveWorkspace(Div):
         self.selected_edge_ids = list(dict.fromkeys(edge_id for edge_id in edge_ids if edge_id in live_edge_ids))
         self.selected_edge_id = self.selected_edge_ids[-1] if self.selected_edge_ids else None
         self.selected_region_id = None
+        self.selected_region_ids = []
         self._selected_condition_id = self.selected_boundary_id
         self.active_section = "boundaries"
         self.layout["active_section"] = self.active_section
@@ -3628,60 +3828,71 @@ class SolveWorkspace(Div):
         self._render_canvas_dimensions()
         self._sync_boundary_selection_controls()
 
-    def add_boundary_stage_region(self, region_id):
-        """Add all boundary edges associated with a clicked region."""
+    def toggle_boundary_stage_region(self, region_id):
+        """Toggle every unique edge belonging to a clicked region."""
         region = next((item for item in self.model.get("geometry", {}).get("regions", []) if item.get("id") == region_id), None)
         if region is None:
             return
-        self._set_boundary_stage_selection([*self.selected_edge_ids, *region.get("edge_ids", [])])
+        region_edges = list(dict.fromkeys(region.get("edge_ids", [])))
+        current = list(self.selected_edge_ids)
+        if region_edges and all(edge_id in current for edge_id in region_edges):
+            blocked = set(region_edges)
+            current = [edge_id for edge_id in current if edge_id not in blocked]
+        else:
+            current = list(dict.fromkeys([*current, *region_edges]))
+        self._set_boundary_stage_selection(current)
+        if any(edge_id in current for edge_id in region_edges):
+            self._assign_active_boundary_to_edges(region_edges)
+
+    def add_boundary_stage_region(self, region_id):
+        """Backward-compatible alias for the region selection toggle."""
+        self.toggle_boundary_stage_region(region_id)
 
     def toggle_boundary_stage_edge(self, edge_id):
-        """Toggle one edge independently of how it entered the selection."""
+        """Toggle one boundary independently of any region selection."""
         live_edge_ids = {edge["id"] for edge in self.model.get("geometry", {}).get("edges", [])}
         if edge_id not in live_edge_ids:
             return
         selected = list(self.selected_edge_ids)
-        if edge_id in selected:
-            selected.remove(edge_id)
-        else:
+        added = edge_id not in selected
+        if added:
             selected.append(edge_id)
+        else:
+            selected.remove(edge_id)
         self._set_boundary_stage_selection(selected)
+        if added:
+            self._assign_active_boundary_to_edges([edge_id])
+
+    def _assign_active_boundary_to_edges(self, edge_ids):
+        condition = next((item for item in self.model.get("boundary_conditions", []) if item.get("id") == self.selected_boundary_id), None)
+        if condition is None or not edge_ids or condition.get("automatic_for_axis") or condition.get("automatic_for_mechanics"):
+            return
+        kind = str(condition.get("type", ""))
+        physics = "mechanical" if kind.startswith("mechanical_") or kind == "transmission_interface" else "electromagnetic"
+        self._set_edge_conditions(edge_ids, physics, condition["id"])
 
     def _sync_boundary_selection_controls(self):
         summary = getattr(self, "_boundary_selection_summary", None)
-        button = getattr(self, "_boundary_apply_selection_button", None)
-        if summary is None or button is None:
+        if summary is None:
             return
         selected_count = len(self.selected_edge_ids)
         condition = next((item for item in self.model.get("boundary_conditions", []) if item.get("id") == self.selected_boundary_id), None)
         if condition is None:
-            detail = "Add or select a condition in this panel, then apply it to the selected boundaries."
-            button.ui_label = f"Apply condition to {selected_count} selected boundaries"
-            button.ui_disable = selected_count == 0
+            detail = "Select a condition definition, then click a region or edge to assign it."
+        elif condition.get("automatic_for_axis") or condition.get("automatic_for_mechanics"):
+            detail = f"{condition.get('name', 'Condition')} is automatic and cannot be assigned manually."
         else:
-            detail = f"Selected condition: {condition.get('name', 'Boundary condition')} · {selected_count} {'boundary' if selected_count == 1 else 'boundaries'} selected."
-            button.ui_label = f"Apply {condition.get('name', 'condition')} to {selected_count} selected boundaries"
-            button.ui_disable = selected_count == 0 or bool(condition.get("automatic_for_axis") or condition.get("automatic_for_mechanics"))
+            detail = f"Active condition: {condition.get('name', 'Boundary condition')} - {selected_count} unique edge(s) selected."
         summary.ui_children = [
             Div("Geometry selection", ui_style="font-size:10px; font-weight:700; letter-spacing:.06em; color:var(--fg-muted);"),
-            Div("Click a region to add all its boundaries. Click an edge to toggle just that edge.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+            Div("Click a region to toggle all its boundaries. Click an edge to toggle only that edge. The active condition is assigned on each new selection.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
             Div(detail, ui_style="font-size:12px; font-weight:600; line-height:1.4; padding-top:4px;"),
         ]
-
-    def _apply_selected_boundary_condition(self, *args):
-        condition = next((item for item in self.model.get("boundary_conditions", []) if item.get("id") == self.selected_boundary_id), None)
-        if condition is None or not self.selected_edge_ids:
-            return
-        if condition.get("automatic_for_axis") or condition.get("automatic_for_mechanics"):
-            self._message("Automatic boundary conditions cannot be assigned manually.", error=True)
-            return
-        physics = "mechanical" if str(condition.get("type", "")).startswith("mechanical_") else "electromagnetic"
-        self._set_edge_conditions(self.selected_edge_ids, physics, condition["id"])
 
     def _sync_canvas_selection(self):
         """Update selected sketch styling without replacing canvas geometry."""
         edge_ids = json.dumps(self.selected_edge_ids)
-        region_id = json.dumps(self.selected_region_id)
+        region_ids = json.dumps(getattr(self, "selected_region_ids", []) or ([self.selected_region_id] if self.selected_region_id else []))
         highlighted_edges = [
             edge["id"] for edge in self.model.get("geometry", {}).get("edges", [])
             if self._selected_condition_id in _edge_condition_ids(edge)
@@ -3692,7 +3903,7 @@ class SolveWorkspace(Div):
   const svg = document.querySelector('svg.solve-sketch-canvas');
   if (!svg) return;
   const selectedEdges = new Set({edge_ids});
-  const selectedRegion = {region_id};
+  const selectedRegions = new Set({region_ids});
   const highlightedEdges = new Set({highlighted_ids});
   window.__ngsolveSketchBoundarySelection = {str(self.active_section == "boundaries").lower()};
   svg.querySelectorAll('[data-sketch-edge-role="visible"]').forEach((line) => {{
@@ -3703,10 +3914,10 @@ class SolveWorkspace(Div):
     line.setAttribute('data-sketch-condition-highlight', String(highlighted));
     const hovered = window.__ngsolveSketchBoundarySelection && window.__ngsolveSketchHoveredEdgeId === id;
     line.setAttribute('stroke', selected ? '#0877b9' : (hovered ? '#e29a12' : (highlighted ? '#c66f16' : '#263746')));
-    line.setAttribute('stroke-width', selected ? '3.2' : (hovered ? '3.1' : (highlighted ? '2.2' : '1.6')));
+    line.setAttribute('stroke-width', selected ? '4.6' : (hovered ? '4.4' : (highlighted ? '4.2' : '1.6')));
   }});
   svg.querySelectorAll('[data-sketch-region-role="shape"]').forEach((shape) => {{
-    const selected = shape.getAttribute('data-sketch-region-id') === selectedRegion;
+    const selected = selectedRegions.has(shape.getAttribute('data-sketch-region-id'));
     const hovered = window.__ngsolveSketchBoundarySelection && window.__ngsolveSketchHoveredRegionId === shape.getAttribute('data-sketch-region-id');
     shape.setAttribute('data-sketch-selected', String(selected));
     shape.setAttribute('fill-opacity', selected ? '0.48' : (hovered ? '0.40' : '0.33'));
@@ -3874,30 +4085,47 @@ class SolveWorkspace(Div):
             ui_emit_value=True, ui_map_options=True, ui_dense=True, ui_filled=True,
         )
         self._edge_mech_select.on_update_model_value(lambda event: self._set_edge_conditions(self.selected_edge_ids, "mechanical", event.value))
+        self._edge_boundary_note = Div(
+            "An edge can have one EM and one mechanical condition. A manual mechanical condition replaces automatic transmission.",
+            ui_style="font-size:11px; color:var(--fg-muted); line-height:1.45;",
+        )
         self._edge_panel = Div(
             self._edge_title,
             self._edge_name_input,
             self._edge_em_select,
             self._edge_mech_select,
-            Div("Electromagnetic and mechanical conditions are assigned independently, so one edge can participate in both physics. The axis is excluded from mechanical support assignments in this version.", ui_style="font-size:11px; color:var(--fg-muted); line-height:1.45;"),
+            self._edge_boundary_note,
             ui_hidden=True,
             ui_style="display:flex; flex-direction:column; gap:12px;",
         )
         self._geometry_inspector_children = [self._geometry_empty_panel, self._region_panel, self._edge_panel]
         self._geometry_inspector_ready = True
 
-    def _edge_condition_options(self, physics):
+    def _edge_condition_options(self, physics, assigned_ids=()):
         if physics == "mechanical":
-            kinds = lambda item: item.get("type", "").startswith("mechanical_")
-            empty = "No mechanical condition"
+            kinds = lambda item: (
+                item.get("type", "").startswith("mechanical_")
+                or item.get("type") == "transmission_interface"
+            )
+            empty = "No mechanical condition (default)"
         else:
             kinds = lambda item: item.get("type") in {"axis_of_symmetry", "magnetic_potential_zero", "natural"}
             empty = "Natural / material interface"
-        return [{"label": empty, "value": None}] + [
-            {"label": item["name"], "value": item["id"]}
-            for item in self.model.get("boundary_conditions", [])
-            if kinds(item)
-        ]
+        assigned_ids = set(assigned_ids)
+        options = [{"label": empty, "value": None}]
+        for item in self.model.get("boundary_conditions", []):
+            if not kinds(item):
+                continue
+            automatic = bool(item.get("automatic_for_mechanics") or item.get("automatic_for_axis"))
+            if automatic and item.get("id") not in assigned_ids:
+                continue
+            label = item.get("name", "Boundary condition")
+            option = {"label": label, "value": item["id"]}
+            if automatic:
+                option["disable"] = True
+                option["label"] = label + " (automatic)"
+            options.append(option)
+        return options
 
     def _material_options(self):
         """Offer library presets and project materials without preloading them."""
@@ -3974,13 +4202,22 @@ class SolveWorkspace(Div):
             conditions = {item["id"]: item for item in self.model.get("boundary_conditions", [])}
             assignments = [_edge_condition_ids(edge) for edge in edges]
             em_values = [next((cid for cid in ids if conditions.get(cid, {}).get("type") in {"axis_of_symmetry", "magnetic_potential_zero", "natural"}), None) for ids in assignments]
-            mech_values = [next((cid for cid in ids if conditions.get(cid, {}).get("type", "").startswith("mechanical_")), None) for ids in assignments]
-            self._edge_em_select.ui_options = self._edge_condition_options("electromagnetic")
+            mech_values = [next((cid for cid in ids if conditions.get(cid, {}).get("type", "").startswith("mechanical_") or conditions.get(cid, {}).get("type") == "transmission_interface"), None) for ids in assignments]
+            assigned_ids = [condition_id for ids in assignments for condition_id in ids]
+            self._edge_em_select.ui_options = self._edge_condition_options("electromagnetic", assigned_ids)
             self._edge_em_select.ui_model_value = em_values[0] if all(value == em_values[0] for value in em_values) else None
-            self._edge_mech_select.ui_options = self._edge_condition_options("mechanical")
+            self._edge_mech_select.ui_options = self._edge_condition_options("mechanical", assigned_ids)
             self._edge_mech_select.ui_model_value = mech_values[0] if all(value == mech_values[0] for value in mech_values) else None
-            on_axis = any(all(abs(float(point[0])) <= 1e-12 for point in edge.get("vertices", [])) for edge in edges)
-            self._edge_mech_select.ui_disable = on_axis
+            axis_count = sum(_edge_is_on_rotation_axis(edge) for edge in edges)
+            locked_mechanical_count = sum(bool(edge.get("mechanical_boundary_locked")) for edge in edges)
+            self._edge_em_select.ui_disable = axis_count == len(edges)
+            self._edge_mech_select.ui_disable = axis_count + locked_mechanical_count == len(edges)
+            if axis_count == len(edges):
+                self._edge_boundary_note.ui_children = ["The axis of symmetry is required and locked; no other condition can be applied there."]
+            elif axis_count or locked_mechanical_count:
+                self._edge_boundary_note.ui_children = ["Protected edges in this selection will be skipped. Shared mechanical edges keep the default mechanical condition; the EM condition remains editable."]
+            else:
+                self._edge_boundary_note.ui_children = ["One EM and one mechanical condition are allowed. A user mechanical condition replaces automatic transmission."]
 
     def _render_inspector(self):
         if self.active_section == "geometry":
@@ -4093,6 +4330,12 @@ class SolveWorkspace(Div):
             self._render_inspector()
 
     def _geometry_properties(self):
+        if len(getattr(self, "selected_region_ids", [])) > 1:
+            return [
+                _section_title("Geometry selection", "Multiple regions selected in the viewport."),
+                Div(f"{len(self.selected_region_ids)} regions and {len(self.selected_edge_ids)} unique boundaries are selected.", ui_style="font-size:12px; line-height:1.5; color:var(--fg-muted);"),
+                Div("Drag left-to-right to select enclosed regions; drag right-to-left to select regions crossed by the marquee. Hold Shift to add to the selection.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+            ]
         region = self._selected_region()
         edge = self._selected_edge()
         selected_edges = self._selected_edges()
@@ -4331,15 +4574,8 @@ class SolveWorkspace(Div):
     def _boundary_properties(self):
         children = [_section_title("Boundary conditions", "Enter displacements in m, tractions in N/m², and stiffnesses in N/m³.")]
         self._boundary_selection_summary = Div(ui_style="display:flex; flex-direction:column; gap:4px; padding:9px 10px; border:1px solid var(--border); border-radius:6px; background:var(--surface-subtle, #f7f9fb);")
-        self._boundary_apply_selection_button = _button(
-            "Apply condition to selected boundaries",
-            "mdi-vector-link",
-            self._apply_selected_boundary_condition,
-            color="primary",
-            style="width:100%; justify-content:flex-start; text-align:left;",
-            align="left",
-        )
-        children.extend([self._boundary_selection_summary, self._boundary_apply_selection_button])
+        children.append(_button("Add boundary condition", "mdi-plus", self.add_boundary))
+        children.append(self._boundary_selection_summary)
         kinds = [
             ("axis_of_symmetry", "Axis of symmetry"),
             ("magnetic_potential_zero", "Magnetic potential = 0"),
@@ -4357,7 +4593,7 @@ class SolveWorkspace(Div):
         if conditions:
             children.append(Div("Condition definitions · assigned edges", ui_style="font-size:10px; font-weight:700; color:var(--fg-muted); padding:3px 6px;"))
         else:
-            children.append(Div("No boundary conditions yet. Add a condition, then assign it to one or more sketch edges.", ui_style="font-size:12px; color:var(--fg-muted); line-height:1.45;"))
+            children.append(Div("No boundary conditions yet. Add one above, then select it and assign it by clicking geometry.", ui_style="font-size:12px; color:var(--fg-muted); line-height:1.45;"))
         for condition in conditions:
             assigned = sum(condition["id"] in _edge_condition_ids(edge) for edge in self.model["geometry"].get("edges", []))
             children.append(_button(
@@ -4405,7 +4641,7 @@ class SolveWorkspace(Div):
                     _input("Normal stiffness", condition.get("stiffness_normal", "0"), lambda event, bid=condition["id"]: self._set_boundary_value(bid, "stiffness_normal", event.value), suffix="N/m³"),
                     _input("Tangential stiffness", condition.get("stiffness_tangential", "0"), lambda event, bid=condition["id"]: self._set_boundary_value(bid, "stiffness_tangential", event.value), suffix="N/m³"),
                 ])
-            children.append(Div("Condition type and values stay here. Select boundaries directly in the viewport, then use the apply button above.", ui_style="font-size:11px; line-height:1.45; color:var(--fg-muted);"))
+            children.append(Div("Choose this condition, then click geometry in the viewport to assign it. It applies to each new region or edge selection.", ui_style="font-size:11px; line-height:1.45; color:var(--fg-muted);"))
             if condition.get("automatic_for_mechanics"):
                 children.append(Div(
                     "Assigned automatically where a mechanical region meets non-mechanical material. Shared mechanical interfaces use the default condition.",
@@ -4413,7 +4649,6 @@ class SolveWorkspace(Div):
                 ))
             if not condition.get("automatic_for_axis") and not condition.get("automatic_for_mechanics"):
                 children.append(_button("Remove condition", "mdi-delete-outline", lambda *a, bid=condition["id"]: self.remove_boundary(bid)))
-        children.append(_button("Add boundary condition", "mdi-plus", self.add_boundary))
         return children
 
     def _physics_properties(self):
@@ -4436,11 +4671,14 @@ class SolveWorkspace(Div):
                 _input("Mass coefficient (alpha)", mechanics.get("rayleigh_alpha", "0"), lambda event: self._set_physics("mechanics", "rayleigh_alpha", event.value), suffix="1/s"),
                 _input("Stiffness coefficient (beta)", mechanics.get("rayleigh_beta", "0"), lambda event: self._set_physics("mechanics", "rayleigh_beta", event.value), suffix="s"),
             ])
-        children.extend([
-            Div("Set frequency points and sweep values in Study.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted); padding-top:8px;"),
-            _button("Configure study frequencies", "mdi-play-box-outline", lambda *a: self.select_section("studies")),
-            Div("Regional current densities and mechanical body forces are configured separately under Sources & loads.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
-        ])
+        if physics.get("harmonic_electromagnetic", {}).get("enabled", False):
+            children.extend([
+                Div("Set frequency points and sweep values in Study.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted); padding-top:8px;"),
+                _button("Configure study frequencies", "mdi-play-box-outline", lambda *a: self.select_section("studies")),
+            ])
+        else:
+            children.append(Div("Static electromagnetic studies do not require a frequency.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted); padding-top:8px;"))
+        children.append(Div("Regional current densities and mechanical body forces are configured separately under Sources & loads.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"))
         children.append(Div("Coupling requires DC magnetic, time-harmonic EM and mechanics to be enabled.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted); padding-top:5px;"))
         return children
 
@@ -4586,11 +4824,25 @@ class SolveWorkspace(Div):
 
     def _study_properties(self):
         studies = self.studies.get("studies", [])
-        children = [_section_title("Study", "One DC + time-harmonic study; enter a single frequency or a comma-separated sweep.")]
+        harmonic_enabled = bool(
+            self.model.get("physics", {}).get("harmonic_electromagnetic", {}).get("enabled", False)
+        )
+        description = (
+            "One DC + time-harmonic study; enter a single frequency or a comma-separated sweep."
+            if harmonic_enabled else
+            "Static electromagnetic study; no frequency is required."
+        )
+        children = [_section_title("Study", description)]
         for study in studies:
-            children.append(Div(
+            controls = [
                 _input("Study name", study.get("name", ""), lambda event, sid=study["id"]: self._set_study(sid, "name", event.value)),
-                _input("Frequency points (comma separated)", ", ".join(str(v) for v in study.get("frequency_hz", [])), lambda event, sid=study["id"]: self._set_study_frequencies(sid, event.value), suffix="Hz"),
+            ]
+            if harmonic_enabled:
+                controls.append(
+                    _input("Frequency points (comma separated)", ", ".join(str(v) for v in study.get("frequency_hz", [])), lambda event, sid=study["id"]: self._set_study_frequencies(sid, event.value), suffix="Hz")
+                )
+            children.append(Div(
+                *controls,
                 ui_style="display:flex; flex-direction:column; gap:7px; padding:8px; border:1px solid var(--border); border-radius:6px;",
             ))
         children.append(Div("Transient and time-integration studies are not supported in this workflow yet.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"))
@@ -5277,32 +5529,62 @@ class SolveWorkspace(Div):
             return
         if condition:
             kind = condition.get("type", "")
-            is_mechanical = str(kind).startswith("mechanical_")
+            is_mechanical = str(kind).startswith("mechanical_") or kind == "transmission_interface"
+            if condition.get("automatic_for_axis") or condition.get("automatic_for_mechanics"):
+                self._message("Automatic boundary conditions cannot be assigned manually.", error=True)
+                return
             if is_mechanical != (physics == "mechanical"):
                 self._message("Choose a condition for the selected physics.", error=True)
                 return
-            if physics == "mechanical" and any(
-                all(abs(float(point[0])) <= 1e-12 for point in edge.get("vertices", []))
-                for edge in edges
-            ):
-                self._message("Mechanical support conditions on the r=0 axis are not supported yet.", error=True)
-                return
+
+        editable = []
+        protected = []
         for edge in edges:
-            # Imported legacy assignments are kept verbatim until the user
-            # edits that edge. From then on the normal automatic interface
-            # rules apply to it again.
-            edge.pop("legacy_mechanical_boundary_override", None)
-            condition_ids = [
-                condition_id for condition_id in _edge_condition_ids(edge)
-                if conditions.get(condition_id, {}).get("type", "").startswith("mechanical_") != (physics == "mechanical")
-            ]
+            if _edge_is_on_rotation_axis(edge) or (
+                physics == "mechanical" and edge.get("mechanical_boundary_locked")
+            ):
+                protected.append(edge)
+            else:
+                editable.append(edge)
+        if not editable:
+            if any(_edge_is_on_rotation_axis(edge) for edge in protected):
+                self._message("The axis of symmetry is required and cannot be changed.", error=True)
+            else:
+                self._message("A shared mechanical interface is locked to its default mechanical condition.", error=True)
+            return
+
+        em_types = {"axis_of_symmetry", "magnetic_potential_zero", "natural"}
+        def condition_type(condition_id):
+            return conditions.get(condition_id, {}).get("type", "")
+
+        for edge in editable:
+            condition_ids = _edge_condition_ids(edge)
+            if physics == "mechanical":
+                # Replacing transmission with fixed/prescribed/traction/Robin
+                # is a user override of the automatic mechanical default.
+                edge.pop("legacy_mechanical_boundary_override", None)
+                edge["mechanical_boundary_override"] = True
+                condition_ids = [
+                    condition_id for condition_id in condition_ids
+                    if not (
+                        str(condition_type(condition_id)).startswith("mechanical_")
+                        or condition_type(condition_id) == "transmission_interface"
+                    )
+                ]
+            else:
+                condition_ids = [
+                    condition_id for condition_id in condition_ids
+                    if condition_type(condition_id) not in em_types
+                ]
             if value:
                 condition_ids.append(value)
-            edge["boundary_condition_ids"] = condition_ids
+            edge["boundary_condition_ids"] = list(dict.fromkeys(condition_ids))
         self._rebuild_edges()
         self._refresh_model_tree()
         self._render_inspector()
         self.render_canvas()
+        if protected:
+            self._message(f"Updated {len(editable)} edge(s); skipped {len(protected)} protected edge(s).")
 
     @_history_tracked
     def delete_region(self, region_id):
@@ -5561,6 +5843,8 @@ class SolveWorkspace(Div):
     @_history_tracked
     def _set_physics(self, physics, key, value):
         self.model["physics"].setdefault(physics, {})[key] = value
+        if self.active_section == "physics":
+            self._render_inspector()
 
     @_history_tracked
     def _set_mesh(self, key, value):
@@ -5826,7 +6110,7 @@ class SolveWorkspace(Div):
             for item in self.model.get("parameters", [])
             if isinstance(item, dict) and item.get("name")
         }
-        errors.extend(validate_studies(self.studies, parameter_map))
+        errors.extend(validate_studies(self.studies, parameter_map, physics=self.model.get("physics")))
         return errors
 
     def mesh_validation_errors(self):
@@ -6056,6 +6340,72 @@ def _strictly_contains(outer, inner):
     )
 
 
+
+def _area_tolerance(first, second):
+    first_bounds, second_bounds = _bounds(first), _bounds(second)
+    scale = max(
+        abs(first_bounds[1] - first_bounds[0]),
+        abs(first_bounds[3] - first_bounds[2]),
+        abs(second_bounds[1] - second_bounds[0]),
+        abs(second_bounds[3] - second_bounds[2]),
+        1e-12,
+    )
+    return max(abs(_polygon_area(first)), abs(_polygon_area(second)), 1e-30) * 1e-12
+
+
+def _contains_or_touches(outer, inner):
+    if len(outer) < 3 or len(inner) < 3:
+        return False
+    return all(_point_in_or_on_polygon(point, outer) for point in inner)
+
+
+def _polygons_overlap_interior(first, second):
+    if len(first) < 3 or len(second) < 3:
+        return False
+    a, b = _bounds(first), _bounds(second)
+    if a[1] <= b[0] or b[1] <= a[0] or a[3] <= b[2] or b[3] <= a[2]:
+        return False
+
+    if any(_point_in_polygon(point, second) for point in first):
+        return True
+    if any(_point_in_polygon(point, first) for point in second):
+        return True
+
+    # Proper edge crossings imply positive-area overlap. Endpoint-only and
+    # collinear contacts are deliberately excluded.
+    scale = max(
+        abs(a[1] - a[0]), abs(a[3] - a[2]),
+        abs(b[1] - b[0]), abs(b[3] - b[2]), 1e-12,
+    )
+    tolerance = scale * scale * 1e-12
+
+    def orient(p, q, r):
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+    for i, p in enumerate(first):
+        q = first[(i + 1) % len(first)]
+        for j, r in enumerate(second):
+            s = second[(j + 1) % len(second)]
+            o1, o2 = orient(p, q, r), orient(p, q, s)
+            o3, o4 = orient(r, s, p), orient(r, s, q)
+            if (
+                ((o1 > tolerance and o2 < -tolerance) or (o1 < -tolerance and o2 > tolerance))
+                and ((o3 > tolerance and o4 < -tolerance) or (o3 < -tolerance and o4 > tolerance))
+            ):
+                return True
+
+    # Detect coincident polygons and interior containment whose vertices all
+    # lie on the other boundary (for example, identical rectangles).
+    first_center = (
+        sum(point[0] for point in first) / len(first),
+        sum(point[1] for point in first) / len(first),
+    )
+    second_center = (
+        sum(point[0] for point in second) / len(second),
+        sum(point[1] for point in second) / len(second),
+    )
+    return _point_in_polygon(first_center, second) or _point_in_polygon(second_center, first)
+
 def _polygons_overlap(first, second):
     a, b = _bounds(first), _bounds(second)
     if a[1] < b[0] or b[1] < a[0] or a[3] < b[2] or b[3] < a[2]:
@@ -6170,14 +6520,8 @@ def _sync_axis_boundary_conditions(model):
             # Let model validation report malformed assignment containers.
             continue
         if on_axis:
-            # Axis regularity takes precedence over user-selectable EM edge
-            # conditions; a single edge cannot carry two EM conditions.
-            condition_ids = [
-                condition_id for condition_id in condition_ids
-                if condition_type(condition_id) not in electromagnetic_types
-            ]
-            if axis_condition_id:
-                condition_ids.append(axis_condition_id)
+            # The axis condition is the only allowed condition on r=0.
+            condition_ids = [axis_condition_id] if axis_condition_id else []
         else:
             # Axis regularity is only meaningful on the rotational axis.
             condition_ids = [
@@ -6196,60 +6540,65 @@ def _sync_axis_boundary_conditions(model):
         ]
 
 
-def _sync_mechanical_boundary_conditions(model):
-    """Mark contours between mechanical and non-mechanical material automatically.
+def _mechanical_boundary_edge_states(model):
+    """Return automatic-transmission and locked default mechanical edge ids."""
+    geometry = model.get("geometry", {}) if isinstance(model, dict) else {}
+    regions = geometry.get("regions", []) if isinstance(geometry, dict) else []
+    edges = geometry.get("edges", []) if isinstance(geometry, dict) else []
+    if not isinstance(regions, list) or not isinstance(edges, list):
+        return set(), set()
+    regions_by_id = {
+        region.get("id"): region for region in regions
+        if isinstance(region, dict) and isinstance(region.get("id"), str)
+    }
+    edge_ids = {
+        edge.get("id") for edge in edges
+        if isinstance(edge, dict) and isinstance(edge.get("id"), str)
+    }
+    owners_by_edge = {}
+    for region in regions_by_id.values():
+        for edge_id in region.get("edge_ids", []) if isinstance(region.get("edge_ids", []), list) else []:
+            if edge_id in edge_ids:
+                owners_by_edge.setdefault(edge_id, []).append(region)
 
-    In the axisymmetric sketch each region contour separates that region from
-    its nearest containing region (or the exterior). A contour is a
-    transmission interface when exactly one of those two materials participates
-    in mechanics. A contour between two mechanical materials stays on the
-    default condition, so the solver treats it as an internal mechanical
-    interface.
-    """
+    automatic_ids = set()
+    locked_ids = set()
+    for edge_id, owners in owners_by_edge.items():
+        side_pairs = []
+        for region in owners:
+            parent = regions_by_id.get(region.get("parent_id"))
+            side_pairs.append((bool(region.get("mechanical")), bool(parent and parent.get("mechanical"))))
+        for index, first in enumerate(owners):
+            for second in owners[index + 1:]:
+                side_pairs.append((bool(first.get("mechanical")), bool(second.get("mechanical"))))
+        if any(first and second for first, second in side_pairs):
+            locked_ids.add(edge_id)
+        elif any(first != second for first, second in side_pairs):
+            automatic_ids.add(edge_id)
+    return automatic_ids, locked_ids
+
+
+def _sync_mechanical_boundary_conditions(model):
+    """Refresh editable transmission defaults and protected shared interfaces."""
     if not isinstance(model, dict):
         return
     geometry = model.get("geometry")
     if not isinstance(geometry, dict):
         return
-    regions = geometry.get("regions", [])
     edges = geometry.get("edges", [])
     conditions = model.setdefault("boundary_conditions", [])
-    if not isinstance(regions, list) or not isinstance(edges, list) or not isinstance(conditions, list):
+    if not isinstance(edges, list) or not isinstance(conditions, list):
         return
 
-    regions_by_id = {
-        item.get("id"): item
-        for item in regions
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
-    }
+    automatic_ids, locked_ids = _mechanical_boundary_edge_states(model)
     condition_by_id = {
-        item.get("id"): item
-        for item in conditions
+        item.get("id"): item for item in conditions
         if isinstance(item, dict) and isinstance(item.get("id"), str)
     }
     edge_by_id = {
-        item.get("id"): item
-        for item in edges
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
+        edge.get("id"): edge for edge in edges
+        if isinstance(edge, dict) and isinstance(edge.get("id"), str)
     }
-
-    desired_edge_ids = set()
-    for region in regions_by_id.values():
-        parent = regions_by_id.get(region.get("parent_id"))
-        region_is_mechanical = bool(region.get("mechanical"))
-        parent_is_mechanical = bool(parent and parent.get("mechanical"))
-        if region_is_mechanical == parent_is_mechanical:
-            continue
-        region_edge_ids = region.get("edge_ids", [])
-        if not isinstance(region_edge_ids, list):
-            continue
-        desired_edge_ids.update(
-            edge_id for edge_id in region_edge_ids
-            if isinstance(edge_id, str)
-            and edge_id in edge_by_id
-            and not edge_by_id[edge_id].get("legacy_mechanical_boundary_override")
-        )
-
     interface_condition = next(
         (
             item for item in conditions
@@ -6259,7 +6608,7 @@ def _sync_mechanical_boundary_conditions(model):
         ),
         None,
     )
-    if desired_edge_ids and interface_condition is None:
+    if automatic_ids and interface_condition is None:
         interface_condition = {
             "id": new_id("boundary"),
             "name": "Transmission interface",
@@ -6268,31 +6617,67 @@ def _sync_mechanical_boundary_conditions(model):
         }
         conditions.append(interface_condition)
         condition_by_id[interface_condition["id"]] = interface_condition
+    interface_id = interface_condition.get("id") if interface_condition else None
 
-    interface_condition_id = interface_condition.get("id") if interface_condition else None
+    em_types = {"axis_of_symmetry", "magnetic_potential_zero", "natural"}
+    def get_type(condition_id):
+        return condition_by_id.get(condition_id, {}).get("type", "")
+    def is_auto_transmission(condition_id):
+        item = condition_by_id.get(condition_id, {})
+        return item.get("type") == "transmission_interface" and item.get("automatic_for_mechanics")
+    def is_mechanical_type(kind):
+        return str(kind).startswith("mechanical_") or kind == "transmission_interface"
+
     for edge_id, edge in edge_by_id.items():
         try:
             condition_ids = _edge_condition_ids(edge)
         except TypeError:
-            # Keep malformed values intact for validate_model() to explain.
             continue
         if any(not isinstance(condition_id, str) for condition_id in condition_ids):
             continue
-        condition_ids = [
-            condition_id for condition_id in condition_ids
-            if not (
-                isinstance(condition_id, str)
-                and condition_id in condition_by_id
-                and condition_by_id[condition_id].get("automatic_for_mechanics")
-                and condition_by_id[condition_id].get("type") == "transmission_interface"
-            )
-        ]
-        if edge_id in desired_edge_ids and interface_condition_id:
-            condition_ids.append(interface_condition_id)
-        edge["boundary_condition_ids"] = list(dict.fromkeys(condition_ids))
+        if _edge_is_on_rotation_axis(edge):
+            axis_ids = [cid for cid in condition_ids if get_type(cid) == "axis_of_symmetry"]
+            edge["boundary_condition_ids"] = axis_ids[:1]
+            edge.pop("mechanical_boundary_locked", None)
+            edge.pop("boundary_condition_id", None)
+            continue
+
+        if edge_id in locked_ids:
+            edge["mechanical_boundary_locked"] = True
+            edge.pop("mechanical_boundary_override", None)
+            edge.pop("legacy_mechanical_boundary_override", None)
+            # The locked default is mechanical only; an EM condition can still
+            # be applied independently to this geometric interface.
+            em_ids = [cid for cid in condition_ids if get_type(cid) in em_types]
+            edge["boundary_condition_ids"] = em_ids[-1:]
+            edge.pop("boundary_condition_id", None)
+            continue
+        edge.pop("mechanical_boundary_locked", None)
+
+        em_ids = [cid for cid in condition_ids if get_type(cid) in em_types]
+        mechanical_ids = [cid for cid in condition_ids if is_mechanical_type(get_type(cid))]
+        manual_mechanical_ids = [cid for cid in mechanical_ids if not is_auto_transmission(cid)]
+        if manual_mechanical_ids:
+            mechanical_ids = manual_mechanical_ids[-1:]
+            edge["mechanical_boundary_override"] = True
+        elif edge_id in automatic_ids and not edge.get("mechanical_boundary_override") and not edge.get("legacy_mechanical_boundary_override"):
+            mechanical_ids = [interface_id] if interface_id else []
+        else:
+            mechanical_ids = []
+
+        # Keep malformed references intact for validate_model() to report.
+        # Known condition assignments are normalized to one per physics.
+        unknown_ids = [cid for cid in condition_ids if cid not in condition_by_id]
+        em_ids = em_ids[-1:]
+        edge["boundary_condition_ids"] = list(dict.fromkeys([*em_ids, *mechanical_ids, *unknown_ids]))
         edge.pop("boundary_condition_id", None)
 
-    if not desired_edge_ids:
+    assigned_auto_ids = {
+        condition_id for edge in edge_by_id.values()
+        for condition_id in _edge_condition_ids(edge)
+        if isinstance(condition_id, str) and is_auto_transmission(condition_id)
+    }
+    if not assigned_auto_ids:
         conditions[:] = [
             item for item in conditions
             if not (
