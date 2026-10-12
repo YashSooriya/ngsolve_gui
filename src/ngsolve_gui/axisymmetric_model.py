@@ -727,17 +727,19 @@ def validate_model(model: dict) -> list[str]:
             kind if isinstance((kind := condition_by_id.get(item, {}).get("type", "")), str) else ""
             for item in assignments
         ]
-        if sum(kind in {"axis_of_symmetry", "magnetic_potential_zero", "natural"} for kind in assigned_types) > 1:
+        electromagnetic_types = {"axis_of_symmetry", "magnetic_potential_zero", "natural"}
+        mechanical_types = [kind for kind in assigned_types if str(kind).startswith("mechanical_") or kind == "transmission_interface"]
+        if sum(kind in electromagnetic_types for kind in assigned_types) > 1:
             errors.append(f"Edge '{edge.get('name', edge_id)}' has multiple electromagnetic conditions.")
-        if sum(str(kind).startswith("mechanical_") for kind in assigned_types) > 1:
+        if len(mechanical_types) > 1:
             errors.append(f"Edge '{edge.get('name', edge_id)}' has multiple mechanical conditions.")
         if isinstance(edge_vertices, list) and len(edge_vertices) == 2:
             try:
                 on_axis = all(abs(float(point[0])) <= 1e-12 for point in edge_vertices)
             except (TypeError, ValueError, IndexError, OverflowError):
                 on_axis = False
-            if on_axis and any(str(kind).startswith("mechanical_") for kind in assigned_types):
-                errors.append(f"Edge '{edge.get('name', edge_id)}' cannot carry a mechanical support on r=0.")
+            if on_axis and assigned_types != ["axis_of_symmetry"]:
+                errors.append(f"Edge '{edge.get('name', edge_id)}' on r=0 must have only the axis-of-symmetry condition.")
         for condition_id in assignments:
             if condition_id not in condition_by_id:
                 errors.append(f"Edge '{edge.get('name', edge_id)}' references a missing boundary condition.")

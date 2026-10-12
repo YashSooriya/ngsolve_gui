@@ -51,6 +51,11 @@ def _nested_model():
             })
             region["edge_ids"].append(edge_id)
     model["geometry"]["edges"] = edges
+    model["boundary_conditions"] = [{
+        "id": "axis-boundary", "name": "Axis of symmetry", "type": "axis_of_symmetry",
+        "automatic_for_axis": True,
+    }]
+    model["geometry"]["edges"][3]["boundary_condition_ids"] = ["axis-boundary"]
     return model
 
 
@@ -102,6 +107,33 @@ def test_transmission_interface_is_a_supported_auto_boundary_type():
     model["geometry"]["edges"][0]["boundary_condition_ids"].append("automatic-interface")
 
     assert validate_model(model) == []
+
+
+def test_validate_model_allows_one_em_and_one_mechanical_condition():
+    model = _nested_model()
+    model["boundary_conditions"].extend([
+        {"id": "em-condition", "name": "EM", "type": "magnetic_potential_zero"},
+        {"id": "mechanical-condition", "name": "Fixed", "type": "mechanical_fixed"},
+    ])
+    model["geometry"]["edges"][1]["boundary_condition_ids"] = ["em-condition", "mechanical-condition"]
+    assert validate_model(model) == []
+
+
+def test_validate_model_rejects_multiple_conditions_of_one_physics():
+    model = _nested_model()
+    model["boundary_conditions"].extend([
+        {"id": "mechanical-one", "name": "Fixed", "type": "mechanical_fixed"},
+        {"id": "mechanical-two", "name": "Traction", "type": "mechanical_traction"},
+    ])
+    model["geometry"]["edges"][1]["boundary_condition_ids"] = ["mechanical-one", "mechanical-two"]
+    assert any("multiple mechanical conditions" in error for error in validate_model(model))
+
+
+def test_validate_model_requires_axis_condition_to_be_exclusive():
+    model = _nested_model()
+    model["geometry"]["edges"][3]["boundary_condition_ids"] = ["axis-boundary", "mechanical-one"]
+    model["boundary_conditions"].append({"id": "mechanical-one", "name": "Fixed", "type": "mechanical_fixed"})
+    assert any("must have only the axis-of-symmetry condition" in error for error in validate_model(model))
 
 
 def test_parameter_declaration_and_explicit_si_suffixes_are_checked():

@@ -35,6 +35,25 @@ def test_gridfunction_pickle_draw_uses_result_view_defaults(monkeypatch):
     assert captured["_ngsolve_gui_fieldline_seed_material"] is None
     assert "_ngsolve_gui_axisymmetric" not in captured
 
+def test_2d_pickle_draw_caps_cubic_geometry_for_viewer(monkeypatch):
+    from netgen.occ import OCCGeometry, Rectangle
+
+    mesh = ngs.Mesh(OCCGeometry(Rectangle(1, 1).Face(), dim=2).GenerateMesh(maxh=0.8))
+    mesh.Curve(3)
+    grid_function = ngs.GridFunction(ngs.H1(mesh, order=1))
+    captured = {}
+    monkeypatch.setattr(file_loader, "_is_axisymmetric_pickle", lambda _path: False)
+    monkeypatch.setattr(
+        file_loader,
+        "DrawImpl",
+        lambda obj, **options: captured.update(object=obj, **options),
+    )
+
+    file_loader._draw_pickle_object(grid_function, "curved 2D field")
+
+    assert mesh.GetCurveOrder() == 2
+    assert captured["object"] is grid_function
+
 
 def test_axisymmetric_pickle_draw_enables_revolution_from_metadata(monkeypatch):
     from netgen.occ import Rectangle
@@ -237,7 +256,7 @@ def test_solution_bundle_loader_draws_all_fields_in_one_script(monkeypatch, tmp_
     result = file_loader.load_file(bundle, app)
 
     assert result == ("thread", "done")
-    assert str(field_path) in repr(captured["code"].co_consts)
+    assert str(field_path) in captured["code"].co_consts
     assert "_draw_pickle_object" in captured["code"].co_names
     assert app._solution_import_dirs == [str(fields_dir.parent.parent)]
     assert captured["code"].co_filename == str(bundle.resolve())

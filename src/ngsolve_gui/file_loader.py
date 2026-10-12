@@ -433,15 +433,22 @@ def _draw_pickle_object(obj, name: str, field_path=None):
         return DrawImpl(obj, name=name)
 
     mesh = obj.space.mesh
+    saved_curve_order = int(mesh.GetCurveOrder())
     if mesh.dim == 3:
-        saved_curve_order = int(mesh.GetCurveOrder())
         display_curve_order = min(saved_curve_order, 4)
-        if display_curve_order < saved_curve_order:
-            mesh.Curve(display_curve_order)
-            print(
-                "Saved mesh curve order:", saved_curve_order,
-                "| viewer curve order:", display_curve_order,
-            )
+    elif mesh.dim == 2:
+        # The current WebGPU surface renderer produces broken facets for
+        # cubic-curved 2D result meshes. Keep quadratic geometry in the viewer;
+        # the pickle on disk and the solver mesh are unchanged.
+        display_curve_order = min(saved_curve_order, 2)
+    else:
+        display_curve_order = saved_curve_order
+    if display_curve_order < saved_curve_order:
+        mesh.Curve(display_curve_order)
+        print(
+            "Saved mesh curve order:", saved_curve_order,
+            "| viewer curve order:", display_curve_order,
+        )
 
     field_name = name.lower()
     is_mechanical_field = any(
