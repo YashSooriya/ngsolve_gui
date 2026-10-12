@@ -17,7 +17,7 @@ import sys
 # ``(label, "ext ext ...")`` groups, mirroring tkinter's filetypes argument.
 DEFAULT_FILTERS = [
     ("All Files", "*"),
-    ("MM-FEM Problem Files", "*.ngsmodel"),
+    ("MM-FEM Problem Files", "*.json *.ngsmodel"),
     ("MM-FEM Mesh Bundles", "*.mmfem-mesh"),
     ("MM-FEM Solution Bundles", "*.mmfem-solutions"),
     ("Mesh Files", "*.vol *.vol.gz"),

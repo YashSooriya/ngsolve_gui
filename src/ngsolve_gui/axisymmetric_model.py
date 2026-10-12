@@ -26,6 +26,8 @@ LEGACY_SCHEMA_VERSION = 1
 MODEL_FILENAME = "problem.json"
 STUDIES_FILENAME = "studies.json"
 LAYOUT_FILENAME = "layout.json"
+PROJECT_JSON_FORMAT = "mm-fem.axisymmetric-project"
+PROJECT_JSON_VERSION = 1
 
 _BINARY_OPS = {
     ast.Add: operator.add,
@@ -1112,12 +1114,93 @@ def package_model(model: dict, studies: dict | None = None, layout: dict | None 
     return out.getvalue()
 
 
+def serialize_model_json(model: dict, studies: dict | None = None, layout: dict | None = None) -> bytes:
+    """Serialize a standalone JSON problem file containing model and study data."""
+    model = migrate_legacy_model(model)
+    errors = validate_model(model)
+    if errors:
+        raise ValueError("Cannot save model: " + " ".join(errors))
+    studies = migrate_legacy_studies(studies or new_studies())
+    parameter_map = {
+        item.get("name"): item
+        for item in model.get("parameters", [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    study_errors = validate_studies(studies, parameter_map)
+    if study_errors:
+        raise ValueError("Cannot save studies: " + " ".join(study_errors))
+    layout = layout or {"schema_version": 1, "active_section": "geometry", "camera": "fit"}
+    if not isinstance(layout, dict):
+        raise ValueError("Layout data must be an object.")
+    project = {
+        "format": PROJECT_JSON_FORMAT,
+        "format_version": PROJECT_JSON_VERSION,
+        "model": model,
+        "studies": studies,
+        "layout": layout,
+    }
+    try:
+        payload = json.dumps(project, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Project data cannot be represented as JSON: {error}") from error
+    encoded = payload.encode("utf-8")
+    if len(encoded) > 20_000_000:
+        raise ValueError("Problem JSON exceeds the 20 MB size limit.")
+    return encoded
+
+
+def _validate_unpacked_model(model, studies, layout):
+    model = migrate_legacy_model(model)
+    studies = migrate_legacy_studies(studies)
+    errors = validate_model(model)
+    if errors:
+        raise ValueError("Invalid model: " + " ".join(errors))
+    parameter_map = {
+        item.get("name"): item
+        for item in model.get("parameters", [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    study_errors = validate_studies(studies, parameter_map)
+    if study_errors:
+        raise ValueError("Invalid studies: " + " ".join(study_errors))
+    if not isinstance(layout, dict):
+        raise ValueError("Invalid layout data.")
+    return model, studies, layout
+
+
 def unpack_model(data: bytes) -> tuple[dict, dict, dict]:
-    """Read a model archive with bounded sizes and strict known entry names."""
+    """Read a standalone JSON problem file or a legacy .ngsmodel ZIP archive."""
     if not isinstance(data, (bytes, bytearray)):
         data = bytes(data)
     if len(data) > 20_000_000:
-        raise ValueError("Model archive exceeds the 20 MB size limit.")
+        raise ValueError("Problem file exceeds the 20 MB size limit.")
+    data = bytes(data)
+    if not zipfile.is_zipfile(io.BytesIO(data)):
+        def reject_constant(value):
+            raise ValueError(f"Invalid JSON number: {value}")
+        try:
+            project = json.loads(data.decode("utf-8"), parse_constant=reject_constant)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise ValueError(f"Problem file is neither a supported JSON project nor a valid .ngsmodel archive: {error}") from error
+        if not isinstance(project, dict):
+            raise ValueError("Problem JSON must contain an object.")
+        if project.get("format") == PROJECT_JSON_FORMAT:
+            if project.get("format_version") != PROJECT_JSON_VERSION:
+                raise ValueError(f"Unsupported JSON project format version: {project.get('format_version')}.")
+            model = project.get("model")
+            studies = project.get("studies", new_studies())
+            layout = project.get("layout", {})
+        elif project.get("schema") == SCHEMA:
+            # Accept a bare data-only model JSON as well as the full project envelope.
+            project = copy.deepcopy(project)
+            metadata = project.pop("project", {})
+            model = project
+            studies = metadata.get("studies", new_studies()) if isinstance(metadata, dict) else new_studies()
+            layout = metadata.get("layout", {}) if isinstance(metadata, dict) else {}
+        else:
+            raise ValueError("JSON file is not an MM-FEM axisymmetric problem project.")
+        return _validate_unpacked_model(model, studies, layout)
+
     with zipfile.ZipFile(io.BytesIO(data), "r") as archive:
         names = set(archive.namelist())
         if len(names) != len(archive.infolist()):
@@ -1132,21 +1215,7 @@ def unpack_model(data: bytes) -> tuple[dict, dict, dict]:
                 raise ValueError(f"Model archive contains an unsafe path: {name}")
             if archive.getinfo(name).file_size > 2_000_000:
                 raise ValueError(f"Model entry is too large: {name}")
-        model = migrate_legacy_model(json.loads(archive.read(MODEL_FILENAME)))
+        model = json.loads(archive.read(MODEL_FILENAME))
         studies = json.loads(archive.read(STUDIES_FILENAME)) if STUDIES_FILENAME in names else new_studies()
-        studies = migrate_legacy_studies(studies)
         layout = json.loads(archive.read(LAYOUT_FILENAME)) if LAYOUT_FILENAME in names else {}
-    errors = validate_model(model)
-    if errors:
-        raise ValueError("Invalid model: " + " ".join(errors))
-    parameter_map = {
-        item.get("name"): item
-        for item in model.get("parameters", [])
-        if isinstance(item, dict) and item.get("name")
-    }
-    study_errors = validate_studies(studies, parameter_map)
-    if study_errors:
-        raise ValueError("Invalid studies.json: " + " ".join(study_errors))
-    if not isinstance(layout, dict):
-        raise ValueError("Invalid layout.json.")
-    return model, studies, layout
+    return _validate_unpacked_model(model, studies, layout)

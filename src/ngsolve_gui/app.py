@@ -5,6 +5,7 @@ import time
 import copy
 import io
 import json
+import mimetypes
 import re
 import subprocess
 from datetime import datetime as _datetime, timezone as _timezone
@@ -25,7 +26,7 @@ from .cerbsim_style import theme, kb_theme, flex_fill, panel_full
 from .system_monitor import SystemMonitor, available as system_monitor_available
 from .footer import StatusFooter
 from .solve_workspace import SolveWorkspace
-from .axisymmetric_model import new_model, new_studies, unpack_model, package_model
+from .axisymmetric_model import new_model, new_studies, unpack_model, package_model, serialize_model_json
 from .result_files import (
     MESH_SUFFIX,
     SOLUTION_SUFFIX,
@@ -492,7 +493,7 @@ class NGSolveGui(App):
             button.on_click(handler)
             return button
 
-        def _artifact_group(name, save_handler, load_handler, new_handler=None):
+        def _artifact_group(name, save_handler, load_handler, new_handler=None, extra_action=None):
             actions = []
             if new_handler is not None:
                 actions.append(_file_action("New", f"Start a new {name.lower()}", new_handler))
@@ -500,6 +501,9 @@ class NGSolveGui(App):
                 _file_action("Save", f"Save {name.lower()}", save_handler),
                 _file_action("Load", f"Load {name.lower()}", load_handler),
             ))
+            if extra_action is not None:
+                action_label, action_tip, action_handler = extra_action
+                actions.append(_file_action(action_label, action_tip, action_handler))
             return Div(
                 Div(
                     name,
@@ -522,6 +526,7 @@ class NGSolveGui(App):
         problem_actions = _artifact_group(
             "Problem", self.save_problem_file, self.load_problem_file,
             new_handler=self.new_problem,
+            extra_action=("Import .py", "Import a legacy Python problem file", self._choose_legacy_problem_file),
         )
         mesh_actions = _artifact_group("Mesh", self.save_mesh_file, self.load_mesh_file)
         solution_actions = _artifact_group(
@@ -916,12 +921,15 @@ class NGSolveGui(App):
         # before it opens. In that case let the user choose any file and rely
         # on the bundle validator below to reject unrelated files safely.
         if all(re.fullmatch(r"\.[a-z0-9]+", suffix, re.IGNORECASE) for suffix in picker_extensions):
+            accepted_types = {}
+            for suffix in picker_extensions:
+                mime_type = {".ngsmodel": "application/zip", ".json": "application/json"}.get(
+                    suffix.lower(), mimetypes.guess_type("file" + suffix)[0]
+                ) or "application/octet-stream"
+                accepted_types.setdefault(mime_type, []).append(suffix)
             picker_options["types"] = [{
                 "description": description,
-                "accept": {
-                    "application/zip": [extension],
-                    **({"application/octet-stream": list(additional_extensions)} if additional_extensions else {}),
-                },
+                "accept": accepted_types,
             }]
         handles = self.js.showOpenFilePicker(picker_options)
         if not handles:
@@ -936,6 +944,36 @@ class NGSolveGui(App):
             target.write(data)
         return path, data
 
+    def _choose_legacy_problem_file(self, *args):
+        try:
+            path, _data = self._pick_artifact(
+                title="Import legacy Python problem file",
+                description="Legacy Python problem file",
+                extension=".py",
+            )
+            if not path:
+                return
+            from .legacy_problem_import import import_legacy_problem_file
+
+            model, studies, layout = import_legacy_problem_file(path)
+            self.solve_workspace.set_model(model, studies, layout)
+            self._loaded_mesh_path = None
+            self._loaded_mesh_problem_sha256 = None
+            if self._workspace_mode != "solve":
+                self._workspace_mode_toggle.select("solve")
+            region_count = len(model.get("geometry", {}).get("regions", []))
+            boundary_count = len(model.get("boundary_conditions", []))
+            self._notify(
+                f"Imported {region_count} regions and {boundary_count} boundary condition types. "
+                "Review the mesh and study settings, then save this problem as JSON.",
+                type="positive",
+                timeout=6500,
+            )
+            self.solve_workspace._message(f"Imported legacy problem: {Path(path).name}.")
+        except Exception as error:
+            self._notify(f"Could not import legacy problem: {error}", type="negative", timeout=9000)
+            self.solve_workspace._message(f"Legacy import failed: {error}", error=True)
+
     def save_problem_file(self):
         """Save the problem definition and its study settings."""
         model = self.solve_workspace.model
@@ -943,9 +981,9 @@ class NGSolveGui(App):
         # Empty sketches are useful drafts; structural errors still prevent
         # saving, while the status message explains the missing geometry.
         try:
-            data = package_model(model, self.solve_workspace.studies, self.solve_workspace.layout)
+            data = serialize_model_json(model, self.solve_workspace.studies, self.solve_workspace.layout)
             title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in model.get("name", "axisymmetric-model")).strip()
-            filename = (title or "axisymmetric-model") + ".ngsmodel"
+            filename = (title or "axisymmetric-model") + ".json"
             if not self._save_artifact(data, filename):
                 return False
             self.solve_workspace.mark_saved()
@@ -964,12 +1002,13 @@ class NGSolveGui(App):
         return self.save_problem_file()
 
     def load_problem_file(self):
-        """Load a declarative axisymmetric problem file."""
+        """Load a declarative JSON or legacy .ngsmodel problem file."""
         try:
             path, data = self._pick_artifact(
                 title="Open MM-FEM problem file",
-                description="MM-FEM problem file",
-                extension=".ngsmodel",
+                description="MM-FEM problem file (.json or .ngsmodel)",
+                extension=".json",
+                additional_extensions=(".ngsmodel",),
             )
             if not path:
                 return

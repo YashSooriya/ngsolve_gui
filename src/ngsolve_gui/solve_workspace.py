@@ -4429,6 +4429,13 @@ class SolveWorkspace(Div):
             toggle = QCheckbox(ui_model_value=bool(physics[key].get("enabled")), ui_label=label, ui_dense=True)
             toggle.on_update_model_value(lambda event, selected=key: self._set_physics(selected, "enabled", bool(event.value)))
             children.append(Div(toggle, Div(hint, ui_style="font-size:11px; color:var(--fg-muted); margin-left:30px; margin-top:-5px;"), ui_style="padding:7px 0; border-bottom:1px solid var(--border);"))
+        mechanics = physics.get("mechanics", {})
+        if isinstance(mechanics, dict) and ("rayleigh_alpha" in mechanics or "rayleigh_beta" in mechanics):
+            children.extend([
+                Div("RAYLEIGH DAMPING", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:10px;"),
+                _input("Mass coefficient (alpha)", mechanics.get("rayleigh_alpha", "0"), lambda event: self._set_physics("mechanics", "rayleigh_alpha", event.value), suffix="1/s"),
+                _input("Stiffness coefficient (beta)", mechanics.get("rayleigh_beta", "0"), lambda event: self._set_physics("mechanics", "rayleigh_beta", event.value), suffix="s"),
+            ])
         children.extend([
             Div("Set frequency points and sweep values in Study.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted); padding-top:8px;"),
             _button("Configure study frequencies", "mdi-play-box-outline", lambda *a: self.select_section("studies")),
@@ -5281,6 +5288,10 @@ class SolveWorkspace(Div):
                 self._message("Mechanical support conditions on the r=0 axis are not supported yet.", error=True)
                 return
         for edge in edges:
+            # Imported legacy assignments are kept verbatim until the user
+            # edits that edge. From then on the normal automatic interface
+            # rules apply to it again.
+            edge.pop("legacy_mechanical_boundary_override", None)
             condition_ids = [
                 condition_id for condition_id in _edge_condition_ids(edge)
                 if conditions.get(condition_id, {}).get("type", "").startswith("mechanical_") != (physics == "mechanical")
@@ -6234,7 +6245,9 @@ def _sync_mechanical_boundary_conditions(model):
             continue
         desired_edge_ids.update(
             edge_id for edge_id in region_edge_ids
-            if isinstance(edge_id, str) and edge_id in edge_by_id
+            if isinstance(edge_id, str)
+            and edge_id in edge_by_id
+            and not edge_by_id[edge_id].get("legacy_mechanical_boundary_override")
         )
 
     interface_condition = next(
