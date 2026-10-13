@@ -2117,6 +2117,54 @@ def test_modified_stationary_edge_pointer_gesture_adds_edge_selection(standalone
     assert workspace.selected_edge_ids == [first["id"], second["id"]]
 
 
+def test_blank_canvas_click_clears_selected_boundary_regions_and_edges(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    workspace.select_section("boundaries")
+    region = workspace.model["geometry"]["regions"][0]
+    edge_ids = [edge["id"] for edge in workspace.model["geometry"]["edges"]]
+    workspace.selected_region_id = region["id"]
+    workspace.selected_region_ids = [region["id"]]
+    workspace.selected_edge_ids = edge_ids[:2]
+    workspace.selected_edge_id = edge_ids[1]
+
+    completed = ["marquee", "select", 120, 180, 120, 180, "", False, False, 1, 0, 0, 1, ""]
+    fake_js = SimpleNamespace(eval=lambda _script: completed)
+    monkeypatch.setattr(SolveWorkspace, "js", property(lambda self: fake_js), raising=False)
+    workspace._commit_browser_canvas_view = lambda *args, **kwargs: False
+
+    workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
+
+    assert workspace.selected_region_id is None
+    assert workspace.selected_region_ids == []
+    assert workspace.selected_edge_id is None
+    assert workspace.selected_edge_ids == []
+    assert workspace.active_section == "boundaries"
+
+
+def test_blank_canvas_click_clears_geometry_selection(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    edge_id = workspace.model["geometry"]["edges"][0]["id"]
+    workspace.selected_region_id = region["id"]
+    workspace.selected_region_ids = [region["id"]]
+    workspace.selected_edge_id = edge_id
+    workspace.selected_edge_ids = [edge_id]
+
+    completed = ["marquee", "select", 120, 180, 120, 180, "", False, False, 1, 0, 0, 1, ""]
+    fake_js = SimpleNamespace(eval=lambda _script: completed)
+    monkeypatch.setattr(SolveWorkspace, "js", property(lambda self: fake_js), raising=False)
+    workspace._commit_browser_canvas_view = lambda *args, **kwargs: False
+
+    workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
+
+    assert workspace.selected_region_id is None
+    assert workspace.selected_region_ids == []
+    assert workspace.selected_edge_id is None
+    assert workspace.selected_edge_ids == []
+
+
 def test_canvas_render_keeps_background_and_layer_components_mounted(standalone_components):
     workspace = SolveWorkspace()
     root_layers = tuple(workspace._canvas.ui_children)

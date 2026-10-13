@@ -2684,6 +2684,8 @@ class SolveWorkspace(Div):
                             self.toggle_boundary_stage_edge(edge_id)
                         elif region_id:
                             self.toggle_boundary_stage_region(region_id)
+                        elif operation != "pan":
+                            self._clear_canvas_selection()
                     if view_changed and operation not in {"pan", "draw"}:
                         self._render_canvas_after_interaction()
                     return
@@ -2723,6 +2725,11 @@ class SolveWorkspace(Div):
                 elif operation == "region" and region_id:
                     if self.selected_region_id != region_id:
                         self.select_region(region_id)
+                elif not moved and operation != "pan":
+                    view_changed = self._commit_browser_canvas_view(view, render=False)
+                    self._clear_canvas_selection()
+                    if view_changed:
+                        self._render_canvas_after_interaction()
                 elif self._commit_browser_canvas_view(view, render=False):
                     self._render_canvas_after_interaction()
                 return
@@ -2761,6 +2768,8 @@ class SolveWorkspace(Div):
                     self.toggle_boundary_stage_edge(drag["edge_id"])
                 elif drag.get("region_id"):
                     self.toggle_boundary_stage_region(drag["region_id"])
+                elif drag.get("operation") != "pan":
+                    self._clear_canvas_selection()
             elif moved and drag["operation"] == "pan":
                 self._pan_canvas_by_pixels(start, end)
             return
@@ -2777,6 +2786,8 @@ class SolveWorkspace(Div):
         elif drag["operation"] == "region" and drag.get("region_id"):
             if self.selected_region_id != drag["region_id"]:
                 self.select_region(drag["region_id"])
+        elif not moved and drag.get("operation") != "pan":
+            self._clear_canvas_selection()
 
     def _on_canvas_pointer_cancel(self, event=None):
         """Discard an incomplete sketch gesture after a cancelled pointer."""
@@ -3924,6 +3935,33 @@ class SolveWorkspace(Div):
         self._sync_canvas_selection()
         self._render_canvas_dimensions()
         self._sync_boundary_selection_controls()
+
+    def _clear_canvas_selection(self):
+        """Clear selected regions and edges after a click on blank canvas."""
+        has_selection = bool(
+            self.selected_region_id
+            or getattr(self, "selected_region_ids", [])
+            or self.selected_edge_id
+            or self.selected_edge_ids
+        )
+        if not has_selection:
+            return
+        if self.active_section == "boundaries":
+            self._set_boundary_stage_selection([])
+            return
+
+        self.selected_region_id = None
+        self.selected_region_ids = []
+        self.selected_edge_id = None
+        self.selected_edge_ids = []
+        self._selected_condition_id = None
+        self._update_model_tree_selection()
+        if self._inspector_view != "geometry":
+            self._render_inspector()
+        else:
+            self._update_geometry_inspector()
+        self._sync_canvas_selection()
+        self._render_canvas_dimensions()
 
     def toggle_boundary_stage_region(self, region_id):
         """Toggle every unique edge belonging to a clicked region."""
