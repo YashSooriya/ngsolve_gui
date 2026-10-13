@@ -1,6 +1,9 @@
 from ngapp.components import *
 from ngapp.utils import UserSettings
 from webgpu import Scene, CoordinateAxes, NavigationCube
+from .camera_pointer_focus import install_webgpu_pointer_focus
+
+install_webgpu_pointer_focus()
 
 _usersettings = UserSettings(app_id="NGSolve GUI")
 from webgpu import Scene
