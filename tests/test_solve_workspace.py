@@ -376,12 +376,44 @@ def test_setup_check_flashes_bottom_status_for_pass_and_failure(standalone_compo
 
     assert "Setup checks passed" in workspace.message
     assert "mmfem-solve-status-flash-a" in workspace._bottom_bar.ui_class
+    assert len(workspace.setup_check_results) == 12
+    assert not workspace._messages_panel.ui_hidden
 
     workspace.validation_errors = lambda: ["Create a geometry region."]
     workspace.validate_action()
 
     assert "found 1 issue" in workspace.message
     assert "mmfem-solve-status-flash-b" in workspace._bottom_bar.ui_class
+
+
+def test_setup_check_results_show_group_status_and_applicability(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.model["physics"]["dc_magnetic"]["enabled"] = True
+    workspace.model["physics"]["mechanics"]["enabled"] = True
+    results = workspace._setup_check_results([
+        "Assign magnetic potential = 0 to an exterior edge of each disconnected region to anchor the electromagnetic solution.",
+        "Mechanical region 'coil' needs a fixed or prescribed displacement, or a positive Robin support that restrains axial motion.",
+        "Mesh settings: target element size must be positive.",
+        "Regional load 'coil current' dc_current_density: invalid expression.",
+    ])
+    by_id = {item["id"]: item for item in results}
+
+    assert len(results) == 12
+    assert by_id["em_reference"]["status"] == "Needs attention"
+    assert by_id["mechanics"]["status"] == "Needs attention"
+    assert by_id["mesh"]["status"] == "Needs attention"
+    assert by_id["loads"]["status"] == "Needs attention"
+    assert by_id["geometry"]["status"] == "Passed"
+    assert by_id["materials"]["status"] == "Passed"
+
+    workspace.model["physics"]["dc_magnetic"]["enabled"] = False
+    workspace.model["physics"]["harmonic_electromagnetic"]["enabled"] = False
+    workspace.model["physics"]["mechanics"]["enabled"] = False
+    results = workspace._setup_check_results([])
+    by_id = {item["id"]: item for item in results}
+    assert by_id["em_reference"]["status"] == "Not applicable"
+    assert by_id["mechanics"]["status"] == "Not applicable"
+    assert by_id["harmonic_frequencies"]["status"] == "Not applicable"
 
 
 def test_study_opens_solver_log_and_close_button_minimises_it(standalone_components):

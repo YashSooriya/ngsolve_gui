@@ -3102,6 +3102,130 @@ class SolveWorkspace(Div):
         self._messages_visible = not self._messages_visible
         self._messages_panel.ui_hidden = not self._messages_visible
 
+    @staticmethod
+    def _setup_check_category(issue):
+        """Map validator messages to the visible Check Setup checklist groups."""
+        text = str(issue).casefold()
+        if "anchor the electromagnetic solution" in text or "magnetic potential = 0 to an exterior edge" in text:
+            return "em_reference"
+        if "young's modulus" in text or "material" in text:
+            return "materials"
+        if (
+            "mechanical region" in text
+            or "mechanical regions" in text
+            or "positive robin support" in text
+            or "robin support stiffnesses" in text
+            or "stiffnesses must be non-negative" in text
+            or "region to include in mechanics" in text
+            or "axial motion" in text
+        ):
+            return "mechanics"
+        if any(term in text for term in ("regional load", "source", "current density", "body force")):
+            return "loads"
+        if "frequency" in text:
+            return "harmonic_frequencies"
+        if "study" in text:
+            return "studies"
+        if any(term in text for term in ("mesh", "hp layer", "hp refinement", "hp-refined")):
+            return "mesh"
+        if any(term in text for term in ("solver", "anderson", "relative tolerance", "linear solver", "iteration")):
+            return "solver"
+        if "physics" in text or "coupling" in text or "time-harmonic mechanics" in text:
+            return "physics"
+        if any(term in text for term in ("sketch edge", "geometry", "region", "polygon", "coordinate", "r=0 axis")):
+            return "geometry"
+        if "boundary" in text or "edge" in text or "axis of symmetry" in text:
+            return "boundaries"
+        return "model"
+
+    def _setup_check_results(self, errors):
+        physics = self.model.get("physics", {})
+        dc_enabled = bool((physics.get("dc_magnetic") or {}).get("enabled", False))
+        harmonic_enabled = bool((physics.get("harmonic_electromagnetic") or {}).get("enabled", False))
+        mechanics_enabled = bool((physics.get("mechanics") or {}).get("enabled", False))
+        by_category = {}
+        for issue in errors:
+            by_category.setdefault(self._setup_check_category(issue), []).append(str(issue))
+        definitions = [
+            ("model", "Model structure, parameters and units", True),
+            ("geometry", "Geometry and region topology", True),
+            ("materials", "Materials and region assignments", True),
+            ("boundaries", "Boundary definitions and edge assignments", True),
+            ("loads", "Regional sources and loads", True),
+            ("physics", "Physics selection and coupling requirements", True),
+            ("em_reference", "Electromagnetic reference boundaries", dc_enabled or harmonic_enabled),
+            ("mechanics", "Mechanical support constraints", mechanics_enabled),
+            ("studies", "Study definition", True),
+            ("harmonic_frequencies", "Time-harmonic frequency inputs", harmonic_enabled),
+            ("mesh", "Mesh and refinement settings", True),
+            ("solver", "Solver settings", True),
+        ]
+        return [
+            {
+                "id": category,
+                "label": label,
+                "applicable": applicable,
+                "issues": by_category.get(category, []),
+                "status": (
+                    "Not applicable" if not applicable
+                    else "Needs attention" if by_category.get(category)
+                    else "Passed"
+                ),
+            }
+            for category, label, applicable in definitions
+        ]
+
+    def _show_setup_check_results(self, errors):
+        """Show every setup-check group, its status, and clickable validation issues."""
+        self.validation_issues = list(errors)
+        self._messages_button.ui_label = f"Messages ({len(errors)})" if errors else "Messages"
+        self.setup_check_results = self._setup_check_results(errors)
+        passed = sum(item["status"] == "Passed" for item in self.setup_check_results)
+        failed = sum(item["status"] == "Needs attention" for item in self.setup_check_results)
+        skipped = sum(item["status"] == "Not applicable" for item in self.setup_check_results)
+        rows = [
+            Div("Setup checks performed", ui_style="font-size:13px; font-weight:600; padding:2px 0;"),
+            Div(
+                f"{passed} passed · {failed} need attention · {skipped} not applicable",
+                ui_style="font-size:11px; color:var(--fg-muted); padding:0 0 5px;",
+            ),
+        ]
+        for item in self.setup_check_results:
+            status = item["status"]
+            icon = "✓" if status == "Passed" else "!" if status == "Needs attention" else "–"
+            color = (
+                "var(--positive)" if status == "Passed"
+                else "var(--negative)" if status == "Needs attention"
+                else "var(--fg-muted)"
+            )
+            issue_count = len(item["issues"])
+            detail = f" ({issue_count} issue{'s' if issue_count != 1 else ''})" if issue_count else ""
+            rows.append(Div(
+                f"{icon}  {item['label']} — {status}{detail}",
+                ui_style=f"font-size:11px; padding:3px 0; color:{color};",
+            ))
+        if errors:
+            rows.append(Div(
+                "Issues to fix — select a message for guidance",
+                ui_style="font-size:11px; font-weight:600; padding:7px 0 3px; border-top:1px solid var(--border);",
+            ))
+            for issue in errors:
+                rows.append(_button(
+                    issue,
+                    "mdi-alert-circle-outline",
+                    lambda *a, selected_issue=issue: self._navigate_to_validation_issue(selected_issue),
+                    style="width:100%; justify-content:flex-start; text-align:left; white-space:normal;",
+                    align="left",
+                ))
+        else:
+            rows.append(Div(
+                "These checks validate the inputs; mesh generation and solver convergence are checked separately.",
+                ui_style="font-size:11px; color:var(--fg-muted); padding:7px 0 0; border-top:1px solid var(--border);",
+            ))
+        self._messages_panel.ui_children = rows
+        self._messages_visible = True
+        self._messages_panel.ui_hidden = False
+
     def _show_validation_issues(self, errors):
         self.validation_issues = list(errors)
         self._messages_button.ui_label = f"Messages ({len(errors)})" if errors else "Messages"
@@ -6761,7 +6885,7 @@ class SolveWorkspace(Div):
 
     def validate_action(self, *args):
         errors = self.validation_errors()
-        self._show_validation_issues(errors)
+        self._show_setup_check_results(errors)
         if errors:
             self._message(f"Setup check found {len(errors)} issue{'s' if len(errors) != 1 else ''}. Select a message for guidance.", error=True)
         else:
