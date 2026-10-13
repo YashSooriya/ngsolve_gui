@@ -40,6 +40,67 @@ def test_scalar_field_revolves_to_a_closed_3d_volume():
     assert ngs.Integrate(1, mesh3d) == pytest.approx(polygon_cylinder_volume, rel=1e-9)
 
 
+def test_large_meridian_mesh_is_coarsened_for_a_smooth_bounded_preview():
+    """Large solver meshes keep geometry and field while the view stays bounded."""
+    geometry = SplineGeometry()
+    geometry.AddRectangle(
+        p1=(0, 0), p2=(1, 1), bc="outer", leftdomain=1, rightdomain=0
+    )
+    geometry.SetMaterial(1, "Air")
+    meridian = ngs.Mesh(geometry.GenerateMesh(maxh=0.012))
+    assert meridian.ne > 5_000
+    source = ngs.GridFunction(ngs.H1(meridian, order=1), name="linear")
+    source.Set(ngs.x + 2 * ngs.y)
+
+    mesh3d, field3d = revolve_gridfunction(source)
+
+    assert mesh3d.dim == 3
+    assert mesh3d.ne <= 300_000
+    assert list(mesh3d.GetMaterials()) == ["Air"]
+    assert field3d(mesh3d(0.5, 0.0, 0.25)) == pytest.approx(1.0, abs=1e-6)
+    angles = {
+        round(
+            math.atan2(
+                float(mesh3d[vertex].point[1]),
+                float(mesh3d[vertex].point[0]),
+            ),
+            3,
+        )
+        for vertex in mesh3d.vertices
+        if math.hypot(
+            float(mesh3d[vertex].point[0]),
+            float(mesh3d[vertex].point[1]),
+        ) == pytest.approx(1.0, abs=1e-8)
+        and abs(float(mesh3d[vertex].point[2])) < 1e-8
+    }
+    assert len(angles) >= 60
+
+
+def test_nested_material_interfaces_survive_preview_coarsening():
+    geometry = SplineGeometry()
+    geometry.AddRectangle(
+        p1=(0, 0), p2=(1, 1), bc="outer", leftdomain=1, rightdomain=0
+    )
+    geometry.AddRectangle(
+        p1=(0.3, 0.3),
+        p2=(0.7, 0.7),
+        bc="interface",
+        leftdomain=2,
+        rightdomain=1,
+    )
+    geometry.SetMaterial(1, "Air")
+    geometry.SetMaterial(2, "coil")
+    meridian = ngs.Mesh(geometry.GenerateMesh(maxh=0.015))
+    source = ngs.GridFunction(ngs.H1(meridian, order=1), name="nested")
+    source.Set(ngs.x + ngs.y)
+
+    mesh3d, _ = revolve_gridfunction(source)
+
+    assert list(mesh3d.GetMaterials()) == ["Air", "coil"]
+    boundaries = set(map(str, mesh3d.GetBoundaries()))
+    assert any("interface" in name.lower() for name in boundaries)
+
+
 def test_cubic_interior_field_survives_revolution_sampling():
     """P3 interior values must not disappear when the view is revolved."""
     meridian = _meridian_mesh(maxh=10.0)

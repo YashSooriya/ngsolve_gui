@@ -15,13 +15,18 @@ import netgen.meshing as ngm
 import ngsolve as ngs
 
 
-DEFAULT_SECTORS = 24
-MAX_TETRAHEDRA = 900_000
+DEFAULT_SECTORS = 64
+MAX_TETRAHEDRA = 300_000
 MIN_SECTORS = 8
 MAX_MERIDIAN_SUBDIVISIONS = 4
 
 
-def revolve_gridfunction(grid_function, sectors: int = DEFAULT_SECTORS):
+def revolve_gridfunction(
+    grid_function,
+    sectors: int = DEFAULT_SECTORS,
+    *,
+    _allow_coarsen: bool = True,
+):
     """Return ``(mesh3d, field3d)`` for a scalar or vector axisymmetric field.
 
     Scalars repeat around the revolution. Two-component vectors are interpreted
@@ -38,6 +43,11 @@ def revolve_gridfunction(grid_function, sectors: int = DEFAULT_SECTORS):
         raise ValueError(
             "Only scalar, radial-axial, or cylindrical 3D fields can be revolved"
         )
+    try:
+        sectors = int(sectors)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Revolution resolution must be an integer") from error
+    sectors = max(MIN_SECTORS, sectors)
 
     source_vertices = list(source_mesh.vertices)
     source_points = {}
@@ -86,15 +96,25 @@ def revolve_gridfunction(grid_function, sectors: int = DEFAULT_SECTORS):
         source_order = 1
     subdivisions = max(1, min(source_order, MAX_MERIDIAN_SUBDIVISIONS))
     while (
-        len(source_triangles) * subdivisions**2 * MIN_SECTORS * 3
+        len(source_triangles) * subdivisions**2 * sectors * 3
         > MAX_TETRAHEDRA
         and subdivisions > 1
     ):
         subdivisions -= 1
-    if len(source_triangles) * subdivisions**2 * MIN_SECTORS * 3 > MAX_TETRAHEDRA:
-        raise ValueError(
-            "The meridian mesh is too large for a responsive 3D revolution "
-            f"({len(source_triangles):,} triangles). Refine or reduce the 2D mesh first."
+    if len(source_triangles) * subdivisions**2 * sectors * 3 > MAX_TETRAHEDRA:
+        if not _allow_coarsen:
+            raise ValueError(
+                "The meridian mesh is still too large after coarsening for a "
+                "responsive 3D revolution."
+            )
+        from .axisymmetric_preview import coarsen_meridian_field
+
+        max_triangles = MAX_TETRAHEDRA // (sectors * 3)
+        coarse_field = coarsen_meridian_field(
+            grid_function, max_triangles=max_triangles
+        )
+        return revolve_gridfunction(
+            coarse_field, sectors=sectors, _allow_coarsen=False
         )
 
     meridian_points = {}
@@ -181,19 +201,22 @@ def revolve_gridfunction(grid_function, sectors: int = DEFAULT_SECTORS):
             )
             boundary_segments.append((first_node, second_node, adjacent_names))
 
-    try:
-        sectors = int(sectors)
-    except (TypeError, ValueError) as error:
-        raise ValueError("Revolution resolution must be an integer") from error
-    sectors = max(MIN_SECTORS, sectors)
     estimated_tetrahedra = len(triangles) * sectors * 3
     if estimated_tetrahedra > MAX_TETRAHEDRA:
-        sectors = MAX_TETRAHEDRA // (len(triangles) * 3)
-        if sectors < MIN_SECTORS:
+        if not _allow_coarsen:
             raise ValueError(
-                "The meridian mesh is too large for a responsive 3D revolution "
-                f"({len(triangles):,} triangles). Refine or reduce the 2D mesh first."
+                "The meridian mesh is still too large after coarsening for a "
+                "responsive 3D revolution."
             )
+        from .axisymmetric_preview import coarsen_meridian_field
+
+        max_triangles = MAX_TETRAHEDRA // (sectors * 3)
+        coarse_field = coarsen_meridian_field(
+            grid_function, max_triangles=max_triangles
+        )
+        return revolve_gridfunction(
+            coarse_field, sectors=sectors, _allow_coarsen=False
+        )
 
     target_ngmesh = ngm.Mesh(dim=3)
     material_ids = {
