@@ -56,6 +56,22 @@ class _MMFEMColormap(Colormap):
             )
 
 
+class _RegionAwareIsolineRenderer(IsolineRenderer):
+    """Isoline surface rendering with per-region culling like mesh views."""
+
+    def get_shader_code(self):
+        source = super().get_shader_code()
+        marker = "    checkClipping(input.p);"
+        if "regionAlphaSurf(input.index)" in source or marker not in source:
+            return source
+        guard = (
+            "#ifdef REGION_VISIBILITY\n"
+            "    if (regionAlphaSurf(input.index) == 0.0) { discard; }\n"
+            "#endif REGION_VISIBILITY\n"
+        )
+        return source.replace(marker, guard + marker, 1)
+
+
 def _fmt_value(v):
     """Fixed-width numeric format for the pick overlay.
 
@@ -1912,22 +1928,43 @@ class FunctionComponent(WebgpuTab):
             from ngsolve_webgpu.cf import FieldLines
 
             vec3 = self.cf if self.cf.dim == 3 else ngs.CF((self.cf[0], self.cf[1], 0))
-            self.fieldlines = FieldLines(
-                vec3,
-                self.region_or_mesh,
-                num_lines=self.fieldlines_num_lines.value,
-                length=self.fieldlines_length.value,
-                thickness=self.fieldlines_thickness.value,
-                direction=self.fieldlines_direction.value,
-                colormap=self.colormap,
-                clipping=self.clipping,
+            fieldline_options = {
+                "num_lines": self.fieldlines_num_lines.value,
+                "length": self.fieldlines_length.value,
+                "thickness": self.fieldlines_thickness.value,
+                "direction": self.fieldlines_direction.value,
+                "colormap": self.colormap,
+                "clipping": self.clipping,
+            }
+            original = self._axisymmetric_original_state
+            axisymmetric_meridian_lines = (
+                self.axisymmetric_revolved.value
+                and original is not None
+                and getattr(original.get("cf"), "dim", None) == 2
             )
+            if axisymmetric_meridian_lines:
+                from .revolved_fieldlines import RevolvedAxisymmetricFieldLines
+
+                self.fieldlines = RevolvedAxisymmetricFieldLines(
+                    vec3,
+                    self.region_or_mesh,
+                    source_cf=original["cf"],
+                    source_mesh=original["mesh"],
+                    all_regions_name=ALL_REGIONS,
+                    **fieldline_options,
+                )
+            else:
+                self.fieldlines = FieldLines(
+                    vec3, self.region_or_mesh, **fieldline_options
+                )
             seed_region = self.fieldline_seed_region.value
             self.fieldlines.start_region = material_region(self.mesh, seed_region)
             self.fieldlines._ngsolve_gui_start_region_name = seed_region
             draw_data = self.data if isinstance(self.data, dict) else {}
-            if self.mesh.dim == 3 and draw_data.get(
-                "_ngsolve_gui_fast_fieldlines", False
+            if (
+                self.mesh.dim == 3
+                and not axisymmetric_meridian_lines
+                and draw_data.get("_ngsolve_gui_fast_fieldlines", False)
             ):
                 from .fast_fieldlines import install_fast_fieldline_update
 
@@ -1964,7 +2001,7 @@ class FunctionComponent(WebgpuTab):
             self.clippingcf = None
         self.slice_renderer = self._create_slice_renderer()
         if self.draw_surf:
-            self.elements2d = IsolineRenderer(
+            self.elements2d = _RegionAwareIsolineRenderer(
                 func_data, n_lines=0, show_field=True,
                 clipping=self.clipping, colormap=self.colormap
             )

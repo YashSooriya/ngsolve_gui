@@ -327,3 +327,37 @@ def test_vector_displacement_deforms_axisymmetric_revolution(page: Page, app) ->
             del function_module.RegionVisibility
         else:
             function_module.RegionVisibility = previous
+
+def test_meridian_fieldline_segments_revolve_into_uniform_planes():
+    from ngsolve_gui.revolved_fieldlines import revolve_meridian_fieldline_arrays
+
+    data = {
+        "pstart": np.array(((1.0, 0.2, 0.0), (0.5, -0.1, 0.0)), dtype=np.float32).reshape(-1),
+        "pend": np.array(((1.0, 0.4, 0.0), (0.5, 0.1, 0.0)), dtype=np.float32).reshape(-1),
+        "value": np.array((2.0, 3.0), dtype=np.float32),
+    }
+    positions, directions, values = revolve_meridian_fieldline_arrays(data, 4)
+    starts = positions.reshape(-1, 3)
+    ends = starts + directions.reshape(-1, 3)
+
+    assert starts.shape == (8, 3)
+    assert values.tolist() == pytest.approx([2, 3] * 4)
+    for plane in range(4):
+        section = slice(plane * 2, (plane + 1) * 2)
+        angle = 2 * math.pi * plane / 4
+        assert np.hypot(starts[section, 0], starts[section, 1]) == pytest.approx([1.0, 0.5])
+        assert starts[section, 2] == pytest.approx([0.2, -0.1])
+        assert ends[section, 2] == pytest.approx([0.4, 0.1])
+        assert starts[section, 0] == pytest.approx(np.array([1.0, 0.5]) * math.cos(angle))
+        assert starts[section, 1] == pytest.approx(np.array([1.0, 0.5]) * math.sin(angle))
+
+
+def test_region_aware_isoline_shader_culls_hidden_surface_regions():
+    from ngsolve_gui.function import _RegionAwareIsolineRenderer
+
+    renderer = object.__new__(_RegionAwareIsolineRenderer)
+    shader = renderer.get_shader_code()
+
+    assert "#ifdef REGION_VISIBILITY" in shader
+    assert "regionAlphaSurf(input.index) == 0.0" in shader
+    assert shader.count("regionAlphaSurf(input.index)") == 1
