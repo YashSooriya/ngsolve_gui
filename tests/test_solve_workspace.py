@@ -1781,7 +1781,6 @@ def test_region_creation_updates_only_changed_canvas_and_tree_subsections(standa
     assert workspace._left_items not in updated_components
     assert all(component in updated_components for component in (
         workspace._tree_entry_lists["geometry"],
-        workspace._tree_entry_lists["sources"],
         workspace._canvas_scene,
         workspace._canvas_dimensions,
         workspace._region_panel,
@@ -2789,9 +2788,7 @@ def test_parameter_removal_is_available_and_blocked_while_referenced(standalone_
     assert "Removed parameter 'length_1'" in workspace.message
 
 
-def test_sources_panel_uses_a_multi_region_viewport_drawer(standalone_components):
-    from types import SimpleNamespace
-
+def test_sources_are_defined_then_assigned_from_the_viewport(standalone_components):
     def component_labels(nodes):
         labels = []
         for node in nodes:
@@ -2807,31 +2804,50 @@ def test_sources_panel_uses_a_multi_region_viewport_drawer(standalone_components
     workspace._primitive_values[("rectangle", "r_min")] = 0.05
     workspace._add_primitive("rectangle")
     second = workspace.model["geometry"]["regions"][1]
-    physics_labels = component_labels(workspace._physics_properties())
+
     source_labels = component_labels(workspace._sources_properties())
-    assert "Configure study frequencies" in physics_labels
-    assert "DC current density" not in physics_labels
     assert source_labels.count("Add source/load") == 1
-    assert "square 1" not in source_labels and "square 2" not in source_labels
+    assert workspace._tree_subsection("sources") == ("REGIONAL LOADS · 0", [])
+    assert workspace.model["regional_loads"] == []
 
     workspace._open_sources_editor()
-    assert workspace._editor_drawer["kind"] == "sources"
-    assert workspace._editor_drawer["select_region_in_viewport"] is True
-    workspace._accept_editor_viewport_region(first["id"])
-    workspace._accept_editor_viewport_region(second["id"])
-    assert workspace._editor_drawer["draft"]["region_ids"] == [first["id"], second["id"]]
-    workspace._accept_editor_viewport_region(first["id"])
-    assert workspace._editor_drawer["draft"]["region_ids"] == [second["id"]]
-    workspace._accept_editor_viewport_region(first["id"])
-    workspace._editor_drawer["draft"].update({"dc_current_density": "1000", "ac_current_density_real": "2000"})
+    assert workspace._editor_drawer["kind"] == "regional_load"
     labels = component_labels(workspace._editor_drawer_children())
+    assert "Source/load name" in labels
     assert "DC current density" in labels
     assert "Radial body force" in labels
+    assert "Select regions" not in labels
     assert "Select region in viewport" not in labels
-    assert "Finish selection" in labels
+    workspace._editor_drawer["draft"].update({
+        "name": "Coil excitation",
+        "dc_current_density": "1000",
+        "ac_current_density_real": "2000",
+    })
     workspace._commit_editor()
+    load = workspace.model["regional_loads"][0]
+    assert load["name"] == "Coil excitation"
+    assert load["region_ids"] == []
+    assert first["sources"]["dc_current_density"] == "0"
+
+    workspace.select_regional_load(load["id"])
+    workspace._toggle_active_source_region(first["id"])
+    workspace._toggle_active_source_region(second["id"])
+    assert load["region_ids"] == [first["id"], second["id"]]
     assert first["sources"]["dc_current_density"] == "1000"
-    assert second["sources"]["dc_current_density"] == "1000"
+    assert second["sources"]["ac_current_density_real"] == "2000"
+    workspace._toggle_active_source_region(first["id"])
+    assert load["region_ids"] == [second["id"]]
+    assert first["sources"]["dc_current_density"] == "0"
+
+    workspace._open_sources_editor(load["id"])
+    assert workspace._editor_drawer["draft"]["name"] == "Coil excitation"
+    workspace._editor_drawer["draft"]["dc_current_density"] = "3000"
+    workspace._commit_editor()
+    assert second["sources"]["dc_current_density"] == "3000"
+    assert workspace.delete_regional_load(load["id"]) is True
+    assert workspace.model["regional_loads"] == []
+    assert second["sources"]["dc_current_density"] == "0"
+
 
 def test_model_and_properties_panels_can_be_collapsed_and_restored(standalone_components):
     workspace = SolveWorkspace()

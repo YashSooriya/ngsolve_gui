@@ -8,6 +8,7 @@ from ngsolve_gui.axisymmetric_model import (
     builtin_materials,
     evaluate_expression,
     new_model,
+    migrate_regional_loads,
     new_studies,
     package_model,
     unpack_model,
@@ -346,3 +347,22 @@ def test_tangent_nested_region_may_touch_its_container():
     _rebuild_test_edges(model)
 
     assert validate_model(model) == []
+
+def test_legacy_region_sources_migrate_to_named_regional_loads():
+    model = _nested_model()
+    coil = model["geometry"]["regions"][1]
+    coil["sources"] = {
+        "dc_current_density": "1e6",
+        "ac_current_density_real": "2e6",
+        "ac_current_density_imaginary": "3e6",
+        "mechanical_body_force": {"r": "4", "z": "5"},
+    }
+
+    migrated = migrate_regional_loads(model)
+    loads = migrated["regional_loads"]
+    assert len(loads) == 1
+    assert loads[0]["name"] == "Coil load"
+    assert loads[0]["region_ids"] == ["coil"]
+    assert migrated["geometry"]["regions"][1]["sources"] == coil["sources"]
+    assert validate_model(migrated) == []
+    assert len(migrate_regional_loads(migrated)["regional_loads"]) == 1

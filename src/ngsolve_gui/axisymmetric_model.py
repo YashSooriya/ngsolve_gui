@@ -181,6 +181,127 @@ def _strip_legacy_mm_suffix(expression):
     return expression
 
 
+def _regional_load_value(load, key):
+    return str(load.get(key, "0") or "0").strip() or "0"
+
+
+def _regional_load_body_force(load):
+    force = load.get("mechanical_body_force", {})
+    if not isinstance(force, dict):
+        force = {}
+    return {
+        "r": str(force.get("r", "0") or "0").strip() or "0",
+        "z": str(force.get("z", "0") or "0").strip() or "0",
+    }
+
+
+def _expression_is_zero(expression):
+    value = str(expression or "0").strip().lower().replace(" ", "")
+    return value in {"", "0", "0.0", "0.00", "0.000", "0e0", "0.0e0", "0e+0", "0.0e+0"}
+
+
+def _sum_source_expressions(expressions):
+    active = [str(value or "0").strip() or "0" for value in expressions]
+    active = [value for value in active if not _expression_is_zero(value)]
+    if not active:
+        return "0"
+    if len(active) == 1:
+        return active[0]
+    return " + ".join(f"({value})" for value in active)
+
+
+def migrate_regional_loads(model):
+    """Add named regional loads and materialize their assignments for solver compatibility."""
+    if not isinstance(model, dict):
+        return model
+    migrated = copy.deepcopy(model)
+    geometry = migrated.get("geometry", {})
+    if not isinstance(geometry, dict):
+        return migrated
+    regions = geometry.get("regions", [])
+    if not isinstance(regions, list):
+        return migrated
+
+    loads = migrated.get("regional_loads", [])
+    if not isinstance(loads, list):
+        loads = []
+    for load in loads:
+        if not isinstance(load, dict):
+            continue
+        load.setdefault("region_ids", [])
+        for key in ("dc_current_density", "ac_current_density_real", "ac_current_density_imaginary"):
+            load.setdefault(key, "0")
+        load.setdefault("mechanical_body_force", {"r": "0", "z": "0"})
+        load["mechanical_body_force"] = _regional_load_body_force(load)
+
+    assigned_region_ids = {
+        region_id
+        for load in loads if isinstance(load, dict)
+        for region_id in (load.get("region_ids", []) if isinstance(load.get("region_ids", []), list) else [])
+    }
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        region_id = region.get("id")
+        source = region.get("sources", {})
+        if region_id in assigned_region_ids or not isinstance(source, dict):
+            continue
+        body = source.get("mechanical_body_force", {})
+        if not isinstance(body, dict):
+            body = {}
+        values = {
+            "dc_current_density": str(source.get("dc_current_density", "0") or "0").strip() or "0",
+            "ac_current_density_real": str(source.get("ac_current_density_real", "0") or "0").strip() or "0",
+            "ac_current_density_imaginary": str(source.get("ac_current_density_imaginary", "0") or "0").strip() or "0",
+            "mechanical_body_force": {
+                "r": str(body.get("r", "0") or "0").strip() or "0",
+                "z": str(body.get("z", "0") or "0").strip() or "0",
+            },
+        }
+        if all(_expression_is_zero(value) for key, value in values.items() if key != "mechanical_body_force") and all(
+            _expression_is_zero(value) for value in values["mechanical_body_force"].values()
+        ):
+            continue
+        base_name = f"{region.get('name', 'Region')} load"
+        used_names = {str(item.get("name", "")).casefold() for item in loads if isinstance(item, dict)}
+        name = base_name
+        suffix = 2
+        while name.casefold() in used_names:
+            name = f"{base_name} {suffix}"
+            suffix += 1
+        loads.append({
+            "id": new_id("load"),
+            "name": name,
+            "region_ids": [region_id] if region_id else [],
+            **{key: values[key] for key in ("dc_current_density", "ac_current_density_real", "ac_current_density_imaginary")},
+            "mechanical_body_force": values["mechanical_body_force"],
+        })
+    migrated["regional_loads"] = loads
+
+    for region in regions:
+        if not isinstance(region, dict) or not region.get("id"):
+            continue
+        region_loads = [
+            load for load in loads
+            if isinstance(load, dict)
+            and isinstance(load.get("region_ids", []), list)
+            and region["id"] in load.get("region_ids", [])
+        ]
+        if not region_loads:
+            continue
+        region["sources"] = {
+            key: _sum_source_expressions(_regional_load_value(load, key) for load in region_loads)
+            for key in ("dc_current_density", "ac_current_density_real", "ac_current_density_imaginary")
+        }
+        region["sources"]["mechanical_body_force"] = {
+            component: _sum_source_expressions(
+                _regional_load_body_force(load)[component] for load in region_loads
+            )
+            for component in ("r", "z")
+        }
+    return migrated
+
+
 def migrate_legacy_model(model):
     """Upgrade pre-SI geometry expressions while keeping their geometry fixed."""
     if not isinstance(model, dict) or model.get("schema_version") != LEGACY_SCHEMA_VERSION:
@@ -279,6 +400,7 @@ def new_model(name: str = "Untitled axisymmetric model") -> dict:
         },
         "materials": [],
         "boundary_conditions": [],
+        "regional_loads": [],
         "physics": {
             "dc_magnetic": {"enabled": True},
             "harmonic_electromagnetic": {
@@ -822,6 +944,63 @@ def validate_model(model: dict) -> list[str]:
             errors.append(f"Region '{region_data.get('name')}' edge ids do not match its sketch geometry.")
     if set(edge_keys) != expected_edge_keys:
         errors.append("Geometry edge list does not match the region outlines.")
+
+    regional_loads = model.get("regional_loads", [])
+    if not isinstance(regional_loads, list):
+        errors.append("Regional loads must be a list.")
+        regional_loads = []
+    regional_load_ids = set()
+    regional_load_names = set()
+    allowed_load_fields = {
+        "dc_current_density": "A/m^2",
+        "ac_current_density_real": "A/m^2",
+        "ac_current_density_imaginary": "A/m^2",
+    }
+    for load in regional_loads:
+        if not isinstance(load, dict):
+            errors.append("Each regional load must be an object.")
+            continue
+        load_id = load.get("id")
+        if not isinstance(load_id, str) or not load_id or load_id in regional_load_ids:
+            errors.append("Every regional load must have a unique id.")
+        else:
+            regional_load_ids.add(load_id)
+        load_name = str(load.get("name", "")).strip()
+        if not load_name:
+            errors.append(f"Regional load {load_id!r} needs a name.")
+        elif load_name.casefold() in regional_load_names:
+            errors.append(f"Regional load name '{load_name}' is duplicated.")
+        else:
+            regional_load_names.add(load_name.casefold())
+        region_ids = load.get("region_ids", [])
+        if not isinstance(region_ids, list):
+            errors.append(f"Regional load '{load_name or load_id}' region_ids must be a list.")
+            region_ids = []
+        elif any(not isinstance(region_id, str) or not region_id for region_id in region_ids):
+            errors.append(f"Regional load '{load_name or load_id}' has an invalid region assignment.")
+        elif len(region_ids) != len(dict.fromkeys(region_ids)):
+            errors.append(f"Regional load '{load_name or load_id}' repeats a region assignment.")
+        for region_id in region_ids:
+            if region_id not in region_by_id:
+                errors.append(f"Regional load '{load_name or load_id}' references a missing region.")
+        for key, unit in allowed_load_fields.items():
+            expression = load.get(key, "0")
+            check_unit(f"Regional load '{load_name or load_id}' {key}", expression, unit, allow_coordinates=True)
+            try:
+                _validate_expression(expression, set(parameter_map), allow_coordinates=True)
+            except (TypeError, ValueError, SyntaxError) as error:
+                errors.append(f"Regional load '{load_name or load_id}' {key}: {error}.")
+        body = load.get("mechanical_body_force", {})
+        if not isinstance(body, dict):
+            errors.append(f"Regional load '{load_name or load_id}' body force must be an object.")
+        else:
+            for component in ("r", "z"):
+                expression = body.get(component, "0")
+                check_unit(f"Regional load '{load_name or load_id}' body force {component}", expression, "N/m^3", allow_coordinates=True)
+                try:
+                    _validate_expression(expression, set(parameter_map), allow_coordinates=True)
+                except (TypeError, ValueError, SyntaxError) as error:
+                    errors.append(f"Regional load '{load_name or load_id}' body force {component}: {error}.")
 
     for region in region_by_id.values():
         source = region.get("sources", {})

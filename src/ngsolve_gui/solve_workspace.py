@@ -42,6 +42,7 @@ from .axisymmetric_model import (
     builtin_materials,
     evaluate_expression,
     migrate_legacy_model,
+    migrate_regional_loads,
     migrate_legacy_studies,
     new_id,
     new_model,
@@ -394,6 +395,7 @@ class SolveWorkspace(Div):
         self._mesh_preview_signature = None
         self.selected_material_id = None
         self.selected_boundary_id = None
+        self.selected_source_id = None
         self.selected_parameter_id = None
         self._selected_condition_id = None
         self._tree_panel_width = 240
@@ -1002,6 +1004,7 @@ class SolveWorkspace(Div):
         self._cancel_canvas_zoom_render()
         self._clear_mesh_preview()
         model = migrate_legacy_model(model)
+        model = migrate_regional_loads(model)
         model = copy.deepcopy(model)
         _sync_axis_boundary_conditions(model)
         _sync_mechanical_boundary_conditions(model)
@@ -1029,6 +1032,7 @@ class SolveWorkspace(Div):
         self._load_canvas_view_from_layout()
         self.selected_material_id = None
         self.selected_boundary_id = None
+        self.selected_source_id = None
         self.selected_parameter_id = None
         self._selected_condition_id = None
         requested_section = self.layout.get("active_section", "geometry")
@@ -1050,6 +1054,8 @@ class SolveWorkspace(Div):
             return
         self.active_section = section
         self.layout["active_section"] = section
+        if section == "sources":
+            self.set_sketch_tool("select", announce=False)
         if section != "mesh" and self.hp_target_selection_active:
             self.hp_target_selection_active = False
         if section != "boundaries":
@@ -1115,8 +1121,8 @@ class SolveWorkspace(Div):
     def _tree_selected_entry(self):
         if self.active_section == "geometry" and self.selected_region_id:
             return f"geometry:{self.selected_region_id}"
-        if self.active_section == "sources" and self.selected_region_id:
-            return f"sources:{self.selected_region_id}"
+        if self.active_section == "sources" and self.selected_source_id:
+            return f"sources:{self.selected_source_id}"
         if self.active_section == "parameters" and self.selected_parameter_id:
             return f"parameters:{self.selected_parameter_id}"
         if self.active_section == "materials" and self.selected_material_id:
@@ -1124,7 +1130,6 @@ class SolveWorkspace(Div):
         if self.active_section == "boundaries" and self.selected_boundary_id:
             return f"boundaries:{self.selected_boundary_id}"
         return None
-
     def _update_model_tree_selection(self):
         """Highlight the selected tree rows without replacing the tree slots."""
         for key, button in self._section_buttons.items():
@@ -2556,7 +2561,7 @@ class SolveWorkspace(Div):
         # retarget the eventual click away from the SVG region element. Doing
         # selection here makes a simple viewport press reliable and exposes
         # that region's properties before the pointer is released.
-        if operation == "region" and region_id and self.active_section != "boundaries":
+        if operation == "region" and region_id and self.active_section not in {"boundaries", "sources"}:
             self.select_region(region_id)
 
     def _region_at_canvas_point(self, point):
@@ -2689,6 +2694,22 @@ class SolveWorkspace(Div):
                     if view_changed and operation not in {"pan", "draw"}:
                         self._render_canvas_after_interaction()
                     return
+                if self.active_section == "sources":
+                    self._canvas_drag = None
+                    self._screen_to_svg = None
+                    view_changed = self._commit_browser_canvas_view(view, render=False, clamp_negative_r=True)
+                    if not moved and operation == "region" and region_id:
+                        self._toggle_active_source_region(region_id)
+                    elif not moved and operation != "pan":
+                        self._clear_canvas_selection()
+                    elif moved and operation == "pan":
+                        if view_changed:
+                            self._render_canvas_after_interaction()
+                        else:
+                            self._schedule_canvas_interaction_reset()
+                    elif view_changed:
+                        self._render_canvas_after_interaction()
+                    return
                 self._canvas_drag = None
                 self._screen_to_svg = None
                 if moved and operation in {"region", "edge"} and region_id:
@@ -2772,6 +2793,14 @@ class SolveWorkspace(Div):
                     self._clear_canvas_selection()
             elif moved and drag["operation"] == "pan":
                 self._pan_canvas_by_pixels(start, end)
+            return
+        if self.active_section == "sources":
+            if moved and drag.get("operation") == "pan":
+                self._pan_canvas_by_pixels(start, end)
+            elif not moved and drag.get("operation") == "region" and drag.get("region_id"):
+                self._toggle_active_source_region(drag["region_id"])
+            elif not moved and drag.get("operation") != "pan":
+                self._clear_canvas_selection()
             return
         if moved and drag["operation"] in {"region", "edge"} and drag.get("region_id"):
             self._move_region_from_canvas_drag(drag["region_id"], start, end)
@@ -3105,6 +3134,7 @@ class SolveWorkspace(Div):
             ("parameter", r"Parameter '([^']+)'"),
             ("materials", r"Material '([^']+)'"),
             ("boundaries", r"Boundary '([^']+)'"),
+            ("sources", r"Regional load '([^']+)'"),
             ("boundaries", r"(?:Geometry )?Edge '([^']+)'"),
             ("region", r"Region '([^']+)'"),
         )
@@ -3130,6 +3160,12 @@ class SolveWorkspace(Div):
                         self._open_region_material_editor(assigned[0]["id"])
                     else:
                         self.select_section("materials")
+                    return
+            elif target_kind == "sources":
+                matches = [item for item in self.model.get("regional_loads", []) if item.get("name") == target_name]
+                if len(matches) == 1:
+                    self.select_regional_load(matches[0]["id"])
+                    self._open_sources_editor(matches[0]["id"])
                     return
             elif target_kind == "boundaries":
                 matches = [item for item in self.model.get("boundary_conditions", []) if item.get("name") == target_name]
@@ -3743,6 +3779,106 @@ class SolveWorkspace(Div):
         self._tree_entry_buttons[f"{section}:{entry_id}"] = button
         return button
 
+    def _assigned_regions_for_load(self, load_id):
+        load = next((item for item in self.model.get("regional_loads", []) if item.get("id") == load_id), None)
+        if load is None:
+            return []
+        valid_ids = {region.get("id") for region in self.model.get("geometry", {}).get("regions", [])}
+        return [region_id for region_id in load.get("region_ids", []) if region_id in valid_ids]
+
+    def _sync_region_sources_from_loads(self):
+        """Materialize named regional loads into the legacy solver input fields."""
+        loads = self.model.setdefault("regional_loads", [])
+        for region in self.model.get("geometry", {}).get("regions", []):
+            region_id = region.get("id")
+            assigned = [
+                item for item in loads
+                if region_id in item.get("region_ids", [])
+            ]
+            source = {}
+            for key in ("dc_current_density", "ac_current_density_real", "ac_current_density_imaginary"):
+                values = [str(item.get(key, "0") or "0").strip() or "0" for item in assigned]
+                values = [value for value in values if value not in {"0", "0.0", "0.00", "0e0", "0.0e0"}]
+                source[key] = "0" if not values else values[0] if len(values) == 1 else " + ".join(f"({value})" for value in values)
+            force = {}
+            for component in ("r", "z"):
+                values = [
+                    str((item.get("mechanical_body_force") or {}).get(component, "0") or "0").strip() or "0"
+                    for item in assigned
+                ]
+                values = [value for value in values if value not in {"0", "0.0", "0.00", "0e0", "0.0e0"}]
+                force[component] = "0" if not values else values[0] if len(values) == 1 else " + ".join(f"({value})" for value in values)
+            source["mechanical_body_force"] = force
+            region["sources"] = source
+
+    def select_regional_load(self, load_id):
+        if not any(item.get("id") == load_id for item in self.model.get("regional_loads", [])):
+            return
+        self.selected_source_id = load_id
+        self.set_sketch_tool("select", announce=False)
+        assigned = self._assigned_regions_for_load(load_id)
+        self.selected_region_ids = list(assigned)
+        self.selected_region_id = assigned[-1] if assigned else None
+        self.selected_edge_id = None
+        self.selected_edge_ids = []
+        self._selected_condition_id = None
+        self.active_section = "sources"
+        self.layout["active_section"] = "sources"
+        self._update_model_tree_selection()
+        self._render_inspector()
+        self._sync_canvas_selection()
+        self._render_canvas_dimensions()
+
+    @_history_tracked
+    def _toggle_active_source_region(self, region_id):
+        if self.active_section != "sources" or not self.selected_source_id:
+            self._message("Select a saved source/load before assigning it to regions.", error=True)
+            return False
+        load = next((item for item in self.model.get("regional_loads", []) if item.get("id") == self.selected_source_id), None)
+        if load is None:
+            self.selected_source_id = None
+            return False
+        if not any(region.get("id") == region_id for region in self.model.get("geometry", {}).get("regions", [])):
+            return False
+        assigned = list(load.get("region_ids", []))
+        if region_id in assigned:
+            assigned.remove(region_id)
+            message = f"Removed {next(region['name'] for region in self.model['geometry']['regions'] if region['id'] == region_id)} from {load.get('name', 'source/load')}."
+        else:
+            assigned.append(region_id)
+            message = f"Applied {load.get('name', 'source/load')} to {next(region['name'] for region in self.model['geometry']['regions'] if region['id'] == region_id)}."
+        load["region_ids"] = assigned
+        self._sync_region_sources_from_loads()
+        self.selected_region_ids = list(assigned)
+        self.selected_region_id = assigned[-1] if assigned else None
+        self.selected_edge_id = None
+        self.selected_edge_ids = []
+        self._refresh_model_tree()
+        self._render_inspector()
+        self._sync_canvas_selection()
+        self._render_canvas_dimensions()
+        self._message(message)
+        return True
+
+    @_history_tracked
+    def delete_regional_load(self, load_id):
+        loads = self.model.get("regional_loads", [])
+        index = next((i for i, item in enumerate(loads) if item.get("id") == load_id), None)
+        if index is None:
+            return False
+        name = loads[index].get("name", "Source/load")
+        del loads[index]
+        self._sync_region_sources_from_loads()
+        if self.selected_source_id == load_id:
+            self.selected_source_id = None
+            self.selected_region_id = None
+            self.selected_region_ids = []
+        self._refresh_model_tree()
+        self._render_inspector()
+        self._sync_canvas_selection()
+        self._message(f"Deleted {name}.")
+        return True
+
     def _tree_subsection(self, section):
         if section == "geometry":
             entries = [
@@ -3784,11 +3920,18 @@ class SolveWorkspace(Div):
                 ))
             return f"CONDITIONS · {len(entries)}", entries
         if section == "sources":
-            entries = [
-                (region["id"], region["name"], "mdi-flash-outline", lambda *a, rid=region["id"]: self.select_source_region(rid), region["id"] == self.selected_region_id)
-                for region in self.model["geometry"].get("regions", [])
-            ]
-            return f"REGION LOADS · {len(entries)}", entries
+            entries = []
+            for item in self.model.get("regional_loads", []):
+                assigned = len(self._assigned_regions_for_load(item.get("id")))
+                noun = "region" if assigned == 1 else "regions"
+                entries.append((
+                    item["id"],
+                    f"{item.get('name', 'Source/load')} · {assigned} {noun}",
+                    "mdi-flash-outline",
+                    lambda *a, lid=item["id"]: self.select_regional_load(lid),
+                    item.get("id") == self.selected_source_id,
+                ))
+            return f"REGIONAL LOADS · {len(entries)}", entries
         if section == "studies":
             entries = [
                 (item.get("id", item.get("name", "Study")), item.get("name", "Study"), "mdi-play-box-outline", lambda *a: self.select_section("studies"), False)
@@ -3802,7 +3945,6 @@ class SolveWorkspace(Div):
             ]
             return f"RUNS · {len(entries)}", entries
         return None
-
     def delete_run_history_entry(self, run_id):
         """Hide one Run History entry without deleting its output files."""
         run = next(
@@ -3855,18 +3997,24 @@ class SolveWorkspace(Div):
         self.select_section("geometry")
 
     def select_source_region(self, region_id):
+        load = next((item for item in self.model.get("regional_loads", []) if region_id in item.get("region_ids", [])), None)
+        if load is not None:
+            self.select_regional_load(load["id"])
+            self.selected_region_id = region_id
+            self._sync_canvas_selection()
+            return
+        self.selected_source_id = None
         self.selected_region_id = region_id
         self.selected_region_ids = [region_id]
         self.selected_edge_id = None
         self.selected_edge_ids = []
         self._selected_condition_id = None
         self.active_section = "sources"
-        self.layout["active_section"] = self.active_section
+        self.layout["active_section"] = "sources"
         self._update_model_tree_selection()
         self._render_inspector()
         self._sync_canvas_selection()
         self._render_canvas_dimensions()
-
     def select_region(self, region_id):
         self.selected_region_id = region_id
         self.selected_edge_id = None
@@ -3883,7 +4031,7 @@ class SolveWorkspace(Div):
         self._render_canvas_dimensions()
 
     def _on_canvas_region_click(self, region_id, event=None):
-        if self.active_section == "boundaries":
+        if self.active_section in {"boundaries", "sources"}:
             # Boundary-stage selection is committed on pointer release; the
             # following native click must not apply the same action twice.
             return
@@ -4631,25 +4779,12 @@ class SolveWorkspace(Div):
         if self._editor_drawer is not None:
             self._editor_drawer["draft"][key] = str(getattr(event, "value", event) or "").strip()
 
-    def _set_editor_source_region(self, event):
+    def _set_editor_source_force(self, component, event):
         if self._editor_drawer is None:
             return
-        region_id = str(getattr(event, "value", event))
-        region = next((r for r in self.model["geometry"].get("regions", []) if r["id"] == region_id), None)
-        if region is None:
-            return
-        sources = region.get("sources", {})
-        force = sources.get("mechanical_body_force", {})
-        self._editor_drawer["item_id"] = region_id
-        self._editor_drawer["draft"] = {
-            "region_id": region_id,
-            "dc_current_density": sources.get("dc_current_density", "0"),
-            "ac_current_density_real": sources.get("ac_current_density_real", "0"),
-            "ac_current_density_imaginary": sources.get("ac_current_density_imaginary", "0"),
-            "body_force_r": force.get("r", "0"),
-            "body_force_z": force.get("z", "0"),
-        }
-        self._render_inspector()
+        value = str(getattr(event, "value", event) or "").strip()
+        force = self._editor_drawer["draft"].setdefault("mechanical_body_force", {})
+        force[component] = value or "0"
 
     def _editor_drawer_children(self):
         editor = self._editor_drawer
@@ -4658,7 +4793,7 @@ class SolveWorkspace(Div):
             "material": ("Material details", "Set the material properties and save them to this problem."),
             "region_material": ("Region material", "Choose a preset or define a custom material for this region."),
             "boundary": ("Boundary condition", "Configure this condition. Select it afterwards to assign it in the viewport."),
-            "sources": ("Sources and loads", "Select one or more regions, then apply these sources and loads."),
+            "regional_load": ("Source/load", "Define the values, save, then assign this source to regions from the main page."),
             "region_mesh_size": ("Region-wise element sizing", "Choose one region and its local target element size."),
         }
         title, subtitle = titles[kind]
@@ -4739,21 +4874,18 @@ class SolveWorkspace(Div):
             }
             for key, label, suffix in fields.get(typ, ()):
                 body.append(_input(label, draft.get(key, "0"), lambda event, field=key: self._set_editor_draft(field, event), suffix=suffix))
-        elif kind == "sources":
-            regions_by_id = {region["id"]: region for region in self.model.get("geometry", {}).get("regions", [])}
-            selected_ids = [rid for rid in draft.get("region_ids", []) if rid in regions_by_id]
-            selected_names = [regions_by_id[rid].get("name", "Region") for rid in selected_ids]
+        elif kind == "regional_load":
+            force = draft.get("mechanical_body_force", {})
+            if not isinstance(force, dict):
+                force = {}
             body.extend([
-                Div("Click regions in the viewport to add or remove them from this load. Selected regions are highlighted.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
-                Div(f"Selected regions ({len(selected_ids)}): " + (", ".join(selected_names) if selected_names else "none"), ui_style="font-size:12px; font-weight:600;"),
-                _button("Finish selection" if editor.get("select_region_in_viewport") else "Select regions", "mdi-cursor-default-click-outline", self._toggle_editor_region_pick, color="primary" if editor.get("select_region_in_viewport") else None),
-                *[_button(f"Remove {regions_by_id[rid].get('name', 'region')}", "mdi-close", lambda *a, selected=rid: self._toggle_source_region(selected)) for rid in selected_ids],
+                _input("Source/load name", draft.get("name", ""), lambda event: self._set_editor_draft("name", event)),
                 _input("DC current density", draft.get("dc_current_density", "0"), lambda event: self._set_editor_draft("dc_current_density", event), suffix="A/m²"),
                 _input("AC current density (real)", draft.get("ac_current_density_real", "0"), lambda event: self._set_editor_draft("ac_current_density_real", event), suffix="A/m²"),
                 _input("AC current density (imaginary)", draft.get("ac_current_density_imaginary", "0"), lambda event: self._set_editor_draft("ac_current_density_imaginary", event), suffix="A/m²"),
                 Div("MECHANICAL BODY FORCE", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:4px;"),
-                _input("Radial body force", draft.get("body_force_r", "0"), lambda event: self._set_editor_draft("body_force_r", event), suffix="N/m³"),
-                _input("Axial body force", draft.get("body_force_z", "0"), lambda event: self._set_editor_draft("body_force_z", event), suffix="N/m³"),
+                _input("Radial body force", force.get("r", "0"), lambda event: self._set_editor_source_force("r", event), suffix="N/m³"),
+                _input("Axial body force", force.get("z", "0"), lambda event: self._set_editor_source_force("z", event), suffix="N/m³"),
             ])
         elif kind == "region_mesh_size":
             regions = self.model.get("geometry", {}).get("regions", [])
@@ -4877,24 +5009,37 @@ class SolveWorkspace(Div):
             self.layout["active_section"] = self.active_section
             self._refresh_model_tree()
             self._sync_canvas_selection()
-        elif kind == "sources":
-            region_ids = list(dict.fromkeys(draft.get("region_ids", [])))
-            regions_by_id = {region.get("id"): region for region in self.model.get("geometry", {}).get("regions", [])}
-            region_ids = [region_id for region_id in region_ids if region_id in regions_by_id]
-            if not region_ids:
-                self._message("Select at least one region in the viewport before saving.", error=True)
+        elif kind == "regional_load":
+            name = str(draft.get("name", "")).strip()
+            if not name:
+                self._message("Enter a name for this source/load before saving.", error=True)
                 return
-            for region_id in region_ids:
-                region = regions_by_id[region_id]
-                sources = region.setdefault("sources", {})
-                for key in ("dc_current_density", "ac_current_density_real", "ac_current_density_imaginary"):
-                    sources[key] = str(draft.get(key, "0")).strip()
-                sources["mechanical_body_force"] = {
-                    "r": str(draft.get("body_force_r", "0")).strip(),
-                    "z": str(draft.get("body_force_z", "0")).strip(),
-                }
-            self.selected_region_ids = region_ids
-            self.selected_region_id = region_ids[-1]
+            if any(item.get("id") != item_id and str(item.get("name", "")).strip().casefold() == name.casefold() for item in self.model.get("regional_loads", [])):
+                self._message("Each source/load needs a unique name.", error=True)
+                return
+            existing = next((item for item in self.model.get("regional_loads", []) if item.get("id") == item_id), None)
+            load = {
+                "id": item_id or new_id("load"),
+                "name": name,
+                "region_ids": list(existing.get("region_ids", [])) if existing else [],
+                "dc_current_density": str(draft.get("dc_current_density", "0") or "0").strip() or "0",
+                "ac_current_density_real": str(draft.get("ac_current_density_real", "0") or "0").strip() or "0",
+                "ac_current_density_imaginary": str(draft.get("ac_current_density_imaginary", "0") or "0").strip() or "0",
+                "mechanical_body_force": {
+                    component: str((draft.get("mechanical_body_force") or {}).get(component, "0") or "0").strip() or "0"
+                    for component in ("r", "z")
+                },
+            }
+            if existing is None:
+                self.model.setdefault("regional_loads", []).append(load)
+            else:
+                self.model["regional_loads"][self.model["regional_loads"].index(existing)] = load
+            self._sync_region_sources_from_loads()
+            self.selected_source_id = load["id"]
+            self.active_section = "sources"
+            self.layout["active_section"] = "sources"
+            self.selected_region_ids = self._assigned_regions_for_load(load["id"])
+            self.selected_region_id = self.selected_region_ids[-1] if self.selected_region_ids else None
         self._editor_drawer = None
         self._render_inspector()
         self._refresh_model_tree()
@@ -4973,35 +5118,25 @@ class SolveWorkspace(Div):
             draft, is_new = copy.deepcopy(current), False
         self._open_editor("boundary", item_id=draft["id"], draft=draft, is_new=is_new)
 
-    def _open_sources_editor(self, region_id=None):
-        regions = self.model.get("geometry", {}).get("regions", [])
-        if not regions:
-            self._message("Create a geometry region before adding sources or loads.", error=True)
-            return
-        selected_ids = [region_id] if region_id and any(region.get("id") == region_id for region in regions) else []
-        first = next((region for region in regions if selected_ids and region.get("id") == selected_ids[0]), None)
-        sources = first.get("sources", {}) if first else {}
-        force = sources.get("mechanical_body_force", {})
+    def _open_sources_editor(self, load_id=None):
         self.active_section = "sources"
         self.layout["active_section"] = "sources"
-        self.selected_region_ids = list(selected_ids)
-        self.selected_region_id = selected_ids[-1] if selected_ids else None
-        self.selected_edge_id = None
-        self.selected_edge_ids = []
-        self._selected_condition_id = None
         self.set_sketch_tool("select", announce=False)
-        self._open_editor("sources", item_id=selected_ids[-1] if selected_ids else None, draft={
-            "region_ids": selected_ids,
-            "dc_current_density": sources.get("dc_current_density", "0"),
-            "ac_current_density_real": sources.get("ac_current_density_real", "0"),
-            "ac_current_density_imaginary": sources.get("ac_current_density_imaginary", "0"),
-            "body_force_r": force.get("r", "0"),
-            "body_force_z": force.get("z", "0"),
-        }, is_new=True)
-        self._editor_drawer["select_region_in_viewport"] = True
-        self._sync_canvas_selection()
-        self._render_inspector()
-
+        current = next((item for item in self.model.get("regional_loads", []) if item.get("id") == load_id), None)
+        if current is None:
+            index = len(self.model.get("regional_loads", [])) + 1
+            draft = {
+                "id": new_id("load"),
+                "name": f"Source/load {index}",
+                "region_ids": [],
+                "dc_current_density": "0",
+                "ac_current_density_real": "0",
+                "ac_current_density_imaginary": "0",
+                "mechanical_body_force": {"r": "0", "z": "0"},
+            }
+            self._open_editor("regional_load", item_id=draft["id"], draft=draft, is_new=True)
+        else:
+            self._open_editor("regional_load", item_id=load_id, draft=copy.deepcopy(current), is_new=False)
     def _open_region_mesh_size_editor(self, region_id=None):
         regions = self.model.get("geometry", {}).get("regions", [])
         if not regions:
@@ -5017,32 +5152,17 @@ class SolveWorkspace(Div):
         )
 
     def _toggle_editor_region_pick(self, *args):
-        if self._editor_drawer is None or self._editor_drawer.get("kind") not in {"region_mesh_size", "sources"}:
+        if self._editor_drawer is None or self._editor_drawer.get("kind") != "region_mesh_size":
             return
         enabled = not bool(self._editor_drawer.get("select_region_in_viewport"))
         self._editor_drawer["select_region_in_viewport"] = enabled
         if enabled:
             self.set_sketch_tool("select", announce=False)
-            self._message("Click regions in the viewport to add or remove them from this selection.")
+            self._message("Click a region in the viewport to choose its local mesh size.")
         else:
             self._message("Region selection finished.")
         self._sync_canvas_selection()
         self._render_inspector()
-
-    def _toggle_source_region(self, region_id):
-        if self._editor_drawer is None or self._editor_drawer.get("kind") != "sources":
-            return
-        selected = list(self._editor_drawer["draft"].get("region_ids", []))
-        if region_id in selected:
-            selected.remove(region_id)
-        else:
-            selected.append(region_id)
-        self._editor_drawer["draft"]["region_ids"] = selected
-        self.selected_region_ids = selected
-        self.selected_region_id = selected[-1] if selected else None
-        self._sync_canvas_selection()
-        self._render_inspector()
-
     def _accept_editor_viewport_region(self, region_id):
         editor = self._editor_drawer
         if editor is None:
@@ -5050,37 +5170,12 @@ class SolveWorkspace(Div):
         region = next((r for r in self.model.get("geometry", {}).get("regions", []) if r.get("id") == region_id), None)
         if region is None:
             return
-        if editor.get("kind") == "sources":
-            selected = list(editor["draft"].get("region_ids", []))
-            if region_id in selected:
-                selected.remove(region_id)
-            else:
-                selected.append(region_id)
-            editor["draft"]["region_ids"] = selected
-            editor["select_region_in_viewport"] = True
-            self.selected_region_ids = selected
-            self.selected_region_id = selected[-1] if selected else None
-            self.active_section = "sources"
-            self.layout["active_section"] = "sources"
-            self._sync_canvas_selection()
-            self._render_inspector()
-            return
         editor["select_region_in_viewport"] = False
         editor["item_id"] = region_id
         draft = editor.setdefault("draft", {})
         draft["region_id"] = region_id
         if editor.get("kind") == "region_mesh_size" and not draft.get("value"):
             draft["value"] = self.model.get("mesh", {}).get("region_element_sizes", {}).get(region_id, "")
-        elif editor.get("kind") == "sources":
-            sources = region.get("sources", {})
-            force = sources.get("mechanical_body_force", {})
-            draft.update({
-                "dc_current_density": sources.get("dc_current_density", "0"),
-                "ac_current_density_real": sources.get("ac_current_density_real", "0"),
-                "ac_current_density_imaginary": sources.get("ac_current_density_imaginary", "0"),
-                "body_force_r": force.get("r", "0"),
-                "body_force_z": force.get("z", "0"),
-            })
         self._message(f"Selected {region.get('name', 'region')} for {editor['kind'].replace('_', ' ')}.")
         self._sync_canvas_selection()
         self._render_inspector()
@@ -5271,13 +5366,30 @@ class SolveWorkspace(Div):
         return children
 
     def _sources_properties(self):
-        regions = self.model.get("geometry", {}).get("regions", [])
-        children = [_section_title("Sources & loads", "Apply current densities and mechanical body forces to selected regions.")]
+        loads = self.model.get("regional_loads", [])
+        children = [_section_title("Sources & loads", "Define named loads, select one, then click regions in the viewport to assign it.")]
         children.append(_button("Add source/load", "mdi-plus", self._open_sources_editor, color="primary"))
-        if not regions:
-            children.append(Div("Create geometry before adding sources or loads.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"))
+        if not loads:
+            children.append(Div("No regional loads defined yet.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"))
+            return children
+        for load in loads:
+            selected = load.get("id") == self.selected_source_id
+            count = len(self._assigned_regions_for_load(load.get("id")))
+            label = f"{load.get('name', 'Source/load')} · {count} region{'s' if count != 1 else ''}"
+            children.append(Div(
+                _button(label, "mdi-flash-outline", lambda *a, lid=load.get("id"): self.select_regional_load(lid), color="primary" if selected else None, style="flex:1; min-width:0;"),
+                _icon_button("mdi-pencil-outline", f"Edit {load.get('name', 'source/load')}", lambda *a, lid=load.get("id"): self._open_sources_editor(lid)),
+                _icon_button("mdi-delete-outline", f"Delete {load.get('name', 'source/load')}", lambda *a, lid=load.get("id"): self.delete_regional_load(lid), color="negative"),
+                ui_style="display:flex; align-items:center; gap:4px; padding:4px; border:1px solid " + ("var(--primary);" if selected else "var(--border);") + " border-radius:7px;",
+            ))
+        if self.selected_source_id:
+            assigned = self._assigned_regions_for_load(self.selected_source_id)
+            names = [region.get("name", "Region") for region in self.model.get("geometry", {}).get("regions", []) if region.get("id") in assigned]
+            children.append(Div(
+                "Click a region in the viewport to add or remove it from this load. Assigned: " + (", ".join(names) if names else "none"),
+                ui_style="font-size:11px; line-height:1.45; color:var(--fg-muted); padding-top:4px;",
+            ))
         return children
-
     def _mesh_properties(self):
         mesh = self.model["mesh"]
         order = QSelect(ui_label="Polynomial order", ui_options=[1, 2, 3, 4, 5, 6], ui_model_value=mesh["polynomial_order"], ui_dense=True, ui_filled=True)
@@ -6203,11 +6315,12 @@ class SolveWorkspace(Div):
             shape = region.get("shape", {})
             for dimension, expression in shape.get("dimension_expressions", {}).items():
                 check(f"region '{region.get('name', 'unnamed')}' {dimension}", expression)
-            sources = region.get("sources", {})
+        for load in self.model.get("regional_loads", []):
+            load_name = load.get("name", "unnamed")
             for key in ("dc_current_density", "ac_current_density_real", "ac_current_density_imaginary"):
-                check(f"region '{region.get('name', 'unnamed')}' {key.replace('_', ' ')}", sources.get(key))
-            for component, expression in sources.get("mechanical_body_force", {}).items():
-                check(f"region '{region.get('name', 'unnamed')}' {component} body force", expression)
+                check(f"source/load '{load_name}' {key.replace('_', ' ')}", load.get(key))
+            for component, expression in (load.get("mechanical_body_force") or {}).items():
+                check(f"source/load '{load_name}' {component} body force", expression)
         for material in self.model.get("materials", []):
             for key, expression in material.get("properties", {}).items():
                 check(f"material '{material.get('name', 'unnamed')}' {key.replace('_', ' ')}", expression)
