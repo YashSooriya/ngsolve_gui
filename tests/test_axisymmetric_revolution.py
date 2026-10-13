@@ -18,9 +18,9 @@ from ngsolve_gui.region_state import RegionState
 from ngsolve_gui.sections.axisymmetric_revolution import AxisymmetricRevolutionSection
 
 
-def _meridian_mesh():
+def _meridian_mesh(maxh=0.45):
     geometry = occ.OCCGeometry(occ.Rectangle(1, 1).Face(), dim=2)
-    return ngs.Mesh(geometry.GenerateMesh(maxh=0.45))
+    return ngs.Mesh(geometry.GenerateMesh(maxh=maxh))
 
 
 def test_scalar_field_revolves_to_a_closed_3d_volume():
@@ -38,6 +38,33 @@ def test_scalar_field_revolves_to_a_closed_3d_volume():
 
     polygon_cylinder_volume = math.pi * math.sin(2 * math.pi / 16) / (2 * math.pi / 16)
     assert ngs.Integrate(1, mesh3d) == pytest.approx(polygon_cylinder_volume, rel=1e-9)
+
+
+def test_cubic_interior_field_survives_revolution_sampling():
+    """P3 interior values must not disappear when the view is revolved."""
+    meridian = _meridian_mesh(maxh=10.0)
+    source = ngs.GridFunction(ngs.H1(meridian, order=3), name="cubic bubble")
+    source.Set(ngs.x * (1 - ngs.x) * ngs.y)
+
+    # This P3 field is zero at every original mesh vertex but nonzero inside
+    # the first triangle, reproducing the higher-order displacement mode that
+    # was lost by the old vertex-only transfer.
+    vertex_values = [
+        abs(
+            source(
+                meridian(
+                    float(meridian[vertex].point[0]),
+                    float(meridian[vertex].point[1]),
+                )
+            )
+        )
+        for vertex in meridian.vertices
+    ]
+    assert max(vertex_values) == pytest.approx(0.0, abs=1e-12)
+    mesh3d, field3d = revolve_gridfunction(source, sectors=8)
+
+    interior_value = field3d(mesh3d(2 / 3, 0.0, 1 / 3))
+    assert interior_value == pytest.approx(2 / 27, rel=1e-8, abs=1e-10)
 
 
 def test_revolved_interface_stays_visible_when_outer_region_is_hidden():

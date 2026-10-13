@@ -3,8 +3,8 @@
 The solver stores its axisymmetric results on an ``(r, z)`` mesh. This module
 revolves that mesh around the axial axis and rotates cylindrical vector
 components into Cartesian coordinates for display. The source solution is
-sampled only at its existing mesh vertices; the resulting first-order field is
-for visualization, while the saved 2D solution remains untouched.
+sampled on a meridian lattice matched to its finite-element order; the resulting
+first-order field is for visualization, while the saved 2D solution remains untouched.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import ngsolve as ngs
 DEFAULT_SECTORS = 24
 MAX_TETRAHEDRA = 900_000
 MIN_SECTORS = 8
+MAX_MERIDIAN_SUBDIVISIONS = 4
 
 
 def revolve_gridfunction(grid_function, sectors: int = DEFAULT_SECTORS):
@@ -56,14 +57,14 @@ def revolve_gridfunction(grid_function, sectors: int = DEFAULT_SECTORS):
         raise ValueError("Axisymmetric meshes must use non-negative radius coordinates")
     materials = list(source_mesh.GetMaterials()) or ["default"]
 
-    triangles = []
+    source_triangles = []
     for element in source_mesh.Elements(ngs.VOL):
         vertices = [vertex.nr for vertex in element.vertices]
         material = str(element.mat)
         if len(vertices) == 3:
-            triangles.append((vertices, material))
+            source_triangles.append((vertices, material))
         elif len(vertices) == 4:
-            triangles.extend(
+            source_triangles.extend(
                 (
                     ([vertices[0], vertices[1], vertices[2]], material),
                     ([vertices[0], vertices[2], vertices[3]], material),
@@ -73,10 +74,77 @@ def revolve_gridfunction(grid_function, sectors: int = DEFAULT_SECTORS):
             raise ValueError(
                 "The meridian mesh must contain triangles or quadrilaterals"
             )
-    if not triangles:
+    if not source_triangles:
         raise ValueError("The meridian mesh contains no volume elements")
+
+    # Sampling only the original mesh vertices loses higher-order interior
+    # displacement modes. Subdivide each meridian triangle at the source
+    # polynomial order, then sample those points before revolving the field.
+    try:
+        source_order = int(grid_function.space.globalorder)
+    except (AttributeError, TypeError, ValueError):
+        source_order = 1
+    subdivisions = max(1, min(source_order, MAX_MERIDIAN_SUBDIVISIONS))
+    while (
+        len(source_triangles) * subdivisions**2 * MIN_SECTORS * 3
+        > MAX_TETRAHEDRA
+        and subdivisions > 1
+    ):
+        subdivisions -= 1
+    if len(source_triangles) * subdivisions**2 * MIN_SECTORS * 3 > MAX_TETRAHEDRA:
+        raise ValueError(
+            "The meridian mesh is too large for a responsive 3D revolution "
+            f"({len(source_triangles):,} triangles). Refine or reduce the 2D mesh first."
+        )
+
+    meridian_points = {}
+    meridian_point_ids = {}
+
+    def meridian_node(vertices, weights):
+        key = tuple(
+            sorted(
+                (int(vertex), int(weight))
+                for vertex, weight in zip(vertices, weights)
+                if weight
+            )
+        )
+        if key not in meridian_point_ids:
+            point_id = len(meridian_points)
+            denominator = float(subdivisions)
+            meridian_points[point_id] = (
+                sum(source_points[vertex][0] * weight for vertex, weight in key)
+                / denominator,
+                sum(source_points[vertex][1] * weight for vertex, weight in key)
+                / denominator,
+            )
+            meridian_point_ids[key] = point_id
+        return meridian_point_ids[key]
+
+    triangles = []
+    for vertices, material in source_triangles:
+        lattice = {}
+        for first_weight in range(subdivisions + 1):
+            for second_weight in range(subdivisions - first_weight + 1):
+                weights = (
+                    subdivisions - first_weight - second_weight,
+                    first_weight,
+                    second_weight,
+                )
+                lattice[(first_weight, second_weight)] = meridian_node(
+                    vertices, weights
+                )
+        for first_weight in range(subdivisions):
+            for second_weight in range(subdivisions - first_weight):
+                first = lattice[(first_weight, second_weight)]
+                second = lattice[(first_weight + 1, second_weight)]
+                third = lattice[(first_weight, second_weight + 1)]
+                triangles.append(([first, second, third], material))
+                if first_weight + second_weight + 2 <= subdivisions:
+                    fourth = lattice[(first_weight + 1, second_weight + 1)]
+                    triangles.append(([second, fourth, third], material))
+
     edge_materials = {}
-    for vertices, material in triangles:
+    for vertices, material in source_triangles:
         for index, first in enumerate(vertices):
             second = vertices[(index + 1) % len(vertices)]
             edge_materials.setdefault(tuple(sorted((first, second))), set()).add(
@@ -90,7 +158,7 @@ def revolve_gridfunction(grid_function, sectors: int = DEFAULT_SECTORS):
     ]
     default_material = materials[0]
     material_order = {str(name): index for index, name in enumerate(materials)}
-    boundary_regions = {}
+    boundary_segments = []
     for vertices in boundary_edges:
         key = tuple(sorted(vertices))
         adjacent = edge_materials.get(key) or {default_material}
@@ -98,12 +166,20 @@ def revolve_gridfunction(grid_function, sectors: int = DEFAULT_SECTORS):
             raise ValueError(
                 "A revolved meridian edge cannot border more than two regions"
             )
-        boundary_regions[key] = tuple(
+        adjacent_names = tuple(
             sorted(
                 adjacent,
                 key=lambda name: material_order.get(str(name), len(material_order)),
             )
         )
+        for step in range(subdivisions):
+            first_node = meridian_node(
+                vertices, (subdivisions - step, step)
+            )
+            second_node = meridian_node(
+                vertices, (subdivisions - step - 1, step + 1)
+            )
+            boundary_segments.append((first_node, second_node, adjacent_names))
 
     try:
         sectors = int(sectors)
@@ -125,7 +201,7 @@ def revolve_gridfunction(grid_function, sectors: int = DEFAULT_SECTORS):
     }
     boundary_descriptors = {}
     default_material_id = next(iter(material_ids.values()))
-    for adjacent_names in dict.fromkeys(boundary_regions.values()):
+    for adjacent_names in dict.fromkeys(segment[2] for segment in boundary_segments):
         descriptor_number = len(boundary_descriptors) + 1
         dominant_name = adjacent_names[0]
         dominant_id = material_ids.get(dominant_name, default_material_id)
@@ -153,8 +229,7 @@ def revolve_gridfunction(grid_function, sectors: int = DEFAULT_SECTORS):
     point_ids: dict[int, list] = {}
     point_coordinates: dict[int, tuple[float, float, float]] = {}
     point_payload: dict[int, tuple[int, int]] = {}
-    for vertex in source_vertices:
-        radius, axial = source_points[vertex.nr]
+    for meridian_node_id, (radius, axial) in meridian_points.items():
         on_axis = abs(radius) <= axis_tolerance
         ring = []
         for sector in range(sectors):
@@ -169,8 +244,8 @@ def revolve_gridfunction(grid_function, sectors: int = DEFAULT_SECTORS):
             )
             ring.append(point_id)
             point_coordinates[point_id.nr] = (x_coord, y_coord, axial)
-            point_payload[point_id.nr] = (vertex.nr, sector)
-        point_ids[vertex.nr] = ring
+            point_payload[point_id.nr] = (meridian_node_id, sector)
+        point_ids[meridian_node_id] = ring
 
     determinant_tolerance = max(scale**3 * 1e-15, 1e-300)
     recipes = (
@@ -204,16 +279,14 @@ def revolve_gridfunction(grid_function, sectors: int = DEFAULT_SECTORS):
     # Revolve only the source mesh's exterior edges into surface triangles.
     # This avoids retaining a large tetra-face incidence table just to recover
     # the outer skin, while the volume tetrahedra remain available for clipping.
-    for edge_vertices in boundary_edges:
-        first_vertex, second_vertex = edge_vertices
-        adjacent_names = boundary_regions[tuple(sorted(edge_vertices))]
+    for first_node, second_node, adjacent_names in boundary_segments:
         boundary_descriptor = boundary_descriptors[adjacent_names]
         for sector in range(sectors):
             next_sector = (sector + 1) % sectors
-            first = point_ids[first_vertex][sector]
-            second = point_ids[second_vertex][sector]
-            second_next = point_ids[second_vertex][next_sector]
-            first_next = point_ids[first_vertex][next_sector]
+            first = point_ids[first_node][sector]
+            second = point_ids[second_node][sector]
+            second_next = point_ids[second_node][next_sector]
+            first_next = point_ids[first_node][next_sector]
             for triangle in (
                 (first, second, second_next),
                 (first, second_next, first_next),
@@ -230,7 +303,7 @@ def revolve_gridfunction(grid_function, sectors: int = DEFAULT_SECTORS):
         source_mesh,
         target_mesh,
         point_payload,
-        source_points,
+        meridian_points,
         axis_tolerance,
         sectors,
     )
@@ -255,21 +328,20 @@ def _interpolate_vertex_field(
     source_mesh,
     target_mesh,
     point_payload,
-    source_points,
+    meridian_points,
     axis_tolerance,
     sectors,
 ):
-    """Sample the source at meridian vertices into first-order 3D H1 fields."""
+    """Sample meridian subdivision nodes into first-order 3D H1 fields."""
     import numpy as np
 
     dtype = complex if source.is_complex else float
     source_values = {}
-    for vertex in source_mesh.vertices:
-        radius, axial = source_mesh[vertex].point
+    for meridian_node_id, (radius, axial) in meridian_points.items():
         value = np.asarray(
             source(source_mesh(float(radius), float(axial))), dtype=dtype
         )
-        source_values[vertex.nr] = value.reshape(-1)
+        source_values[meridian_node_id] = value.reshape(-1)
 
     scalar_space = ngs.H1(target_mesh, order=1, complex=source.is_complex)
     if source.dim == 1:
@@ -289,8 +361,8 @@ def _interpolate_vertex_field(
         dof = dofs[0]
         netgen_vertex_number = vertex.nr + 1
         try:
-            source_vertex, sector = point_payload[netgen_vertex_number]
-            values = source_values[source_vertex]
+            meridian_node_id, sector = point_payload[netgen_vertex_number]
+            values = source_values[meridian_node_id]
         except KeyError as error:
             raise RuntimeError(
                 "Could not map a revolved mesh vertex to the meridian field"
@@ -305,7 +377,7 @@ def _interpolate_vertex_field(
             circumferential = 0
         else:
             radial, circumferential, axial = values[:3]
-        if abs(source_points[source_vertex][0]) <= axis_tolerance:
+        if abs(meridian_points[meridian_node_id][0]) <= axis_tolerance:
             x_value = y_value = 0
         else:
             cosine, sine = math.cos(angle), math.sin(angle)
