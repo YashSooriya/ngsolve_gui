@@ -57,6 +57,14 @@ def _request_guest_vm_shutdown():
             detail or f"Guest shutdown exited with status {result.returncode}."
         )
 
+    # Let the guest-side disconnect watchdog avoid issuing a duplicate request.
+    try:
+        (Path.home() / ".mmfem-vm-shutdown-requested").write_text(
+            "File menu requested shutdown.\n", encoding="utf-8"
+        )
+    except OSError:
+        pass
+
 
 def _inject_solve_status_styles(js):
     style = js.document.createElement("style")
