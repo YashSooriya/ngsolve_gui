@@ -463,6 +463,7 @@ class SolveWorkspace(Div):
         self._canvas_context_menu = None
         self._canvas_edge_nodes = {}
         self._pending_arc_points = []
+        self._pending_line_points = []
         self._canvas_preview = Component(
             "g",
             _svg(
@@ -483,9 +484,50 @@ class SolveWorkspace(Div):
                 stroke_dasharray="6 4", style="pointer-events:none;",
             ),
             _svg(
-                "path", id="solve-sketch-drag-line", d="", display="none",
-                fill="none", stroke="#0877b9", stroke_width="2.5",
+                "path", id="solve-sketch-line-chain-halo", d="",
+                fill="none", stroke="#ffffff", stroke_width="7",
+                stroke_linecap="round", stroke_linejoin="round",
                 style="pointer-events:none;",
+            ),
+            _svg(
+                "path", id="solve-sketch-line-chain", d="",
+                fill="none", stroke="#0877b9", stroke_width="3.2",
+                stroke_linecap="round", stroke_linejoin="round",
+                style="pointer-events:none;",
+            ),
+            _svg(
+                "path", id="solve-sketch-drag-line-halo", d="", display="none",
+                fill="none", stroke="#ffffff", stroke_width="7",
+                stroke_linecap="round", stroke_linejoin="round",
+                style="pointer-events:none;",
+            ),
+            _svg(
+                "path", id="solve-sketch-drag-line", d="", display="none",
+                fill="none", stroke="#0877b9", stroke_width="3.2",
+                stroke_dasharray="7 4", stroke_linecap="round",
+                style="pointer-events:none;",
+            ),
+            _svg(
+                "path", id="solve-sketch-drag-arc-halo", d="", display="none",
+                fill="none", stroke="#ffffff", stroke_width="7",
+                stroke_linecap="round", stroke_linejoin="round",
+                style="pointer-events:none;",
+            ),
+            _svg(
+                "path", id="solve-sketch-drag-arc", d="", display="none",
+                fill="none", stroke="#0877b9", stroke_width="3.2",
+                stroke_dasharray="7 4", stroke_linecap="round",
+                stroke_linejoin="round", style="pointer-events:none;",
+            ),
+            _svg(
+                "path", id="solve-sketch-construction-halo", d="",
+                fill="none", stroke="#ffffff", stroke_width="6",
+                stroke_linecap="round", style="pointer-events:none;",
+            ),
+            _svg(
+                "path", id="solve-sketch-construction-points", d="",
+                fill="none", stroke="#d04a2b", stroke_width="2.3",
+                stroke_linecap="round", style="pointer-events:none;",
             ),
             _svg(
                 "path", id="solve-sketch-drag-trim", d="", display="none",
@@ -538,6 +580,8 @@ class SolveWorkspace(Div):
         self._canvas.on_mounted(self._install_canvas_pointer_capture)
         self._canvas.on("mousedown", self._on_canvas_mouse_down)
         self._canvas.on("mouseup", self._on_canvas_mouse_up)
+        self._canvas.on("keydown", self._on_canvas_keydown)
+        self._canvas._props["tabindex"] = "0"
         self._canvas.on("wheel", self._on_canvas_wheel)
         self._inspector = Div(ui_style="display:flex; flex-direction:column; gap:12px; padding:12px; overflow:auto; min-height:0;")
         self._status = Div(ui_style="display:flex; align-items:center; gap:8px; min-width:0; overflow:hidden; white-space:nowrap;")
@@ -1233,6 +1277,10 @@ class SolveWorkspace(Div):
     def _on_model_rename_keydown(self, event):
         payload = getattr(event, "value", None)
         key = payload.get("key") if isinstance(payload, dict) else getattr(payload, "key", None)
+        if not key:
+            key = getattr(event, "key", None)
+        if not key and isinstance(payload, str):
+            key = payload
         key = str(key or "").lower()
         if key in {"enter", "numpadenter"}:
             self._commit_model_rename()
@@ -1334,6 +1382,8 @@ class SolveWorkspace(Div):
             self._sketch_tool_variant = {"rectangle": "corner", "circle": "center-radius", "arc": "three-point"}
         if tool != "arc":
             self._pending_arc_points = []
+        if tool != "line":
+            self._pending_line_points = []
         if tool != "circle":
             self._pending_circle_points = []
         if variant is not None:
@@ -1374,17 +1424,18 @@ class SolveWorkspace(Div):
             )
         self._refresh_sketch_tool_buttons()
         self._sync_canvas_interaction_settings()
+        self._sync_pending_construction_preview()
         if announce:
             variant = self._sketch_tool_variant.get(tool, "")
             help_text = {
                 "select": "Drag regions to move them; drag empty space to select edges; middle-drag to pan. Hold Shift to add to the selection.",
                 "rectangle": "Drag to draw a center rectangle." if variant == "center" else "Drag between opposite corners to draw a rectangle.",
                 "circle": "Click three points on the circle." if variant == "three-point" else "Drag from the circle centre to its radius.",
-                "line": "Drag between two endpoints; the live line preview follows your pointer.",
+                "line": "Drag to draw one line and return to Select; click points to chain lines, then click an edge or press Enter/Esc to finish.",
                 "arc": {
-                    "three-point": "Click the start, a point on the arc, then its end.",
-                    "centerpoint": "Click the center, start point, then end point of the arc.",
-                    "tangent": "Click an existing curve endpoint, then the tangent arc endpoint.",
+                    "three-point": "Click the start, click the end, then place a point on the live arc preview.",
+                    "centerpoint": "Click the center, click the start point, then place the end on the live fixed-radius preview.",
+                    "tangent": "Click an existing curve endpoint, then place the end on the live tangent preview.",
                 }.get(variant, "Choose an arc construction method."),
                 "spline": "Drag to draw a smooth spline. Closed curve loops become regions automatically.",
                 "trim": "Drag the trim pencil across sketch edges to remove the touched curve segments.",
@@ -1432,6 +1483,7 @@ class SolveWorkspace(Div):
             self.js.eval(
                 f"window.__ngsolveSketchLiveGrid = {json.dumps(live_grid, allow_nan=False)}"
             )
+            self._sync_pending_construction_preview()
             move_step = 0.00001 * pixels_per_world  # 0.01 mm, represented as 1e-5 m.
             self.js.eval(f"window.__ngsolveSketchMoveStep = {move_step!r}")
         except Exception:
@@ -1735,8 +1787,8 @@ class SolveWorkspace(Div):
         script = r"""
 (() => {
   window.__ngsolveSketchTool = '__SKETCH_TOOL__';
-  if (window.__ngsolveSketchPointerCaptureVersion === 11) return;
-  window.__ngsolveSketchPointerCaptureVersion = 11;
+  if (window.__ngsolveSketchPointerCaptureVersion === 13) return;
+  window.__ngsolveSketchPointerCaptureVersion = 13;
   let active = false;
   let activePointerId = null;
   let dragStart = null;
@@ -1803,6 +1855,26 @@ class SolveWorkspace(Div):
   }, true);
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') hideSketchContextMenu();
+    const svg = currentSvg();
+    const state = window.__ngsolveSketchConstruction || {};
+    const target = event.target;
+    const editingText = Boolean(target && target.closest
+      && target.closest('input, textarea, select, [contenteditable="true"]'));
+    if (svg && !editingText
+        && window.__ngsolveSketchTool === 'line'
+        && (event.key === 'Enter' || event.key === 'Escape')
+        && Array.isArray(state.linePoints) && state.linePoints.length) {
+      // Some WebView/remote-desktop combinations leave focus outside SVG even
+      // after a sketch click. Forward the key to the canvas event callback so
+      // Enter/Escape work consistently without requiring a focus workaround.
+      if (!targetIsSvg(event, svg)) {
+        const forwarded = new KeyboardEvent('keydown', {
+          key: event.key, code: event.code, bubbles: true, cancelable: true,
+        });
+        svg.dispatchEvent(forwarded);
+      }
+      event.preventDefault();
+    }
   }, true);
   document.addEventListener('click', (event) => {
     const menu = document.querySelector('.solve-sketch-context-menu');
@@ -2149,7 +2221,7 @@ class SolveWorkspace(Div):
       const dimensions = svg.querySelector('#solve-sketch-dimensions');
       if (dimensions) dimensions.removeAttribute('transform');
     }
-    for (const id of ['solve-sketch-drag-rect', 'solve-sketch-drag-circle', 'solve-sketch-drag-spline', 'solve-sketch-drag-line', 'solve-sketch-drag-trim']) {
+    for (const id of ['solve-sketch-drag-rect', 'solve-sketch-drag-circle', 'solve-sketch-drag-spline', 'solve-sketch-drag-line', 'solve-sketch-drag-line-halo', 'solve-sketch-drag-arc', 'solve-sketch-drag-arc-halo', 'solve-sketch-drag-trim']) {
       const shape = svg.querySelector('#' + id);
       if (shape) shape.setAttribute('display', 'none');
     }
@@ -2186,6 +2258,105 @@ class SolveWorkspace(Div):
     visualScale * point[0] + visualTranslateX,
     visualScale * point[1] + visualTranslateY,
   ];
+  const setPreviewPath = (svg, id, d, visible = true) => {
+    const node = svg && svg.querySelector("#" + id);
+    if (!node) return;
+    node.setAttribute("d", d || "");
+    node.setAttribute("display", visible && d ? "inline" : "none");
+  };
+  const arcPathThroughThreePoints = (start, through, end) => {
+    const ax = start[0], ay = start[1], bx = through[0], by = through[1], cx = end[0], cy = end[1];
+    const denominator = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+    if (Math.abs(denominator) < 1e-9) return "";
+    const aa = ax * ax + ay * ay, bb = bx * bx + by * by, cc = cx * cx + cy * cy;
+    const center = [
+      (aa * (by - cy) + bb * (cy - ay) + cc * (ay - by)) / denominator,
+      (aa * (cx - bx) + bb * (ax - cx) + cc * (bx - ax)) / denominator,
+    ];
+    const radius = Math.hypot(start[0] - center[0], start[1] - center[1]);
+    if (!(radius > 0) || !Number.isFinite(radius)) return "";
+    const a0 = Math.atan2(ay - center[1], ax - center[0]);
+    const am = Math.atan2(by - center[1], bx - center[0]);
+    const a1 = Math.atan2(cy - center[1], cx - center[0]);
+    const positive = (a1 - a0 + 2 * Math.PI) % (2 * Math.PI);
+    const throughSweep = (am - a0 + 2 * Math.PI) % (2 * Math.PI);
+    const sweep = throughSweep > positive ? positive - 2 * Math.PI : positive;
+    return "M" + ax + "," + ay + " A" + radius + "," + radius + " 0 "
+      + (Math.abs(sweep) > Math.PI ? "1" : "0") + " " + (sweep >= 0 ? "1" : "0")
+      + " " + cx + "," + cy;
+  };
+  const arcPathFromCenter = (center, start, cursor) => {
+    const radius = Math.hypot(start[0] - center[0], start[1] - center[1]);
+    const cursorRadius = Math.hypot(cursor[0] - center[0], cursor[1] - center[1]);
+    if (!(radius > 0) || !(cursorRadius > 1e-9)) return "";
+    const a0 = Math.atan2(start[1] - center[1], start[0] - center[0]);
+    const a1 = Math.atan2(cursor[1] - center[1], cursor[0] - center[0]);
+    const sweep = (a1 - a0 + 2 * Math.PI) % (2 * Math.PI);
+    const end = [center[0] + radius * Math.cos(a1), center[1] + radius * Math.sin(a1)];
+    if (Math.hypot(end[0] - start[0], end[1] - start[1]) < 1e-7) return "";
+    return "M" + start[0] + "," + start[1] + " A" + radius + "," + radius + " 0 "
+      + (sweep > Math.PI ? "1" : "0") + " 1 " + end[0] + "," + end[1];
+  };
+  const arcPathTangent = (start, tangent, end) => {
+    const dx = end[0] - start[0], dy = end[1] - start[1];
+    const chordSquared = dx * dx + dy * dy;
+    const normal = [-tangent[1], tangent[0]];
+    const denominator = 2 * (dx * normal[0] + dy * normal[1]);
+    if (chordSquared < 1e-9 || Math.abs(denominator) < 1e-9) return "";
+    const offset = chordSquared / denominator;
+    const center = [start[0] + offset * normal[0], start[1] + offset * normal[1]];
+    const radius = Math.hypot(start[0] - center[0], start[1] - center[1]);
+    if (!(radius > 0) || !Number.isFinite(radius)) return "";
+    const a0 = Math.atan2(start[1] - center[1], start[0] - center[0]);
+    const a1 = Math.atan2(end[1] - center[1], end[0] - center[0]);
+    const positive = (a1 - a0 + 2 * Math.PI) % (2 * Math.PI);
+    const ccw = [-Math.sin(a0), Math.cos(a0)];
+    const sweep = ccw[0] * tangent[0] + ccw[1] * tangent[1] >= 0 ? positive : positive - 2 * Math.PI;
+    if (Math.abs(sweep) < 1e-9) return "";
+    return "M" + start[0] + "," + start[1] + " A" + radius + "," + radius + " 0 "
+      + (Math.abs(sweep) > Math.PI ? "1" : "0") + " " + (sweep >= 0 ? "1" : "0")
+      + " " + end[0] + "," + end[1];
+  };
+  const constructionCrosses = (points) => points.map((point) => {
+    const x = point[0], y = point[1], r = 6;
+    return "M" + (x - r) + "," + y + " L" + (x + r) + "," + y
+      + " M" + x + "," + (y - r) + " L" + x + "," + (y + r)
+      + " M" + (x - 3.5) + "," + y + " a3.5,3.5 0 1,0 7,0 a3.5,3.5 0 1,0 -7,0";
+  }).join(" ");
+  const updateConstructionPreview = (svg, point) => {
+    const state = window.__ngsolveSketchConstruction || {};
+    const tool = window.__ngsolveSketchTool || "select";
+    const linePoints = Array.isArray(state.linePoints) ? state.linePoints : [];
+    const arcPoints = Array.isArray(state.arcPoints) ? state.arcPoints : [];
+    const markers = tool === "line" ? linePoints.slice() : (tool === "arc" ? arcPoints.slice() : []);
+    if (active && dragMode === "draw" && dragStart && (tool === "line" || tool === "arc")) markers.push(dragStart);
+    const fixedLine = linePoints.map((point, index) => (index ? "L" : "M") + point[0] + "," + point[1]).join(" ");
+    setPreviewPath(svg, "solve-sketch-line-chain-halo", fixedLine, tool === "line");
+    setPreviewPath(svg, "solve-sketch-line-chain", fixedLine, tool === "line");
+    let lineTail = "";
+    if (tool === "line" && point) {
+      const anchor = linePoints.length ? linePoints[linePoints.length - 1] : (active && dragMode === "draw" ? dragStart : null);
+      if (anchor && Math.hypot(point[0] - anchor[0], point[1] - anchor[1]) > 1) {
+        lineTail = "M" + anchor[0] + "," + anchor[1] + " L" + point[0] + "," + point[1];
+      }
+    }
+    setPreviewPath(svg, "solve-sketch-drag-line-halo", lineTail, tool === "line");
+    setPreviewPath(svg, "solve-sketch-drag-line", lineTail, tool === "line");
+    let arc = "";
+    if (tool === "arc" && point) {
+      const variant = state.arcVariant || "three-point";
+      if (variant === "three-point" && arcPoints.length >= 2) arc = arcPathThroughThreePoints(arcPoints[0], point, arcPoints[1]);
+      else if (variant === "centerpoint" && arcPoints.length >= 2) arc = arcPathFromCenter(arcPoints[0], arcPoints[1], point);
+      else if (variant === "tangent" && arcPoints.length >= 1 && Array.isArray(state.arcTangent)) arc = arcPathTangent(arcPoints[0], state.arcTangent, point);
+    }
+    setPreviewPath(svg, "solve-sketch-drag-arc-halo", arc, tool === "arc");
+    setPreviewPath(svg, "solve-sketch-drag-arc", arc, tool === "arc");
+    const cross = constructionCrosses(markers);
+    setPreviewPath(svg, "solve-sketch-construction-halo", cross, true);
+    setPreviewPath(svg, "solve-sketch-construction-points", cross, true);
+  };
+  window.__ngsolveRefreshConstructionPreview = () => updateConstructionPreview(currentSvg(), null);
+
   const updatePreview = (svg, point, screenPoint = null) => {
     if (!active || !dragStart || !point) return;
     if ((dragMode === 'region' || dragMode === 'edge') && dragRegionId) {
@@ -2243,9 +2414,7 @@ class SolveWorkspace(Div):
     const hide = (node) => { if (node) node.setAttribute('display', 'none'); };
     if (tool === 'line') {
       hide(rect); hide(circle); hide(spline); hide(trim);
-      if (!line || Math.hypot(dx, dy) < 1) { hide(line); return; }
-      line.setAttribute('display', 'inline');
-      line.setAttribute('d', `M${dragStart[0]},${dragStart[1]} L${point[0]},${point[1]}`);
+      updateConstructionPreview(svg, point);
       return;
     }
     if (tool === 'trim') {
@@ -2272,6 +2441,7 @@ class SolveWorkspace(Div):
     }
     if (tool === 'arc') {
       hide(rect); hide(circle); hide(spline); hide(line); hide(trim);
+      updateConstructionPreview(svg, point);
       return;
     }
     hide(spline); hide(line); hide(trim);
@@ -2312,6 +2482,13 @@ class SolveWorkspace(Div):
   };
   const beginGesture = (event, svg) => {
     if (!targetIsSvg(event, svg) || ![0, 1].includes(event.button) || event.isPrimary === false) return;
+    // The line-chain tool completes with Enter/Escape. SVG canvases are not
+    // reliably focused by pointer capture alone, so focus it explicitly on
+    // line-tool gestures to ensure the keyboard event reaches its handler.
+    if (window.__ngsolveSketchTool === 'line') {
+      try { svg.focus({preventScroll: true}); }
+      catch (_) { try { svg.focus(); } catch (_) { /* non-focusable SVG */ } }
+    }
     const middlePan = event.button === 1;
     if (active) clearPreview(svg, false, true);
     window.__ngsolveSketchCompletedGesture = null;
@@ -2332,15 +2509,15 @@ class SolveWorkspace(Div):
     const edge = event.target && event.target.closest
       ? event.target.closest('[data-sketch-edge-id]')
       : null;
-    const selectionEnabled = ['select', 'trim'].includes(window.__ngsolveSketchTool || 'select');
+    const tool = window.__ngsolveSketchTool || 'select';
+    const selectionEnabled = ['select', 'trim'].includes(tool);
     dragRegionId = selectionEnabled && region
       ? region.getAttribute('data-sketch-region-id')
       : null;
-    dragEdgeId = selectionEnabled && edge
+    dragEdgeId = (selectionEnabled || tool === 'line') && edge
       ? edge.getAttribute('data-sketch-edge-id')
       : null;
     window.__ngsolveSketchLastRegionId = dragRegionId;
-    const tool = window.__ngsolveSketchTool || 'select';
     dragMode = middlePan
       ? 'pan'
       : tool === 'trim'
@@ -2631,6 +2808,17 @@ class SolveWorkspace(Div):
       const svg = currentSvg();
       updateHover(event, svg);
       moveGesture(event, svg);
+      if (!active && svg) {
+        const state = window.__ngsolveSketchConstruction || {};
+        const tool = window.__ngsolveSketchTool || 'select';
+        const hasPending = tool === 'line'
+          ? (Array.isArray(state.linePoints) && state.linePoints.length > 0)
+          : (tool === 'arc' && Array.isArray(state.arcPoints) && state.arcPoints.length > 0);
+        if (hasPending) {
+          const screen = svgPoint(svg, event);
+          if (screen) updateConstructionPreview(svg, sketchPoint(toScenePoint(screen)));
+        }
+      }
     }, true);
     document.addEventListener('pointerup', event => finishGesture(event, currentSvg()), true);
     document.addEventListener('pointercancel', event => finishGesture(event, currentSvg(), true), true);
@@ -2828,6 +3016,36 @@ class SolveWorkspace(Div):
         if operation == "region" and region_id and self.active_section not in {"boundaries", "sources"}:
             self.select_region(region_id)
 
+    def _sync_pending_construction_preview(self):
+        if not hasattr(self, "_pending_line_points"):
+            return
+        project, _ = self._canvas_projection()
+        payload = {
+            "linePoints": [list(project(point)) for point in self._pending_line_points],
+            "arcPoints": [],
+            "arcTangent": None,
+            "arcVariant": self._sketch_tool_variant.get("arc", "three-point"),
+        }
+        if self.sketch_tool == "arc" and self._pending_arc_points:
+            points = self._pending_arc_points
+            if self._sketch_tool_variant.get("arc") == "tangent" and len(points) >= 2:
+                endpoint, tangent = points[0], points[1]
+                base = project(endpoint)
+                adjacent = project((endpoint[0] + tangent[0], endpoint[1] + tangent[1]))
+                payload["arcPoints"] = [list(base)]
+                payload["arcTangent"] = [adjacent[0] - base[0], adjacent[1] - base[1]]
+            else:
+                payload["arcPoints"] = [list(project(point)) for point in points]
+        try:
+            self.js.eval(
+                "window.__ngsolveSketchConstruction = "
+                + json.dumps(payload, allow_nan=False)
+                + "; if (window.__ngsolveRefreshConstructionPreview) "
+                  "window.__ngsolveRefreshConstructionPreview();"
+            )
+        except Exception:
+            pass
+
     def _region_at_canvas_point(self, point):
         """Hit-test a canvas position against regions, preferring the innermost."""
         _, unproject = self._canvas_projection()
@@ -2923,7 +3141,26 @@ class SolveWorkspace(Div):
                     self._canvas_drag = None
                     self._screen_to_svg = None
                     view_changed = self._commit_browser_canvas_view(view, render=False, clamp_negative_r=True)
-                    if tool == "arc" and not moved:
+                    if tool == "line":
+                        if moved:
+                            points = self._sketch_screen_points_to_world([start, end], snap=True)
+                            if self._pending_line_points:
+                                if math.dist(self._pending_line_points[-1], points[0]) > 1e-12:
+                                    self._pending_line_points.append(points[0])
+                                self._pending_line_points.append(points[1])
+                            else:
+                                self._pending_line_points = points
+                            self._finish_line_sketch_chain(select_tool=True)
+                        else:
+                            world_point = self._sketch_screen_points_to_world([start], snap=True)[0]
+                            on_edge = bool(edge_id or (
+                                self._pending_line_points
+                                and self._edge_at_canvas_point(start) is not None
+                            ))
+                            self._accept_line_sketch_point(world_point, edge_termination=on_edge)
+                            if view_changed:
+                                self._render_canvas_after_interaction()
+                    elif tool == "arc" and not moved:
                         world_point = self._sketch_screen_points_to_world([start], snap=True)[0]
                         self._accept_arc_sketch_point(world_point, variant=tool_variant)
                         if view_changed:
@@ -2933,9 +3170,6 @@ class SolveWorkspace(Div):
                         self._accept_circle_sketch_point(world_point)
                         if view_changed:
                             self._render_canvas_after_interaction()
-                    elif moved and tool == "line":
-                        points = self._sketch_screen_points_to_world([start, end], snap=True)
-                        self._add_sketch_entity("line", points)
                     elif moved and tool == "spline":
                         raw_points = sketch_screen_points or [start, end]
                         points = self._sketch_screen_points_to_world(raw_points, snap=False)
@@ -3124,6 +3358,59 @@ class SolveWorkspace(Div):
         elif not moved and drag.get("operation") != "pan":
             self._clear_canvas_selection()
 
+    def _accept_line_sketch_point(self, point, *, edge_termination=False):
+        point = tuple(_round_sketch_m(float(value)) for value in self._snap_sketch_endpoint(point))
+        if not self._pending_line_points:
+            self._pending_line_points = [point]
+            self._sync_pending_construction_preview()
+            self._message("Line chain: choose the next point. Click another edge or press Enter/Esc to finish.")
+            return True
+        point = tuple(self._snap_sketch_endpoint(point))
+        if math.dist(point, self._pending_line_points[-1]) > 1e-12:
+            self._pending_line_points.append(point)
+        if edge_termination:
+            self._finish_line_sketch_chain()
+            return True
+        self._sync_pending_construction_preview()
+        self._message("Line chain: choose another point, or click an edge / press Enter/Esc to finish.")
+        return True
+
+    def _finish_line_sketch_chain(self, *, select_tool=False):
+        points = [tuple(point) for point in self._pending_line_points]
+        self._pending_line_points = []
+        self._sync_pending_construction_preview()
+        segments = [
+            (first, second)
+            for first, second in zip(points, points[1:])
+            if math.dist(first, second) > 1e-12
+        ]
+        added = 0
+        for first, second in segments:
+            if self._add_sketch_entity("line", [first, second]):
+                added += 1
+        if select_tool:
+            self.set_sketch_tool("select", announce=False)
+        elif added == 0:
+            self._sync_pending_construction_preview()
+        if added:
+            self._message(f"Finished line chain ({added} segment{'s' if added != 1 else ''}).")
+        else:
+            self._message("No line segment was created; choose two distinct points.", error=True)
+        return added > 0
+
+    def _on_canvas_keydown(self, event):
+        payload = getattr(event, "value", None)
+        key = payload.get("key") if isinstance(payload, dict) else getattr(payload, "key", None)
+        if not key:
+            key = getattr(event, "key", None)
+        if not key and isinstance(payload, str):
+            key = payload
+        key = str(key or "").lower()
+        if self.sketch_tool != "line" or not self._pending_line_points:
+            return
+        if key in {"enter", "numpadenter", "escape"}:
+            self._finish_line_sketch_chain(select_tool=(key == "escape"))
+
     def _on_canvas_pointer_cancel(self, event=None):
         """Discard an incomplete sketch gesture after a cancelled pointer."""
         self._canvas_drag = None
@@ -3289,21 +3576,44 @@ class SolveWorkspace(Div):
         return result
 
     def _snap_sketch_endpoint(self, point):
-        """Snap endpoints to nearby sketch vertices or curve segments."""
+        """Snap endpoints to nearby sketch vertices and existing curve segments."""
         project, _ = self._canvas_projection()
         target = project(point)
         candidates = []
+        sources = []
         for entity in self.model["geometry"].get("sketch_entities", []):
             samples = entity.get("sampled_points") or entity.get("points") or []
+            if len(samples) >= 2:
+                sources.append(samples)
+        represented = {
+            edge.get("sketch_entity_id")
+            for edge in self.model["geometry"].get("edges", [])
+            if edge.get("sketch_entity_id")
+        }
+        for edge in self.model["geometry"].get("edges", []):
+            if edge.get("sketch_entity_id") in represented:
+                continue
+            curve = edge.get("curve", {})
+            samples = curve.get("sampled_points") if isinstance(curve, dict) else None
+            samples = samples if isinstance(samples, list) and len(samples) >= 2 else edge.get("vertices", [])
+            if len(samples) >= 2:
+                sources.append(samples)
+        for samples in sources:
             projected = [project(candidate) for candidate in samples]
             for first, second, screen_first, screen_second in zip(samples, samples[1:], projected, projected[1:]):
                 dx, dy = screen_second[0] - screen_first[0], screen_second[1] - screen_first[1]
                 length_squared = dx * dx + dy * dy
-                fraction = 0.0 if length_squared <= 1e-16 else min(1.0, max(0.0, ((target[0] - screen_first[0]) * dx + (target[1] - screen_first[1]) * dy) / length_squared))
+                fraction = 0.0 if length_squared <= 1e-16 else min(
+                    1.0,
+                    max(0.0, ((target[0] - screen_first[0]) * dx + (target[1] - screen_first[1]) * dy) / length_squared),
+                )
                 screen_nearest = (screen_first[0] + fraction * dx, screen_first[1] + fraction * dy)
                 distance = math.hypot(target[0] - screen_nearest[0], target[1] - screen_nearest[1])
                 if distance <= 8.0:
-                    world_nearest = (first[0] + fraction * (second[0] - first[0]), first[1] + fraction * (second[1] - first[1]))
+                    world_nearest = (
+                        first[0] + fraction * (second[0] - first[0]),
+                        first[1] + fraction * (second[1] - first[1]),
+                    )
                     candidates.append((distance, tuple(world_nearest)))
         if candidates:
             return min(candidates)[1]
@@ -3365,7 +3675,7 @@ class SolveWorkspace(Div):
         return sampled
 
     @_history_tracked
-    def _add_sketch_entity(self, curve_type, points):
+    def _add_sketch_entity(self, curve_type, points, *, arc_geometry=None):
         if curve_type not in {"line", "arc", "spline"}:
             return False
         cleaned = []
@@ -3376,8 +3686,13 @@ class SolveWorkspace(Div):
         if len(cleaned) < 2:
             self._message("Sketch curves need two distinct points.", error=True)
             return False
-        cleaned[0] = self._snap_sketch_endpoint(cleaned[0])
-        cleaned[-1] = self._snap_sketch_endpoint(cleaned[-1])
+        if curve_type == "arc" and arc_geometry:
+            cleaned[0] = tuple(arc_geometry["start"])
+            cleaned[1] = tuple(arc_geometry["through"])
+            cleaned[-1] = tuple(arc_geometry["end"])
+        else:
+            cleaned[0] = self._snap_sketch_endpoint(cleaned[0])
+            cleaned[-1] = self._snap_sketch_endpoint(cleaned[-1])
         if any(point[0] < -1e-12 for point in cleaned):
             self._message("Sketch geometry must remain at r = 0 or to its right.", error=True)
             return False
@@ -3388,9 +3703,18 @@ class SolveWorkspace(Div):
                 return False
             entity["sampled_points"] = [list(cleaned[0]), list(cleaned[-1])]
         elif curve_type == "arc":
-            center, radius, clockwise, samples = self._arc_from_three_points(*cleaned[:3])
+            if arc_geometry:
+                center = tuple(float(value) for value in arc_geometry["center"])
+                radius = float(arc_geometry["radius"])
+                clockwise = bool(arc_geometry["clockwise"])
+                samples = copy.deepcopy(arc_geometry["samples"])
+                if not math.isfinite(radius) or radius <= 0 or len(samples) < 2:
+                    raise ValueError("Arc radius must be positive and finite.")
+            else:
+                center, radius, clockwise, samples = self._arc_from_three_points(*cleaned[:3])
             entity.update({
                 "center": list(center), "radius": radius, "clockwise": clockwise,
+                "points": [list(cleaned[0]), list(cleaned[1]), list(cleaned[-1])],
                 "sampled_points": samples,
             })
         else:
@@ -3453,14 +3777,35 @@ class SolveWorkspace(Div):
         project, _ = self._canvas_projection()
         target = project(point)
         candidates = []
+        sources = []
         for entity in self.model["geometry"].get("sketch_entities", []):
             samples = entity.get("sampled_points") or entity.get("points") or []
-            if len(samples) < 2:
+            if len(samples) >= 2:
+                sources.append(samples)
+        represented = {
+            edge.get("sketch_entity_id")
+            for edge in self.model["geometry"].get("edges", [])
+            if edge.get("sketch_entity_id")
+        }
+        for edge in self.model["geometry"].get("edges", []):
+            if edge.get("sketch_entity_id") in represented:
                 continue
-            for endpoint, neighbor in ((samples[0], samples[1]), (samples[-1], samples[-2])):
+            curve = edge.get("curve", {})
+            samples = curve.get("sampled_points") if isinstance(curve, dict) else None
+            samples = samples if isinstance(samples, list) and len(samples) >= 2 else edge.get("vertices", [])
+            if len(samples) >= 2:
+                sources.append(samples)
+        for samples in sources:
+            for endpoint, neighbor, direction in (
+                (samples[0], samples[1], -1.0),
+                (samples[-1], samples[-2], 1.0),
+            ):
                 screen = project(endpoint)
                 distance = math.hypot(target[0] - screen[0], target[1] - screen[1])
-                tangent = (endpoint[0] - neighbor[0], endpoint[1] - neighbor[1])
+                tangent = (
+                    direction * (endpoint[0] - neighbor[0]),
+                    direction * (endpoint[1] - neighbor[1]),
+                )
                 norm = math.hypot(*tangent)
                 if distance <= tolerance_px and norm > 1e-15:
                     candidates.append((distance, tuple(endpoint), (tangent[0] / norm, tangent[1] / norm)))
@@ -3471,79 +3816,228 @@ class SolveWorkspace(Div):
 
     def _accept_arc_sketch_point(self, point, *, variant=None):
         variant = variant or self._sketch_tool_variant.get("arc", "three-point")
-        point = tuple(point)
+        point = tuple(float(value) for value in point)
+        pending = self._pending_arc_points
+
         if variant == "tangent":
-            if not self._pending_arc_points:
+            if not pending:
                 tangent_start = self._tangent_at_sketch_endpoint(point)
                 if tangent_start is None:
-                    self._message("Tangent arc: click near an existing curve endpoint first.", error=True)
-                    return
+                    self._message("Tangent arc must start at an existing line or curve endpoint.", error=True)
+                    return False
                 endpoint, tangent = tangent_start
                 self._pending_arc_points = [tuple(endpoint), tuple(tangent)]
-                self._message("Tangent arc: click the end point.")
-                return
-            start, tangent = self._pending_arc_points[:2]
-            self._pending_arc_points = []
-            end = point
+                self._sync_pending_construction_preview()
+                self._message("Tangent arc: move the pointer to preview the tangent, then click its end point.")
+                return True
+            start, tangent = pending[:2]
+            end = tuple(self._snap_sketch_endpoint(point))
             chord = (end[0] - start[0], end[1] - start[1])
             chord_squared = chord[0] ** 2 + chord[1] ** 2
             normal = (-tangent[1], tangent[0])
             denominator = 2.0 * (chord[0] * normal[0] + chord[1] * normal[1])
             if chord_squared <= 1e-24 or abs(denominator) <= 1e-18:
-                self._message("The tangent arc endpoint must define a curved arc.", error=True)
-                return
+                self._message("Choose a distinct end point that makes a finite curved arc.", error=True)
+                return False
             offset = chord_squared / denominator
             center = (start[0] + offset * normal[0], start[1] + offset * normal[1])
+            radius = math.dist(start, center)
+            if not math.isfinite(radius) or radius <= 0:
+                self._message("The tangent arc radius must be positive.", error=True)
+                return False
             start_angle = math.atan2(start[1] - center[1], start[0] - center[0])
             end_angle = math.atan2(end[1] - center[1], end[0] - center[0])
             positive_sweep = (end_angle - start_angle) % (2.0 * math.pi)
             ccw_tangent = (-math.sin(start_angle), math.cos(start_angle))
             sweep = positive_sweep if ccw_tangent[0] * tangent[0] + ccw_tangent[1] * tangent[1] >= 0 else positive_sweep - 2.0 * math.pi
-            middle_angle = start_angle + sweep / 2.0
-            radius = math.hypot(start[0] - center[0], start[1] - center[1])
-            through = (center[0] + radius * math.cos(middle_angle), center[1] + radius * math.sin(middle_angle))
+            if abs(sweep) <= 1e-12 or abs(sweep) >= 2.0 * math.pi - 1e-12:
+                self._message("The tangent arc must have a nonzero angular span.", error=True)
+                return False
+            through_angle = start_angle + sweep / 2.0
+            through = (
+                center[0] + radius * math.cos(through_angle),
+                center[1] + radius * math.sin(through_angle),
+            )
+            count = min(512, max(12, int(math.ceil(abs(sweep) / (math.pi / 48.0)))))
+            samples = [
+                [center[0] + radius * math.cos(start_angle + sweep * index / count),
+                 center[1] + radius * math.sin(start_angle + sweep * index / count)]
+                for index in range(count + 1)
+            ]
+            self._pending_arc_points = []
+            self._sync_pending_construction_preview()
             try:
-                self._add_sketch_entity("arc", [start, through, end])
+                return self._add_sketch_entity(
+                    "arc", [start, through, end],
+                    arc_geometry={
+                        "start": start, "through": through, "end": end,
+                        "center": center, "radius": radius, "clockwise": sweep < 0,
+                        "samples": samples,
+                    },
+                )
             except ValueError as exc:
                 self._message(str(exc), error=True)
-            return
+                return False
 
-        required = 3
-        if not self._pending_arc_points:
-            self._pending_arc_points = [point]
-            next_hint = "start point" if variant == "centerpoint" else "a point on the arc"
-            self._message(f"Arc: click the {next_hint}, then the end point.")
-            return
-        if len(self._pending_arc_points) < 2:
-            self._pending_arc_points.append(point)
-            self._message("Arc: click the end point.")
-            return
-        points = [*self._pending_arc_points, point]
-        self._pending_arc_points = []
+        if variant == "three-point":
+            point = tuple(self._snap_sketch_endpoint(point))
+            if not pending:
+                self._pending_arc_points = [point]
+                self._sync_pending_construction_preview()
+                self._message("3-point arc: click the start point; next click the end point.")
+                return True
+            if len(pending) == 1:
+                self._pending_arc_points.append(point)
+                self._sync_pending_construction_preview()
+                self._message("3-point arc: move the pointer to preview through-point C, then click.")
+                return True
+            start, end = pending[:2]
+            through = point
+            self._pending_arc_points = []
+            self._sync_pending_construction_preview()
+            try:
+                self._arc_from_three_points(start, through, end)
+                return self._add_sketch_entity("arc", [start, through, end])
+            except ValueError as exc:
+                self._message(str(exc), error=True)
+                return False
+
         if variant == "centerpoint":
-            center, start, end = points
+            point = tuple(self._snap_sketch_endpoint(point))
+            if not pending:
+                self._pending_arc_points = [point]
+                self._sync_pending_construction_preview()
+                self._message("Centerpoint arc: click the center; next click the start point.")
+                return True
+            if len(pending) == 1:
+                start = point
+                radius = math.dist(pending[0], start)
+                if radius <= 1e-12:
+                    self._message("The arc center and start point must be different.", error=True)
+                    return False
+                self._pending_arc_points.append(start)
+                self._sync_pending_construction_preview()
+                self._message("Centerpoint arc: move the pointer to preview the fixed-radius arc, then click its end.")
+                return True
+            center, start = pending[:2]
             radius = math.dist(center, start)
-            if radius <= 1e-12 or math.dist(center, end) <= 1e-12:
-                self._message("Arc center and endpoint must be different.", error=True)
-                return
-            end_angle = math.atan2(end[1] - center[1], end[0] - center[0])
+            cursor = point
+            cursor_radius = math.dist(center, cursor)
+            if radius <= 0 or cursor_radius <= 1e-12:
+                self._message("The arc radius must be positive and the endpoint must differ from its center.", error=True)
+                return False
+            end_angle = math.atan2(cursor[1] - center[1], cursor[0] - center[0])
             start_angle = math.atan2(start[1] - center[1], start[0] - center[0])
-            sweep = (end_angle - start_angle) % (2.0 * math.pi)
-            if sweep <= 1e-12:
-                self._message("Arc start and end must be different.", error=True)
-                return
             end = (center[0] + radius * math.cos(end_angle), center[1] + radius * math.sin(end_angle))
-            middle_angle = start_angle + sweep / 2.0
-            through = (center[0] + radius * math.cos(middle_angle), center[1] + radius * math.sin(middle_angle))
+            if math.dist(start, end) <= 1e-12:
+                self._message("The arc start and end must define a nonzero angular span.", error=True)
+                return False
+            sweep = (end_angle - start_angle) % (2.0 * math.pi)
+            through_angle = start_angle + sweep / 2.0
+            through = (
+                center[0] + radius * math.cos(through_angle),
+                center[1] + radius * math.sin(through_angle),
+            )
+            count = min(512, max(12, int(math.ceil(abs(sweep) / (math.pi / 48.0)))))
+            samples = [
+                [center[0] + radius * math.cos(start_angle + sweep * index / count),
+                 center[1] + radius * math.sin(start_angle + sweep * index / count)]
+                for index in range(count + 1)
+            ]
+            self._pending_arc_points = []
+            self._sync_pending_construction_preview()
             try:
-                self._add_sketch_entity("arc", [start, through, end])
+                return self._add_sketch_entity(
+                    "arc", [start, through, end],
+                    arc_geometry={
+                        "start": start, "through": through, "end": end,
+                        "center": center, "radius": radius, "clockwise": False,
+                        "samples": samples,
+                    },
+                )
             except ValueError as exc:
                 self._message(str(exc), error=True)
-        else:
-            try:
-                self._add_sketch_entity("arc", points)
-            except ValueError as exc:
-                self._message(str(exc), error=True)
+                return False
+
+        self._message("Choose a supported arc construction method.", error=True)
+        return False
+
+    @_history_tracked
+    def _set_selected_arc_radius(self, value):
+        edge = self._selected_edge()
+        if edge is None or len(self.selected_edge_ids) != 1:
+            return False
+        try:
+            radius = float(value)
+        except (TypeError, ValueError, OverflowError):
+            self._message("Enter a positive arc radius in metres.", error=True)
+            return False
+        if not math.isfinite(radius) or radius <= 0:
+            self._message("Arc radius must be positive.", error=True)
+            return False
+        curve = edge.get("curve", {})
+        if not isinstance(curve, dict) or curve.get("type") != "arc":
+            self._message("Select one sketch arc to edit its radius.", error=True)
+            return False
+        entity = next(
+            (item for item in self.model["geometry"].get("sketch_entities", [])
+             if item.get("id") == edge.get("sketch_entity_id")),
+            None,
+        )
+        if entity is None or len(entity.get("points", [])) < 3:
+            self._message("This arc is not an editable sketch arc.", error=True)
+            return False
+        start = tuple(float(value) for value in entity["points"][0])
+        end = tuple(float(value) for value in entity["points"][-1])
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        chord = math.hypot(dx, dy)
+        if chord <= 1e-15 or radius < chord / 2.0 - 1e-12:
+            self._message("The radius must be at least half the distance between the fixed endpoints.", error=True)
+            return False
+        midpoint = ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0)
+        height = math.sqrt(max(0.0, radius * radius - chord * chord / 4.0))
+        normal = (-dy / chord, dx / chord)
+        centers = (
+            (midpoint[0] + height * normal[0], midpoint[1] + height * normal[1]),
+            (midpoint[0] - height * normal[0], midpoint[1] - height * normal[1]),
+        )
+        previous_center = entity.get("center", curve.get("center", midpoint))
+        center = min(centers, key=lambda candidate: math.dist(candidate, previous_center))
+        clockwise = bool(entity.get("clockwise", curve.get("clockwise", False)))
+        start_angle = math.atan2(start[1] - center[1], start[0] - center[0])
+        end_angle = math.atan2(end[1] - center[1], end[0] - center[0])
+        positive_sweep = (end_angle - start_angle) % (2.0 * math.pi)
+        sweep = positive_sweep - 2.0 * math.pi if clockwise else positive_sweep
+        if abs(sweep) <= 1e-12:
+            self._message("Arc endpoints must define a nonzero angular span.", error=True)
+            return False
+        count = min(512, max(12, int(math.ceil(abs(sweep) / (math.pi / 48.0)))))
+        samples = [
+            [center[0] + radius * math.cos(start_angle + sweep * index / count),
+             center[1] + radius * math.sin(start_angle + sweep * index / count)]
+            for index in range(count + 1)
+        ]
+        through_angle = start_angle + sweep / 2.0
+        through = (
+            center[0] + radius * math.cos(through_angle),
+            center[1] + radius * math.sin(through_angle),
+        )
+        entity["center"] = list(center)
+        entity["radius"] = radius
+        entity["clockwise"] = clockwise
+        entity["points"] = [list(start), list(through), list(end)]
+        entity["sampled_points"] = samples
+        edge["curve"] = {
+            **curve, "type": "arc", "center": list(center), "radius": radius,
+            "clockwise": clockwise, "sampled_points": copy.deepcopy(samples),
+        }
+        self._preserve_canvas_view()
+        self._refresh_sketch_generated_regions()
+        self._refresh_model_tree()
+        self._render_inspector()
+        self.render_canvas()
+        self._message(f"Arc radius set to {radius:.6g} m.")
+        return True
 
     def _accept_circle_sketch_point(self, point):
         self._pending_circle_points.append(tuple(point))
@@ -5897,6 +6391,8 @@ class SolveWorkspace(Div):
             ui_style="padding:14px 14px 10px; border-bottom:1px solid var(--border);",
         )
         self._edge_name_input = _input("Edge name", "", lambda event: self._set_selected_edge_name(event.value))
+        self._arc_radius_input = _input("Arc radius", "", lambda event: self._set_selected_arc_radius(event.value), number=True, suffix="m", hint="Keep the endpoints fixed; radius must be at least half their separation.")
+        self._arc_radius_input.ui_hidden = True
         em_options = self._edge_condition_options("electromagnetic")
         mech_options = self._edge_condition_options("mechanical")
         self._edge_em_select = QSelect(
@@ -5918,6 +6414,7 @@ class SolveWorkspace(Div):
         self._edge_panel = Div(
             self._edge_title,
             self._edge_name_input,
+            self._arc_radius_input,
             self._edge_em_select,
             self._edge_mech_select,
             self._edge_boundary_note,
@@ -6028,7 +6525,13 @@ class SolveWorkspace(Div):
                 self._edge_subtitle.ui_children = [edge.get("name", "Edge") + " · single edge"]
                 self._edge_name_input.ui_model_value = edge.get("name", "")
                 self._edge_name_input.ui_hidden = False
+                curve = edge.get("curve", {})
+                is_editable_arc = isinstance(curve, dict) and curve.get("type") == "arc" and bool(edge.get("sketch_entity_id"))
+                self._arc_radius_input.ui_hidden = not is_editable_arc
+                if is_editable_arc:
+                    self._arc_radius_input.ui_model_value = str(float(curve.get("radius", 0.0)))
             else:
+                self._arc_radius_input.ui_hidden = True
                 self._edge_subtitle.ui_children = [f"{len(edges)} edges selected · assignments apply to all"]
                 self._edge_name_input.ui_hidden = True
             conditions = {item["id"]: item for item in self.model.get("boundary_conditions", [])}

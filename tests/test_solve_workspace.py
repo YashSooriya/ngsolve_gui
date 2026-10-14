@@ -1279,6 +1279,122 @@ def test_line_and_trim_preview_paths_are_separate_from_marquee(standalone_compon
     assert "corner rectangle" not in preview
 
 
+
+def test_click_line_chain_waits_until_finish_and_then_commits_all_segments(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.set_sketch_tool("line", announce=False)
+
+    workspace._accept_line_sketch_point((0.002, 0.001))
+    workspace._accept_line_sketch_point((0.006, 0.001))
+    workspace._accept_line_sketch_point((0.006, 0.004))
+    assert workspace.model["geometry"]["sketch_entities"] == []
+
+    assert workspace._finish_line_sketch_chain()
+    entities = workspace.model["geometry"]["sketch_entities"]
+    assert [item["points"] for item in entities] == [
+        [[0.002, 0.001], [0.006, 0.001]],
+        [[0.006, 0.001], [0.006, 0.004]],
+    ]
+    assert len(workspace.model["geometry"]["edges"]) == 2
+
+
+def test_enter_finishes_line_chain_and_escape_returns_to_select(standalone_components):
+    from types import SimpleNamespace
+
+    workspace = SolveWorkspace()
+    workspace.set_sketch_tool("line", announce=False)
+    workspace._accept_line_sketch_point((0.002, 0.001))
+    workspace._accept_line_sketch_point((0.006, 0.001))
+    workspace._on_canvas_keydown(SimpleNamespace(value={"key": "Enter"}))
+    assert len(workspace.model["geometry"]["edges"]) == 1
+    assert workspace.sketch_tool == "line"
+
+    workspace._accept_line_sketch_point((0.006, 0.001))
+    workspace._accept_line_sketch_point((0.006, 0.004))
+    workspace._on_canvas_keydown(SimpleNamespace(value=None, key="Escape"))
+    assert len(workspace.model["geometry"]["edges"]) == 2
+    assert workspace.sketch_tool == "select"
+
+
+def test_arc_three_point_click_order_is_start_end_then_through(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.set_sketch_tool("arc", announce=False, variant="three-point")
+    start, end, through = (0.004, 0.002), (0.010, 0.002), (0.007, 0.005)
+
+    assert workspace._accept_arc_sketch_point(start, variant="three-point")
+    assert workspace._accept_arc_sketch_point(end, variant="three-point")
+    assert workspace._pending_arc_points == [start, end]
+    assert workspace._accept_arc_sketch_point(through, variant="three-point")
+
+    entity = workspace.model["geometry"]["sketch_entities"][0]
+    assert entity["points"][0] == list(start)
+    assert entity["points"][1] == list(through)
+    assert entity["points"][2] == list(end)
+    assert math.dist(entity["center"], start) == pytest.approx(entity["radius"])
+    assert math.dist(entity["center"], through) == pytest.approx(entity["radius"])
+    assert math.dist(entity["center"], end) == pytest.approx(entity["radius"])
+
+
+def test_centerpoint_arc_projects_end_to_start_radius(standalone_components):
+    workspace = SolveWorkspace()
+    center, start, cursor = (0.006, 0.001), (0.010, 0.001), (0.006, 0.005)
+    workspace._accept_arc_sketch_point(center, variant="centerpoint")
+    workspace._accept_arc_sketch_point(start, variant="centerpoint")
+    assert workspace._accept_arc_sketch_point(cursor, variant="centerpoint")
+
+    entity = workspace.model["geometry"]["sketch_entities"][0]
+    assert math.dist(center, start) == pytest.approx(math.dist(center, entity["points"][-1]))
+    assert math.dist(center, start) == pytest.approx(entity["radius"])
+    assert math.dist(start, entity["points"][-1]) > 0
+
+
+def test_tangent_arc_starts_at_endpoint_and_has_common_tangent(standalone_components):
+    workspace = SolveWorkspace()
+    assert workspace._add_sketch_entity("line", [(0.002, 0.002), (0.006, 0.002)])
+    endpoint = (0.006, 0.002)
+    workspace._accept_arc_sketch_point(endpoint, variant="tangent")
+    assert workspace._pending_arc_points[0] == endpoint
+    assert workspace._accept_arc_sketch_point((0.010, 0.006), variant="tangent")
+
+    arc = next(item for item in workspace.model["geometry"]["sketch_entities"] if item["type"] == "arc")
+    edge = next(item for item in workspace.model["geometry"]["edges"] if item.get("sketch_entity_id") == arc["id"])
+    tangent = (1.0, 0.0)
+    radius_vector = (arc["center"][0] - endpoint[0], arc["center"][1] - endpoint[1])
+    assert radius_vector[0] * tangent[0] + radius_vector[1] * tangent[1] == pytest.approx(0.0, abs=1e-10)
+    assert math.dist(arc["center"], endpoint) == pytest.approx(arc["radius"])
+    assert edge["vertices"][0] == list(endpoint)
+
+
+def test_selected_arc_radius_is_editable_and_preserves_endpoints(standalone_components):
+    workspace = SolveWorkspace()
+    for point in ((0.004, 0.002), (0.010, 0.002), (0.007, 0.005)):
+        workspace._accept_arc_sketch_point(point, variant="three-point")
+    edge = next(item for item in workspace.model["geometry"]["edges"] if item.get("curve", {}).get("type") == "arc")
+    edge_id = edge["id"]
+    endpoints = copy.deepcopy(edge["vertices"])
+    workspace.selected_edge_id = edge_id
+    workspace.selected_edge_ids = [edge_id]
+
+    assert workspace._set_selected_arc_radius(0.004)
+    updated = next(item for item in workspace.model["geometry"]["edges"] if item.get("curve", {}).get("type") == "arc")
+    assert updated["vertices"] == endpoints
+    assert updated["curve"]["radius"] == pytest.approx(0.004)
+    assert workspace._set_selected_arc_radius(0.001) is False
+
+
+def test_live_preview_supports_arc_construction_and_point_markers(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    scripts = []
+    monkeypatch.setattr(SolveWorkspace, "js", property(lambda self: SimpleNamespace(eval=scripts.append)), raising=False)
+    workspace._install_canvas_pointer_capture()
+    script = scripts[0]
+    assert "arcPathThroughThreePoints" in script
+    assert "arcPathFromCenter" in script
+    assert "arcPathTangent" in script
+    assert "solve-sketch-construction-points" in script
+    assert "window.__ngsolveRefreshConstructionPreview" in script
+    assert "hasPending" in script and "updateConstructionPreview" in script
+
 def test_trim_pencil_stroke_removes_only_curves_it_crosses(standalone_components):
     workspace = SolveWorkspace()
     assert workspace._add_sketch_entity("line", [(0.002, 0.0), (0.008, 0.0)])
@@ -3591,6 +3707,9 @@ def test_canvas_context_menu_offers_group_delete_ungroup_for_current_selection(s
     assert "[data-sketch-region-selected=\"true\"]" in scripts[0]
     assert "event.clientX - bounds.left" in scripts[0]
     assert "event.key === 'Escape'" in scripts[0]
+    assert "new KeyboardEvent('keydown'" in scripts[0]
+    assert "svg.dispatchEvent(forwarded)" in scripts[0]
+    assert "svg.focus({preventScroll: true})" in scripts[0]
 
 
 def test_group_deletion_removes_all_selected_regions_and_stale_assignments(standalone_components):
