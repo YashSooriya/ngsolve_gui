@@ -3255,3 +3255,78 @@ def test_setup_validation_survives_malformed_nested_sections(standalone_componen
     results = workspace._setup_check_results(errors)
     assert any("Physics setting" in error for error in errors)
     assert len(results) == 13
+
+
+def test_boundary_condition_fields_follow_selected_type_and_save_values(standalone_components):
+    def components(items):
+        for item in items:
+            yield item
+            yield from components(getattr(item, "ui_children", []))
+
+    def labels(items):
+        return [
+            item.ui_label for item in components(items)
+            if getattr(item, "ui_label", None)
+        ]
+
+    workspace = SolveWorkspace()
+    workspace._open_boundary_editor()
+    assert workspace._editor_drawer["kind"] == "boundary"
+
+    workspace._set_editor_draft("type", SimpleNamespace(value="mechanical_prescribed"))
+    controls = list(components(workspace._inspector.ui_children))
+    field_units = {
+        item.ui_label: getattr(item, "ui_suffix", None)
+        for item in controls if getattr(item, "ui_label", None)
+    }
+    assert field_units["Radial displacement"] == "m"
+    assert field_units["Axial displacement"] == "m"
+
+    workspace._set_editor_draft("type", SimpleNamespace(value="mechanical_traction"))
+    controls = list(components(workspace._inspector.ui_children))
+    field_units = {
+        item.ui_label: getattr(item, "ui_suffix", None)
+        for item in controls if getattr(item, "ui_label", None)
+    }
+    assert field_units["Radial traction"] == "N/m" + chr(178)
+    assert field_units["Axial traction"] == "N/m" + chr(178)
+
+    workspace._set_editor_draft("type", SimpleNamespace(value="mechanical_robin"))
+    controls = list(components(workspace._inspector.ui_children))
+    field_units = {
+        item.ui_label: getattr(item, "ui_suffix", None)
+        for item in controls if getattr(item, "ui_label", None)
+    }
+    assert field_units["Normal stiffness"] == "N/m" + chr(179)
+    assert field_units["Tangential stiffness"] == "N/m" + chr(179)
+
+    for condition_type in (
+        "mechanical_fixed",
+        "axis_of_symmetry",
+        "magnetic_potential_zero",
+        "natural",
+    ):
+        workspace._set_editor_draft("type", SimpleNamespace(value=condition_type))
+        labels_for_type = labels(workspace._inspector.ui_children)
+        assert "Radial displacement" not in labels_for_type
+        assert "Axial displacement" not in labels_for_type
+        assert "Radial traction" not in labels_for_type
+        assert "Axial traction" not in labels_for_type
+        assert "Normal stiffness" not in labels_for_type
+        assert "Tangential stiffness" not in labels_for_type
+
+    for condition_type, values in (
+        ("mechanical_prescribed", {"displacement_r": 0, "displacement_z": "-2e-4"}),
+        ("mechanical_traction", {"traction_r": "12.5", "traction_z": "-3"}),
+        ("mechanical_robin", {"stiffness_normal": "4e6", "stiffness_tangential": "2e6"}),
+    ):
+        if workspace.model["boundary_conditions"]:
+            workspace._open_boundary_editor()
+        workspace._set_editor_draft("type", SimpleNamespace(value=condition_type))
+        for key, value in values.items():
+            workspace._set_editor_draft(key, SimpleNamespace(value=value))
+        workspace._commit_editor()
+        condition = workspace.model["boundary_conditions"][-1]
+        assert condition["type"] == condition_type
+        for key, value in values.items():
+            assert condition[key] == str(value)

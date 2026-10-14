@@ -4932,8 +4932,14 @@ class SolveWorkspace(Div):
         self._render_inspector()
 
     def _set_editor_draft(self, key, event):
-        if self._editor_drawer is not None:
-            self._editor_drawer["draft"][key] = str(getattr(event, "value", event) or "").strip()
+        if self._editor_drawer is None:
+            return
+        value = getattr(event, "value", event)
+        self._editor_drawer["draft"][key] = "" if value is None else str(value).strip()
+        if key == "type" and self._editor_drawer.get("kind") == "boundary":
+            # The boundary editor's value fields depend on the selected type.
+            # Rebuild the drawer as soon as the user changes that selection.
+            self._render_inspector()
 
     def _set_editor_source_force(self, component, event):
         if self._editor_drawer is None:
@@ -5023,6 +5029,17 @@ class SolveWorkspace(Div):
                 select,
             ])
             typ = draft.get("type", "natural")
+            type_help = {
+                "axis_of_symmetry": "Enforces axisymmetric regularity on r = 0; no value is prescribed.",
+                "magnetic_potential_zero": "Sets magnetic potential to zero.",
+                "natural": "Uses the homogeneous natural (zero-flux / zero-traction) condition.",
+                "mechanical_fixed": "Sets both radial and axial displacement to zero.",
+                "mechanical_prescribed": "Enter the prescribed radial and axial displacements.",
+                "mechanical_traction": "Enter the radial and axial traction components.",
+                "mechanical_robin": "Enter the normal and tangential spring stiffnesses to ground.",
+            }.get(typ)
+            if type_help:
+                body.append(Div(type_help, ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"))
             fields = {
                 "mechanical_prescribed": (("displacement_r", "Radial displacement", "m"), ("displacement_z", "Axial displacement", "m")),
                 "mechanical_traction": (("traction_r", "Radial traction", "N/m²"), ("traction_z", "Axial traction", "N/m²")),
