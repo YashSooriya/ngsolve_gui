@@ -597,7 +597,7 @@ def test_3d_preview_opens_large_modal_and_exit_restores_editable_sketch(standalo
     assert workspace._preview_3d_component is preview
     assert workspace._preview_3d_dialog.ui_model_value is True
     assert workspace._preview_3d_viewport.ui_children == [preview]
-    assert workspace._canvas_host.ui_children == [original_canvas, workspace._canvas_resize_observer]
+    assert workspace._canvas_host.ui_children == [original_canvas, workspace._canvas_resize_observer, workspace._canvas_context_menu]
     assert workspace._preview_3d_dialog._props["maximized"] is True
     assert workspace._preview_3d_dialog._props["persistent"] is True
     assert workspace._preview_3d_exit_button.ui_label == "Exit 3D Preview"
@@ -610,7 +610,7 @@ def test_3d_preview_opens_large_modal_and_exit_restores_editable_sketch(standalo
     assert workspace._preview_3d_dialog.ui_model_value is False
     assert workspace._preview_3d_component is None
     assert workspace._preview_3d_viewport.ui_children == []
-    assert workspace._canvas_host.ui_children == [original_canvas, workspace._canvas_resize_observer]
+    assert workspace._canvas_host.ui_children == [original_canvas, workspace._canvas_resize_observer, workspace._canvas_context_menu]
     assert workspace._preview_3d_button.ui_label == "Preview in 3D"
     assert all(not control.ui_hidden for control in workspace._sketch_view_controls)
 
@@ -841,7 +841,7 @@ def test_3d_preview_failure_keeps_editable_sketch_active(standalone_components):
 
     assert not workspace._preview_3d_active
     assert workspace._preview_3d_dialog.ui_model_value is False
-    assert workspace._canvas_host.ui_children == [workspace._canvas, workspace._canvas_resize_observer]
+    assert workspace._canvas_host.ui_children == [workspace._canvas, workspace._canvas_resize_observer, workspace._canvas_context_menu]
     assert workspace._preview_3d_button.ui_label == "Preview in 3D"
     assert "invalid profile" in workspace.message
 
@@ -2237,7 +2237,7 @@ def test_canvas_drag_suppresses_the_click_that_follows_mouseup(standalone_compon
     assert "data-sketch-edge-id" in scripts[0]
     assert "![0, 1].includes(event.button)" in scripts[0]
     assert "const middlePan = event.button === 1" in scripts[0]
-    assert "? 'marquee'" in scripts[0]
+    assert "? (dragRegionId ? 'region' : (dragEdgeId ? 'edge' : 'marquee'))" in scripts[0]
     assert "gridCacheFor" in scripts[0]
     assert "liveGrid.replaceChildren();" in scripts[0]
     assert "while (liveGrid.firstChild)" not in scripts[0]
@@ -3465,3 +3465,128 @@ def test_boundary_condition_fields_follow_selected_type_and_save_values(standalo
         assert condition["type"] == condition_type
         for key, value in values.items():
             assert condition[key] == str(value)
+
+
+def _workspace_with_two_regions():
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    first = workspace.model["geometry"]["regions"][0]
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.02,
+        ("rectangle", "z_min"): 0.01,
+        ("rectangle", "width"): 0.006,
+        ("rectangle", "height"): 0.007,
+    })
+    workspace._add_primitive("rectangle")
+    second = workspace.model["geometry"]["regions"][1]
+    return workspace, first, second
+
+
+def test_ctrl_or_shift_region_selection_toggles_regions_and_expands_groups(standalone_components):
+    workspace, first, second = _workspace_with_two_regions()
+
+    workspace.select_region(first["id"])
+    assert workspace.selected_region_ids == [first["id"]]
+    workspace.select_region(second["id"], additive=True)
+    assert set(workspace.selected_region_ids) == {first["id"], second["id"]}
+    workspace.select_region(first["id"], additive=True)
+    assert workspace.selected_region_ids == [second["id"]]
+    workspace.select_region(first["id"], additive=True)
+    assert set(workspace.selected_region_ids) == {first["id"], second["id"]}
+
+    assert workspace.group_selected_regions()
+    group = workspace.model["region_groups"][0]
+    assert set(group["region_ids"]) == {first["id"], second["id"]}
+    workspace.select_region(first["id"])
+    assert set(workspace.selected_region_ids) == {first["id"], second["id"]}
+    assert workspace.ungroup_selected_regions()
+    workspace.select_region(first["id"])
+    assert workspace.selected_region_ids == [first["id"]]
+
+
+def test_canvas_context_menu_offers_group_delete_ungroup_for_current_selection(standalone_components, monkeypatch):
+    workspace, first, second = _workspace_with_two_regions()
+    workspace.select_region(first["id"])
+    workspace.select_region(second["id"], additive=True)
+    workspace.render_canvas()
+
+    context_menu = workspace._canvas_context_menu
+    assert context_menu in workspace._canvas_host.ui_children
+    assert context_menu.__class__.__name__ == "Div"
+    assert context_menu._id == "solve-sketch-context-menu"
+    assert context_menu._props["class"] == "solve-sketch-context-menu"
+    assert "display:none" in context_menu._props["style"]
+
+    def strings(component):
+        if isinstance(component, str):
+            return [component]
+        return [text for child in getattr(component, "ui_children", []) for text in strings(child)]
+
+    labels = strings(context_menu)
+    assert "Delete selected regions" in labels
+    assert "Group selected regions" in labels
+    assert "Ungroup selected regions" in labels
+    assert set(workspace.selected_region_ids) == {first["id"], second["id"]}
+    for region_id in (first["id"], second["id"]):
+        assert workspace._canvas_region_nodes[region_id]._props["data-sketch-region-selected"] == "true"
+
+    scripts = []
+    monkeypatch.setattr(SolveWorkspace, "js", property(lambda self: SimpleNamespace(eval=scripts.append)), raising=False)
+    workspace._install_canvas_pointer_capture()
+    assert "document.addEventListener('contextmenu', openSketchContextMenu, true)" in scripts[0]
+    assert "[data-sketch-region-selected=\"true\"]" in scripts[0]
+    assert "event.clientX - bounds.left" in scripts[0]
+    assert "event.key === 'Escape'" in scripts[0]
+
+
+def test_group_deletion_removes_all_selected_regions_and_stale_assignments(standalone_components):
+    workspace, first, second = _workspace_with_two_regions()
+    workspace.model["regional_loads"] = [{"id": "load-test", "name": "Coil current", "region_ids": [first["id"], second["id"]]}]
+    workspace.model["mesh"]["region_element_sizes"] = {first["id"]: "0.001", second["id"]: "0.002"}
+    workspace.model["mesh"]["hp_region_ids"] = [first["id"], second["id"]]
+    workspace._sync_region_sources_from_loads()
+    workspace.select_region(first["id"])
+    workspace.select_region(second["id"], additive=True)
+    workspace.group_selected_regions()
+
+    assert workspace.delete_selected_regions()
+    assert workspace.model["geometry"]["regions"] == []
+    assert workspace.model["region_groups"] == []
+    assert workspace.model["regional_loads"][0]["region_ids"] == []
+    assert workspace.model["mesh"]["region_element_sizes"] == {}
+    assert workspace.model["mesh"]["hp_region_ids"] == []
+
+
+def test_group_selection_applies_material_and_mechanical_setting_in_one_action(standalone_components):
+    workspace, first, second = _workspace_with_two_regions()
+    workspace.select_region(first["id"])
+    workspace.select_region(second["id"], additive=True)
+    workspace.group_selected_regions()
+    workspace.select_section("materials")
+    workspace._bulk_material_choice = "material-copper"
+    workspace._bulk_mechanical_choice = "true"
+
+    assert workspace._apply_bulk_region_material()
+    assert all(region["material_id"] == "material-copper" for region in (first, second))
+    assert all(region["mechanical"] for region in (first, second))
+    bulk_controls = workspace._material_properties()
+    assert any(getattr(item, "ui_label", "").startswith("Material for 2 selected") for item in bulk_controls)
+
+
+def test_grouped_region_toggles_source_assignment_for_every_member(standalone_components):
+    workspace, first, second = _workspace_with_two_regions()
+    workspace.select_region(first["id"])
+    workspace.select_region(second["id"], additive=True)
+    workspace.group_selected_regions()
+    workspace.model["regional_loads"] = [{
+        "id": "load-test", "name": "Coil current", "region_ids": [],
+        "dc_current_density": "1200000", "ac_current_density_real": "0",
+        "ac_current_density_imaginary": "0", "mechanical_body_force": {"r": "0", "z": "0"},
+    }]
+    workspace.active_section = "sources"
+    workspace.selected_source_id = "load-test"
+
+    assert workspace._toggle_active_source_region(first["id"])
+    assert set(workspace.model["regional_loads"][0]["region_ids"]) == {first["id"], second["id"]}
+    assert workspace._toggle_active_source_region(second["id"])
+    assert workspace.model["regional_loads"][0]["region_ids"] == []

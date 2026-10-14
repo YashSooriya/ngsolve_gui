@@ -363,6 +363,7 @@ class SolveWorkspace(Div):
 
     def __init__(self, on_log=None, on_run=None, on_mesh=None, on_open_file=None, on_history_change=None, on_cancel=None, material_library=None):
         self.model = new_model()
+        self.model.setdefault("region_groups", [])
         self._material_library = material_library or MaterialLibrary()
         self._user_materials = self._material_library.load()
         self.studies = new_studies()
@@ -399,6 +400,8 @@ class SolveWorkspace(Div):
         self.selected_source_id = None
         self.selected_parameter_id = None
         self._selected_condition_id = None
+        self._bulk_material_choice = "__keep__"
+        self._bulk_mechanical_choice = "keep"
         self._tree_panel_width = 240
         self._properties_panel_width = 340
         self.snap_to_grid = False
@@ -457,6 +460,7 @@ class SolveWorkspace(Div):
         self._canvas_grid_signature = None
         self._canvas_scene_component_ids = None
         self._canvas_region_nodes = {}
+        self._canvas_context_menu = None
         self._canvas_edge_nodes = {}
         self._pending_arc_points = []
         self._canvas_preview = Component(
@@ -578,9 +582,13 @@ class SolveWorkspace(Div):
         )
         self._canvas_resize_observer = QResizeObserver(ui_debounce=80)
         self._canvas_resize_observer.on_resize(self._on_canvas_resize)
+        # Mount one context menu on the canvas host so right-clicking a selected
+        # region set opens the actions at the pointer, regardless of SVG nesting.
+        self._canvas_context_menu = self._region_context_menu()
         self._canvas_host = Div(
             self._canvas,
             self._canvas_resize_observer,
+            self._canvas_context_menu,
             ui_class="relative-position",
             ui_style="position:relative; display:flex; flex:1 1 0%; height:0; flex-direction:column; min-width:0; min-height:0; overflow:hidden;",
         )
@@ -608,7 +616,7 @@ class SolveWorkspace(Div):
         select_button = _button(
             "Select", "mdi-cursor-default-outline",
             lambda *a: self.set_sketch_tool("select"),
-            tooltip="Drag regions to move them; drag empty space to select edges; middle-drag to pan. Hold Shift to add to the selection.",
+            tooltip="Drag regions to move them; drag empty space to select edges; middle-drag to pan. Hold Ctrl or Shift to select multiple regions, then right-click for group, ungroup, or delete.",
             style="flex:0 0 auto; white-space:nowrap;",
         )
         def sketch_tool_group(label, icon, tool, options, tooltip):
@@ -1021,6 +1029,7 @@ class SolveWorkspace(Div):
             "studies": copy.deepcopy(self.studies),
             "selection": {
                 "region_id": self.selected_region_id,
+                "region_ids": list(getattr(self, "selected_region_ids", [])),
                 "edge_id": self.selected_edge_id,
                 "edge_ids": list(self.selected_edge_ids),
                 "parameter_id": self.selected_parameter_id,
@@ -1051,6 +1060,8 @@ class SolveWorkspace(Div):
         self._preserve_canvas_view()
         mesh_preview_signature = self._mesh_preview_signature
         self.model = copy.deepcopy(state["model"])
+        self.model.setdefault("region_groups", [])
+        self._prune_region_groups()
         self.studies = copy.deepcopy(state["studies"])
         if (
             mesh_preview_signature is not None
@@ -1060,8 +1071,15 @@ class SolveWorkspace(Div):
         selection = state["selection"]
         region_ids = {item["id"] for item in self.model["geometry"].get("regions", [])}
         edge_ids = {item["id"] for item in self.model["geometry"].get("edges", [])}
-        self.selected_region_id = selection["region_id"] if selection["region_id"] in region_ids else None
-        self.selected_edge_id = selection["edge_id"] if selection["edge_id"] in edge_ids else None
+        self.selected_region_id = selection.get("region_id") if selection.get("region_id") in region_ids else None
+        self.selected_region_ids = [
+            region_id for region_id in selection.get("region_ids", [])
+            if region_id in region_ids
+        ]
+        if self.selected_region_id and self.selected_region_id not in self.selected_region_ids:
+            self.selected_region_ids.append(self.selected_region_id)
+        self.selected_region_id = self.selected_region_ids[0] if len(self.selected_region_ids) == 1 else None
+        self.selected_edge_id = selection.get("edge_id") if selection.get("edge_id") in edge_ids else None
         self.selected_edge_ids = [item for item in selection["edge_ids"] if item in edge_ids]
         self.selected_parameter_id = selection["parameter_id"]
         self.selected_material_id = selection["material_id"]
@@ -1122,6 +1140,8 @@ class SolveWorkspace(Div):
             raise ValueError("Invalid studies: " + " ".join(study_errors))
         self._cancel_model_rename()
         self.model = model
+        self.model.setdefault("region_groups", [])
+        self._prune_region_groups()
         self.studies = studies
         self.mark_saved()
         self._undo_history.clear()
@@ -1692,8 +1712,8 @@ class SolveWorkspace(Div):
         script = r"""
 (() => {
   window.__ngsolveSketchTool = '__SKETCH_TOOL__';
-  if (window.__ngsolveSketchPointerCaptureVersion === 10) return;
-  window.__ngsolveSketchPointerCaptureVersion = 10;
+  if (window.__ngsolveSketchPointerCaptureVersion === 11) return;
+  window.__ngsolveSketchPointerCaptureVersion = 11;
   let active = false;
   let activePointerId = null;
   let dragStart = null;
@@ -1730,6 +1750,41 @@ class SolveWorkspace(Div):
     svg && event.target && event.target.closest
       && event.target.closest(selector) === svg
   );
+  const hideSketchContextMenu = () => {
+    const menu = document.querySelector('.solve-sketch-context-menu');
+    if (menu) menu.style.display = 'none';
+  };
+  const openSketchContextMenu = (event) => {
+    const svg = currentSvg();
+    const menu = document.querySelector('.solve-sketch-context-menu');
+    if (!menu || !targetIsSvg(event, svg)) return;
+    if (!svg.querySelector('[data-sketch-region-selected="true"]')) return;
+    event.preventDefault();
+    const host = menu.parentElement;
+    if (!host) return;
+    menu.style.display = 'block';
+    const bounds = host.getBoundingClientRect();
+    const maxLeft = Math.max(0, host.clientWidth - menu.offsetWidth);
+    const maxTop = Math.max(0, host.clientHeight - menu.offsetHeight);
+    menu.style.left = Math.max(0, Math.min(event.clientX - bounds.left, maxLeft)) + 'px';
+    menu.style.top = Math.max(0, Math.min(event.clientY - bounds.top, maxTop)) + 'px';
+  };
+  document.addEventListener('contextmenu', openSketchContextMenu, true);
+  document.addEventListener('pointerdown', (event) => {
+    if (event.button === 2) {
+      openSketchContextMenu(event);
+      return;
+    }
+    const menu = document.querySelector('.solve-sketch-context-menu');
+    if (menu && menu.style.display !== 'none' && !menu.contains(event.target)) hideSketchContextMenu();
+  }, true);
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') hideSketchContextMenu();
+  }, true);
+  document.addEventListener('click', (event) => {
+    const menu = document.querySelector('.solve-sketch-context-menu');
+    if (menu && menu.contains(event.target)) window.setTimeout(hideSketchContextMenu, 0);
+  });
   const gridCacheFor = (liveGrid) => {
     let cache = liveGrid.__ngsolveSketchGridCache;
     if (cache && cache.host === liveGrid && cache.nodes.every(node => node.isConnected)) return cache;
@@ -2272,7 +2327,7 @@ class SolveWorkspace(Div):
           : window.__ngsolveSketchBoundarySelection
             ? (dragEdgeId ? 'edge' : (dragRegionId ? 'region' : 'marquee'))
             : (event.shiftKey || event.ctrlKey)
-              ? 'marquee'
+              ? (dragRegionId ? 'region' : (dragEdgeId ? 'edge' : 'marquee'))
               : dragEdgeId
                 ? 'edge'
                 : dragRegionId
@@ -2974,8 +3029,7 @@ class SolveWorkspace(Div):
                 elif edge_id:
                     self.select_edge(edge_id, additive=additive)
                 elif operation == "region" and region_id:
-                    if self.selected_region_id != region_id:
-                        self.select_region(region_id)
+                    self.select_region(region_id, additive=additive)
                 elif not moved and operation != "pan":
                     view_changed = self._commit_browser_canvas_view(view, render=False)
                     self._clear_canvas_selection()
@@ -3043,8 +3097,7 @@ class SolveWorkspace(Div):
         elif drag.get("edge_id"):
             self.select_edge(drag["edge_id"], additive=drag["additive"])
         elif drag["operation"] == "region" and drag.get("region_id"):
-            if self.selected_region_id != drag["region_id"]:
-                self.select_region(drag["region_id"])
+            self.select_region(drag["region_id"], additive=drag.get("additive", False))
         elif not moved and drag.get("operation") != "pan":
             self._clear_canvas_selection()
 
@@ -3129,10 +3182,19 @@ class SolveWorkspace(Div):
             )
             if matches:
                 selected.append(edge["id"])
+        selected_regions = self._expand_region_group_ids(selected_regions)
+        regions_by_id = {
+            region.get("id"): region
+            for region in self.model.get("geometry", {}).get("regions", [])
+        }
+        for selected_region_id in selected_regions:
+            selected.extend(regions_by_id.get(selected_region_id, {}).get("edge_ids", []))
         selected = list(dict.fromkeys(selected))
         if additive:
             selected = list(dict.fromkeys([*self.selected_edge_ids, *selected]))
-            selected_regions = list(dict.fromkeys([*getattr(self, "selected_region_ids", []), *selected_regions]))
+            selected_regions = self._expand_region_group_ids([
+                *getattr(self, "selected_region_ids", []), *selected_regions
+            ])
         self.selected_edge_ids = selected
         self.selected_edge_id = selected[-1] if selected else None
         self.selected_region_ids = selected_regions
@@ -3631,6 +3693,7 @@ class SolveWorkspace(Div):
             geometry["regions"].append(region)
         self._recompute_parent_links()
         self._rebuild_edges()
+        self._prune_region_groups()
 
     @_history_tracked
     def delete_selected_sketch_edges(self):
@@ -4979,14 +5042,23 @@ class SolveWorkspace(Div):
             return False
         if not any(region.get("id") == region_id for region in self.model.get("geometry", {}).get("regions", [])):
             return False
-        assigned = list(load.get("region_ids", []))
-        if region_id in assigned:
-            assigned.remove(region_id)
-            message = f"Removed {next(region['name'] for region in self.model['geometry']['regions'] if region['id'] == region_id)} from {load.get('name', 'source/load')}."
+        target_ids = self._group_members_for_region(region_id)
+        assigned_set = set(load.get("region_ids", []))
+        if set(target_ids).issubset(assigned_set):
+            assigned_set.difference_update(target_ids)
+            action = "Removed"
         else:
-            assigned.append(region_id)
-            message = f"Applied {load.get('name', 'source/load')} to {next(region['name'] for region in self.model['geometry']['regions'] if region['id'] == region_id)}."
+            assigned_set.update(target_ids)
+            action = "Applied"
+        region_order = [item.get("id") for item in self.model.get("geometry", {}).get("regions", [])]
+        assigned = [item for item in region_order if item in assigned_set]
         load["region_ids"] = assigned
+        names = [
+            item.get("name", "Region") for item in self.model.get("geometry", {}).get("regions", [])
+            if item.get("id") in target_ids
+        ]
+        target_label = ", ".join(names)
+        message = f"{action} {load.get('name', 'source/load')} {'to' if action == 'Applied' else 'from'} {target_label}."
         self._sync_region_sources_from_loads()
         self.selected_region_ids = list(assigned)
         self.selected_region_id = assigned[-1] if assigned else None
@@ -5020,8 +5092,20 @@ class SolveWorkspace(Div):
 
     def _tree_subsection(self, section):
         if section == "geometry":
+            selected_regions = set(self._selected_region_ids_live())
+            groups_by_region = {
+                region_id: group.get("name", "Region group")
+                for group in self.model.get("region_groups", [])
+                for region_id in group.get("region_ids", [])
+            }
             entries = [
-                (region["id"], region["name"], "mdi-vector-square-outline", lambda *a, rid=region["id"]: self.select_region(rid), region["id"] == self.selected_region_id)
+                (
+                    region["id"],
+                    f"{region['name']}  ·  {groups_by_region[region['id']]}" if region["id"] in groups_by_region else region["name"],
+                    "mdi-vector-square-outline",
+                    lambda *a, rid=region["id"]: self.select_region(rid),
+                    region["id"] in selected_regions,
+                )
                 for region in self.model["geometry"]["regions"]
             ]
             return f"REGIONS · {len(entries)}", entries
@@ -5042,7 +5126,7 @@ class SolveWorkspace(Div):
                     f"{region.get('name', 'Region')} · {status}",
                     "mdi-cube-outline",
                     lambda *a, rid=region["id"]: self._open_region_material_editor(rid),
-                    self.active_section == "materials" and region.get("id") == self.selected_region_id,
+                    self.active_section == "materials" and region.get("id") in set(self._selected_region_ids_live()),
                 ))
             return f"MATERIALS · {len(entries)}", entries
         if section == "boundaries":
@@ -5154,8 +5238,70 @@ class SolveWorkspace(Div):
         self._render_inspector()
         self._sync_canvas_selection()
         self._render_canvas_dimensions()
-    def select_region(self, region_id):
-        self.selected_region_id = region_id
+    def _selected_region_ids_live(self):
+        live = {item.get("id") for item in self.model.get("geometry", {}).get("regions", [])}
+        selected = [
+            region_id for region_id in getattr(self, "selected_region_ids", [])
+            if region_id in live
+        ]
+        if self.selected_region_id in live and self.selected_region_id not in selected:
+            selected.append(self.selected_region_id)
+        return list(dict.fromkeys(selected))
+
+    def _group_members_for_region(self, region_id):
+        live = {item.get("id") for item in self.model.get("geometry", {}).get("regions", [])}
+        for group in self.model.get("region_groups", []):
+            members = [item for item in group.get("region_ids", []) if item in live]
+            if region_id in members:
+                return members
+        return [region_id] if region_id in live else []
+
+    def _expand_region_group_ids(self, region_ids):
+        live_order = [
+            item.get("id") for item in self.model.get("geometry", {}).get("regions", [])
+            if item.get("id")
+        ]
+        requested = set(region_ids)
+        for region_id in list(requested):
+            requested.update(self._group_members_for_region(region_id))
+        return [region_id for region_id in live_order if region_id in requested]
+
+    def _prune_region_groups(self):
+        if not isinstance(getattr(self, "model", None), dict):
+            return
+        groups = self.model.get("region_groups", [])
+        if not isinstance(groups, list):
+            self.model["region_groups"] = []
+            return
+        live = {
+            item.get("id") for item in self.model.get("geometry", {}).get("regions", [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        claimed = set()
+        normalized = []
+        for group in groups:
+            if not isinstance(group, dict) or not group.get("id"):
+                continue
+            members = [
+                region_id for region_id in group.get("region_ids", [])
+                if region_id in live and region_id not in claimed
+            ]
+            if len(members) < 2:
+                continue
+            group["region_ids"] = members
+            group.setdefault("name", f"Region group {len(normalized) + 1}")
+            normalized.append(group)
+            claimed.update(members)
+        self.model["region_groups"] = normalized
+
+    def _set_selected_regions(self, region_ids, *, additive=False):
+        region_ids = self._expand_region_group_ids(region_ids)
+        if additive:
+            region_ids = self._expand_region_group_ids([
+                *self._selected_region_ids_live(), *region_ids
+            ])
+        self.selected_region_ids = list(dict.fromkeys(region_ids))
+        self.selected_region_id = self.selected_region_ids[0] if len(self.selected_region_ids) == 1 else None
         self.selected_edge_id = None
         self.selected_edge_ids = []
         self._selected_condition_id = None
@@ -5169,12 +5315,182 @@ class SolveWorkspace(Div):
         self._sync_canvas_selection()
         self._render_canvas_dimensions()
 
+    def select_region(self, region_id, additive=False):
+        targets = set(self._group_members_for_region(region_id))
+        if not targets:
+            return
+        if additive:
+            current = self._selected_region_ids_live()
+            if targets.issubset(set(current)):
+                selected = [item for item in current if item not in targets]
+            else:
+                selected = [*current, *targets]
+            self._set_selected_regions(selected)
+            self._message(f"Selected {len(self.selected_region_ids)} region(s).")
+            return
+        self._set_selected_regions(list(targets))
+
+    def _region_context_menu(self):
+        delete_item = QItem(
+            QItemSection(QIcon(ui_name="mdi-delete-outline", ui_size="xs"), ui_avatar=True),
+            QItemSection("Delete selected regions"),
+            ui_clickable=True, ui_dense=True,
+        )
+        delete_item.on_click(lambda *args: self._run_region_context_action(self.delete_selected_regions))
+        group_item = QItem(
+            QItemSection(QIcon(ui_name="mdi-folder-plus-outline", ui_size="xs"), ui_avatar=True),
+            QItemSection("Group selected regions"),
+            ui_clickable=True, ui_dense=True,
+        )
+        group_item.on_click(lambda *args: self._run_region_context_action(self.group_selected_regions))
+        ungroup_item = QItem(
+            QItemSection(QIcon(ui_name="mdi-folder-remove-outline", ui_size="xs"), ui_avatar=True),
+            QItemSection("Ungroup selected regions"),
+            ui_clickable=True, ui_dense=True,
+        )
+        ungroup_item.on_click(lambda *args: self._run_region_context_action(self.ungroup_selected_regions))
+        menu = Div(
+            delete_item, group_item, ungroup_item,
+            id="solve-sketch-context-menu",
+            ui_class="solve-sketch-context-menu",
+            ui_style=(
+                "display:none; position:absolute; z-index:10000; min-width:220px; "
+                "padding:4px; border:1px solid var(--border, #d6dde5); "
+                "border-radius:8px; background:var(--surface, #fff); "
+                "box-shadow:0 8px 24px #14263830;"
+            ),
+        )
+        menu.on("click", lambda *_: self._hide_region_context_menu())
+        return menu
+
+    def _run_region_context_action(self, action):
+        try:
+            return action()
+        finally:
+            self._hide_region_context_menu()
+
+    def _hide_region_context_menu(self):
+        try:
+            self.js.eval(
+                "(() => { const menu = document.querySelector('.solve-sketch-context-menu'); "
+                "if (menu) menu.style.display = 'none'; })()"
+            )
+        except Exception:
+            pass
+
+    @_history_tracked
+    def group_selected_regions(self, *args):
+        self._prune_region_groups()
+        region_ids = self._selected_region_ids_live()
+        if len(region_ids) < 2:
+            self._message("Select at least two regions before grouping them.", error=True)
+            return False
+        groups = self.model.setdefault("region_groups", [])
+        for group in groups:
+            group["region_ids"] = [
+                region_id for region_id in group.get("region_ids", [])
+                if region_id not in region_ids
+            ]
+        groups[:] = [group for group in groups if len(group.get("region_ids", [])) >= 2]
+        indices = [
+            int(match.group(1)) for group in groups
+            if (match := re.fullmatch(r"Region group (\d+)", str(group.get("name", ""))))
+        ]
+        group = {
+            "id": new_id("region-group"),
+            "name": f"Region group {max(indices, default=0) + 1}",
+            "region_ids": region_ids,
+        }
+        groups.append(group)
+        self.selected_region_ids = region_ids
+        self.selected_region_id = None
+        self._refresh_model_tree()
+        self._render_inspector()
+        self._sync_canvas_selection()
+        self._message(f"Grouped {len(region_ids)} regions as {group['name']}.")
+        return True
+
+    @_history_tracked
+    def ungroup_selected_regions(self, *args):
+        selected = set(self._selected_region_ids_live())
+        groups = self.model.get("region_groups", [])
+        removed = [group for group in groups if selected.intersection(group.get("region_ids", []))]
+        if not removed:
+            self._message("Select a grouped region before ungrouping.", error=True)
+            return False
+        self.model["region_groups"] = [group for group in groups if group not in removed]
+        self._refresh_model_tree()
+        self._render_inspector()
+        self._sync_canvas_selection()
+        self._message(f"Ungrouped {sum(len(group.get('region_ids', [])) for group in removed)} regions.")
+        return True
+
+    def delete_selected_regions(self, *args):
+        return self.delete_regions(self._selected_region_ids_live())
+
+    @_history_tracked
+    def delete_regions(self, region_ids):
+        regions = self.model.get("geometry", {}).get("regions", [])
+        region_by_id = {region.get("id"): region for region in regions}
+        removed_ids = {region_id for region_id in region_ids if region_id in region_by_id}
+        if not removed_ids:
+            self._message("Select one or more regions to delete.", error=True)
+            return False
+        removed_names = [
+            region.get("name", "Region") for region in regions
+            if region.get("id") in removed_ids
+        ]
+        self._preserve_canvas_view()
+        with self._batch_frontend_updates():
+            def surviving_parent(parent_id):
+                visited = set()
+                while parent_id in removed_ids and parent_id not in visited:
+                    visited.add(parent_id)
+                    parent_id = region_by_id[parent_id].get("parent_id")
+                return parent_id if parent_id in region_by_id and parent_id not in removed_ids else None
+
+            for region in regions:
+                if region.get("id") not in removed_ids and region.get("parent_id") in removed_ids:
+                    region["parent_id"] = surviving_parent(region.get("parent_id"))
+            self.model["geometry"]["regions"] = [
+                region for region in regions if region.get("id") not in removed_ids
+            ]
+            for load in self.model.get("regional_loads", []):
+                load["region_ids"] = [
+                    region_id for region_id in load.get("region_ids", [])
+                    if region_id not in removed_ids
+                ]
+            mesh = self.model.get("mesh", {})
+            sizes = mesh.get("region_element_sizes", {})
+            if isinstance(sizes, dict):
+                for region_id in removed_ids:
+                    sizes.pop(region_id, None)
+            mesh["hp_region_ids"] = [
+                region_id for region_id in mesh.get("hp_region_ids", [])
+                if region_id not in removed_ids
+            ]
+            self._prune_region_groups()
+            self.selected_region_id = None
+            self.selected_region_ids = []
+            self.selected_edge_id = None
+            self.selected_edge_ids = []
+            self._recompute_parent_links()
+            self._rebuild_edges()
+            self._sync_region_sources_from_loads()
+            self._message("Deleted " + ", ".join(removed_names) + ".")
+            self._refresh_model_tree()
+            self._render_inspector()
+            self.render_canvas()
+        return True
+
     def _on_canvas_region_click(self, region_id, event=None):
         if self.active_section in {"boundaries", "sources"}:
             # Boundary-stage selection is committed on pointer release; the
             # following native click must not apply the same action twice.
             return
-        self.select_region(region_id)
+        value = getattr(event, "value", None) or {}
+        additive = isinstance(value, dict) and bool(value.get("shiftKey") or value.get("ctrlKey"))
+        self.select_region(region_id, additive=additive)
 
     def _on_canvas_edge_click(self, edge_id, event=None):
         if self.active_section == "boundaries":
@@ -5503,7 +5819,14 @@ class SolveWorkspace(Div):
             ui_hidden=True,
             ui_style="display:flex; flex-direction:column; gap:12px;",
         )
-        self._geometry_inspector_children = [self._geometry_empty_panel, self._region_panel, self._edge_panel]
+        self._multi_region_panel = Div(
+            _section_title("Multiple regions selected", "Use the Materials section to apply a shared material to this selection."),
+            Div("Right-click a selected region to group, ungroup, or delete the selection. Grouped regions stay separate for solving.", ui_style="font-size:11px; line-height:1.45; color:var(--fg-muted);"),
+            _button("Assign material to selection", "mdi-cube-outline", lambda *args: self.select_section("materials"), color="primary"),
+            ui_hidden=True,
+            ui_style="display:flex; flex-direction:column; gap:12px;",
+        )
+        self._geometry_inspector_children = [self._geometry_empty_panel, self._multi_region_panel, self._region_panel, self._edge_panel]
         self._geometry_inspector_ready = True
 
     def _edge_condition_options(self, physics, assigned_ids=()):
@@ -5568,9 +5891,11 @@ class SolveWorkspace(Div):
             return
         region = self._selected_region()
         edges = self._selected_edges()
-        show_region = region is not None and not edges
-        show_edges = bool(edges)
-        self._geometry_empty_panel.ui_hidden = show_region or show_edges
+        multiple_regions = len(self._selected_region_ids_live()) > 1
+        show_region = region is not None and not edges and not multiple_regions
+        show_edges = bool(edges) and not multiple_regions
+        self._geometry_empty_panel.ui_hidden = show_region or show_edges or multiple_regions
+        self._multi_region_panel.ui_hidden = not multiple_regions
         self._region_panel.ui_hidden = not show_region
         self._edge_panel.ui_hidden = not show_edges
         if show_region:
@@ -5730,11 +6055,18 @@ class SolveWorkspace(Div):
             self._render_inspector()
 
     def _geometry_properties(self):
-        if len(getattr(self, "selected_region_ids", [])) > 1:
+        if len(self._selected_region_ids_live()) > 1:
+            selected_ids = set(self._selected_region_ids_live())
+            group = next((
+                item for item in self.model.get("region_groups", [])
+                if set(item.get("region_ids", [])) == selected_ids
+            ), None)
+            title = f"{group.get('name')} selected" if group else "Geometry selection"
             return [
-                _section_title("Geometry selection", "Multiple regions selected in the viewport."),
-                Div(f"{len(self.selected_region_ids)} regions and {len(self.selected_edge_ids)} unique boundaries are selected.", ui_style="font-size:12px; line-height:1.5; color:var(--fg-muted);"),
-                Div("Drag left-to-right to select enclosed regions; drag right-to-left to select regions crossed by the marquee. Hold Shift to add to the selection.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+                _section_title(title, "Multiple regions selected in the viewport."),
+                Div(f"{len(selected_ids)} regions are selected.", ui_style="font-size:12px; line-height:1.5; color:var(--fg-muted);"),
+                Div("Ctrl-click or Shift-click regions to add or remove them. Right-click a region to group, ungroup, or delete the selection.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+                _button("Assign material to selection", "mdi-cube-outline", lambda *args: self.select_section("materials"), color="primary"),
             ]
         region = self._selected_region()
         edge = self._selected_edge()
@@ -6430,6 +6762,52 @@ class SolveWorkspace(Div):
     def _material_properties(self):
         regions = self.model.get("geometry", {}).get("regions", [])
         children = [_section_title("Materials", "Assign a material and mechanical participation to each region.")]
+        selected_ids = self._selected_region_ids_live()
+        if len(selected_ids) > 1:
+            selected_regions = [region for region in regions if region.get("id") in set(selected_ids)]
+            assigned_materials = {region.get("material_id") for region in selected_regions}
+            default_material = next(iter(assigned_materials)) if len(assigned_materials) == 1 else "__keep__"
+            material_options = [
+                {"label": "Keep each region's current material", "value": "__keep__"},
+                *self._material_options(),
+            ]
+            material_select = QSelect(
+                ui_label=f"Material for {len(selected_regions)} selected regions",
+                ui_options=material_options,
+                ui_option_label="label", ui_option_value="value",
+                ui_model_value=default_material, ui_emit_value=True,
+                ui_map_options=True, ui_dense=True, ui_filled=True,
+            )
+            material_select.on_update_model_value(
+                lambda event: setattr(self, "_bulk_material_choice", getattr(event, "value", event))
+            )
+            mechanics = {bool(region.get("mechanical", False)) for region in selected_regions}
+            default_mechanics = str(next(iter(mechanics))).lower() if len(mechanics) == 1 else "keep"
+            self._bulk_material_choice = default_material
+            self._bulk_mechanical_choice = default_mechanics
+            mechanics_select = QSelect(
+                ui_label="Mechanical participation",
+                ui_options=[
+                    {"label": "Keep each region's current setting", "value": "keep"},
+                    {"label": "Mechanical", "value": "true"},
+                    {"label": "Not mechanical", "value": "false"},
+                ],
+                ui_option_label="label", ui_option_value="value",
+                ui_model_value=default_mechanics, ui_emit_value=True,
+                ui_map_options=True, ui_dense=True, ui_filled=True,
+            )
+            mechanics_select.on_update_model_value(
+                lambda event: setattr(self, "_bulk_mechanical_choice", getattr(event, "value", event))
+            )
+            children.extend([
+                Div(
+                    f"Apply one material and optional mechanical setting to {len(selected_regions)} selected regions.",
+                    ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted); padding:8px; border:1px solid var(--border); border-radius:6px;",
+                ),
+                material_select,
+                mechanics_select,
+                _button("Apply to selected regions", "mdi-check", self._apply_bulk_region_material, color="primary"),
+            ])
         if not regions:
             return children + [
                 Div("Create geometry before assigning materials.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
@@ -6461,6 +6839,43 @@ class SolveWorkspace(Div):
                 ui_style=f"display:flex; align-items:center; gap:4px; padding:3px; border:1px solid {border}; border-radius:7px; background:{background}; margin:5px 10px;",
             ))
         return children
+
+    @_history_tracked
+    def _apply_bulk_region_material(self, *args):
+        selected_ids = self._selected_region_ids_live()
+        if len(selected_ids) < 2:
+            self._message("Select at least two regions before applying shared properties.", error=True)
+            return False
+        material_choice = getattr(self, "_bulk_material_choice", "__keep__")
+        mechanical_choice = getattr(self, "_bulk_mechanical_choice", "keep")
+        material = None
+        if material_choice != "__keep__" and material_choice is not None:
+            material = self._find_material(material_choice)
+            if material is None:
+                self._message("Choose a material from the available list.", error=True)
+                return False
+            if not any(item.get("id") == material_choice for item in self.model.get("materials", [])):
+                self.model.setdefault("materials", []).append(copy.deepcopy(material))
+        if material_choice == "__keep__" and mechanical_choice == "keep":
+            self._message("Choose a material or mechanical participation change to apply.", error=True)
+            return False
+        regions = [
+            region for region in self.model.get("geometry", {}).get("regions", [])
+            if region.get("id") in set(selected_ids)
+        ]
+        for region in regions:
+            if material_choice != "__keep__":
+                region["material_id"] = material_choice
+            if mechanical_choice != "keep":
+                region["mechanical"] = mechanical_choice == "true"
+        if mechanical_choice != "keep":
+            self._rebuild_edges()
+        self._refresh_model_tree()
+        self._render_inspector()
+        self._sync_canvas_selection()
+        self.render_canvas()
+        self._message(f"Updated shared properties for {len(regions)} regions.")
+        return True
 
     def _boundary_properties(self):
         children = [_section_title("Boundary conditions", "Click a condition to make it active, then assign it directly in the viewport.")]
@@ -6840,15 +7255,17 @@ class SolveWorkspace(Div):
                 if item
             )
             color = _MATERIAL_COLORS[material_index.get(region.get("material_id"), 0) % len(_MATERIAL_COLORS)]
-            selected = region_id == self.selected_region_id
+            selected = region_id in set(self._selected_region_ids_live())
             props = {
                 "d": path_data,
+                "id": f"solve-sketch-region-{region_id}",
                 "fill": color,
                 "fill_opacity": "0.33" if not selected else "0.48",
                 "stroke": "none",
                 "stroke_width": "0",
                 "data_sketch_region_id": region_id,
                 "data_sketch_region_role": "shape",
+                "data_sketch_region_selected": "true" if selected else "false",
                 "tabindex": "0",
                 "style": f"cursor:{region_cursor}; fill-rule:evenodd;",
             }
@@ -6862,6 +7279,11 @@ class SolveWorkspace(Div):
             scene_children.append(shape)
         for region_id in self._canvas_region_nodes.keys() - live_region_ids:
             del self._canvas_region_nodes[region_id]
+        self._canvas_host.ui_children = [
+            self._canvas,
+            self._canvas_resize_observer,
+            self._canvas_context_menu,
+        ]
 
         if self.mesh_preview_visible and self.mesh_preview_edges:
             mesh_path = " ".join(
@@ -6900,7 +7322,7 @@ class SolveWorkspace(Div):
             edge_path = "M" + f"{projected[0][0]:.3f},{projected[0][1]:.3f}"
             edge_path += " ".join(f"L{x:.3f},{y:.3f}" for x, y in projected[1:])
             region_id = region_for_edge.get(edge_id)
-            selected = edge_id in self.selected_edge_ids or region_id == self.selected_region_id
+            selected = edge_id in self.selected_edge_ids or region_id in set(self._selected_region_ids_live())
             condition_highlight = edge_id in highlighted_edges
             edge_color = "#ff8738" if condition_highlight else ("#0877b9" if selected else "#263746")
             visible_props = {
@@ -7423,36 +7845,8 @@ class SolveWorkspace(Div):
         if protected:
             self._message(f"Updated {len(editable)} edge(s); skipped {len(protected)} protected edge(s).")
 
-    @_history_tracked
     def delete_region(self, region_id):
-        region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
-        if region is None:
-            return
-        self._preserve_canvas_view()
-        with self._batch_frontend_updates():
-            for child in self.model["geometry"]["regions"]:
-                if child.get("parent_id") == region_id:
-                    child["parent_id"] = region.get("parent_id")
-            self.model["geometry"]["regions"] = [item for item in self.model["geometry"]["regions"] if item["id"] != region_id]
-            for load in self.model.get("regional_loads", []):
-                load["region_ids"] = [
-                    assigned_id for assigned_id in load.get("region_ids", [])
-                    if assigned_id != region_id
-                ]
-            self.selected_region_id = None
-            self.selected_region_ids = [
-                selected_id for selected_id in self.selected_region_ids
-                if selected_id != region_id
-            ]
-            self.selected_edge_id = None
-            self.selected_edge_ids = []
-            self._recompute_parent_links()
-            self._rebuild_edges()
-            self._sync_region_sources_from_loads()
-            self._message(f"Deleted {region['name']}.")
-            self._refresh_model_tree()
-            self._render_inspector()
-            self.render_canvas()
+        return self.delete_regions([region_id])
 
     @_history_tracked
     def add_parameter(self, *args):
