@@ -537,7 +537,25 @@ class SolveWorkspace(Div):
             ui_hidden=True,
             ui_style="display:flex; flex-direction:column; flex:0 0 170px; min-height:0; overflow:hidden; border-top:1px solid var(--border); background:var(--surface);",
         )
-        self._messages_panel = Div(ui_hidden=True, ui_style="max-height:180px; flex:none; overflow:auto; border-top:1px solid var(--border); background:var(--surface); padding:8px 14px;")
+        self._messages_close_button = _button(
+            "", "mdi-close", self.hide_messages,
+            tooltip="Minimise messages",
+            style="margin-left:auto;",
+        )
+        self._messages_header = Div(
+            Div("Messages", ui_style="font-size:12px; font-weight:600;"),
+            self._messages_close_button,
+            ui_style="display:flex; align-items:center; gap:8px; flex:none; min-height:34px; padding:0 8px 0 14px; border-bottom:1px solid var(--border);",
+        )
+        self._messages_body = Div(
+            ui_style="flex:1 1 auto; min-height:0; overflow:auto; padding:6px 14px 10px;",
+        )
+        self._messages_panel = Div(
+            self._messages_header,
+            self._messages_body,
+            ui_hidden=True,
+            ui_style="display:flex; flex-direction:column; max-height:180px; flex:none; min-height:0; overflow:hidden; border-top:1px solid var(--border); background:var(--surface);",
+        )
         self._canvas_resize_observer = QResizeObserver(ui_debounce=80)
         self._canvas_resize_observer.on_resize(self._on_canvas_resize)
         self._canvas_host = Div(
@@ -3099,8 +3117,18 @@ class SolveWorkspace(Div):
             self.on_log(self.message, error)
 
     def toggle_messages(self, *args):
-        self._messages_visible = not self._messages_visible
-        self._messages_panel.ui_hidden = not self._messages_visible
+        if self._messages_visible:
+            self.hide_messages()
+        else:
+            self.show_messages()
+
+    def show_messages(self, *args):
+        self._messages_visible = True
+        self._messages_panel.ui_hidden = False
+
+    def hide_messages(self, *args):
+        self._messages_visible = False
+        self._messages_panel.ui_hidden = True
 
     @staticmethod
     def _setup_check_category(issue):
@@ -3254,7 +3282,7 @@ class SolveWorkspace(Div):
                 "Input checks passed. Mesh-dependent operator checks and convergence remain pending until the solve runs.",
                 ui_style="font-size:11px; color:var(--fg-muted); padding:7px 0 0; border-top:1px solid var(--border);",
             ))
-        self._messages_panel.ui_children = rows
+        self._messages_body.ui_children = rows
         self._messages_visible = True
         self._messages_panel.ui_hidden = False
 
@@ -3262,7 +3290,7 @@ class SolveWorkspace(Div):
         self.validation_issues = list(errors)
         self._messages_button.ui_label = f"Messages ({len(errors)})" if errors else "Messages"
         if not errors:
-            self._messages_panel.ui_children = [Div(
+            self._messages_body.ui_children = [Div(
                 "Setup checks passed. Meshing and solving still need to complete successfully.",
                 ui_style="font-size:12px; color:var(--positive); padding:5px 0;",
             )]
@@ -3278,7 +3306,7 @@ class SolveWorkspace(Div):
                 style="width:100%; justify-content:flex-start; text-align:left; white-space:normal;",
                 align="left",
             ))
-        self._messages_panel.ui_children = rows
+        self._messages_body.ui_children = rows
         self._messages_visible = True
         self._messages_panel.ui_hidden = False
 

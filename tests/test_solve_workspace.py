@@ -443,6 +443,24 @@ def test_study_opens_solver_log_and_close_button_minimises_it(standalone_compone
     assert not workspace._log_visible
 
 
+def test_messages_panel_has_close_button_to_minimise(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.toggle_messages()
+
+    assert workspace._messages_visible
+    assert not workspace._messages_panel.ui_hidden
+    assert workspace._messages_close_button.ui_icon == "mdi-close"
+    assert workspace._messages_close_button in workspace._messages_header.ui_children
+
+    workspace._messages_close_button._callbacks["click.stop"][0](None)
+    assert not workspace._messages_visible
+    assert workspace._messages_panel.ui_hidden
+
+    workspace.toggle_messages()
+    assert workspace._messages_visible
+    assert not workspace._messages_panel.ui_hidden
+
+
 def test_solver_job_can_be_cancelled_and_is_recorded(standalone_components):
     cancelled = []
     workspace = SolveWorkspace(on_run=lambda: None, on_cancel=lambda: cancelled.append(True))
