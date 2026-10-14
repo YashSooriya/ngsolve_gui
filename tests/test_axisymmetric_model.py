@@ -131,11 +131,14 @@ def test_validate_model_rejects_multiple_conditions_of_one_physics():
     assert any("multiple mechanical conditions" in error for error in validate_model(model))
 
 
-def test_validate_model_requires_axis_condition_to_be_exclusive():
+def test_axis_condition_can_coexist_with_one_mechanical_condition():
     model = _nested_model()
     model["geometry"]["edges"][3]["boundary_condition_ids"] = ["axis-boundary", "mechanical-one"]
     model["boundary_conditions"].append({"id": "mechanical-one", "name": "Fixed", "type": "mechanical_fixed"})
-    assert any("must have only the axis-of-symmetry condition" in error for error in validate_model(model))
+    assert not any(
+        "multiple" in error or "must have only the axis-of-symmetry" in error
+        for error in validate_model(model)
+    )
 
 
 def test_parameter_declaration_and_explicit_si_suffixes_are_checked():
@@ -259,11 +262,51 @@ def test_ngsmodel_round_trip_is_data_only_and_rejects_extra_files():
         unpack_model(malicious.getvalue())
 
 
-def test_sweeps_are_single_study_frequency_lists():
+def test_drafts_can_save_multiple_studies_but_solver_reports_unsupported_count():
+    model = new_model()
     studies = new_studies()
-    studies["studies"].append(dict(studies["studies"][0], id="second"))
-    with pytest.raises(ValueError, match="Exactly one"):
-        package_model(new_model(), studies)
+    studies["studies"].append(dict(studies["studies"][0], id="second", name="Second study"))
+
+    package_model(model, studies)
+    errors = validate_studies(studies, physics=model["physics"], for_solve=True)
+    assert any("one study at a time" in error for error in errors)
+
+
+def test_mesh_scope_ignores_incomplete_physics_materials_and_boundary_data():
+    model = _nested_model()
+    model["materials"] = "unfinished"
+    model["physics"] = "unfinished"
+    model["boundary_conditions"] = None
+    for region in model["geometry"]["regions"]:
+        region["material_id"] = None
+
+    assert validate_model(model, scope="mesh") == []
+
+
+def test_harmonic_mechanics_can_be_solved_without_electromagnetics():
+    model = _nested_model()
+    model["physics"] = {
+        "dc_magnetic": {"enabled": False},
+        "harmonic_electromagnetic": {"enabled": False},
+        "mechanics": {"enabled": True},
+        "coupling": {"enabled": False},
+    }
+    model["geometry"]["regions"][1]["mechanical"] = True
+    model["materials"][1]["properties"].update({
+        "youngs_modulus": "110e9",
+        "poissons_ratio": "0.34",
+        "density": "8960",
+    })
+    studies = new_studies()
+    studies["studies"][0]["frequency_hz"] = ["500"]
+    assert validate_model(model) == []
+    assert validate_studies(studies, physics=model["physics"], for_solve=True) == []
+
+    studies["studies"][0]["frequency_hz"] = []
+    assert any(
+        "positive frequency" in error
+        for error in validate_studies(studies, physics=model["physics"], for_solve=True)
+    )
 
 
 def test_static_only_study_does_not_require_frequency():
@@ -366,3 +409,12 @@ def test_legacy_region_sources_migrate_to_named_regional_loads():
     assert migrated["geometry"]["regions"][1]["sources"] == coil["sources"]
     assert validate_model(migrated) == []
     assert len(migrate_regional_loads(migrated)["regional_loads"]) == 1
+
+
+def test_validate_studies_handles_malformed_physics_sections():
+    studies = new_studies()
+    assert validate_studies(
+        studies,
+        physics={"harmonic_electromagnetic": "invalid", "mechanics": None},
+        for_solve=True,
+    ) == []

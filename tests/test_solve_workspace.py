@@ -374,9 +374,10 @@ def test_setup_check_flashes_bottom_status_for_pass_and_failure(standalone_compo
 
     workspace.validate_action()
 
-    assert "Setup checks passed" in workspace.message
+    assert "Setup inputs passed" in workspace.message
+    assert callable(workspace.validation_warnings)
     assert "mmfem-solve-status-flash-a" in workspace._bottom_bar.ui_class
-    assert len(workspace.setup_check_results) == 12
+    assert len(workspace.setup_check_results) == 13
     assert not workspace._messages_panel.ui_hidden
 
     workspace.validation_errors = lambda: ["Create a geometry region."]
@@ -391,20 +392,21 @@ def test_setup_check_results_show_group_status_and_applicability(standalone_comp
     workspace.model["physics"]["dc_magnetic"]["enabled"] = True
     workspace.model["physics"]["mechanics"]["enabled"] = True
     results = workspace._setup_check_results([
-        "Assign magnetic potential = 0 to an exterior edge of each disconnected region to anchor the electromagnetic solution.",
-        "Mechanical region 'coil' needs a fixed or prescribed displacement, or a positive Robin support that restrains axial motion.",
         "Mesh settings: target element size must be positive.",
         "Regional load 'coil current' dc_current_density: invalid expression.",
+    ], warnings=[
+        "No magnetic-potential boundary is explicitly assigned; natural boundaries are allowed."
     ])
     by_id = {item["id"]: item for item in results}
 
-    assert len(results) == 12
-    assert by_id["em_reference"]["status"] == "Needs attention"
-    assert by_id["mechanics"]["status"] == "Needs attention"
+    assert len(results) == 13
+    assert by_id["em_reference"]["status"] == "Warning"
+    assert by_id["mechanics"]["status"] == "Passed"
     assert by_id["mesh"]["status"] == "Needs attention"
     assert by_id["loads"]["status"] == "Needs attention"
     assert by_id["geometry"]["status"] == "Passed"
     assert by_id["materials"]["status"] == "Passed"
+    assert by_id["numerical_operator"]["status"] == "Pending"
 
     workspace.model["physics"]["dc_magnetic"]["enabled"] = False
     workspace.model["physics"]["harmonic_electromagnetic"]["enabled"] = False
@@ -865,14 +867,18 @@ def test_one_em_and_mechanical_condition_coexist_and_support_replaces_transmissi
     assert workspace.validation_errors() == []
 
 
-def test_electromagnetic_run_requires_an_exterior_reference_boundary(standalone_components):
+def test_electromagnetic_run_does_not_require_an_explicit_far_field_boundary(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
+    workspace._set_region_value(workspace.model["geometry"]["regions"][0]["id"], "material_id", "material-air")
 
-    assert any("anchor the electromagnetic solution" in error for error in workspace.validation_errors())
+    assert not any(
+        "anchor the electromagnetic solution" in error or "exterior edge" in error
+        for error in workspace.validation_errors()
+    )
 
 
-def test_internal_magnetic_reference_does_not_anchor_the_exterior_problem(standalone_components):
+def test_internal_magnetic_reference_does_not_create_an_exterior_requirement(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
     outer = workspace.model["geometry"]["regions"][0]
@@ -892,20 +898,14 @@ def test_internal_magnetic_reference_does_not_anchor_the_exterior_problem(standa
     inner_edge = next(edge for edge in workspace.model["geometry"]["edges"] if edge["id"] in inner["edge_ids"])
     workspace._set_edge_condition(inner_edge["id"], "electromagnetic", "boundary-inner")
 
-    assert any("exterior edge" in error for error in workspace.validation_errors())
+    assert not any("exterior edge" in error for error in workspace.validation_errors())
 
 
-def test_each_disconnected_electromagnetic_region_needs_an_exterior_reference(standalone_components):
+def test_disconnected_em_regions_do_not_each_require_a_far_field_reference(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
     first = workspace.model["geometry"]["regions"][0]
     workspace._set_region_value(first["id"], "material_id", "material-air")
-    workspace.model["boundary_conditions"].append(
-        {"id": "boundary-outer", "name": "Outer reference", "type": "magnetic_potential_zero"}
-    )
-    first_edge = next(edge for edge in workspace.model["geometry"]["edges"] if edge["id"] in first["edge_ids"])
-    workspace._set_edge_condition(first_edge["id"], "electromagnetic", "boundary-outer")
-
     workspace._primitive_values.update({
         ("rectangle", "r_min"): 0.05,
         ("rectangle", "z_min"): 0.03,
@@ -916,8 +916,24 @@ def test_each_disconnected_electromagnetic_region_needs_an_exterior_reference(st
     second = workspace.model["geometry"]["regions"][1]
     workspace._set_region_value(second["id"], "material_id", "material-copper")
 
-    errors = workspace.validation_errors()
-    assert any("square 2" in error and "exterior edge" in error for error in errors)
+    assert not any("exterior edge" in error for error in workspace.validation_errors())
+
+
+def test_positive_mass_harmonic_mechanics_does_not_require_em_or_a_fixed_edge(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    workspace._set_region_value(region["id"], "material_id", "material-copper")
+    region["mechanical"] = True
+    workspace.model["physics"]["dc_magnetic"]["enabled"] = False
+    workspace.model["physics"]["harmonic_electromagnetic"]["enabled"] = False
+    workspace.model["physics"]["mechanics"]["enabled"] = True
+    workspace.studies["studies"][0]["frequency_hz"] = ["500"]
+
+    assert workspace.validation_errors() == []
+
+    workspace.studies["studies"][0]["frequency_hz"] = []
+    assert any("positive frequency" in error for error in workspace.validation_errors())
 
 
 def _mechanical_test_workspace(region_material="material-copper"):
@@ -939,8 +955,12 @@ def _mechanical_test_workspace(region_material="material-copper"):
     return workspace, region, outer_edge
 
 
-def test_mechanics_requires_support_on_a_mechanical_body_boundary(standalone_components):
+def test_massless_mechanics_requires_support_on_its_body_boundary(standalone_components):
     workspace, region, outer_edge = _mechanical_test_workspace()
+    next(
+        material for material in workspace.model["materials"]
+        if material.get("id") == "material-copper"
+    )["properties"]["density"] = "0"
     workspace.model["boundary_conditions"].append(
         {"id": "boundary-unrelated", "name": "Unrelated support", "type": "mechanical_fixed"}
     )
@@ -959,11 +979,23 @@ def test_mechanics_requires_support_on_a_mechanical_body_boundary(standalone_com
     region["mechanical"] = False
     inner["mechanical"] = True
 
-    assert any("Mechanical region 'square 2' needs a fixed" in error for error in workspace.validation_errors())
+    errors = workspace.validation_errors()
+    assert any(
+        "Mechanical boundary 'Unrelated support' is assigned to an edge that does not touch a mechanical region."
+        in error for error in errors
+    )
+    assert any(
+        "Massless harmonic mechanical component 'square 2'" in error
+        for error in errors
+    )
 
 
-def test_positive_robin_spring_can_anchor_axisymmetric_mechanics(standalone_components):
+def test_positive_robin_spring_can_anchor_massless_axisymmetric_mechanics(standalone_components):
     workspace, _region, _outer_edge = _mechanical_test_workspace()
+    next(
+        material for material in workspace.model["materials"]
+        if material.get("id") == "material-copper"
+    )["properties"]["density"] = "0"
     workspace.model["boundary_conditions"].append({
         "id": "boundary-robin",
         "name": "Axial spring",
@@ -980,8 +1012,12 @@ def test_positive_robin_spring_can_anchor_axisymmetric_mechanics(standalone_comp
     assert not any("positive Robin support" in error for error in workspace.validation_errors())
 
 
-def test_robin_spring_must_act_in_the_axial_direction_to_anchor_mechanics(standalone_components):
+def test_robin_spring_must_act_in_the_axial_direction_for_massless_mechanics(standalone_components):
     workspace, _region, _outer_edge = _mechanical_test_workspace()
+    next(
+        material for material in workspace.model["materials"]
+        if material.get("id") == "material-copper"
+    )["properties"]["density"] = "0"
     workspace.model["boundary_conditions"].append({
         "id": "boundary-robin",
         "name": "Radial-only spring",
@@ -1017,8 +1053,12 @@ def test_negative_robin_stiffness_is_reported_during_setup_check(standalone_comp
     assert any("stiffnesses must be non-negative" in error for error in workspace.validation_errors())
 
 
-def test_each_disconnected_mechanical_body_needs_its_own_support(standalone_components):
+def test_each_disconnected_massless_mechanical_body_needs_its_own_support(standalone_components):
     workspace, first_region, first_edge = _mechanical_test_workspace()
+    next(
+        material for material in workspace.model["materials"]
+        if material.get("id") == "material-copper"
+    )["properties"]["density"] = "0"
     workspace._set_edge_condition(first_edge["id"], "mechanical", "boundary-support")
     workspace._primitive_values.update({
         ("rectangle", "r_min"): 0.05,
@@ -3189,3 +3229,29 @@ def test_boundary_condition_add_button_is_at_the_top_of_properties(standalone_co
 
     assert properties.index(add_button) <= 1
     assert not hasattr(workspace, "_boundary_apply_selection_button")
+
+
+def test_setup_validation_survives_malformed_nested_sections(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    workspace._set_region_value(region["id"], "material_id", "material-copper")
+    region["mechanical"] = True
+    workspace.model["physics"]["mechanics"]["enabled"] = True
+    workspace.model["parameters"] = None
+    workspace.model["materials"] = None
+    workspace.model["boundary_conditions"] = None
+    workspace.model["geometry"]["edges"] = None
+
+    errors = workspace.validation_errors()
+    assert any("Parameters must be a list" in error for error in errors)
+    assert any("Materials must be a list" in error for error in errors)
+    assert any("Boundary conditions must be a list" in error for error in errors)
+    assert any("Geometry edges must be a list" in error for error in errors)
+    assert workspace.mesh_validation_errors()
+
+    workspace.model["physics"]["dc_magnetic"] = "malformed"
+    errors = workspace.validation_errors()
+    results = workspace._setup_check_results(errors)
+    assert any("Physics setting" in error for error in errors)
+    assert len(results) == 13

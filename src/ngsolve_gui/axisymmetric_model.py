@@ -536,11 +536,48 @@ def evaluate_expression(expression, parameters=None) -> float:
     return result
 
 
-def validate_model(model: dict) -> list[str]:
-    """Return actionable schema/input problems without mutating the model."""
+def _validate_draft_structure(model: dict) -> list[str]:
+    """Check the document envelope so incomplete projects remain saveable."""
     errors = []
     if not isinstance(model, dict):
         return ["Model must be a JSON object."]
+    if model.get("schema") != SCHEMA:
+        errors.append(f"Expected schema '{SCHEMA}'.")
+    if model.get("schema_version") != SCHEMA_VERSION:
+        errors.append(f"Unsupported model schema version: {model.get('schema_version')}.")
+    for key in ("parameters", "materials", "boundary_conditions", "regional_loads"):
+        if key in model and not isinstance(model[key], list):
+            errors.append(f"{key.replace('_', ' ').capitalize()} must be a list.")
+    for key in ("physics", "mesh", "solver"):
+        if key in model and not isinstance(model[key], dict):
+            errors.append(f"{key.capitalize()} settings must be an object.")
+    geometry = model.get("geometry")
+    if not isinstance(geometry, dict):
+        errors.append("Geometry section is missing.")
+    else:
+        for key in ("regions", "edges"):
+            if key in geometry and not isinstance(geometry[key], list):
+                errors.append(f"Geometry {key} must be a list.")
+    studies = model.get("studies")
+    if studies is not None and not isinstance(studies, list):
+        errors.append("Studies must be a list.")
+    return errors
+
+
+def validate_model(model: dict, *, scope="solve") -> list[str]:
+    """Validate for draft saving, meshing, or solving.
+
+    Draft checks only the document envelope; mesh checks geometry and mesh
+    controls; solve also checks active physics inputs.
+    """
+    if scope not in {"draft", "mesh", "solve"}:
+        return [f"Unknown model validation scope: {scope!r}."]
+    if not isinstance(model, dict):
+        return ["Model must be a JSON object."]
+    if scope == "draft":
+        return _validate_draft_structure(model)
+    errors = []
+    semantic = scope == "solve"
     if model.get("schema") != SCHEMA:
         errors.append(f"Expected schema '{SCHEMA}'.")
     if model.get("schema_version") != SCHEMA_VERSION:
@@ -568,6 +605,12 @@ def validate_model(model: dict) -> list[str]:
             evaluate_expression(name, parameter_map)
         except (AttributeError, TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError) as error:
             errors.append(f"Parameter '{name}': {error}")
+    physics = model.get("physics", {})
+    if not isinstance(physics, dict):
+        physics = {}
+    dc_enabled = physics.get("dc_magnetic", {}).get("enabled") is True if isinstance(physics.get("dc_magnetic", {}), dict) else False
+    ac_enabled = physics.get("harmonic_electromagnetic", {}).get("enabled") is True if isinstance(physics.get("harmonic_electromagnetic", {}), dict) else False
+    mechanics_enabled = physics.get("mechanics", {}).get("enabled") is True if isinstance(physics.get("mechanics", {}), dict) else False
     try:
         parameter_dims = infer_parameter_dimensions(parameters)
     except (AttributeError, TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError) as error:
@@ -586,10 +629,27 @@ def validate_model(model: dict) -> list[str]:
             errors.append(f"{label}: {error}.")
 
     materials_list = model.get("materials", [])
-    if not isinstance(materials_list, list):
+    if scope != "solve":
+        # Meshing uses region names and coordinates, not physical material
+        # assignments. Let users generate a mesh while materials are unfinished.
+        materials_list = []
+    elif not isinstance(materials_list, list):
         errors.append("Materials must be a list.")
         materials_list = []
     materials_by_id = {}
+    geometry_preview = model.get("geometry", {})
+    preview_regions = geometry_preview.get("regions", []) if isinstance(geometry_preview, dict) else []
+    active_material_fields = {}
+    for region in preview_regions if isinstance(preview_regions, list) else []:
+        if not isinstance(region, dict) or not isinstance(region.get("material_id"), str):
+            continue
+        fields = active_material_fields.setdefault(region["material_id"], set())
+        if dc_enabled or ac_enabled:
+            fields.add("relative_permeability")
+        if ac_enabled:
+            fields.add("electrical_conductivity")
+        if mechanics_enabled and region.get("mechanical") is True:
+            fields.update(("youngs_modulus", "poissons_ratio", "density"))
     for material in materials_list:
         if not isinstance(material, dict):
             errors.append("Each material must be an object.")
@@ -606,7 +666,7 @@ def validate_model(model: dict) -> list[str]:
             errors.append(f"Material '{material.get('name', material_id)}' properties must be an object.")
             continue
         for key in ("relative_permeability", "electrical_conductivity", "youngs_modulus", "poissons_ratio", "density"):
-            if key not in properties:
+            if scope != "solve" or key not in active_material_fields.get(material_id, set()) or key not in properties:
                 continue
             expected_units = {
                 "relative_permeability": "dimensionless",
@@ -622,6 +682,8 @@ def validate_model(model: dict) -> list[str]:
             )
             try:
                 value = evaluate_expression(properties[key], parameter_map)
+                if not math.isfinite(float(value)):
+                    raise ValueError("must be finite")
                 if key == "relative_permeability" and value <= 0:
                     raise ValueError("must be positive")
                 if key in {"electrical_conductivity", "youngs_modulus", "density"} and value < 0:
@@ -658,8 +720,23 @@ def validate_model(model: dict) -> list[str]:
             region_by_id[rid] = region
         if not region.get("name"):
             errors.append(f"Region {rid or '(unnamed)'} needs a name.")
-        if not isinstance(region.get("material_id"), str) or region.get("material_id") not in materials:
+        if scope == "solve" and (
+            not isinstance(region.get("material_id"), str)
+            or region.get("material_id") not in materials
+        ):
             errors.append(f"Region '{region.get('name', rid)}' needs a valid material.")
+        if scope == "solve" and mechanics_enabled and region.get("mechanical") is True:
+            material = materials_by_id.get(region.get("material_id"), {})
+            properties = material.get("properties", {}) if isinstance(material, dict) else {}
+            try:
+                youngs_modulus = evaluate_expression(properties.get("youngs_modulus", "0"), parameter_map)
+                if not math.isfinite(float(youngs_modulus)) or youngs_modulus <= 0:
+                    raise ValueError("must be finite and positive")
+            except (AttributeError, TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError) as error:
+                errors.append(
+                    f"Material '{material.get('name', region.get('material_id'))}' needs positive "
+                    f"Young's modulus for mechanical region '{region.get('name', rid)}': {error}."
+                )
         vertices = region.get("vertices", [])
         if not isinstance(vertices, list) or len(vertices) < 3:
             errors.append(f"Region '{region.get('name', rid)}' needs at least three vertices.")
@@ -765,7 +842,8 @@ def validate_model(model: dict) -> list[str]:
 
     conditions = model.get("boundary_conditions", [])
     if not isinstance(conditions, list):
-        errors.append("Boundary conditions must be a list.")
+        if scope == "solve":
+            errors.append("Boundary conditions must be a list.")
         conditions = []
     condition_by_id = {}
     allowed_boundary_types = {
@@ -773,7 +851,7 @@ def validate_model(model: dict) -> list[str]:
         "mechanical_fixed", "mechanical_prescribed", "mechanical_traction", "mechanical_robin",
         "transmission_interface",
     }
-    for condition in conditions:
+    for condition in (conditions if scope == "solve" else []):
         if not isinstance(condition, dict):
             errors.append("Each boundary condition must be an object.")
             continue
@@ -793,6 +871,10 @@ def validate_model(model: dict) -> list[str]:
             "mechanical_traction": ("traction_r", "traction_z"),
             "mechanical_robin": ("stiffness_normal", "stiffness_tangential"),
         }.get(kind, ())
+        if kind.startswith("mechanical_") and not mechanics_enabled:
+            continue
+        if kind in {"axis_of_symmetry", "magnetic_potential_zero", "natural"} and not (dc_enabled or ac_enabled):
+            continue
         for key in expression_keys:
             required_unit = {
                 "displacement_r": "m",
@@ -847,7 +929,7 @@ def validate_model(model: dict) -> list[str]:
                     edge_key_by_id[edge_id] = key
             except (TypeError, ValueError, OverflowError) as error:
                 errors.append(f"Edge '{edge.get('name', edge_id)}': {error}.")
-        assignments = edge.get("boundary_condition_ids")
+        assignments = edge.get("boundary_condition_ids") if scope == "solve" else []
         if assignments is None:
             legacy_id = edge.get("boundary_condition_id")
             assignments = [legacy_id] if legacy_id else []
@@ -869,13 +951,26 @@ def validate_model(model: dict) -> list[str]:
             errors.append(f"Edge '{edge.get('name', edge_id)}' has multiple electromagnetic conditions.")
         if len(mechanical_types) > 1:
             errors.append(f"Edge '{edge.get('name', edge_id)}' has multiple mechanical conditions.")
-        if isinstance(edge_vertices, list) and len(edge_vertices) == 2:
+        if scope == "solve" and isinstance(edge_vertices, list) and len(edge_vertices) == 2:
             try:
-                on_axis = all(abs(float(point[0])) <= 1e-12 for point in edge_vertices)
+                edge_scale = max(
+                    math.hypot(float(edge_vertices[1][0]) - float(edge_vertices[0][0]),
+                               float(edge_vertices[1][1]) - float(edge_vertices[0][1])),
+                    1e-12,
+                )
+                axis_tol = max(1e-12, edge_scale * 1e-12)
+                on_axis = all(abs(float(point[0])) <= axis_tol for point in edge_vertices)
             except (TypeError, ValueError, IndexError, OverflowError):
                 on_axis = False
-            if on_axis and assigned_types != ["axis_of_symmetry"]:
-                errors.append(f"Edge '{edge.get('name', edge_id)}' on r=0 must have only the axis-of-symmetry condition.")
+            if "axis_of_symmetry" in assigned_types and not on_axis:
+                errors.append(f"Edge '{edge.get('name', edge_id)}' has an axis-of-symmetry condition away from r=0.")
+            if on_axis and (dc_enabled or ac_enabled):
+                em_assigned = [kind for kind in assigned_types if kind in electromagnetic_types]
+                if em_assigned != ["axis_of_symmetry"]:
+                    errors.append(
+                        f"Edge '{edge.get('name', edge_id)}' on r=0 must have the axis-of-symmetry "
+                        "electromagnetic condition; one mechanical condition may also be assigned."
+                    )
         for condition_id in assignments:
             if condition_id not in condition_by_id:
                 errors.append(f"Edge '{edge.get('name', edge_id)}' references a missing boundary condition.")
@@ -947,7 +1042,10 @@ def validate_model(model: dict) -> list[str]:
 
     regional_loads = model.get("regional_loads", [])
     if not isinstance(regional_loads, list):
-        errors.append("Regional loads must be a list.")
+        if scope == "solve":
+            errors.append("Regional loads must be a list.")
+        regional_loads = []
+    if scope != "solve":
         regional_loads = []
     regional_load_ids = set()
     regional_load_names = set()
@@ -984,6 +1082,10 @@ def validate_model(model: dict) -> list[str]:
             if region_id not in region_by_id:
                 errors.append(f"Regional load '{load_name or load_id}' references a missing region.")
         for key, unit in allowed_load_fields.items():
+            if key == "dc_current_density" and not dc_enabled:
+                continue
+            if key.startswith("ac_current_density") and not ac_enabled:
+                continue
             expression = load.get(key, "0")
             check_unit(f"Regional load '{load_name or load_id}' {key}", expression, unit, allow_coordinates=True)
             try:
@@ -991,9 +1093,9 @@ def validate_model(model: dict) -> list[str]:
             except (TypeError, ValueError, SyntaxError) as error:
                 errors.append(f"Regional load '{load_name or load_id}' {key}: {error}.")
         body = load.get("mechanical_body_force", {})
-        if not isinstance(body, dict):
+        if mechanics_enabled and not isinstance(body, dict):
             errors.append(f"Regional load '{load_name or load_id}' body force must be an object.")
-        else:
+        elif mechanics_enabled:
             for component in ("r", "z"):
                 expression = body.get(component, "0")
                 check_unit(f"Regional load '{load_name or load_id}' body force {component}", expression, "N/m^3", allow_coordinates=True)
@@ -1002,12 +1104,16 @@ def validate_model(model: dict) -> list[str]:
                 except (TypeError, ValueError, SyntaxError) as error:
                     errors.append(f"Regional load '{load_name or load_id}' body force {component}: {error}.")
 
-    for region in region_by_id.values():
+    for region in (region_by_id.values() if scope == "solve" else []):
         source = region.get("sources", {})
         if not isinstance(source, dict):
             errors.append(f"Region '{region.get('name', region.get('id'))}' sources must be an object.")
             continue
         for key in ("dc_current_density", "ac_current_density_real", "ac_current_density_imaginary"):
+            if key == "dc_current_density" and not dc_enabled:
+                continue
+            if key.startswith("ac_current_density") and not ac_enabled:
+                continue
             check_unit(
                 f"Region '{region.get('name', region.get('id'))}' {key}",
                 source.get(key, "0"),
@@ -1019,9 +1125,9 @@ def validate_model(model: dict) -> list[str]:
             except (TypeError, ValueError, SyntaxError) as error:
                 errors.append(f"Region '{region.get('name', region.get('id'))}' {key}: {error}.")
         body = source.get("mechanical_body_force", {})
-        if not isinstance(body, dict):
+        if mechanics_enabled and not isinstance(body, dict):
             errors.append(f"Region '{region.get('name', region.get('id'))}' body force must be an object.")
-        else:
+        elif mechanics_enabled:
             for key in ("r", "z"):
                 check_unit(
                     f"Region '{region.get('name', region.get('id'))}' body force {key}",
@@ -1034,24 +1140,16 @@ def validate_model(model: dict) -> list[str]:
                 except (TypeError, ValueError, SyntaxError) as error:
                     errors.append(f"Region '{region.get('name', region.get('id'))}' body force {key}: {error}.")
 
-    physics = model.get("physics", {})
-    if not isinstance(physics, dict):
-        errors.append("Physics settings must be an object.")
-        physics = {}
-    expected_physics = ("dc_magnetic", "harmonic_electromagnetic", "mechanics", "coupling")
-    for key in expected_physics:
-        section = physics.get(key, {})
-        if not isinstance(section, dict) or not isinstance(section.get("enabled", False), bool):
-            errors.append(f"Physics setting '{key}' must contain an enabled boolean.")
-    harmonic = physics.get("harmonic_electromagnetic", {})
-    if isinstance(harmonic, dict) and harmonic.get("enabled", False):
-        check_unit("Default frequency", harmonic.get("frequency_hz", "500"), "Hz")
-        try:
-            frequency = evaluate_expression(harmonic.get("frequency_hz", "500"), parameter_map)
-            if frequency <= 0:
-                raise ValueError("must be positive")
-        except (TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError) as error:
-            errors.append(f"Default frequency: {error}.")
+    if scope == "solve":
+        physics = model.get("physics", {})
+        if not isinstance(physics, dict):
+            errors.append("Physics settings must be an object.")
+            physics = {}
+        expected_physics = ("dc_magnetic", "harmonic_electromagnetic", "mechanics", "coupling")
+        for key in expected_physics:
+            section = physics.get(key, {})
+            if not isinstance(section, dict) or not isinstance(section.get("enabled", False), bool):
+                errors.append(f"Physics setting '{key}' must contain an enabled boolean.")
 
     mesh = model.get("mesh", {})
     if not isinstance(mesh, dict):
@@ -1059,10 +1157,15 @@ def validate_model(model: dict) -> list[str]:
         mesh = {}
     try:
         check_unit("Mesh element size", mesh.get("element_size", "0.01"), "m")
-        if int(mesh.get("polynomial_order", 3)) not in range(1, 7):
+        raw_order = mesh.get("polynomial_order", 3)
+        order_value = float(raw_order)
+        if isinstance(raw_order, bool) or not math.isfinite(order_value) or not order_value.is_integer():
+            raise ValueError("polynomial order must be an integer between 1 and 6")
+        if int(order_value) not in range(1, 7):
             raise ValueError("polynomial order must be between 1 and 6")
-        if float(evaluate_expression(mesh.get("element_size", "0.01"), parameter_map)) <= 0:
-            raise ValueError("target element size must be positive")
+        element_size = float(evaluate_expression(mesh.get("element_size", "0.01"), parameter_map))
+        if not math.isfinite(element_size) or element_size <= 0:
+            raise ValueError("target element size must be finite and positive")
     except (TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError) as error:
         errors.append(f"Mesh settings: {error}.")
 
@@ -1077,8 +1180,9 @@ def validate_model(model: dict) -> list[str]:
         label = region_by_id.get(region_id, {}).get("name", region_id)
         try:
             check_unit(f"Region '{label}' mesh size", expression, "m")
-            if float(evaluate_expression(expression, parameter_map)) <= 0:
-                raise ValueError("target element size must be positive")
+            size_value = float(evaluate_expression(expression, parameter_map))
+            if not math.isfinite(size_value) or size_value <= 0:
+                raise ValueError("target element size must be finite and positive")
         except (TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError) as error:
             errors.append(f"Region '{label}' mesh size: {error}.")
 
@@ -1122,27 +1226,42 @@ def validate_model(model: dict) -> list[str]:
 
     solver = model.get("solver", {})
     if not isinstance(solver, dict):
-        errors.append("Solver settings must be an object.")
+        if scope == "solve":
+            errors.append("Solver settings must be an object.")
         solver = {}
+    coupling_enabled = bool(
+        isinstance(physics.get("coupling"), dict)
+        and physics["coupling"].get("enabled") is True
+    ) if isinstance(physics, dict) else False
     try:
-        if int(solver.get("anderson_depth", 3)) < 0:
-            raise ValueError("Anderson depth cannot be negative")
-        if float(solver.get("anderson_beta", 1.0)) <= 0:
-            raise ValueError("Anderson relaxation must be positive")
-        if float(solver.get("relative_tolerance", 1e-6)) <= 0:
-            raise ValueError("relative tolerance must be positive")
-        if int(solver.get("maximum_iterations", 50)) < 1:
-            raise ValueError("maximum iterations must be at least one")
-        if solver.get("linear_solver", "direct") != "direct":
+        if scope == "solve" and coupling_enabled:
+            raw_depth = solver.get("anderson_depth", 3)
+            depth_value = float(raw_depth)
+            if isinstance(raw_depth, bool) or not math.isfinite(depth_value) or not depth_value.is_integer() or depth_value < 0:
+                raise ValueError("Anderson depth must be a finite non-negative integer")
+            beta = float(solver.get("anderson_beta", 1.0))
+            tolerance = float(solver.get("relative_tolerance", 1e-6))
+            raw_iterations = solver.get("maximum_iterations", 50)
+            iteration_value = float(raw_iterations)
+            if not math.isfinite(beta) or beta <= 0:
+                raise ValueError("Anderson relaxation must be finite and positive")
+            if not math.isfinite(tolerance) or tolerance <= 0:
+                raise ValueError("relative tolerance must be finite and positive")
+            if isinstance(raw_iterations, bool) or not math.isfinite(iteration_value) or not iteration_value.is_integer() or iteration_value < 1:
+                raise ValueError("maximum iterations must be a finite positive integer")
+        if scope == "solve" and solver.get("linear_solver", "direct") != "direct":
             raise ValueError("Only the direct linear solver is currently supported")
     except (TypeError, ValueError, OverflowError) as error:
         errors.append(f"Solver settings: {error}.")
 
     studies = model.get("studies", [])
-    harmonic_enabled = bool(physics.get("harmonic_electromagnetic", {}).get("enabled", False))
-    if studies is not None and not isinstance(studies, list):
+    harmonic_enabled = bool(
+        physics.get("harmonic_electromagnetic", {}).get("enabled", False)
+        or physics.get("mechanics", {}).get("enabled", False)
+    ) if isinstance(physics, dict) else False
+    if scope == "solve" and studies is not None and not isinstance(studies, list):
         errors.append("Studies must be a list.")
-    elif isinstance(studies, list) and harmonic_enabled:
+    elif scope == "solve" and isinstance(studies, list) and harmonic_enabled:
         for study in studies:
             if not isinstance(study, dict):
                 errors.append("Each study must be an object.")
@@ -1156,8 +1275,9 @@ def validate_model(model: dict) -> list[str]:
             for point in points:
                 try:
                     check_unit(f"Study '{study.get('name', '')}' frequency", point, "Hz")
-                    if evaluate_expression(point, parameter_map) <= 0:
-                        raise ValueError("frequency must be positive")
+                    frequency = float(evaluate_expression(point, parameter_map))
+                    if not math.isfinite(frequency) or frequency <= 0:
+                        raise ValueError("frequency must be finite and positive")
                 except (TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError) as error:
                     errors.append(f"Study '{study.get('name', '')}' frequency: {error}.")
     return errors
@@ -1378,62 +1498,72 @@ def _simple_polygon(points):
     return True
 
 
-def validate_studies(studies: dict, parameters=None, *, physics=None) -> list[str]:
-    """Validate the initially supported DC/time-harmonic sweep definition."""
+def validate_studies(studies: dict, parameters=None, *, physics=None, for_solve=False) -> list[str]:
+    """Validate saved study data and current solver capability when requested."""
     errors = []
     if not isinstance(studies, dict) or studies.get("schema") != SCHEMA:
         return [f"Studies must use the '{SCHEMA}' schema."]
     if studies.get("schema_version") != SCHEMA_VERSION:
         errors.append(f"Unsupported studies schema version: {studies.get('schema_version')}.")
     entries = studies.get("studies")
-    if not isinstance(entries, list) or len(entries) != 1:
-        errors.append("Exactly one DC + harmonic study is supported; use its frequency list for a sweep.")
-        return errors
-    study = entries[0]
-    if not isinstance(study, dict):
-        return ["The study definition must be an object."]
-    if not str(study.get("id", "")).strip() or not str(study.get("name", "")).strip():
-        errors.append("The study needs an id and a name.")
-    harmonic_enabled = (
-        True if physics is None
-        else bool((physics.get("harmonic_electromagnetic") or {}).get("enabled", False))
-    )
-    if not harmonic_enabled:
-        return errors
-    points = study.get("frequency_hz", [])
-    if isinstance(points, str):
-        points = [part.strip() for part in points.split(",") if part.strip()]
-    if not isinstance(points, list) or not points:
-        errors.append("Enter at least one positive frequency for the study.")
-        return errors
+    if not isinstance(entries, list):
+        return ["Studies must contain a list of study definitions."]
+    if for_solve and len(entries) != 1:
+        errors.append("This solver currently runs one study at a time; use its frequency list for a sweep.")
+    if physics is None:
+        harmonic_enabled = True
+    elif isinstance(physics, dict):
+        def enabled(name):
+            section = physics.get(name)
+            return isinstance(section, dict) and section.get("enabled") is True
+
+        harmonic_enabled = enabled("harmonic_electromagnetic") or enabled("mechanics")
+    else:
+        harmonic_enabled = False
     parameters = parameters or {}
     parameter_entries = list(parameters.values()) if isinstance(parameters, dict) else parameters
     try:
         parameter_dims = infer_parameter_dimensions(parameter_entries)
     except (AttributeError, TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError):
         parameter_dims = {}
-    for point in points:
-        try:
-            require_expression_unit(point, "Hz", parameter_dims)
-            if evaluate_expression(point, parameters) <= 0:
-                raise ValueError("frequency must be positive")
-        except (TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError) as error:
-            errors.append(f"Study frequency {point!r}: {error}.")
+    for study in entries:
+        if not isinstance(study, dict):
+            errors.append("The study definition must be an object.")
+            continue
+        if not str(study.get("id", "")).strip() or not str(study.get("name", "")).strip():
+            errors.append("The study needs an id and a name.")
+        if not harmonic_enabled:
+            continue
+        points = study.get("frequency_hz", [])
+        if isinstance(points, str):
+            points = [part.strip() for part in points.split(",") if part.strip()]
+        if not isinstance(points, list) or not points:
+            if for_solve:
+                errors.append(f"Study '{study.get('name', '')}': enter at least one positive frequency.")
+            continue
+        for point in points:
+            try:
+                require_expression_unit(point, "Hz", parameter_dims)
+                frequency = float(evaluate_expression(point, parameters))
+                if not math.isfinite(frequency) or frequency <= 0:
+                    raise ValueError("frequency must be finite and positive")
+            except (TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError) as error:
+                errors.append(f"Study frequency {point!r}: {error}.")
     return errors
 
 
 def package_model(model: dict, studies: dict | None = None, layout: dict | None = None) -> bytes:
     model = migrate_legacy_model(model)
-    errors = validate_model(model)
+    errors = validate_model(model, scope="draft")
     if errors:
-        raise ValueError("Cannot save model: " + " ".join(errors))
+        raise ValueError("Cannot save model document: " + " ".join(errors))
     studies = migrate_legacy_studies(studies or new_studies())
     parameter_map = {
         item.get("name"): item
         for item in model.get("parameters", [])
         if isinstance(item, dict) and item.get("name")
     }
-    study_errors = validate_studies(studies, parameter_map, physics=model.get("physics"))
+    study_errors = validate_studies(studies, parameter_map, physics=model.get("physics"), for_solve=False)
     if study_errors:
         raise ValueError("Cannot save studies: " + " ".join(study_errors))
     layout = layout or {"schema_version": 1, "active_section": "geometry", "camera": "fit"}
@@ -1450,16 +1580,16 @@ def package_model(model: dict, studies: dict | None = None, layout: dict | None 
 def serialize_model_json(model: dict, studies: dict | None = None, layout: dict | None = None) -> bytes:
     """Serialize a standalone JSON problem file containing model and study data."""
     model = migrate_legacy_model(model)
-    errors = validate_model(model)
+    errors = validate_model(model, scope="draft")
     if errors:
-        raise ValueError("Cannot save model: " + " ".join(errors))
+        raise ValueError("Cannot save model document: " + " ".join(errors))
     studies = migrate_legacy_studies(studies or new_studies())
     parameter_map = {
         item.get("name"): item
         for item in model.get("parameters", [])
         if isinstance(item, dict) and item.get("name")
     }
-    study_errors = validate_studies(studies, parameter_map, physics=model.get("physics"))
+    study_errors = validate_studies(studies, parameter_map, physics=model.get("physics"), for_solve=False)
     if study_errors:
         raise ValueError("Cannot save studies: " + " ".join(study_errors))
     layout = layout or {"schema_version": 1, "active_section": "geometry", "camera": "fit"}
@@ -1485,15 +1615,15 @@ def serialize_model_json(model: dict, studies: dict | None = None, layout: dict 
 def _validate_unpacked_model(model, studies, layout):
     model = migrate_legacy_model(model)
     studies = migrate_legacy_studies(studies)
-    errors = validate_model(model)
+    errors = validate_model(model, scope="draft")
     if errors:
-        raise ValueError("Invalid model: " + " ".join(errors))
+        raise ValueError("Invalid model document: " + " ".join(errors))
     parameter_map = {
         item.get("name"): item
         for item in model.get("parameters", [])
         if isinstance(item, dict) and item.get("name")
     }
-    study_errors = validate_studies(studies, parameter_map, physics=model.get("physics"))
+    study_errors = validate_studies(studies, parameter_map, physics=model.get("physics"), for_solve=False)
     if study_errors:
         raise ValueError("Invalid studies: " + " ".join(study_errors))
     if not isinstance(layout, dict):

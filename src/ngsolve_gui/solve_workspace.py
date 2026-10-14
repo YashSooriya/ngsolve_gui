@@ -1009,16 +1009,16 @@ class SolveWorkspace(Div):
         _sync_axis_boundary_conditions(model)
         _sync_mechanical_boundary_conditions(model)
         studies = migrate_legacy_studies(studies or new_studies())
-        errors = validate_model(model)
+        errors = validate_model(model, scope="draft")
         if errors:
-            raise ValueError("Invalid model: " + " ".join(errors))
+            raise ValueError("Invalid model document: " + " ".join(errors))
         studies = copy.deepcopy(studies)
         parameter_map = {
             item.get("name"): item
             for item in model.get("parameters", [])
             if isinstance(item, dict) and item.get("name")
         }
-        study_errors = validate_studies(studies, parameter_map, physics=model.get("physics"))
+        study_errors = validate_studies(studies, parameter_map, physics=model.get("physics"), for_solve=False)
         if study_errors:
             raise ValueError("Invalid studies: " + " ".join(study_errors))
         self._cancel_model_rename()
@@ -3104,24 +3104,16 @@ class SolveWorkspace(Div):
 
     @staticmethod
     def _setup_check_category(issue):
-        """Map validator messages to the visible Check Setup checklist groups."""
+        """Group messages by the input area that can resolve them."""
         text = str(issue).casefold()
-        if "anchor the electromagnetic solution" in text or "magnetic potential = 0 to an exterior edge" in text:
-            return "em_reference"
         if "young's modulus" in text or "material" in text:
             return "materials"
-        if (
-            "mechanical region" in text
-            or "mechanical regions" in text
-            or "positive robin support" in text
-            or "robin support stiffnesses" in text
-            or "stiffnesses must be non-negative" in text
-            or "region to include in mechanics" in text
-            or "axial motion" in text
-        ):
+        if any(term in text for term in ("mechanical region", "mechanical regions", "robin support", "stiffnesses must be non-negative", "region to include in mechanics", "axial motion")):
             return "mechanics"
         if any(term in text for term in ("regional load", "source", "current density", "body force")):
             return "loads"
+        if "magnetic-potential boundary" in text or "finite domain boundary" in text:
+            return "em_reference"
         if "frequency" in text:
             return "harmonic_frequencies"
         if "study" in text:
@@ -3130,7 +3122,7 @@ class SolveWorkspace(Div):
             return "mesh"
         if any(term in text for term in ("solver", "anderson", "relative tolerance", "linear solver", "iteration")):
             return "solver"
-        if "physics" in text or "coupling" in text or "time-harmonic mechanics" in text:
+        if "physics" in text or "coupling" in text:
             return "physics"
         if any(term in text for term in ("sketch edge", "geometry", "region", "polygon", "coordinate", "r=0 axis")):
             return "geometry"
@@ -3138,68 +3130,99 @@ class SolveWorkspace(Div):
             return "boundaries"
         return "model"
 
-    def _setup_check_results(self, errors):
+    def _setup_check_results(self, errors, warnings=None):
         physics = self.model.get("physics", {})
-        dc_enabled = bool((physics.get("dc_magnetic") or {}).get("enabled", False))
-        harmonic_enabled = bool((physics.get("harmonic_electromagnetic") or {}).get("enabled", False))
-        mechanics_enabled = bool((physics.get("mechanics") or {}).get("enabled", False))
+        if not isinstance(physics, dict):
+            physics = {}
+        def enabled(name):
+            section = physics.get(name)
+            return isinstance(section, dict) and section.get("enabled") is True
+
+        dc_enabled = enabled("dc_magnetic")
+        harmonic_enabled = enabled("harmonic_electromagnetic")
+        mechanics_enabled = enabled("mechanics")
+        active = dc_enabled or harmonic_enabled or mechanics_enabled
         by_category = {}
+        warning_by_category = {}
         for issue in errors:
             by_category.setdefault(self._setup_check_category(issue), []).append(str(issue))
+        for issue in warnings or []:
+            warning_by_category.setdefault(self._setup_check_category(issue), []).append(str(issue))
         definitions = [
             ("model", "Model structure, parameters and units", True),
             ("geometry", "Geometry and region topology", True),
-            ("materials", "Materials and region assignments", True),
-            ("boundaries", "Boundary definitions and edge assignments", True),
-            ("loads", "Regional sources and loads", True),
+            ("materials", "Active material properties and assignments", active),
+            ("boundaries", "Boundary definitions and assignments", active),
+            ("loads", "Sources and loads for selected physics", active),
             ("physics", "Physics selection and coupling requirements", True),
-            ("em_reference", "Electromagnetic reference boundaries", dc_enabled or harmonic_enabled),
-            ("mechanics", "Mechanical support constraints", mechanics_enabled),
+            ("em_reference", "Electromagnetic boundaries (natural boundaries are allowed)", dc_enabled or harmonic_enabled),
+            ("mechanics", "Mechanical domains and properties", mechanics_enabled),
             ("studies", "Study definition", True),
-            ("harmonic_frequencies", "Time-harmonic frequency inputs", harmonic_enabled),
+            ("harmonic_frequencies", "Time-harmonic frequency inputs", harmonic_enabled or mechanics_enabled),
             ("mesh", "Mesh and refinement settings", True),
             ("solver", "Solver settings", True),
+            ("numerical_operator", "Mesh-dependent singularity and quality checks", active),
         ]
-        return [
-            {
+        results = []
+        for category, label, applicable in definitions:
+            category_errors = by_category.get(category, [])
+            category_warnings = warning_by_category.get(category, [])
+            unsupported = any("currently runs one study at a time" in item for item in category_errors)
+            if not applicable:
+                status = "Not applicable"
+            elif unsupported:
+                status = "Unsupported"
+            elif category_errors:
+                status = "Needs attention"
+            elif category_warnings:
+                status = "Warning"
+            elif category == "numerical_operator":
+                status = "Pending"
+            else:
+                status = "Passed"
+            issues = category_errors + category_warnings
+            if category == "numerical_operator" and applicable:
+                issues = ["Operator singularities, resonance, conditioning, and mesh quality are evaluated after meshing during the solve."]
+            results.append({
                 "id": category,
                 "label": label,
                 "applicable": applicable,
-                "issues": by_category.get(category, []),
-                "status": (
-                    "Not applicable" if not applicable
-                    else "Needs attention" if by_category.get(category)
-                    else "Passed"
-                ),
-            }
-            for category, label, applicable in definitions
-        ]
+                "issues": issues,
+                "status": status,
+            })
+        return results
 
-    def _show_setup_check_results(self, errors):
-        """Show every setup-check group, its status, and clickable validation issues."""
+    def _show_setup_check_results(self, errors, warnings=None):
+        """Show checks, warnings, solver-pending work, and clickable errors."""
+        warnings = list(warnings or [])
         self.validation_issues = list(errors)
-        self._messages_button.ui_label = f"Messages ({len(errors)})" if errors else "Messages"
-        self.setup_check_results = self._setup_check_results(errors)
+        self.setup_validation_warnings = warnings
+        total = len(errors) + len(warnings)
+        self._messages_button.ui_label = f"Messages ({total})" if total else "Messages"
+        self.setup_check_results = self._setup_check_results(errors, warnings)
         passed = sum(item["status"] == "Passed" for item in self.setup_check_results)
-        failed = sum(item["status"] == "Needs attention" for item in self.setup_check_results)
+        failed = sum(item["status"] in {"Needs attention", "Unsupported"} for item in self.setup_check_results)
+        warned = sum(item["status"] == "Warning" for item in self.setup_check_results)
+        pending = sum(item["status"] == "Pending" for item in self.setup_check_results)
         skipped = sum(item["status"] == "Not applicable" for item in self.setup_check_results)
         rows = [
             Div("Setup checks performed", ui_style="font-size:13px; font-weight:600; padding:2px 0;"),
             Div(
-                f"{passed} passed · {failed} need attention · {skipped} not applicable",
+                f"{passed} passed · {failed} need attention · {warned} warnings · {pending} pending · {skipped} not applicable",
                 ui_style="font-size:11px; color:var(--fg-muted); padding:0 0 5px;",
             ),
         ]
         for item in self.setup_check_results:
             status = item["status"]
-            icon = "✓" if status == "Passed" else "!" if status == "Needs attention" else "–"
+            icon = "✓" if status == "Passed" else "!" if status in {"Needs attention", "Unsupported"} else "…" if status == "Pending" else "–"
             color = (
                 "var(--positive)" if status == "Passed"
-                else "var(--negative)" if status == "Needs attention"
+                else "var(--negative)" if status in {"Needs attention", "Unsupported"}
+                else "var(--warning)" if status == "Warning"
                 else "var(--fg-muted)"
             )
             issue_count = len(item["issues"])
-            detail = f" ({issue_count} issue{'s' if issue_count != 1 else ''})" if issue_count else ""
+            detail = f" ({issue_count} item{'s' if issue_count != 1 else ''})" if issue_count else ""
             rows.append(Div(
                 f"{icon}  {item['label']} — {status}{detail}",
                 ui_style=f"font-size:11px; padding:3px 0; color:{color};",
@@ -3217,9 +3240,18 @@ class SolveWorkspace(Div):
                     style="width:100%; justify-content:flex-start; text-align:left; white-space:normal;",
                     align="left",
                 ))
-        else:
+        if warnings:
             rows.append(Div(
-                "These checks validate the inputs; mesh generation and solver convergence are checked separately.",
+                "Warnings — these do not prevent a solve",
+                ui_style="font-size:11px; font-weight:600; padding:7px 0 3px; border-top:1px solid var(--border);",
+            ))
+            rows.extend(Div(
+                warning,
+                ui_style="font-size:11px; padding:3px 0; color:var(--warning); white-space:normal;",
+            ) for warning in warnings)
+        if not errors and not warnings:
+            rows.append(Div(
+                "Input checks passed. Mesh-dependent operator checks and convergence remain pending until the solve runs.",
                 ui_style="font-size:11px; color:var(--fg-muted); padding:7px 0 0; border-top:1px solid var(--border);",
             ))
         self._messages_panel.ui_children = rows
@@ -6662,12 +6694,18 @@ class SolveWorkspace(Div):
             study["frequency_hz"] = [part.strip() for part in str(value).split(",") if part.strip()]
 
     def _mechanical_components(self):
-        """Return each connected mechanical body and the edges on its boundary."""
-        regions = self.model.get("geometry", {}).get("regions", [])
+        """Return bonded mechanical bodies and their non-internal boundary edges."""
+        geometry = self.model.get("geometry")
+        regions = geometry.get("regions", []) if isinstance(geometry, dict) else []
+        if not isinstance(regions, list):
+            return [], []
         mechanical = {
             region.get("id"): region
             for region in regions
-            if isinstance(region, dict) and region.get("id") and region.get("mechanical")
+            if isinstance(region, dict)
+            and region.get("id")
+            and region.get("mechanical") is True
+            and isinstance(region.get("edge_ids", []), list)
         }
         parent = {region_id: region_id for region_id in mechanical}
 
@@ -6677,12 +6715,29 @@ class SolveWorkspace(Div):
                 region_id = parent[region_id]
             return region_id
 
+        edge_owners = {}
+        for region in regions:
+            if not isinstance(region, dict):
+                continue
+            edge_ids = region.get("edge_ids", [])
+            if not isinstance(edge_ids, list):
+                continue
+            for edge_id in edge_ids:
+                if isinstance(edge_id, str):
+                    edge_owners.setdefault(edge_id, set()).add(region.get("id"))
+
         for region_id, region in mechanical.items():
+            linked = set(region.get("edge_ids", []))
             parent_id = region.get("parent_id")
             if parent_id in mechanical:
-                first, second = find(region_id), find(parent_id)
-                if first != second:
-                    parent[first] = second
+                linked.update(mechanical[parent_id].get("edge_ids", []))
+            for other_id, other in mechanical.items():
+                if other_id == region_id:
+                    continue
+                if linked.intersection(other.get("edge_ids", [])):
+                    first, second = find(region_id), find(other_id)
+                    if first != second:
+                        parent[first] = second
 
         groups = {}
         for region_id in mechanical:
@@ -6690,16 +6745,27 @@ class SolveWorkspace(Div):
 
         components = []
         for region_ids in groups.values():
-            # A nested child's outline is also a boundary of its immediate
-            # parent material. This includes cavity walls when the child is
-            # not itself selected for mechanics.
-            edge_ids = set()
+            boundary_edges = set()
+            for region_id in region_ids:
+                for edge_id in mechanical[region_id].get("edge_ids", []):
+                    owners = edge_owners.get(edge_id, set())
+                    bonded_owners = owners.intersection(region_ids)
+                    if len(bonded_owners) < 2:
+                        boundary_edges.add(edge_id)
+            # A non-mechanical child outline is a real boundary of its
+            # mechanical parent (for example a cavity wall).
             for region in regions:
-                if not isinstance(region, dict):
-                    continue
-                if region.get("id") in region_ids or region.get("parent_id") in region_ids:
-                    edge_ids.update(item for item in region.get("edge_ids", []) if isinstance(item, str))
-            components.append((region_ids, edge_ids))
+                if (
+                    isinstance(region, dict)
+                    and region.get("id") not in region_ids
+                    and region.get("parent_id") in region_ids
+                    and not region.get("mechanical")
+                ):
+                    boundary_edges.update(
+                        edge_id for edge_id in region.get("edge_ids", [])
+                        if isinstance(edge_id, str)
+                    )
+            components.append((region_ids, boundary_edges))
         return list(mechanical.values()), components
 
     def _robin_edge_supports_axial_translation(self, edge, condition, parameters):
@@ -6742,101 +6808,104 @@ class SolveWorkspace(Div):
         return False, ""
 
     def validation_errors(self):
-        errors = validate_model(self.model)
-        if not self.model["geometry"]["regions"]:
+        errors = validate_model(self.model, scope="solve")
+        geometry = self.model.get("geometry")
+        regions = geometry.get("regions", []) if isinstance(geometry, dict) else []
+        if not isinstance(regions, list):
+            regions = []
+        if not regions:
             errors.append("Create at least one material region.")
         physics = self.model.get("physics", {})
-        if not any(item.get("enabled") for item in physics.values() if isinstance(item, dict)):
+        if not isinstance(physics, dict):
+            physics = {}
+
+        def physics_enabled(name):
+            section = physics.get(name, {})
+            return isinstance(section, dict) and section.get("enabled") is True
+
+        dc = physics_enabled("dc_magnetic")
+        harmonic = physics_enabled("harmonic_electromagnetic")
+        mechanics = physics_enabled("mechanics")
+        coupling = physics_enabled("coupling")
+        parameter_items = self.model.get("parameters", [])
+        if not isinstance(parameter_items, list):
+            parameter_items = []
+        material_items = self.model.get("materials", [])
+        if not isinstance(material_items, list):
+            material_items = []
+        condition_items = self.model.get("boundary_conditions", [])
+        if not isinstance(condition_items, list):
+            condition_items = []
+        geometry_edges = geometry.get("edges", []) if isinstance(geometry, dict) else []
+        if not isinstance(geometry_edges, list):
+            geometry_edges = []
+        if not (dc or harmonic or mechanics):
             errors.append("Select at least one physics problem.")
-        mechanics = physics.get("mechanics", {}).get("enabled", False)
-        harmonic = physics.get("harmonic_electromagnetic", {}).get("enabled", False)
-        coupling = physics.get("coupling", {}).get("enabled", False)
-        electromagnetic = physics.get("dc_magnetic", {}).get("enabled", False) or harmonic
-        if electromagnetic:
-            condition_types = {
-                condition.get("id"): condition.get("type")
-                for condition in self.model.get("boundary_conditions", [])
-                if isinstance(condition, dict)
-            }
-            exterior_regions = [
-                region
-                for region in self.model["geometry"].get("regions", [])
-                if isinstance(region, dict) and region.get("parent_id") is None
-            ]
-            edges_by_id = {
-                edge.get("id"): edge
-                for edge in self.model["geometry"].get("edges", [])
-                if isinstance(edge, dict) and edge.get("id")
-            }
-            missing_references = []
-            for region in exterior_regions:
-                has_reference = any(
-                    condition_types.get(condition_id) == "magnetic_potential_zero"
-                    for edge_id in region.get("edge_ids", [])
-                    for condition_id in _edge_condition_ids(edges_by_id.get(edge_id, {}))
-                )
-                if not has_reference:
-                    missing_references.append(region.get("name", region.get("id", "unnamed")))
-            if missing_references:
-                names = ", ".join(f"'{name}'" for name in missing_references)
-                errors.append(
-                    "Assign magnetic potential = 0 to an exterior edge of each disconnected "
-                    f"region to anchor the electromagnetic solution. Missing: {names}."
-                )
-        if mechanics and not harmonic:
-            errors.append("Time-harmonic mechanics currently requires Time-harmonic EM.")
         mechanical_regions, mechanical_components = self._mechanical_components()
         if mechanics and not mechanical_regions:
             errors.append("Choose at least one region to include in mechanics.")
-        if mechanics:
+        if coupling and not (dc and harmonic and mechanics):
+            errors.append("Coupling requires DC magnetic, time-harmonic EM, and mechanics.")
+
+        if mechanics and mechanical_regions:
             parameter_map = {
-                item.get("name"): item
-                for item in self.model.get("parameters", [])
+                item.get("name"): item for item in parameter_items
                 if isinstance(item, dict) and item.get("name")
             }
             materials = {
-                item.get("id"): item
-                for item in self.model.get("materials", [])
+                item.get("id"): item for item in material_items
                 if isinstance(item, dict) and item.get("id")
             }
-            for region in mechanical_regions:
-                material = materials.get(region.get("material_id"))
-                if material is None:
-                    continue
-                try:
-                    youngs_modulus = evaluate_expression(
-                        material.get("properties", {}).get("youngs_modulus", "0"),
-                        parameter_map,
-                    )
-                except (AttributeError, TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError):
-                    continue
-                if youngs_modulus <= 0:
-                    errors.append(
-                        f"Material '{material.get('name', 'unnamed')}' needs positive Young's modulus "
-                        f"for mechanical region '{region.get('name', 'unnamed')}'."
-                    )
-        if coupling and not (physics.get("dc_magnetic", {}).get("enabled") and harmonic and mechanics):
-            errors.append("Coupling requires DC magnetic, time-harmonic EM, and mechanics.")
-        if mechanics and mechanical_regions:
             condition_by_id = {
-                item.get("id"): item
-                for item in self.model.get("boundary_conditions", [])
+                item.get("id"): item for item in condition_items
                 if isinstance(item, dict) and item.get("id")
-            }
-            parameter_map = {
-                item.get("name"): item
-                for item in self.model.get("parameters", [])
-                if isinstance(item, dict) and item.get("name")
             }
             edges_by_id = {
-                edge.get("id"): edge
-                for edge in self.model["geometry"].get("edges", [])
+                edge.get("id"): edge for edge in geometry_edges
                 if isinstance(edge, dict) and edge.get("id")
             }
+            owners_by_edge = {}
+            for region in regions:
+                if not isinstance(region, dict):
+                    continue
+                edge_ids = region.get("edge_ids", [])
+                if not isinstance(edge_ids, list):
+                    continue
+                for edge_id in edge_ids:
+                    if isinstance(edge_id, str):
+                        owners_by_edge.setdefault(edge_id, set()).add(region.get("id"))
+
+            for edge in edges_by_id.values():
+                for condition_id in _edge_condition_ids(edge):
+                    condition = condition_by_id.get(condition_id, {})
+                    kind = condition.get("type")
+                    if not str(kind).startswith("mechanical_") and kind != "transmission_interface":
+                        continue
+                    if not owners_by_edge.get(edge.get("id"), set()).intersection(
+                        region.get("id") for region in mechanical_regions
+                    ):
+                        errors.append(
+                            f"Mechanical boundary '{condition.get('name', condition_id)}' is assigned "
+                            "to an edge that does not touch a mechanical region."
+                        )
+
             for region_ids, edge_ids in mechanical_components:
+                has_inertia = False
+                for region in mechanical_regions:
+                    if region.get("id") not in region_ids:
+                        continue
+                    material = materials.get(region.get("material_id"), {})
+                    try:
+                        density = float(evaluate_expression(
+                            material.get("properties", {}).get("density", "0"), parameter_map
+                        ))
+                        has_inertia = has_inertia or (math.isfinite(density) and density > 0)
+                    except (AttributeError, TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError):
+                        pass
+
                 direct_support = False
-                robin_error_reported = set()
                 robin_support = False
+                reported_robin = set()
                 for edge_id in edge_ids:
                     edge = edges_by_id.get(edge_id)
                     if edge is None:
@@ -6851,45 +6920,160 @@ class SolveWorkspace(Div):
                                 edge, condition, parameter_map
                             )
                             robin_support = robin_support or supports
-                            if issue and condition_id not in robin_error_reported:
+                            if issue and condition_id not in reported_robin:
                                 errors.append(f"Boundary '{condition.get('name', condition_id)}': {issue}")
-                                robin_error_reported.add(condition_id)
-                if not direct_support and not robin_support:
-                    region_names = ", ".join(
+                                reported_robin.add(condition_id)
+                # Harmonic inertia makes a free body mathematically valid. A
+                # massless harmonic component still has a rigid null mode.
+                if not has_inertia and not direct_support and not robin_support:
+                    names = ", ".join(
                         region.get("name", region.get("id", "unnamed"))
-                        for region in mechanical_regions
-                        if region.get("id") in region_ids
-                    )
-                    subject = (
-                        f"Mechanical region '{region_names}' needs"
-                        if len(region_ids) == 1
-                        else f"Mechanical regions '{region_names}' need"
+                        for region in mechanical_regions if region.get("id") in region_ids
                     )
                     errors.append(
-                        f"{subject} a fixed or prescribed displacement, or a positive Robin support that "
-                        "restrains axial motion, on their boundary."
+                        f"Massless harmonic mechanical component '{names}' needs a fixed/prescribed "
+                        "boundary or a positive Robin support to remove its rigid axial mode."
                     )
+
         parameter_map = {
-            item.get("name"): item
-            for item in self.model.get("parameters", [])
+            item.get("name"): item for item in parameter_items
             if isinstance(item, dict) and item.get("name")
         }
-        errors.extend(validate_studies(self.studies, parameter_map, physics=self.model.get("physics")))
+        errors.extend(validate_studies(
+            self.studies, parameter_map, physics=self.model.get("physics"), for_solve=True
+        ))
         return errors
 
+    def validation_warnings(self):
+        """Return useful cautions that should never block a valid solve."""
+        warnings = []
+        physics = self.model.get("physics", {})
+        if not isinstance(physics, dict):
+            return warnings
+
+        def section(name):
+            value = physics.get(name, {})
+            return value if isinstance(value, dict) else {}
+
+        dc = section("dc_magnetic").get("enabled") is True
+        ac = section("harmonic_electromagnetic").get("enabled") is True
+        mechanics = section("mechanics").get("enabled") is True
+        geometry = self.model.get("geometry")
+        if not isinstance(geometry, dict):
+            geometry = {}
+        regions = geometry.get("regions", [])
+        if not isinstance(regions, list):
+            regions = []
+        boundary_conditions = self.model.get("boundary_conditions", [])
+        if not isinstance(boundary_conditions, list):
+            boundary_conditions = []
+        regional_loads = self.model.get("regional_loads", [])
+        if not isinstance(regional_loads, list):
+            regional_loads = []
+        if (dc or ac) and regions:
+            assigned_types = {
+                condition.get("id"): condition.get("type")
+                for condition in boundary_conditions
+                if isinstance(condition, dict)
+            }
+            edges = geometry.get("edges", [])
+            if not isinstance(edges, list):
+                edges = []
+            has_explicit_magnetic_boundary = bool(regions) and any(
+                assigned_types.get(condition_id) == "magnetic_potential_zero"
+                for edge in edges if isinstance(edge, dict)
+                for condition_id in _edge_condition_ids(edge)
+            )
+            if not has_explicit_magnetic_boundary:
+                warnings.append(
+                    "No magnetic-potential boundary is explicitly assigned. Unspecified edges use the "
+                    "natural condition; confirm that the finite domain boundary matches the intended open-region model."
+                )
+
+        sources = []
+        for region in regions:
+            if isinstance(region, dict):
+                sources.append(region.get("sources", {}))
+        for load in regional_loads:
+            if isinstance(load, dict):
+                if not load.get("region_ids"):
+                    warnings.append(f"Regional load '{load.get('name', load.get('id', 'unnamed'))}' is not assigned to any region.")
+                sources.append(load)
+        inactive = []
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            if not dc and str(source.get("dc_current_density", "0")).strip() not in {"", "0", "0.0", "0.0e0"}:
+                inactive.append("DC current")
+            if not ac and any(
+                str(source.get(key, "0")).strip() not in {"", "0", "0.0", "0.0e0"}
+                for key in ("ac_current_density_real", "ac_current_density_imaginary")
+            ):
+                inactive.append("AC current")
+            if not mechanics:
+                body = source.get("mechanical_body_force", {})
+                if isinstance(body, dict) and any(
+                    str(body.get(key, "0")).strip() not in {"", "0", "0.0", "0.0e0"}
+                    for key in ("r", "z")
+                ):
+                    inactive.append("mechanical body force")
+        if inactive:
+            warnings.append(
+                "Some defined loads target disabled physics and will be ignored: "
+                + ", ".join(sorted(set(inactive))) + "."
+            )
+
+        if (dc or ac) and regions:
+            current = section("dc_magnetic").get("source_current_density", "0") if dc else "0"
+            ac_source = section("harmonic_electromagnetic")
+            source_values = [str(current).strip()]
+            if ac:
+                source_values.extend([
+                    str(ac_source.get("source_current_density_real", "0")).strip(),
+                    str(ac_source.get("source_current_density_imaginary", "0")).strip(),
+                ])
+            for source in sources:
+                if isinstance(source, dict):
+                    source_values.extend(str(source.get(key, "0")).strip() for key in (
+                        "dc_current_density", "ac_current_density_real", "ac_current_density_imaginary"
+                    ))
+            if all(value in {"", "0", "0.0", "0.0e0"} for value in source_values):
+                warnings.append(
+                    "All active electromagnetic current sources are zero; a zero-field solution may be correct."
+                )
+        if mechanics and regions:
+            mechanical_sources = [
+                str(section("mechanics").get(key, "0")).strip()
+                for key in ("body_force_r", "body_force_z")
+            ]
+            mechanical_sources.extend(
+                str(source.get("mechanical_body_force", {}).get(key, "0")).strip()
+                for source in sources if isinstance(source, dict)
+                and isinstance(source.get("mechanical_body_force", {}), dict)
+                for key in ("r", "z")
+            )
+            if all(value in {"", "0", "0.0", "0.0e0"} for value in mechanical_sources):
+                warnings.append(
+                    "All explicit mechanical body forces are zero; verify that the applied boundary conditions or coupling provide the intended excitation."
+                )
+        return list(dict.fromkeys(warnings))
+
     def mesh_validation_errors(self):
-        errors = validate_model(self.model)
+        errors = validate_model(self.model, scope="mesh")
         if not self.model["geometry"].get("regions"):
             errors.append("Create at least one material region before generating a mesh.")
         return errors
 
     def validate_action(self, *args):
         errors = self.validation_errors()
-        self._show_setup_check_results(errors)
+        warnings = self.validation_warnings()
+        self._show_setup_check_results(errors, warnings)
         if errors:
             self._message(f"Setup check found {len(errors)} issue{'s' if len(errors) != 1 else ''}. Select a message for guidance.", error=True)
+        elif warnings:
+            self._message(f"Setup inputs are valid with {len(warnings)} warning{'s' if len(warnings) != 1 else ''}; operator checks remain pending until solve.")
         else:
-            self._message("Setup checks passed. Mesh and solver results are reported separately.")
+            self._message("Setup inputs passed. Mesh-dependent operator checks remain pending until solve.")
         self._flash_status_bar()
 
     def run_mesh_action(self, *args):
@@ -6950,10 +7134,13 @@ class SolveWorkspace(Div):
 
     def run_study_action(self, *args):
         errors = self.validation_errors()
+        warnings = self.validation_warnings() if not errors else []
         if errors:
-            self._show_validation_issues(errors)
+            self._show_setup_check_results(errors, warnings)
             self._message(f"Study setup found {len(errors)} issue{'s' if len(errors) != 1 else ''}.", error=True)
             return
+        if warnings:
+            self._show_setup_check_results(errors, warnings)
         if self.on_run:
             if not self.begin_solver_job("Study"):
                 return
