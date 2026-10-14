@@ -37,6 +37,27 @@ from .result_files import (
 )
 
 
+def _request_guest_vm_shutdown():
+    # Only the packaged VM sets this flag; standalone launches quit normally.
+    if os.environ.get("MMFEM_VM_GUEST") != "1":
+        return
+
+    result = subprocess.run(
+        ["sudo", "-n", "/usr/bin/systemctl", "poweroff"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            detail or f"Guest shutdown exited with status {result.returncode}."
+        )
+
+
 def _inject_solve_status_styles(js):
     style = js.document.createElement("style")
     style.id = "mmfem-solve-status-styles"
@@ -826,7 +847,7 @@ class NGSolveGui(App):
                 ("Load solutions...", self.load_solutions_file, "mdi-folder-open-outline", None),
                 ("Save solutions", self.save_solutions_file, "mdi-content-save-outline", None),
                 None,
-                ("Exit", self.quit, "mdi-exit-to-app", None),
+                ("Exit", self._quit_application, "mdi-exit-to-app", None),
             ]),
             ("Edit", [
                 ("Undo", self._undo_solve_action, "mdi-undo", "Ctrl+Z"),
@@ -905,6 +926,18 @@ class NGSolveGui(App):
                 "background:var(--panel-header); border-bottom:1px solid var(--border);"
             ),
         )
+
+    def _quit_application(self, *args):
+        try:
+            _request_guest_vm_shutdown()
+        except Exception as error:
+            self._notify(
+                f"Could not shut down the solver VM: {error}",
+                type="negative",
+                timeout=8000,
+            )
+            return False
+        return self.quit()
 
     def _open_settings(self, *args):
         self._settings_dialog.ui_model_value = True
