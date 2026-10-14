@@ -302,17 +302,204 @@ def migrate_regional_loads(model):
     return migrated
 
 
+def _topology_coordinate_key(point):
+    return tuple(round(float(value), 12) for value in point)
+
+
+def _topology_point_id(point):
+    key = _topology_coordinate_key(point)
+    token = f"{key[0]:.12g},{key[1]:.12g}"
+    return "point-" + uuid.uuid5(uuid.NAMESPACE_URL, "mm-fem-sketch-point:" + token).hex[:12]
+
+
+def _edge_forward_for_region(edge, vertices):
+    """Determine whether stored endpoint order follows the region contour."""
+    endpoints = edge.get("vertices", [])
+    if len(endpoints) != 2 or len(vertices) < 3:
+        return True
+    scale = max(1.0, *(abs(float(v)) for point in vertices for v in point))
+    tolerance = scale * 1e-9
+
+    def position(point):
+        px, py = float(point[0]), float(point[1])
+        for index, start in enumerate(vertices):
+            end = vertices[(index + 1) % len(vertices)]
+            dx, dy = end[0] - start[0], end[1] - start[1]
+            length2 = dx * dx + dy * dy
+            if length2 <= 1e-30:
+                continue
+            fraction = ((px - start[0]) * dx + (py - start[1]) * dy) / length2
+            if fraction < -1e-8 or fraction > 1.0 + 1e-8:
+                continue
+            distance = abs(dx * (py - start[1]) - dy * (px - start[0])) / math.sqrt(length2)
+            if distance <= tolerance:
+                return index + min(1.0, max(0.0, fraction))
+        return None
+
+    first, second = position(endpoints[0]), position(endpoints[1])
+    if first is None or second is None:
+        return True
+    count = float(len(vertices))
+    return (second - first) % count <= (first - second) % count
+
+
+def _upgrade_sketch_topology(model):
+    """Add persistent point references, curve types and oriented region loops."""
+    geometry = model.get("geometry")
+    if not isinstance(geometry, dict):
+        return
+    existing_points = geometry.get("points", [])
+    if not isinstance(existing_points, list):
+        existing_points = []
+    point_ids = {}
+    points = []
+    for point in existing_points:
+        if not isinstance(point, dict):
+            continue
+        coords = point.get("coordinates")
+        if not isinstance(coords, (list, tuple)) or len(coords) != 2:
+            continue
+        try:
+            key = _topology_coordinate_key(coords)
+            if not all(math.isfinite(v) for v in key):
+                continue
+        except (TypeError, ValueError, OverflowError):
+            continue
+        point_id = point.get("id")
+        if not isinstance(point_id, str) or not point_id:
+            point_id = _topology_point_id(key)
+        if key not in point_ids:
+            point_ids[key] = point_id
+            points.append({"id": point_id, "coordinates": list(key)})
+
+    regions = geometry.get("regions", [])
+    edges = geometry.get("edges", [])
+    if not isinstance(regions, list):
+        regions = []
+    if not isinstance(edges, list):
+        edges = []
+    edge_by_id = {
+        edge.get("id"): edge
+        for edge in edges
+        if isinstance(edge, dict) and isinstance(edge.get("id"), str)
+    }
+    regions_by_edge = {}
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        edge_ids = region.get("edge_ids", [])
+        for edge_id in edge_ids if isinstance(edge_ids, list) else []:
+            regions_by_edge.setdefault(edge_id, []).append(region)
+
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        endpoints = edge.get("vertices")
+        if not isinstance(endpoints, list) or len(endpoints) != 2:
+            continue
+        try:
+            coords = [_topology_coordinate_key(point) for point in endpoints]
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not all(math.isfinite(v) for point in coords for v in point):
+            continue
+        references = []
+        for key in coords:
+            point_id = point_ids.get(key)
+            if point_id is None:
+                point_id = _topology_point_id(key)
+                point_ids[key] = point_id
+                points.append({"id": point_id, "coordinates": list(key)})
+            references.append(point_id)
+        edge["point_ids"] = references
+        curve = edge.get("curve")
+        if isinstance(curve, dict) and curve.get("type") in {"line", "arc", "spline3"}:
+            continue
+        circle = next((
+            region for region in regions_by_edge.get(edge.get("id"), [])
+            if isinstance(region.get("shape"), dict) and region["shape"].get("type") == "circle"
+        ), None)
+        if circle:
+            shape = circle["shape"]
+            center = [float(shape["r_center"]), float(shape["z_center"])]
+            start, end = endpoints
+            cross = (
+                (float(start[0]) - center[0]) * (float(end[1]) - center[1])
+                - (float(start[1]) - center[1]) * (float(end[0]) - center[0])
+            )
+            edge["curve"] = {
+                "type": "arc",
+                "center": center,
+                "radius": float(shape["radius"]),
+                "clockwise": cross < 0.0,
+            }
+        else:
+            edge["curve"] = {"type": "line"}
+
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        loops = region.get("boundary_loops")
+        if isinstance(loops, list) and loops:
+            continue
+        try:
+            vertices = [(float(point[0]), float(point[1])) for point in region.get("vertices", [])]
+        except (TypeError, ValueError, IndexError, OverflowError):
+            vertices = []
+        refs = []
+        edge_ids = region.get("edge_ids", [])
+        for edge_id in edge_ids if isinstance(edge_ids, list) else []:
+            edge = edge_by_id.get(edge_id)
+            if edge:
+                refs.append({"edge_id": edge_id, "forward": _edge_forward_for_region(edge, vertices)})
+        region["boundary_loops"] = [{"role": "outer", "edges": refs}] if refs else []
+
+    regions_by_id = {
+        region.get("id"): region for region in regions
+        if isinstance(region, dict) and isinstance(region.get("id"), str)
+    }
+    for child in regions:
+        if not isinstance(child, dict):
+            continue
+        parent = regions_by_id.get(child.get("parent_id"))
+        if not isinstance(parent, dict):
+            continue
+        outer = next((loop for loop in child.get("boundary_loops", []) if loop.get("role") == "outer"), None)
+        if not isinstance(outer, dict):
+            continue
+        parent_loops = parent.setdefault("boundary_loops", [])
+        if any(
+            isinstance(loop, dict) and loop.get("role") == "hole" and loop.get("region_id") == child.get("id")
+            for loop in parent_loops
+        ):
+            continue
+        parent_loops.append({
+            "role": "hole",
+            "region_id": child.get("id"),
+            "edges": [
+                {"edge_id": item["edge_id"], "forward": not bool(item.get("forward", True))}
+                for item in reversed(outer.get("edges", []))
+                if isinstance(item, dict) and item.get("edge_id")
+            ],
+        })
+    geometry["points"] = points
+    geometry["topology_version"] = 1
+
+
 def migrate_legacy_model(model):
     """Upgrade pre-SI geometry expressions while keeping their geometry fixed."""
     if not isinstance(model, dict) or model.get("schema_version") != LEGACY_SCHEMA_VERSION:
         return model
-    geometry = model.get("geometry", {})
-    if not isinstance(geometry, dict) or geometry.get("dimension_expression_unit") == "m":
-        return model
-    if geometry.get("dimension_expression_unit", "mm") != "mm":
-        return model
     model = copy.deepcopy(model)
     geometry = model.get("geometry", {})
+    if not isinstance(geometry, dict):
+        return model
+    dimension_unit = geometry.get("dimension_expression_unit", "mm")
+    if dimension_unit == "m":
+        _upgrade_sketch_topology(model)
+        return model
+    if dimension_unit != "mm":
+        return model
     for parameter in model.get("parameters", []) if isinstance(model.get("parameters", []), list) else []:
         if isinstance(parameter, dict) and "expression" in parameter:
             parameter["expression"] = _strip_legacy_mm_suffix(parameter["expression"])
@@ -359,6 +546,7 @@ def migrate_legacy_model(model):
                     for key, expression in body.items():
                         body[key] = _strip_legacy_mm_suffix(expression)
     geometry["dimension_expression_unit"] = "m"
+    _upgrade_sketch_topology(model)
     return model
 
 
@@ -394,6 +582,8 @@ def new_model(name: str = "Untitled axisymmetric model") -> dict:
         "geometry": {
             "coordinate_system": "r-z",
             "dimension_expression_unit": "m",
+            "topology_version": 1,
+            "points": [],
             "regions": [],
             "edges": [],
             "constraints": [],

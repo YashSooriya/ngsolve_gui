@@ -9,6 +9,7 @@ from ngsolve_gui.axisymmetric_model import (
     evaluate_expression,
     new_model,
     migrate_regional_loads,
+    migrate_legacy_model,
     new_studies,
     package_model,
     unpack_model,
@@ -71,6 +72,85 @@ def test_parameter_expressions_resolve_safely_and_reject_cycles():
         evaluate_expression("first", {"first": {"expression": "second"}, "second": {"expression": "first"}})
     with pytest.raises(ValueError, match="Only|unsupported|unknown"):
         evaluate_expression("__import__('os').system('echo unsafe')")
+
+
+def test_legacy_sketch_migration_adds_stable_points_and_oriented_nested_loops():
+    model = _nested_model()
+    geometry = model["geometry"]
+    geometry.pop("topology_version", None)
+    geometry.pop("points", None)
+    for region in geometry["regions"]:
+        region.pop("boundary_loops", None)
+    for edge in geometry["edges"]:
+        edge.pop("curve", None)
+        edge.pop("point_ids", None)
+
+    migrated = migrate_legacy_model(model)
+    geometry = migrated["geometry"]
+    point_ids = {point["id"] for point in geometry["points"]}
+    assert geometry["topology_version"] == 1
+    assert len(point_ids) == len(geometry["points"])
+    assert all(set(edge["point_ids"]) <= point_ids for edge in geometry["edges"])
+    assert all(edge["curve"]["type"] == "line" for edge in geometry["edges"])
+
+    outer = next(region for region in geometry["regions"] if region["id"] == "outer")
+    coil = next(region for region in geometry["regions"] if region["id"] == "coil")
+    hole = next(loop for loop in outer["boundary_loops"] if loop["role"] == "hole")
+    assert hole["region_id"] == "coil"
+    assert {edge["edge_id"] for edge in hole["edges"]} == set(coil["edge_ids"])
+    assert all(
+        reverse["forward"] is not forward["forward"]
+        for reverse, forward in zip(hole["edges"], reversed(coil["boundary_loops"][0]["edges"]))
+    )
+
+
+def test_legacy_circle_migration_keeps_curved_edges_exact():
+    import math
+    from ngsolve_gui.axisymmetric_model import migrate_legacy_model
+
+    model = new_model()
+    center = (0.01, 0.02)
+    radius = 0.004
+    vertices = [
+        [center[0] + radius * math.cos(2 * math.pi * index / 48),
+         center[1] + radius * math.sin(2 * math.pi * index / 48)]
+        for index in range(48)
+    ]
+    edges = []
+    edge_ids = []
+    for index, start in enumerate(vertices):
+        edge_id = f"arc-{index}"
+        edge_ids.append(edge_id)
+        edges.append({
+            "id": edge_id,
+            "vertices": [start, vertices[(index + 1) % len(vertices)]],
+            "boundary_condition_ids": [],
+        })
+    model["geometry"]["regions"] = [{
+        "id": "circle-region",
+        "name": "circle",
+        "shape": {
+            "type": "circle",
+            "r_center": center[0],
+            "z_center": center[1],
+            "radius": radius,
+            "segments": 48,
+            "dimension_expressions": {
+                "r_center": "0.01", "z_center": "0.02", "radius": "0.004",
+            },
+        },
+        "vertices": vertices,
+        "edge_ids": edge_ids,
+        "parent_id": None,
+    }]
+    model["geometry"]["edges"] = edges
+
+    migrated = migrate_legacy_model(model)
+    migrated_edges = migrated["geometry"]["edges"]
+    assert all(edge["curve"]["type"] == "arc" for edge in migrated_edges)
+    assert all(edge["curve"]["center"] == list(center) for edge in migrated_edges)
+    assert all(edge["curve"]["radius"] == pytest.approx(radius) for edge in migrated_edges)
+    assert migrate_legacy_model(migrated) == migrated
 
 
 def test_nested_geometry_and_parameter_driven_dimensions_validate():
@@ -249,7 +329,8 @@ def test_ngsmodel_round_trip_is_data_only_and_rejects_extra_files():
     studies["studies"][0]["frequency_hz"] = ["500", "1000"]
     archive = package_model(model, studies, {"active_section": "geometry"})
     restored_model, restored_studies, restored_layout = unpack_model(archive)
-    assert restored_model == model
+    assert restored_model == migrate_legacy_model(model)
+    assert restored_model["geometry"]["topology_version"] == 1
     assert restored_studies == studies
     assert restored_layout["active_section"] == "geometry"
 

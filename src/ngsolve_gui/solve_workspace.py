@@ -3649,6 +3649,14 @@ class SolveWorkspace(Div):
     def _rebuild_edges(self):
         geometry = self.model["geometry"]
         old_edges = geometry.get("edges", [])
+        old_points_by_coordinate = {
+            tuple(round(float(value), 12) for value in point.get("coordinates", [])): point.get("id")
+            for point in geometry.get("points", [])
+            if isinstance(point, dict)
+            and isinstance(point.get("coordinates"), (list, tuple))
+            and len(point.get("coordinates")) == 2
+            and isinstance(point.get("id"), str)
+        }
         selected_before = set(getattr(self, "selected_edge_ids", []))
         old_selected = {
             edge["id"]: edge.get("vertices")
@@ -3715,6 +3723,7 @@ class SolveWorkspace(Div):
 
         for region in geometry.get("regions", []):
             region_edge_ids = []
+            region_loop_refs = []
             points = region.get("vertices", [])
             for index, raw_start in enumerate(points):
                 raw_end = points[(index + 1) % len(points)]
@@ -3752,6 +3761,8 @@ class SolveWorkspace(Div):
                     if key in edges_by_key:
                         edge = edges_by_key[key]
                         region_edge_ids.append(edge["id"])
+                        forward = tuple(round(float(value), 12) for value in edge["vertices"][0]) == tuple(round(float(value), 12) for value in first)
+                        region_loop_refs.append({"edge_id": edge["id"], "forward": forward})
                         continue
 
                     candidates = source_edges_for(first, second, key)
@@ -3765,6 +3776,25 @@ class SolveWorkspace(Div):
                         edge_id = new_id("edge")
                     edge["id"] = edge_id
                     edge["vertices"] = [list(first), list(second)]
+                    source_curve_key = _edge_key(source_edge["vertices"]) if source_edge else None
+                    if source_edge and source_edge.get("curve") and source_curve_key == key:
+                        edge["curve"] = copy.deepcopy(source_edge["curve"])
+                    else:
+                        shape = region.get("shape", {})
+                        if isinstance(shape, dict) and shape.get("type") == "circle":
+                            center = [float(shape["r_center"]), float(shape["z_center"])]
+                            cross = (
+                                (float(first[0]) - center[0]) * (float(second[1]) - center[1])
+                                - (float(first[1]) - center[1]) * (float(second[0]) - center[0])
+                            )
+                            edge["curve"] = {
+                                "type": "arc",
+                                "center": center,
+                                "radius": float(shape["radius"]),
+                                "clockwise": cross < 0.0,
+                            }
+                        else:
+                            edge["curve"] = {"type": "line"}
                     if source_edge is None:
                         edge["name"] = f"Edge {len(edges) + 1}"
                         edge["boundary_condition_ids"] = []
@@ -3779,8 +3809,50 @@ class SolveWorkspace(Div):
                     edges_by_key[key] = edge
                     edges.append(edge)
                     region_edge_ids.append(edge_id)
+                    region_loop_refs.append({"edge_id": edge_id, "forward": True})
             region["edge_ids"] = list(dict.fromkeys(region_edge_ids))
+            region["boundary_loops"] = [{"role": "outer", "edges": region_loop_refs}] if region_loop_refs else []
 
+        regions_by_id = {
+            region.get("id"): region for region in geometry.get("regions", [])
+            if isinstance(region, dict) and isinstance(region.get("id"), str)
+        }
+        for child in geometry.get("regions", []):
+            if not isinstance(child, dict):
+                continue
+            parent = regions_by_id.get(child.get("parent_id"))
+            if not isinstance(parent, dict):
+                continue
+            outer = next((loop for loop in child.get("boundary_loops", []) if loop.get("role") == "outer"), None)
+            if not isinstance(outer, dict):
+                continue
+            parent_loops = parent.setdefault("boundary_loops", [])
+            parent_loops.append({
+                "role": "hole",
+                "region_id": child.get("id"),
+                "edges": [
+                    {"edge_id": item["edge_id"], "forward": not bool(item.get("forward", True))}
+                    for item in reversed(outer.get("edges", []))
+                ],
+            })
+
+        points_by_coordinate = dict(old_points_by_coordinate)
+        topology_points_by_coordinate = {}
+        for edge in edges:
+            point_ids = []
+            for point in edge.get("vertices", []):
+                key = tuple(round(float(value), 12) for value in point)
+                point_id = points_by_coordinate.get(key)
+                if not point_id:
+                    point_id = new_id("point")
+                    points_by_coordinate[key] = point_id
+                topology_points_by_coordinate.setdefault(
+                    key, {"id": point_id, "coordinates": list(key)}
+                )
+                point_ids.append(point_id)
+            edge["point_ids"] = point_ids
+        geometry["points"] = list(topology_points_by_coordinate.values())
+        geometry["topology_version"] = 1
         geometry["edges"] = edges
 
         # Keep a selected old edge selected across each of its split segments.
@@ -5871,23 +5943,39 @@ class SolveWorkspace(Div):
         for region in regions:
             region_id = region["id"]
             live_region_ids.add(region_id)
-            polygon = " ".join(f"{x:.3f},{y:.3f}" for x, y in (xy(point) for point in region["vertices"]))
+            def subpath(points):
+                projected = [xy(point) for point in points]
+                if not projected:
+                    return ""
+                commands = [f"M{projected[0][0]:.3f},{projected[0][1]:.3f}"]
+                commands.extend(f"L{x:.3f},{y:.3f}" for x, y in projected[1:])
+                return " ".join(commands) + " Z"
+
+            child_loops = [
+                child.get("vertices", [])
+                for child in regions
+                if child.get("parent_id") == region_id
+            ]
+            path_data = " ".join(
+                item for item in [subpath(region.get("vertices", [])), *(subpath(loop) for loop in child_loops)]
+                if item
+            )
             color = _MATERIAL_COLORS[material_index.get(region.get("material_id"), 0) % len(_MATERIAL_COLORS)]
             selected = region_id == self.selected_region_id
             props = {
-                "points": polygon,
+                "d": path_data,
                 "fill": color,
                 "fill_opacity": "0.33" if not selected else "0.48",
-                "stroke": "#344658" if not selected else "#1b73ae",
-                "stroke_width": "2.2" if selected else "1.6",
+                "stroke": "none",
+                "stroke_width": "0",
                 "data_sketch_region_id": region_id,
                 "data_sketch_region_role": "shape",
                 "tabindex": "0",
-                "style": f"cursor:{region_cursor};",
+                "style": f"cursor:{region_cursor}; fill-rule:evenodd;",
             }
             shape = self._canvas_region_nodes.get(region_id)
             if shape is None:
-                shape = _svg("polygon", **props)
+                shape = _svg("path", **props)
                 shape.on("click", lambda event, rid=region_id: self._on_canvas_region_click(rid, event))
                 self._canvas_region_nodes[region_id] = shape
             else:
@@ -5928,10 +6016,10 @@ class SolveWorkspace(Div):
             start, end = edge["vertices"]
             x1, y1 = xy(start)
             x2, y2 = xy(end)
-            selected = edge_id in self.selected_edge_ids
+            region_id = region_for_edge.get(edge_id)
+            selected = edge_id in self.selected_edge_ids or region_id == self.selected_region_id
             condition_highlight = edge_id in highlighted_edges
             edge_color = "#ff8738" if condition_highlight else ("#0877b9" if selected else "#263746")
-            region_id = region_for_edge.get(edge_id)
             visible_props = {
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "stroke": edge_color,
