@@ -1214,6 +1214,34 @@ class NGSolveGui(App):
             refresh_history_controls()
 
     def _save_artifact(self, data, filename):
+        # The browser File System Access writer is asynchronous. In the local
+        # Windows application, use an OS save dialog and a synchronous write so
+        # JSON, mesh, and solution bundles are complete before the action returns.
+        if os.name == "nt":
+            from .native_dialog import save_file_dialog
+
+            initialdir = (
+                self._local_path
+                or self.usersettings.get("save_dir", "")
+                or self.usersettings.get("load_dir", "")
+                or os.path.expanduser("~")
+            )
+            suffix = Path(filename).suffix or "*"
+            path = save_file_dialog(
+                title="Save MM-FEM file",
+                initialdir=initialdir,
+                filename=filename,
+                filters=[("MM-FEM file", f"*{suffix}"), ("All Files", "*")],
+            )
+            if not path:
+                return False
+            payload = data.encode("utf-8") if isinstance(data, str) else bytes(data)
+            Path(path).write_bytes(payload)
+            self._local_path = str(Path(path).parent)
+            self.usersettings.set("save_dir", self._local_path)
+            self.usersettings.set("load_dir", self._local_path)
+            return True
+
         from ngapp.utils import get_environment
 
         write = get_environment().begin_save_file_local(filename)
