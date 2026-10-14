@@ -531,7 +531,7 @@ class SolveWorkspace(Div):
             ),
             _svg(
                 "path", id="solve-sketch-drag-trim", d="", display="none",
-                fill="none", stroke="#d65a31", stroke_width="8",
+                fill="none", stroke="#737b85", stroke_width="3",
                 stroke_linecap="round", stroke_linejoin="round",
                 style="pointer-events:none;",
             ),
@@ -5606,6 +5606,126 @@ class SolveWorkspace(Div):
                         for item in reversed(outer_refs)
                     ],
                 })
+
+        # Region boundaries only consume the portions of sketch curves that
+        # form closed faces. Keep the remaining portions of intersecting line
+        # entities as individual edges so open branches remain visible and
+        # available to select/trim after a nearby face is created.
+        sketch_entities = [
+            entity for entity in geometry.get("sketch_entities", [])
+            if isinstance(entity, dict) and isinstance(entity.get("id"), str)
+        ]
+        line_entities = [
+            entity for entity in sketch_entities
+            if entity.get("type") == "line"
+            and len(entity.get("sampled_points") or entity.get("points") or []) == 2
+        ]
+        split_parameters = {entity["id"]: {0.0, 1.0} for entity in line_entities}
+
+        def vector_cross(first, second):
+            return first[0] * second[1] - first[1] * second[0]
+
+        for entity in line_entities:
+            entity_id = entity["id"]
+            try:
+                first, second = [
+                    tuple(float(value) for value in point[:2])
+                    for point in (entity.get("sampled_points") or entity.get("points"))
+                ]
+            except (TypeError, ValueError, IndexError, OverflowError):
+                continue
+            dx, dy = second[0] - first[0], second[1] - first[1]
+            length_squared = dx * dx + dy * dy
+            length = math.sqrt(length_squared)
+            if length_squared <= 1e-30:
+                continue
+            for other in sketch_entities:
+                if other.get("id") == entity_id:
+                    continue
+                samples = other.get("sampled_points") or other.get("points") or []
+                try:
+                    path = [tuple(float(value) for value in point[:2]) for point in samples]
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    continue
+                for start, end in zip(path, path[1:]):
+                    sx, sy = end[0] - start[0], end[1] - start[1]
+                    other_length = math.hypot(sx, sy)
+                    if other_length <= 1e-15:
+                        continue
+                    denominator = vector_cross((dx, dy), (sx, sy))
+                    qx, qy = start[0] - first[0], start[1] - first[1]
+                    area_tolerance = max(1e-12 * max(length, other_length), 1e-24)
+                    parameter_tolerance = max(
+                        1e-10,
+                        1e-12 / max(length, 1e-12),
+                        1e-12 / max(other_length, 1e-12),
+                    )
+                    if abs(denominator) > area_tolerance:
+                        t = vector_cross((qx, qy), (sx, sy)) / denominator
+                        u = vector_cross((qx, qy), (dx, dy)) / denominator
+                        if (
+                            -parameter_tolerance <= t <= 1.0 + parameter_tolerance
+                            and -parameter_tolerance <= u <= 1.0 + parameter_tolerance
+                        ):
+                            split_parameters[entity_id].add(round(min(1.0, max(0.0, t)), 12))
+                        continue
+
+                    if abs(vector_cross((qx, qy), (dx, dy))) > area_tolerance:
+                        continue
+                    for point in (start, end):
+                        if not _point_on_segment(point, first, second, 1e-10):
+                            continue
+                        t = ((point[0] - first[0]) * dx + (point[1] - first[1]) * dy) / length_squared
+                        split_parameters[entity_id].add(round(min(1.0, max(0.0, t)), 12))
+
+        for entity in line_entities:
+            entity_id = entity["id"]
+            try:
+                first, second = [
+                    tuple(float(value) for value in point[:2])
+                    for point in (entity.get("sampled_points") or entity.get("points"))
+                ]
+            except (TypeError, ValueError, IndexError, OverflowError):
+                continue
+            dx, dy = second[0] - first[0], second[1] - first[1]
+            parameters = sorted(split_parameters[entity_id])
+            for start_t, end_t in zip(parameters, parameters[1:]):
+                if end_t - start_t <= 1e-12:
+                    continue
+                start = (first[0] + start_t * dx, first[1] + start_t * dy)
+                end = (first[0] + end_t * dx, first[1] + end_t * dy)
+                key = _edge_key([start, end])
+                if key in edges_by_key:
+                    continue
+                candidates = source_edges_for(start, end, key)
+                source_edge = next(
+                    (old for old in candidates if old.get("sketch_entity_id") == entity_id),
+                    candidates[0] if candidates else None,
+                )
+                edge = copy.deepcopy(source_edge) if source_edge else {}
+                old_id = source_edge.get("id") if source_edge else None
+                if old_id and old_id not in used_old_ids:
+                    edge_id = old_id
+                    used_old_ids.add(old_id)
+                else:
+                    edge_id = new_id("edge")
+                edge["id"] = edge_id
+                edge["vertices"] = [list(start), list(end)]
+                edge["sketch_entity_id"] = entity_id
+                edge["sketch_t0"] = start_t
+                edge["sketch_t1"] = end_t
+                edge["curve"] = {"type": "line"}
+                if source_edge is None:
+                    edge["name"] = f"Edge {len(edges) + 1}"
+                    edge["boundary_condition_ids"] = []
+                else:
+                    edge["boundary_condition_ids"] = merged_condition_ids(candidates)
+                    if start_t > 1e-12 or end_t < 1.0 - 1e-12:
+                        edge["name"] = f"{source_edge.get('name', 'Edge')} (part)"
+                    edge.pop("boundary_condition_id", None)
+                edges_by_key[key] = edge
+                edges.append(edge)
+                current_edge_ids.add(edge_id)
 
         for old in old_edges:
             if (

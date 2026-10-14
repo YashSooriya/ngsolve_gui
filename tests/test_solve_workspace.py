@@ -1239,6 +1239,52 @@ def test_sketch_line_network_splits_faces_and_reuses_a_shared_boundary(standalon
     assert {tuple(round(value, 12) for value in point) for point in shared_edge["vertices"]} == {(4.0, 0.0), (3.0, 1.5)}
 
 
+def test_intersecting_sketch_lines_keep_open_segments_after_triangle_closes(standalone_components):
+    workspace = SolveWorkspace()
+    for first, second in (
+        ((1, 0), (3, 0)),       # west to east
+        ((2, -1), (2, 1)),      # south to north
+        ((2, 1), (3, 0)),       # close the north-east triangle
+    ):
+        assert workspace._add_sketch_entity("line", [first, second])
+
+    regions = [
+        item for item in workspace.model["geometry"]["regions"]
+        if item.get("shape", {}).get("type") == "sketch"
+    ]
+    assert len(regions) == 1
+
+    def segment_key(edge):
+        return frozenset(tuple(round(float(value), 12) for value in point) for point in edge["vertices"])
+
+    segments = {segment_key(edge) for edge in workspace.model["geometry"]["edges"]}
+    expected = {
+        frozenset({(1.0, 0.0), (2.0, 0.0)}),    # west branch
+        frozenset({(2.0, 0.0), (3.0, 0.0)}),    # east side of triangle
+        frozenset({(2.0, -1.0), (2.0, 0.0)}),   # south branch
+        frozenset({(2.0, 0.0), (2.0, 1.0)}),    # north side of triangle
+        frozenset({(2.0, 1.0), (3.0, 0.0)}),    # closing diagonal
+    }
+    assert segments == expected
+    assert len(workspace.model["geometry"]["sketch_entities"]) == 3
+
+    west_edge = next(
+        edge for edge in workspace.model["geometry"]["edges"]
+        if segment_key(edge) == frozenset({(1.0, 0.0), (2.0, 0.0)})
+    )
+    project, _ = workspace._canvas_projection()
+    assert workspace._trim_sketch_edge_at_canvas_point(west_edge["id"], project((1.5, 0.0)))
+    trimmed_segments = {
+        segment_key(edge) for edge in workspace.model["geometry"]["edges"]
+    }
+    assert frozenset({(1.0, 0.0), (2.0, 0.0)}) not in trimmed_segments
+    assert frozenset({(2.0, -1.0), (2.0, 0.0)}) in trimmed_segments
+    assert len([
+        item for item in workspace.model["geometry"]["regions"]
+        if item.get("shape", {}).get("type") == "sketch"
+    ]) == 1
+
+
 def test_sketch_endpoints_snap_to_nearby_edge_interiors(standalone_components):
     workspace = SolveWorkspace()
     triangle = [
