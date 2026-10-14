@@ -515,6 +515,48 @@ def test_closed_sketch_loop_detection_finds_only_bounded_faces():
     assert set(loops[0]["entity_ids"]) == {"bottom", "right", "top", "left"}
 
 
+def test_closed_sketch_loop_detection_nodes_divider_lines_into_two_faces():
+    entities = [
+        {"id": "bottom", "type": "line", "sampled_points": [[0, 0], [2, 0]]},
+        {"id": "right", "type": "line", "sampled_points": [[2, 0], [2, 2]]},
+        {"id": "top", "type": "line", "sampled_points": [[2, 2], [0, 2]]},
+        {"id": "left", "type": "line", "sampled_points": [[0, 2], [0, 0]]},
+        {"id": "divider", "type": "line", "sampled_points": [[0, 1], [2, 1]]},
+    ]
+
+    loops = find_closed_sketch_loops(entities)
+
+    assert len(loops) == 2
+    areas = [abs(sum(
+        loop["vertices"][index][0] * loop["vertices"][(index + 1) % len(loop["vertices"])][1]
+        - loop["vertices"][index][1] * loop["vertices"][(index + 1) % len(loop["vertices"])][0]
+        for index in range(len(loop["vertices"]))
+    ) / 2) for loop in loops]
+    assert areas == [2.0, 2.0]
+    assert all(any(item["entity_id"] == "divider" for item in loop["boundary"]) for loop in loops)
+
+
+def test_closed_sketch_loop_detection_recognizes_an_adjacent_triangle_on_a_shared_edge():
+    entities = [
+        {"id": "base", "type": "line", "sampled_points": [[0, 0], [4, 0]]},
+        {"id": "right-side", "type": "line", "sampled_points": [[4, 0], [2, 3]]},
+        {"id": "left-side", "type": "line", "sampled_points": [[2, 3], [0, 0]]},
+        {"id": "neighbor-a", "type": "line", "sampled_points": [[4, 0], [5, 1.5]]},
+        {"id": "neighbor-b", "type": "line", "sampled_points": [[5, 1.5], [3, 1.5]]},
+        # The repeated shared edge is intentionally coincident with part of right-side.
+        {"id": "shared-copy", "type": "line", "sampled_points": [[4, 0], [3, 1.5]]},
+    ]
+
+    loops = find_closed_sketch_loops(entities)
+
+    assert len(loops) == 2
+    assert all(len(loop["boundary"]) >= 3 for loop in loops)
+    assert all(
+        reference.get("start_t") is not None and reference.get("end_t") is not None
+        for loop in loops for reference in loop["boundary"]
+    )
+
+
 def test_closed_sketch_loop_detection_supports_curved_samples_and_open_chains():
     entities = [
         {"id": "arc", "type": "arc", "sampled_points": [[0, 0], [1, 0.5], [2, 0]]},

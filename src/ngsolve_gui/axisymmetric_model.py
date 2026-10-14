@@ -56,16 +56,30 @@ _LEGACY_EXPRESSION_UNITS = (*_EXPRESSION_UNITS[:-1], "mm", "m")
 
 
 def find_closed_sketch_loops(entities, *, tolerance=1e-12):
-    """Return bounded polygonal faces formed by connected sampled sketch curves.
+    """Return bounded faces after noding all intersections in sampled curves.
 
-    Entities are polylines with stable ids. A planar half-edge walk extracts
-    each bounded face once, including adjacent faces in a branched sketch.
+    Each sampled curve is treated as a polyline. Proper crossings, T-junctions,
+    and coincident endpoints are inserted as graph vertices before the
+    half-edge walk, so a line that bisects an existing outline creates two
+    selectable faces instead of remaining a visual overlay.
     """
-    if not isinstance(entities, list) or not math.isfinite(float(tolerance)) or tolerance <= 0:
+    if not isinstance(entities, list):
         return []
+    try:
+        tolerance = float(tolerance)
+    except (TypeError, ValueError, OverflowError):
+        return []
+    if not math.isfinite(tolerance) or tolerance <= 0:
+        return []
+
+    paths = {}
+    raw_segments = []
     nodes = {}
     adjacency = {}
-    segments = []
+
+    def point_key(point):
+        return (round(point[0] / tolerance), round(point[1] / tolerance))
+
     for entity in entities:
         if not isinstance(entity, dict) or not isinstance(entity.get("id"), str):
             continue
@@ -80,68 +94,198 @@ def find_closed_sketch_loops(entities, *, tolerance=1e-12):
                 continue
             if not all(math.isfinite(component) for component in value):
                 continue
-            key = (round(value[0] / tolerance), round(value[1] / tolerance))
-            if not path or path[-1] != key:
-                nodes.setdefault(key, value)
-                path.append(key)
+            if not path or math.dist(path[-1], value) > tolerance:
+                path.append(value)
+        if len(path) < 2:
+            continue
+        paths[entity["id"]] = path
+        segment_count = len(path) - 1
         for segment_index, (first, second) in enumerate(zip(path, path[1:])):
-            if first == second:
+            if math.dist(first, second) <= tolerance:
                 continue
-            index = len(segments)
-            segments.append((first, second, entity["id"], segment_index, len(path) - 1))
-            adjacency.setdefault(first, []).append((second, index))
-            adjacency.setdefault(second, []).append((first, index))
+            raw_segments.append({
+                "a": first,
+                "b": second,
+                "entity_id": entity["id"],
+                "segment_index": segment_index,
+                "segment_count": segment_count,
+            })
+
+    if len(raw_segments) < 3:
+        return []
+
+    cuts = [[(0.0, segment["a"]), (1.0, segment["b"])] for segment in raw_segments]
+
+    def cross(a, b):
+        return a[0] * b[1] - a[1] * b[0]
+
+    def add_cut(index, fraction, point):
+        fraction = min(1.0, max(0.0, float(fraction)))
+        cuts[index].append((fraction, (float(point[0]), float(point[1]))))
+
+    def point_parameter(point, first, second):
+        dx, dy = second[0] - first[0], second[1] - first[1]
+        length_squared = dx * dx + dy * dy
+        if length_squared <= tolerance * tolerance:
+            return None
+        fraction = ((point[0] - first[0]) * dx + (point[1] - first[1]) * dy) / length_squared
+        parameter_tolerance = max(1e-10, tolerance / math.sqrt(length_squared))
+        if fraction < -parameter_tolerance or fraction > 1.0 + parameter_tolerance:
+            return None
+        nearest = (first[0] + fraction * dx, first[1] + fraction * dy)
+        if math.dist(point, nearest) > max(tolerance * 10.0, 1e-12):
+            return None
+        return min(1.0, max(0.0, fraction))
+
+    for first_index, first in enumerate(raw_segments):
+        a, b = first["a"], first["b"]
+        rx, ry = b[0] - a[0], b[1] - a[1]
+        first_length = math.hypot(rx, ry)
+        for second_index in range(first_index + 1, len(raw_segments)):
+            second = raw_segments[second_index]
+            c, d = second["a"], second["b"]
+            if (
+                max(a[0], b[0]) < min(c[0], d[0]) - tolerance
+                or max(c[0], d[0]) < min(a[0], b[0]) - tolerance
+                or max(a[1], b[1]) < min(c[1], d[1]) - tolerance
+                or max(c[1], d[1]) < min(a[1], b[1]) - tolerance
+            ):
+                continue
+            if first["entity_id"] == second["entity_id"]:
+                gap = abs(first["segment_index"] - second["segment_index"])
+                closed_path = math.dist(paths[first["entity_id"]][0], paths[first["entity_id"]][-1]) <= tolerance
+                if gap <= 1 or (closed_path and gap == first["segment_count"] - 1):
+                    continue
+            sx, sy = d[0] - c[0], d[1] - c[1]
+            qx, qy = c[0] - a[0], c[1] - a[1]
+            denominator = cross((rx, ry), (sx, sy))
+            second_length = math.hypot(sx, sy)
+            parameter_tolerance = max(
+                1e-10,
+                tolerance / max(first_length, tolerance),
+                tolerance / max(second_length, tolerance),
+            )
+            area_tolerance = max(tolerance * max(first_length, second_length), 1e-24)
+            if abs(denominator) > area_tolerance:
+                t = cross((qx, qy), (sx, sy)) / denominator
+                u = cross((qx, qy), (rx, ry)) / denominator
+                if (
+                    -parameter_tolerance <= t <= 1.0 + parameter_tolerance
+                    and -parameter_tolerance <= u <= 1.0 + parameter_tolerance
+                ):
+                    t = min(1.0, max(0.0, t))
+                    u = min(1.0, max(0.0, u))
+                    point_a = (a[0] + t * rx, a[1] + t * ry)
+                    point_b = (c[0] + u * sx, c[1] + u * sy)
+                    point = ((point_a[0] + point_b[0]) / 2.0, (point_a[1] + point_b[1]) / 2.0)
+                    add_cut(first_index, t, point)
+                    add_cut(second_index, u, point)
+                continue
+
+            if abs(cross((qx, qy), (rx, ry))) > area_tolerance:
+                continue
+            for point in (c, d):
+                t = point_parameter(point, a, b)
+                if t is not None:
+                    u = point_parameter(point, c, d)
+                    add_cut(first_index, t, point)
+                    if u is not None:
+                        add_cut(second_index, u, point)
+            for point in (a, b):
+                u = point_parameter(point, c, d)
+                if u is not None:
+                    t = point_parameter(point, a, b)
+                    add_cut(second_index, u, point)
+                    if t is not None:
+                        add_cut(first_index, t, point)
+
+    segments = []
+    seen_edges = set()
+    for index, segment in enumerate(raw_segments):
+        ordered = sorted(cuts[index], key=lambda item: item[0])
+        clean = []
+        for fraction, point in ordered:
+            key = point_key(point)
+            if clean and key == clean[-1][2]:
+                continue
+            clean.append((fraction, point, key))
+            nodes.setdefault(key, point)
+        for first_cut, second_cut in zip(clean, clean[1:]):
+            first_t, _first_point, first_key = first_cut
+            second_t, _second_point, second_key = second_cut
+            if first_key == second_key:
+                continue
+            edge_key = tuple(sorted((first_key, second_key)))
+            if edge_key in seen_edges:
+                continue
+            seen_edges.add(edge_key)
+            path_t0 = (segment["segment_index"] + first_t) / segment["segment_count"]
+            path_t1 = (segment["segment_index"] + second_t) / segment["segment_count"]
+            edge_index = len(segments)
+            segments.append((first_key, second_key, segment["entity_id"], path_t0, path_t1))
+            adjacency.setdefault(first_key, []).append((second_key, edge_index))
+            adjacency.setdefault(second_key, []).append((first_key, edge_index))
+
     if len(segments) < 3:
         return []
 
-    ordered = {}
-    for origin, neighbors in adjacency.items():
-        ordered[origin] = sorted(
+    ordered_neighbors = {
+        origin: sorted(
             neighbors,
             key=lambda item: math.atan2(
                 nodes[item[0]][1] - nodes[origin][1],
                 nodes[item[0]][0] - nodes[origin][0],
             ),
         )
+        for origin, neighbors in adjacency.items()
+    }
 
     visited = set()
     loops = []
     seen_loops = set()
-    for index, (first, second, _entity_id, _segment_index, _segment_count) in enumerate(segments):
-        for origin, destination in ((first, second), (second, first)):
-            initial = (origin, index)
+    for edge_index, (first, second, _entity_id, _path_t0, _path_t1) in enumerate(segments):
+        for origin, _destination in ((first, second), (second, first)):
+            initial = (origin, edge_index)
             if initial in visited:
                 continue
             current = initial
             cycle_nodes = []
-            cycle_entities = []
+            cycle_refs = []
             closed = False
             for _ in range(2 * len(segments) + 1):
-                start, edge_index = current
+                start, current_edge = current
                 if current in visited:
                     closed = current == initial
                     break
                 visited.add(current)
                 cycle_nodes.append(start)
-                edge_start, edge_end, entity_id, segment_index, _segment_count = segments[edge_index]
+                edge_start, edge_end, entity_id, path_t0, path_t1 = segments[current_edge]
                 forward = start == edge_start
-                cycle_entities.append((entity_id, forward))
+                from_t, to_t = (path_t0, path_t1) if forward else (path_t1, path_t0)
+                cycle_refs.append({
+                    "entity_id": entity_id,
+                    "forward": forward,
+                    "start_t": from_t,
+                    "end_t": to_t,
+                })
                 end = edge_end if forward else edge_start
-                outgoing = ordered.get(end, [])
+                outgoing = ordered_neighbors.get(end, [])
                 reverse_position = next(
-                    (slot for slot, item in enumerate(outgoing) if item[0] == start and item[1] == edge_index),
+                    (slot for slot, item in enumerate(outgoing) if item[0] == start and item[1] == current_edge),
                     None,
                 )
                 if reverse_position is None or not outgoing:
                     break
-                # Taking the preceding ray keeps the traversed face on the left.
-                next_neighbor, next_edge_index = outgoing[(reverse_position - 1) % len(outgoing)]
+                _next_neighbor, next_edge_index = outgoing[(reverse_position - 1) % len(outgoing)]
                 current = (end, next_edge_index)
                 if current == initial:
                     closed = True
                     break
             if not closed or len(cycle_nodes) < 3:
                 continue
+            canonical_start = min(range(len(cycle_nodes)), key=lambda index: cycle_nodes[index])
+            cycle_nodes = cycle_nodes[canonical_start:] + cycle_nodes[:canonical_start]
+            cycle_refs = cycle_refs[canonical_start:] + cycle_refs[:canonical_start]
             polygon = [nodes[key] for key in cycle_nodes]
             area = 0.5 * sum(
                 polygon[i][0] * polygon[(i + 1) % len(polygon)][1]
@@ -156,13 +300,22 @@ def find_closed_sketch_loops(entities, *, tolerance=1e-12):
             if signature in seen_loops:
                 continue
             seen_loops.add(signature)
+
             boundary = []
-            for entity_id, forward in cycle_entities:
-                if boundary and boundary[-1] == {"entity_id": entity_id, "forward": forward}:
-                    continue
-                boundary.append({"entity_id": entity_id, "forward": forward})
-            if len(boundary) > 1 and boundary[0] == boundary[-1]:
-                boundary.pop()
+            for reference_index, reference in enumerate(cycle_refs):
+                join_node = cycle_nodes[reference_index]
+                is_topology_junction = len(adjacency.get(join_node, ())) > 2
+                if boundary and not is_topology_junction:
+                    previous = boundary[-1]
+                    contiguous = abs(previous["end_t"] - reference["start_t"]) <= 1e-9
+                    same_direction = (previous["end_t"] - previous["start_t"]) * (
+                        reference["end_t"] - reference["start_t"]
+                    ) > 0
+                    if previous["entity_id"] == reference["entity_id"] and contiguous and same_direction:
+                        previous["end_t"] = reference["end_t"]
+                        previous["forward"] = previous["end_t"] > previous["start_t"]
+                        continue
+                boundary.append(reference)
             loops.append({
                 "vertices": [[float(point[0]), float(point[1])] for point in polygon],
                 "boundary": boundary,
@@ -1742,9 +1895,17 @@ def _polygons_overlap_interior(first, second):
         or second_bounds[3] <= first_bounds[2]
     ):
         return False
-    if any(_point_in_polygon(point, second) for point in first):
+    def strictly_inside(point, polygon):
+        if any(
+            _point_on_segment(point, polygon[index], polygon[(index + 1) % len(polygon)])
+            for index in range(len(polygon))
+        ):
+            return False
+        return _point_in_polygon(point, polygon)
+
+    if any(strictly_inside(point, second) for point in first):
         return True
-    if any(_point_in_polygon(point, first) for point in second):
+    if any(strictly_inside(point, first) for point in second):
         return True
 
     scale = max(

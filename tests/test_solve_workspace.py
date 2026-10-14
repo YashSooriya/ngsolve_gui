@@ -1156,6 +1156,86 @@ def test_drag_sketches_dimensioned_rectangle_and_circle_regions(standalone_compo
     ]
 
 
+def test_sketch_line_network_splits_faces_and_reuses_a_shared_boundary(standalone_components):
+    workspace = SolveWorkspace()
+    for first, second in (
+        ((0, 0), (4, 0)),
+        ((4, 0), (2, 3)),
+        ((2, 3), (0, 0)),
+    ):
+        assert workspace._add_sketch_entity("line", [first, second])
+    original = workspace.model["geometry"]["regions"][0]
+    original_id = original["id"]
+    original["material_id"] = "material-copper"
+
+    assert workspace._add_sketch_entity("line", [(4, 0), (5, 1.5)])
+    assert workspace._add_sketch_entity("line", [(5, 1.5), (3, 1.5)])
+    # Redrawing the shared boundary must not create a third face or duplicate the topological edge.
+    assert workspace._add_sketch_entity("line", [(4, 0), (3, 1.5)])
+
+    regions = [item for item in workspace.model["geometry"]["regions"] if item.get("shape", {}).get("type") == "sketch"]
+    assert len(regions) == 2
+    assert any(item["id"] == original_id and item["material_id"] == "material-copper" for item in regions)
+    shared_edges = set(regions[0]["edge_ids"]).intersection(regions[1]["edge_ids"])
+    assert len(shared_edges) == 1, {
+        "regions": [(item["vertices"], item["edge_ids"], item["shape"]["boundary"]) for item in regions],
+        "edges": [(item["id"], item["vertices"], item.get("sketch_entity_id")) for item in workspace.model["geometry"]["edges"]],
+    }
+    shared_edge = next(item for item in workspace.model["geometry"]["edges"] if item["id"] in shared_edges)
+    assert {tuple(round(value, 12) for value in point) for point in shared_edge["vertices"]} == {(4.0, 0.0), (3.0, 1.5)}
+
+
+def test_sketch_endpoints_snap_to_nearby_edge_interiors(standalone_components):
+    workspace = SolveWorkspace()
+    triangle = [
+        ((0.004, 0.0), (0.016, 0.0)),
+        ((0.016, 0.0), (0.010, 0.010)),
+        ((0.010, 0.010), (0.004, 0.0)),
+    ]
+    for first, second in triangle:
+        assert workspace._add_sketch_entity("line", [first, second])
+    assert len([item for item in workspace.model["geometry"]["regions"] if item.get("shape", {}).get("type") == "sketch"]) == 1
+
+    project, unproject = workspace._canvas_projection()
+    target = project((0.010, 0.0))
+    near_edge = unproject((target[0], target[1] + 4.0))
+    assert workspace._add_sketch_entity("line", [(0.010, 0.010), near_edge])
+    regions = [item for item in workspace.model["geometry"]["regions"] if item.get("shape", {}).get("type") == "sketch"]
+    assert len(regions) == 2
+
+
+def test_line_and_trim_preview_paths_are_separate_from_marquee(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    scripts = []
+    monkeypatch.setattr(SolveWorkspace, "js", property(lambda self: SimpleNamespace(eval=scripts.append)), raising=False)
+    workspace._install_canvas_pointer_capture()
+    script = scripts[0]
+    preview = script.split("const updatePreview = (svg, point, screenPoint = null) => {", 1)[1].split("const beginGesture", 1)[0]
+    assert "solve-sketch-drag-line" in script
+    assert "tool === 'line'" in preview
+    assert "tool === 'arc'" in preview
+    assert "hide(rect); hide(circle); hide(spline); hide(line); hide(trim);" in preview
+    assert "tool === 'trim'" in preview
+    assert "gestureScreenPoints.map(toScenePoint)" in preview
+    assert "line.setAttribute('d'," in preview
+    assert "dragStart[0]" in preview and "point[0]" in preview
+    assert "updatePreview(pending.svg, toScenePoint(screenPoint), screenPoint);" in script
+    assert "document.addEventListener('pointermove'" in script
+    assert "solve-sketch-drag-trim" in script
+    assert "corner rectangle" not in preview
+
+
+def test_trim_pencil_stroke_removes_only_curves_it_crosses(standalone_components):
+    workspace = SolveWorkspace()
+    assert workspace._add_sketch_entity("line", [(0.002, 0.0), (0.008, 0.0)])
+    assert workspace._add_sketch_entity("line", [(0.020, 0.004), (0.026, 0.004)])
+
+    assert workspace._trim_sketch_entities_along_stroke([(0.005, -0.001), (0.005, 0.001)])
+    remaining = workspace.model["geometry"]["sketch_entities"]
+    assert len(remaining) == 1
+    assert remaining[0]["points"] == [[0.02, 0.004], [0.026, 0.004]]
+
+
 def test_mouse_drawn_geometry_uses_si_values_with_0_01mm_precision(standalone_components):
     workspace = SolveWorkspace()
     project, _ = workspace._canvas_projection()

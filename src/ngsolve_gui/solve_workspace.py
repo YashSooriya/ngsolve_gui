@@ -418,6 +418,8 @@ class SolveWorkspace(Div):
         self._status_flash_variant = 0
         self.validation_issues = []
         self.sketch_tool = "select"
+        self._sketch_tool_variant = {"rectangle": "corner", "circle": "center-radius", "arc": "three-point"}
+        self._pending_circle_points = []
         self._canvas_drag = None
         self._screen_to_svg = None
         self._canvas_view_commit_version = 0
@@ -475,6 +477,17 @@ class SolveWorkspace(Div):
                 "path", id="solve-sketch-drag-spline", d="", display="none",
                 fill="none", stroke="#0877b9", stroke_width="2",
                 stroke_dasharray="6 4", style="pointer-events:none;",
+            ),
+            _svg(
+                "path", id="solve-sketch-drag-line", d="", display="none",
+                fill="none", stroke="#0877b9", stroke_width="2.5",
+                style="pointer-events:none;",
+            ),
+            _svg(
+                "path", id="solve-sketch-drag-trim", d="", display="none",
+                fill="none", stroke="#d65a31", stroke_width="8",
+                stroke_linecap="round", stroke_linejoin="round",
+                style="pointer-events:none;",
             ),
         )
         for component, element_id in (
@@ -598,17 +611,45 @@ class SolveWorkspace(Div):
             tooltip="Drag regions to move them; drag empty space to select edges; middle-drag to pan. Hold Shift to add to the selection.",
             style="flex:0 0 auto; white-space:nowrap;",
         )
-        rectangle_button = _button(
-            "Rectangle", "mdi-rectangle-outline",
-            lambda *a: self.set_sketch_tool("rectangle"),
-            tooltip="Draw a rectangle by dragging between opposite corners.",
-            style="flex:0 0 auto; white-space:nowrap;",
+        def sketch_tool_group(label, icon, tool, options, tooltip):
+            main = _button(
+                label, icon,
+                lambda *a, active_tool=tool, default_variant=options[0][0]:
+                    self.set_sketch_tool(active_tool, variant=default_variant),
+                tooltip=tooltip,
+                style="flex:0 0 auto; white-space:nowrap; border-top-right-radius:0; border-bottom-right-radius:0;",
+            )
+            menu_items = []
+            for variant, option_label in options:
+                item = QItem(QItemSection(option_label), ui_clickable=True, ui_dense=True)
+                item.on_click(
+                    lambda event=None, active_tool=tool, selected_variant=variant:
+                        self.set_sketch_tool(active_tool, variant=selected_variant)
+                )
+                menu_items.append(item)
+            menu = QMenu(
+                QList(*menu_items, ui_dense=True),
+                ui_anchor="bottom left",
+                ui_self="top left",
+            )
+            arrow = QBtn(
+                QTooltip(f"More {label.lower()} options"), menu,
+                ui_icon="mdi-menu-down", ui_flat=True, ui_dense=True, ui_no_caps=True,
+                ui_class="mmfem-sketch-tool-menu",
+                ui_style="min-width:25px; width:25px; padding:0; border-top-left-radius:0; border-bottom-left-radius:0;",
+            )
+            group = Div(main, arrow, ui_style="display:flex; flex:none; align-items:stretch;")
+            return main, group
+
+        rectangle_button, rectangle_group = sketch_tool_group(
+            "Rectangle", "mdi-rectangle-outline", "rectangle",
+            (("corner", "Corner rectangle"), ("center", "Center rectangle")),
+            "Choose corner or center rectangle, then drag to size it.",
         )
-        circle_button = _button(
-            "Circle", "mdi-circle-outline",
-            lambda *a: self.set_sketch_tool("circle"),
-            tooltip="Draw a circle by dragging from its centre to its radius.",
-            style="flex:0 0 auto; white-space:nowrap;",
+        circle_button, circle_group = sketch_tool_group(
+            "Circle", "mdi-circle-outline", "circle",
+            (("center-radius", "Centerpoint circle"), ("three-point", "3-point circle")),
+            "Choose a centerpoint circle by dragging or a 3-point circle by clicking three circumference points.",
         )
         line_button = _button(
             "Line", "mdi-vector-line",
@@ -616,17 +657,10 @@ class SolveWorkspace(Div):
             tooltip="Draw a straight sketch edge by dragging between endpoints.",
             style="flex:0 0 auto; white-space:nowrap;",
         )
-        arc_button = _button(
-            "Arc", "mdi-chart-bell-curve-cumulative",
-            lambda *a: self.set_sketch_tool("arc"),
-            tooltip="Create a circular arc with three clicks: start, point on arc, end.",
-            style="flex:0 0 auto; white-space:nowrap;",
-        )
-        spline_button = _button(
-            "Spline", "mdi-sine-wave",
-            lambda *a: self.set_sketch_tool("spline"),
-            tooltip="Draw a smooth freehand spline by dragging.",
-            style="flex:0 0 auto; white-space:nowrap;",
+        arc_button, arc_group = sketch_tool_group(
+            "Arc", "mdi-chart-bell-curve-cumulative", "arc",
+            (("three-point", "3-point arc"), ("centerpoint", "Centerpoint arc"), ("tangent", "Tangent arc")),
+            "Choose a 3-point, centerpoint, or tangent arc.",
         )
         trim_button = _button(
             "Trim", "mdi-content-cut",
@@ -664,11 +698,10 @@ class SolveWorkspace(Div):
         self._preview_3d_tooltip = self._preview_3d_button.ui_slots["default"][0]
         toolbar = Div(
             select_button,
-            rectangle_button,
-            circle_button,
+            rectangle_group,
+            circle_group,
             line_button,
-            arc_button,
-            spline_button,
+            arc_group,
             trim_button,
             delete_edge_button,
             snap_button,
@@ -687,13 +720,12 @@ class SolveWorkspace(Div):
             "circle": circle_button,
             "line": line_button,
             "arc": arc_button,
-            "spline": spline_button,
             "trim": trim_button,
         }
         self._snap_button = snap_button
         self._sketch_view_controls = [
-            select_button, rectangle_button, circle_button, line_button, arc_button,
-            spline_button, trim_button, delete_edge_button, snap_button,
+            select_button, rectangle_group, circle_group, line_button, arc_group,
+            trim_button, delete_edge_button, snap_button,
             sketch_toolbar_separator, fit_view_button, zoom_out_button,
             zoom_in_button, self._mesh_preview_button,
         ]
@@ -1252,18 +1284,31 @@ class SolveWorkspace(Div):
             self._properties_splitter.ui_limits = [240, 500]
         self._sync_panel_reopen_tabs()
 
-    def set_sketch_tool(self, tool, *, announce=True):
+    def set_sketch_tool(self, tool, *, announce=True, variant=None):
         if tool not in {"select", "rectangle", "circle", "line", "arc", "spline", "trim"}:
             return
+        if not hasattr(self, "_sketch_tool_variant"):
+            self._sketch_tool_variant = {"rectangle": "corner", "circle": "center-radius", "arc": "three-point"}
         if tool != "arc":
             self._pending_arc_points = []
+        if tool != "circle":
+            self._pending_circle_points = []
+        if variant is not None:
+            next_variant = str(variant)
+            if self._sketch_tool_variant.get(tool) != next_variant:
+                if tool == "arc":
+                    self._pending_arc_points = []
+                if tool == "circle":
+                    self._pending_circle_points = []
+            self._sketch_tool_variant[tool] = next_variant
         self.sketch_tool = tool
         self._canvas_drag = None
         self._screen_to_svg = None
         try:
             self.js.eval(
                 "if (window.__ngsolveCancelSketchGesture) window.__ngsolveCancelSketchGesture(); "
-                f"window.__ngsolveSketchTool = '{tool}'"
+                f"window.__ngsolveSketchTool = '{tool}'; "
+                f"window.__ngsolveSketchToolVariant = '{self._sketch_tool_variant.get(tool, '')}'"
             )
         except Exception:
             # Standalone tests and non-browser frontends have no JS runtime.
@@ -1287,14 +1332,19 @@ class SolveWorkspace(Div):
         self._refresh_sketch_tool_buttons()
         self._sync_canvas_interaction_settings()
         if announce:
+            variant = self._sketch_tool_variant.get(tool, "")
             help_text = {
                 "select": "Drag regions to move them; drag empty space to select edges; middle-drag to pan. Hold Shift to add to the selection.",
-                "rectangle": "Drag between opposite corners to sketch a rectangle; its dimensions remain editable.",
-                "circle": "Drag from the circle centre to its radius; its position and radius remain editable.",
-                "line": "Drag between two endpoints to add a line. Connected lines form regions automatically.",
-                "arc": "Click the arc start, a point on the arc, then its end. Connected curves form regions automatically.",
+                "rectangle": "Drag to draw a center rectangle." if variant == "center" else "Drag between opposite corners to draw a rectangle.",
+                "circle": "Click three points on the circle." if variant == "three-point" else "Drag from the circle centre to its radius.",
+                "line": "Drag between two endpoints; the live line preview follows your pointer.",
+                "arc": {
+                    "three-point": "Click the start, a point on the arc, then its end.",
+                    "centerpoint": "Click the center, start point, then end point of the arc.",
+                    "tangent": "Click an existing curve endpoint, then the tangent arc endpoint.",
+                }.get(variant, "Choose an arc construction method."),
                 "spline": "Drag to draw a smooth spline. Closed curve loops become regions automatically.",
-                "trim": "Click the part of an open line to remove between its neighboring intersections.",
+                "trim": "Drag the trim pencil across sketch edges to remove the touched curve segments.",
             }
             self._message(help_text[tool])
 
@@ -2021,7 +2071,7 @@ class SolveWorkspace(Div):
       const dimensions = svg.querySelector('#solve-sketch-dimensions');
       if (dimensions) dimensions.removeAttribute('transform');
     }
-    for (const id of ['solve-sketch-drag-rect', 'solve-sketch-drag-circle', 'solve-sketch-drag-spline']) {
+    for (const id of ['solve-sketch-drag-rect', 'solve-sketch-drag-circle', 'solve-sketch-drag-spline', 'solve-sketch-drag-line', 'solve-sketch-drag-trim']) {
       const shape = svg.querySelector('#' + id);
       if (shape) shape.setAttribute('display', 'none');
     }
@@ -2110,31 +2160,57 @@ class SolveWorkspace(Div):
     const rect = svg.querySelector('#solve-sketch-drag-rect');
     const circle = svg.querySelector('#solve-sketch-drag-circle');
     const spline = svg.querySelector('#solve-sketch-drag-spline');
+    const line = svg.querySelector('#solve-sketch-drag-line');
+    const trim = svg.querySelector('#solve-sketch-drag-trim');
+    const hide = (node) => { if (node) node.setAttribute('display', 'none'); };
+    if (tool === 'line') {
+      hide(rect); hide(circle); hide(spline); hide(trim);
+      if (!line || Math.hypot(dx, dy) < 1) { hide(line); return; }
+      line.setAttribute('display', 'inline');
+      line.setAttribute('d', `M${dragStart[0]},${dragStart[1]} L${point[0]},${point[1]}`);
+      return;
+    }
+    if (tool === 'trim') {
+      hide(rect); hide(circle); hide(spline); hide(line);
+      if (!trim) return;
+      const points = gestureScreenPoints.map(toScenePoint);
+      const current = point;
+      if (!points.length || Math.hypot(points[points.length - 1][0] - current[0], points[points.length - 1][1] - current[1]) > 0.5) points.push(current);
+      if (points.length < 2) { hide(trim); return; }
+      trim.setAttribute('display', 'inline');
+      trim.setAttribute('d', points.map((item, index) => (index ? 'L' : 'M') + item[0] + ',' + item[1]).join(' '));
+      return;
+    }
     if (tool === 'spline') {
-      if (rect) rect.setAttribute('display', 'none');
-      if (circle) circle.setAttribute('display', 'none');
+      hide(rect); hide(circle); hide(line); hide(trim);
       if (!spline) return;
       const points = gestureScreenPoints.map(toScenePoint);
-      const current = toScenePoint(point);
+      const current = point;
       if (!points.length || Math.hypot(points[points.length - 1][0] - current[0], points[points.length - 1][1] - current[1]) > 0.5) points.push(current);
-      if (points.length < 2) { spline.setAttribute('display', 'none'); return; }
+      if (points.length < 2) { hide(spline); return; }
       spline.setAttribute('display', 'inline');
       spline.setAttribute('d', points.map((item, index) => (index ? 'L' : 'M') + item[0] + ',' + item[1]).join(' '));
       return;
     }
-    if (spline) spline.setAttribute('display', 'none');
+    if (tool === 'arc') {
+      hide(rect); hide(circle); hide(spline); hide(line); hide(trim);
+      return;
+    }
+    hide(spline); hide(line); hide(trim);
     if (Math.hypot(dx, dy) < 4) {
       if (rect) rect.setAttribute('display', 'none');
       if (circle) circle.setAttribute('display', 'none');
       return;
     }
     if (tool === 'circle') {
+      if ((window.__ngsolveSketchToolVariant || 'center-radius') === 'three-point') { hide(circle); return; }
       if (rect) rect.setAttribute('display', 'none');
       if (!circle) return;
       circle.setAttribute('display', 'inline');
-      circle.setAttribute('cx', dragStart[0]);
-      circle.setAttribute('cy', dragStart[1]);
-      circle.setAttribute('r', Math.hypot(dx, dy));
+      const variant = window.__ngsolveSketchToolVariant || 'center-radius';
+      circle.setAttribute('cx', variant === 'center-radius' ? dragStart[0] : (dragStart[0] + point[0]) / 2);
+      circle.setAttribute('cy', variant === 'center-radius' ? dragStart[1] : (dragStart[1] + point[1]) / 2);
+      circle.setAttribute('r', Math.hypot(dx, dy) / (variant === 'diameter' ? 2 : 1));
       return;
     }
     if (circle) circle.setAttribute('display', 'none');
@@ -2147,10 +2223,11 @@ class SolveWorkspace(Div):
       ? (windowSelection ? '#2385bd' : '#c66f16')
       : '#0877b9';
     rect.setAttribute('display', 'inline');
-    rect.setAttribute('x', Math.min(dragStart[0], point[0]));
-    rect.setAttribute('y', Math.min(dragStart[1], point[1]));
-    rect.setAttribute('width', Math.abs(dx));
-    rect.setAttribute('height', Math.abs(dy));
+    const centerRectangle = tool === 'rectangle' && (window.__ngsolveSketchToolVariant || '') === 'center';
+    rect.setAttribute('x', centerRectangle ? dragStart[0] - Math.abs(dx) : Math.min(dragStart[0], point[0]));
+    rect.setAttribute('y', centerRectangle ? dragStart[1] - Math.abs(dy) : Math.min(dragStart[1], point[1]));
+    rect.setAttribute('width', centerRectangle ? 2 * Math.abs(dx) : Math.abs(dx));
+    rect.setAttribute('height', centerRectangle ? 2 * Math.abs(dy) : Math.abs(dy));
     rect.setAttribute('fill', fill);
     rect.setAttribute('stroke', stroke);
     rect.setAttribute('stroke-width', isSelection ? '1.5' : '2');
@@ -2261,6 +2338,7 @@ class SolveWorkspace(Div):
         dragRegionId || '', Boolean(event.shiftKey || event.ctrlKey), moved,
         visualScale, visualTranslateX, visualTranslateY, viewVersion,
         finishedEdgeId || '', finishedSketchPoints,
+        window.__ngsolveSketchToolVariant || '',
       ];
       if (wheelCommitTimer) window.clearTimeout(wheelCommitTimer);
       wheelCommitTimer = 0;
@@ -2741,27 +2819,40 @@ class SolveWorkspace(Div):
                 view = tuple(float(completed[index]) for index in (9, 10, 11)) + (int(completed[12]),)
                 edge_id = (str(completed[13]) or None) if len(completed) >= 14 else None
                 sketch_screen_points = completed[14] if len(completed) >= 15 and isinstance(completed[14], (list, tuple)) else []
+                tool_variant = str(completed[15]) if len(completed) >= 16 else self._sketch_tool_variant.get(tool, "")
             except (TypeError, ValueError, OverflowError):
                 completed = None
             else:
                 pending_drag = self._canvas_drag or {}
                 pending_operation = pending_drag.get("operation")
-                if operation == "trim" and not moved:
+                if operation == "trim":
                     self._canvas_drag = None
                     self._screen_to_svg = None
-                    self._commit_browser_canvas_view(view, render=False, clamp_negative_r=True)
-                    if edge_id:
-                        self._trim_sketch_edge_at_canvas_point(edge_id, end)
+                    view_changed = self._commit_browser_canvas_view(view, render=False, clamp_negative_r=True)
+                    if moved:
+                        stroke = sketch_screen_points or [start, end]
+                        world_stroke = self._sketch_screen_points_to_world(stroke, snap=False)
+                        changed = self._trim_sketch_entities_along_stroke(world_stroke)
+                    elif edge_id:
+                        changed = self._trim_sketch_edge_at_canvas_point(edge_id, end)
                     else:
-                        self._message("Select an open sketch edge to trim.")
+                        self._message("Drag the trim pencil across sketch edges to remove them.")
+                        changed = False
+                    if view_changed and not changed:
+                        self._render_canvas_after_interaction()
                     return
-                if operation == "draw" and tool in {"line", "arc", "spline"}:
+                if operation == "draw" and (tool in {"line", "arc", "spline"} or (tool == "circle" and tool_variant == "three-point")):
                     self._canvas_drag = None
                     self._screen_to_svg = None
                     view_changed = self._commit_browser_canvas_view(view, render=False, clamp_negative_r=True)
                     if tool == "arc" and not moved:
                         world_point = self._sketch_screen_points_to_world([start], snap=True)[0]
-                        self._accept_arc_sketch_point(world_point)
+                        self._accept_arc_sketch_point(world_point, variant=tool_variant)
+                        if view_changed:
+                            self._render_canvas_after_interaction()
+                    elif tool == "circle" and tool_variant == "three-point" and not moved:
+                        world_point = self._sketch_screen_points_to_world([start], snap=True)[0]
+                        self._accept_circle_sketch_point(world_point)
                         if view_changed:
                             self._render_canvas_after_interaction()
                     elif moved and tool == "line":
@@ -3073,6 +3164,8 @@ class SolveWorkspace(Div):
         second = tuple(_round_sketch_m(coordinate) for coordinate in unproject(end))
         before = len(self.model["geometry"]["regions"])
         if tool == "rectangle":
+            if self._sketch_tool_variant.get("rectangle", "corner") == "center":
+                second = (2 * first[0] - second[0], 2 * first[1] - second[1])
             r_min, r_max = sorted((first[0], second[0]))
             z_min, z_max = sorted((first[1], second[1]))
             values = {
@@ -3082,10 +3175,15 @@ class SolveWorkspace(Div):
                 "height": _round_sketch_m(z_max - z_min),
             }
         else:
-            radius = math.hypot(second[0] - first[0], second[1] - first[1])
+            if self._sketch_tool_variant.get("circle", "center-radius") == "diameter":
+                center = ((first[0] + second[0]) / 2.0, (first[1] + second[1]) / 2.0)
+                radius = math.hypot(second[0] - first[0], second[1] - first[1]) / 2.0
+            else:
+                center = first
+                radius = math.hypot(second[0] - first[0], second[1] - first[1])
             values = {
-                "r_center": _round_sketch_m(first[0]),
-                "z_center": _round_sketch_m(first[1]),
+                "r_center": _round_sketch_m(center[0]),
+                "z_center": _round_sketch_m(center[1]),
                 "radius": _round_sketch_m(radius),
             }
         for key, value in values.items():
@@ -3106,17 +3204,22 @@ class SolveWorkspace(Div):
         return result
 
     def _snap_sketch_endpoint(self, point):
-        """Snap a newly drawn endpoint to nearby existing curve endpoints."""
+        """Snap endpoints to nearby sketch vertices or curve segments."""
         project, _ = self._canvas_projection()
         target = project(point)
         candidates = []
         for entity in self.model["geometry"].get("sketch_entities", []):
             samples = entity.get("sampled_points") or entity.get("points") or []
-            for candidate in (samples[0], samples[-1]) if samples else ():
-                screen = project(candidate)
-                distance = math.hypot(target[0] - screen[0], target[1] - screen[1])
+            projected = [project(candidate) for candidate in samples]
+            for first, second, screen_first, screen_second in zip(samples, samples[1:], projected, projected[1:]):
+                dx, dy = screen_second[0] - screen_first[0], screen_second[1] - screen_first[1]
+                length_squared = dx * dx + dy * dy
+                fraction = 0.0 if length_squared <= 1e-16 else min(1.0, max(0.0, ((target[0] - screen_first[0]) * dx + (target[1] - screen_first[1]) * dy) / length_squared))
+                screen_nearest = (screen_first[0] + fraction * dx, screen_first[1] + fraction * dy)
+                distance = math.hypot(target[0] - screen_nearest[0], target[1] - screen_nearest[1])
                 if distance <= 8.0:
-                    candidates.append((distance, tuple(candidate)))
+                    world_nearest = (first[0] + fraction * (second[0] - first[0]), first[1] + fraction * (second[1] - first[1]))
+                    candidates.append((distance, tuple(world_nearest)))
         if candidates:
             return min(candidates)[1]
         return tuple(point)
@@ -3261,22 +3364,202 @@ class SolveWorkspace(Div):
         self._message(f"Added {kind}; closed sketch loops are detected as regions.")
         return True
 
-    def _accept_arc_sketch_point(self, point):
+    def _tangent_at_sketch_endpoint(self, point, tolerance_px=12.0):
+        project, _ = self._canvas_projection()
+        target = project(point)
+        candidates = []
+        for entity in self.model["geometry"].get("sketch_entities", []):
+            samples = entity.get("sampled_points") or entity.get("points") or []
+            if len(samples) < 2:
+                continue
+            for endpoint, neighbor in ((samples[0], samples[1]), (samples[-1], samples[-2])):
+                screen = project(endpoint)
+                distance = math.hypot(target[0] - screen[0], target[1] - screen[1])
+                tangent = (endpoint[0] - neighbor[0], endpoint[1] - neighbor[1])
+                norm = math.hypot(*tangent)
+                if distance <= tolerance_px and norm > 1e-15:
+                    candidates.append((distance, tuple(endpoint), (tangent[0] / norm, tangent[1] / norm)))
+        if not candidates:
+            return None
+        _, endpoint, tangent = min(candidates, key=lambda item: item[0])
+        return endpoint, tangent
+
+    def _accept_arc_sketch_point(self, point, *, variant=None):
+        variant = variant or self._sketch_tool_variant.get("arc", "three-point")
+        point = tuple(point)
+        if variant == "tangent":
+            if not self._pending_arc_points:
+                tangent_start = self._tangent_at_sketch_endpoint(point)
+                if tangent_start is None:
+                    self._message("Tangent arc: click near an existing curve endpoint first.", error=True)
+                    return
+                endpoint, tangent = tangent_start
+                self._pending_arc_points = [tuple(endpoint), tuple(tangent)]
+                self._message("Tangent arc: click the end point.")
+                return
+            start, tangent = self._pending_arc_points[:2]
+            self._pending_arc_points = []
+            end = point
+            chord = (end[0] - start[0], end[1] - start[1])
+            chord_squared = chord[0] ** 2 + chord[1] ** 2
+            normal = (-tangent[1], tangent[0])
+            denominator = 2.0 * (chord[0] * normal[0] + chord[1] * normal[1])
+            if chord_squared <= 1e-24 or abs(denominator) <= 1e-18:
+                self._message("The tangent arc endpoint must define a curved arc.", error=True)
+                return
+            offset = chord_squared / denominator
+            center = (start[0] + offset * normal[0], start[1] + offset * normal[1])
+            start_angle = math.atan2(start[1] - center[1], start[0] - center[0])
+            end_angle = math.atan2(end[1] - center[1], end[0] - center[0])
+            positive_sweep = (end_angle - start_angle) % (2.0 * math.pi)
+            ccw_tangent = (-math.sin(start_angle), math.cos(start_angle))
+            sweep = positive_sweep if ccw_tangent[0] * tangent[0] + ccw_tangent[1] * tangent[1] >= 0 else positive_sweep - 2.0 * math.pi
+            middle_angle = start_angle + sweep / 2.0
+            radius = math.hypot(start[0] - center[0], start[1] - center[1])
+            through = (center[0] + radius * math.cos(middle_angle), center[1] + radius * math.sin(middle_angle))
+            try:
+                self._add_sketch_entity("arc", [start, through, end])
+            except ValueError as exc:
+                self._message(str(exc), error=True)
+            return
+
+        required = 3
         if not self._pending_arc_points:
-            self._pending_arc_points = [tuple(point)]
-            self._message("Arc: click a point on the curve, then click its endpoint.")
+            self._pending_arc_points = [point]
+            next_hint = "start point" if variant == "centerpoint" else "a point on the arc"
+            self._message(f"Arc: click the {next_hint}, then the end point.")
             return
-        if len(self._pending_arc_points) == 1:
-            self._pending_arc_points.append(tuple(point))
-            self._message("Arc: click the endpoint.")
+        if len(self._pending_arc_points) < 2:
+            self._pending_arc_points.append(point)
+            self._message("Arc: click the end point.")
             return
-        points = [*self._pending_arc_points, tuple(point)]
+        points = [*self._pending_arc_points, point]
         self._pending_arc_points = []
-        self._add_sketch_entity("arc", points)
+        if variant == "centerpoint":
+            center, start, end = points
+            radius = math.dist(center, start)
+            if radius <= 1e-12 or math.dist(center, end) <= 1e-12:
+                self._message("Arc center and endpoint must be different.", error=True)
+                return
+            end_angle = math.atan2(end[1] - center[1], end[0] - center[0])
+            start_angle = math.atan2(start[1] - center[1], start[0] - center[0])
+            sweep = (end_angle - start_angle) % (2.0 * math.pi)
+            if sweep <= 1e-12:
+                self._message("Arc start and end must be different.", error=True)
+                return
+            end = (center[0] + radius * math.cos(end_angle), center[1] + radius * math.sin(end_angle))
+            middle_angle = start_angle + sweep / 2.0
+            through = (center[0] + radius * math.cos(middle_angle), center[1] + radius * math.sin(middle_angle))
+            try:
+                self._add_sketch_entity("arc", [start, through, end])
+            except ValueError as exc:
+                self._message(str(exc), error=True)
+        else:
+            try:
+                self._add_sketch_entity("arc", points)
+            except ValueError as exc:
+                self._message(str(exc), error=True)
+
+    def _accept_circle_sketch_point(self, point):
+        self._pending_circle_points.append(tuple(point))
+        if len(self._pending_circle_points) < 3:
+            self._message("Circle: click the second point, then the third point on the circumference.")
+            return
+        first, second, third = self._pending_circle_points[:3]
+        self._pending_circle_points = []
+        ax, ay = first
+        bx, by = second
+        cx, cy = third
+        denominator = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+        if abs(denominator) <= 1e-20:
+            self._message("Circle points must not be collinear.", error=True)
+            return
+        aa, bb, cc = ax * ax + ay * ay, bx * bx + by * by, cx * cx + cy * cy
+        center = (
+            (aa * (by - cy) + bb * (cy - ay) + cc * (ay - by)) / denominator,
+            (aa * (cx - bx) + bb * (ax - cx) + cc * (bx - ax)) / denominator,
+        )
+        radius = math.dist(first, center)
+        self._primitive_values[("circle", "r_center")] = _round_sketch_m(center[0])
+        self._primitive_values[("circle", "z_center")] = _round_sketch_m(center[1])
+        self._primitive_values[("circle", "radius")] = _round_sketch_m(radius)
+        self._add_primitive("circle")
+        self.set_sketch_tool("select", announce=False)
+
+    @_history_tracked
+    def _trim_sketch_entities_along_stroke(self, world_stroke):
+        if not isinstance(world_stroke, (list, tuple)) or len(world_stroke) < 2:
+            self._message("Draw a short trim stroke across one or more sketch edges.", error=True)
+            return False
+        project, _ = self._canvas_projection()
+        stroke = [project(point) for point in world_stroke]
+        tolerance = 6.0
+
+        def point_segment_distance(point, first, second):
+            dx, dy = second[0] - first[0], second[1] - first[1]
+            length2 = dx * dx + dy * dy
+            if length2 <= 1e-16:
+                return math.hypot(point[0] - first[0], point[1] - first[1])
+            fraction = min(1.0, max(0.0, ((point[0] - first[0]) * dx + (point[1] - first[1]) * dy) / length2))
+            return math.hypot(point[0] - first[0] - fraction * dx, point[1] - first[1] - fraction * dy)
+
+        def segments_touch(a, b, c, d):
+            def orient(p, q, r):
+                return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+            boxes_overlap = not (
+                max(a[0], b[0]) < min(c[0], d[0]) - tolerance
+                or max(c[0], d[0]) < min(a[0], b[0]) - tolerance
+                or max(a[1], b[1]) < min(c[1], d[1]) - tolerance
+                or max(c[1], d[1]) < min(a[1], b[1]) - tolerance
+            )
+            oa, ob, oc, od = orient(a, b, c), orient(a, b, d), orient(c, d, a), orient(c, d, b)
+            if boxes_overlap and oa * ob <= 0 and oc * od <= 0:
+                return True
+            return min(
+                point_segment_distance(a, c, d), point_segment_distance(b, c, d),
+                point_segment_distance(c, a, b), point_segment_distance(d, a, b),
+            ) <= tolerance
+
+        touched = set()
+        for entity in self.model["geometry"].get("sketch_entities", []):
+            samples = entity.get("sampled_points") or entity.get("points") or []
+            projected = [project(point) for point in samples]
+            if any(
+                segments_touch(stroke_a, stroke_b, edge_a, edge_b)
+                for stroke_a, stroke_b in zip(stroke, stroke[1:])
+                for edge_a, edge_b in zip(projected, projected[1:])
+            ):
+                touched.add(entity.get("id"))
+        touched.discard(None)
+        if not touched:
+            self._message("The trim stroke did not cross any sketch edges.", error=True)
+            return False
+        geometry = self.model["geometry"]
+        geometry["sketch_entities"] = [item for item in geometry.get("sketch_entities", []) if item.get("id") not in touched]
+        geometry["edges"] = [item for item in geometry.get("edges", []) if item.get("sketch_entity_id") not in touched]
+        self._refresh_sketch_generated_regions()
+        self.selected_edge_ids = []
+        self.selected_edge_id = None
+        self.selected_region_id = None
+        self._refresh_model_tree()
+        self._render_inspector()
+        self.render_canvas()
+        self._message(f"Trimmed {len(touched)} sketch curve(s).")
+        return True
 
     @staticmethod
-    def _sketch_region_signature(entity_ids):
-        return tuple(sorted(set(entity_ids)))
+    def _sketch_region_signature(entity_ids, boundary=None):
+        intervals = []
+        for reference in boundary or []:
+            if not isinstance(reference, dict):
+                continue
+            entity_id = reference.get("entity_id")
+            if not isinstance(entity_id, str):
+                continue
+            start = float(reference.get("start_t", 0.0))
+            end = float(reference.get("end_t", 1.0))
+            intervals.append((entity_id, round(min(start, end), 9), round(max(start, end), 9)))
+        return tuple(sorted(intervals)) if intervals else tuple(sorted(set(entity_ids)))
 
     def _refresh_sketch_generated_regions(self):
         geometry = self.model["geometry"]
@@ -3285,9 +3568,13 @@ class SolveWorkspace(Div):
             if isinstance(region.get("shape"), dict) and region["shape"].get("type") == "sketch"
         ]
         generated_by_entities = {
-            self._sketch_region_signature(region.get("shape", {}).get("entity_ids", [])): region
+            self._sketch_region_signature(
+                region.get("shape", {}).get("entity_ids", []),
+                region.get("shape", {}).get("boundary", []),
+            ): region
             for region in old_generated
         }
+        unused_generated = list(old_generated)
         geometry["regions"] = [
             region for region in geometry.get("regions", [])
             if not (isinstance(region.get("shape"), dict) and region["shape"].get("type") == "sketch")
@@ -3297,8 +3584,28 @@ class SolveWorkspace(Div):
             parent_id = self._find_containing_region(vertices)
             if self._has_unsupported_overlap(vertices, parent_id):
                 continue
-            signature = self._sketch_region_signature(loop["entity_ids"])
-            region = copy.deepcopy(generated_by_entities.pop(signature, {}))
+            signature = self._sketch_region_signature(loop["entity_ids"], loop["boundary"])
+            matched = generated_by_entities.pop(signature, None)
+            if matched is None:
+                loop_entities = set(loop["entity_ids"])
+                candidates = []
+                for order, old_region in enumerate(unused_generated):
+                    old_shape = old_region.get("shape", {})
+                    shared_entities = len(loop_entities.intersection(old_shape.get("entity_ids", [])))
+                    if shared_entities <= 0:
+                        continue
+                    old_area = abs(_polygon_area(old_region.get("vertices", [])))
+                    new_area = abs(_polygon_area(vertices))
+                    candidates.append((shared_entities, -abs(old_area - new_area), -order, old_region))
+                if candidates:
+                    matched = max(candidates, key=lambda item: item[:3])[3]
+            if matched in unused_generated:
+                unused_generated.remove(matched)
+            if matched is not None:
+                generated_by_entities = {
+                    key: value for key, value in generated_by_entities.items() if value is not matched
+                }
+            region = copy.deepcopy(matched or {})
             if not region:
                 region = {
                     "id": new_id("region"),
@@ -4217,20 +4524,60 @@ class SolveWorkspace(Div):
                     samples = entity.get("sampled_points") or entity.get("points") or []
                     if len(samples) < 2:
                         continue
-                    edge_start, edge_end = list(samples[0]), list(samples[-1])
+                    path = [tuple(float(value) for value in sample[:2]) for sample in samples]
+                    if len(path) < 2:
+                        continue
+                    start_t = float(reference.get("start_t", 0.0))
+                    end_t = float(reference.get("end_t", 1.0))
+
+                    def sample_at(parameter):
+                        scaled = min(1.0, max(0.0, parameter)) * (len(path) - 1)
+                        index = min(len(path) - 2, int(math.floor(scaled)))
+                        fraction = scaled - index
+                        if parameter >= 1.0:
+                            return path[-1]
+                        return (
+                            path[index][0] + fraction * (path[index + 1][0] - path[index][0]),
+                            path[index][1] + fraction * (path[index + 1][1] - path[index][1]),
+                        )
+
+                    def sample_interval(first_t, last_t):
+                        low, high = sorted((first_t, last_t))
+                        values = [sample_at(first_t)]
+                        for sample_index in range(1, len(path) - 1):
+                            parameter = sample_index / (len(path) - 1)
+                            if low + 1e-12 < parameter < high - 1e-12:
+                                values.append(path[sample_index])
+                        values.append(sample_at(last_t))
+                        if last_t < first_t:
+                            values.reverse()
+                        return [list(point) for point in values]
+
+                    interval_samples = sample_interval(start_t, end_t)
+                    edge_start, edge_end = interval_samples[0], interval_samples[-1]
                     key = _edge_key([edge_start, edge_end])
-                    forward = bool(reference.get("forward", True))
+                    forward = bool(reference.get("forward", end_t >= start_t))
                     if key in edges_by_key:
                         edge = edges_by_key[key]
                         forward = tuple(round(float(value), 12) for value in edge["vertices"][0]) == tuple(round(float(value), 12) for value in (edge_start if forward else edge_end))
                     else:
                         edge = copy.deepcopy(source_edge) if source_edge else {}
-                        edge.setdefault("id", new_id("edge"))
+                        old_id = source_edge.get("id") if source_edge else None
+                        if old_id and old_id not in used_old_ids:
+                            edge["id"] = old_id
+                            used_old_ids.add(old_id)
+                        else:
+                            edge["id"] = new_id("edge")
                         edge.setdefault("name", f"Edge {len(edges) + 1}")
                         edge.setdefault("boundary_condition_ids", [])
                         edge["vertices"] = [edge_start, edge_end]
                         edge["sketch_entity_id"] = entity_id
-                        edge["curve"] = copy.deepcopy(entity.get("curve", edge.get("curve", {"type": entity.get("type", "line")})))
+                        curve = copy.deepcopy(entity.get("curve", edge.get("curve", {"type": entity.get("type", "line")})))
+                        if isinstance(curve, dict):
+                            curve["sampled_points"] = copy.deepcopy(interval_samples)
+                        edge["curve"] = curve
+                        edge["sketch_t0"] = start_t
+                        edge["sketch_t1"] = end_t
                         edges_by_key[key] = edge
                         edges.append(edge)
                     region_edge_ids.append(edge["id"])
@@ -5074,7 +5421,7 @@ class SolveWorkspace(Div):
     def _build_geometry_inspector(self):
         self._geometry_empty_panel = Div(
             _section_title("Geometry", "Click a region or edge to edit it."),
-            Div("Choose Rectangle, Circle, Line, Arc or Spline in the viewport toolbar. Select a region to edit its dimensions. Assign materials and mechanics under Materials.", ui_style="font-size:12px; line-height:1.5; color:var(--fg-muted);"),
+            Div("Choose Rectangle, Circle, Line or Arc in the viewport toolbar. Select a region to edit its dimensions. Assign materials and mechanics under Materials.", ui_style="font-size:12px; line-height:1.5; color:var(--fg-muted);"),
             Div("r ≥ 0 is enforced for axisymmetric geometry. Nested regions must be strictly contained or disjoint.", ui_style="font-size:11px; color:var(--fg-muted); line-height:1.45;"),
         )
 
@@ -5486,7 +5833,7 @@ class SolveWorkspace(Div):
             ]
         return [
             _section_title("Geometry", "Click a region or edge to edit it."),
-            Div("Choose Rectangle, Circle, Line, Arc or Spline in the viewport toolbar. Select a region to edit its dimensions. Assign materials and mechanics under Materials.", ui_style="font-size:12px; line-height:1.5; color:var(--fg-muted);"),
+            Div("Choose Rectangle, Circle, Line or Arc in the viewport toolbar. Select a region to edit its dimensions. Assign materials and mechanics under Materials.", ui_style="font-size:12px; line-height:1.5; color:var(--fg-muted);"),
             Div("r ≥ 0 is enforced for axisymmetric geometry. Nested regions must be strictly contained or disjoint.", ui_style="font-size:11px; color:var(--fg-muted); line-height:1.45;"),
         ]
 
@@ -8002,9 +8349,17 @@ def _polygons_overlap_interior(first, second):
     if a[1] <= b[0] or b[1] <= a[0] or a[3] <= b[2] or b[3] <= a[2]:
         return False
 
-    if any(_point_in_polygon(point, second) for point in first):
+    def strictly_inside(point, polygon):
+        if any(
+            _point_on_segment(point, polygon[index], polygon[(index + 1) % len(polygon)])
+            for index in range(len(polygon))
+        ):
+            return False
+        return _point_in_polygon(point, polygon)
+
+    if any(strictly_inside(point, second) for point in first):
         return True
-    if any(_point_in_polygon(point, first) for point in second):
+    if any(strictly_inside(point, first) for point in second):
         return True
 
     # Proper edge crossings imply positive-area overlap. Endpoint-only and
