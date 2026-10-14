@@ -59,6 +59,35 @@ def test_mirrored_polar_vector_covers_all_four_quadrants_without_changing_source
         assert values == pytest.approx((point[0], point[1], 1.0), abs=1e-8)
 
 
+def test_mirrored_deformation_can_reuse_the_display_mesh():
+    source_mesh = _quarter_box()
+    planes = find_quarter_symmetry_planes(source_mesh)
+    displacement = ngs.GridFunction(ngs.VectorH1(source_mesh, order=1))
+    displacement.Set(ngs.CF((x, y, ngs.z)))
+
+    full_mesh, _ = mirror_quarter_gridfunction(
+        displacement, planes, vector_kind="polar"
+    )
+    reused_mesh, full_displacement = mirror_quarter_gridfunction(
+        displacement,
+        planes,
+        vector_kind="polar",
+        target_mesh=full_mesh,
+    )
+
+    assert reused_mesh is full_mesh
+    points = (
+        (0.4, 0.4, 0.3),
+        (-0.4, 0.4, 0.3),
+        (0.4, -0.4, 0.3),
+        (-0.4, -0.4, 0.3),
+    )
+    for point in points:
+        assert tuple(full_displacement(full_mesh(*point))) == pytest.approx(
+            point, abs=1e-8
+        )
+
+
 def test_mirrored_magnetic_flux_density_uses_axial_vector_parity():
     source_mesh = _quarter_box()
     source = ngs.GridFunction(ngs.VectorH1(source_mesh, order=1))
@@ -108,6 +137,49 @@ def test_scalar_result_is_repeated_unchanged_across_both_planes():
     )
     values = [full_field(full_mesh(*point)) for point in points]
     assert values == pytest.approx([1.8] * 4, abs=1e-8)
+
+
+@app_test("ngsolve_gui.appconfig")
+def test_full_model_symmetry_keeps_solution_deformation(page: Page, app) -> None:
+    import ngsolve_gui.function as function_module
+
+    class _RegionVisibility:
+        def set_alphas(self, **_alphas):
+            pass
+
+    missing = object()
+    previous = getattr(function_module, "RegionVisibility", missing)
+    function_module.RegionVisibility = _RegionVisibility
+    try:
+        mesh = _quarter_box()
+        displacement = ngs.GridFunction(
+            ngs.VectorH1(mesh, order=1, dim=3), name="Displacement"
+        )
+        displacement.Set(ngs.CF((x, y, ngs.z)))
+        _draw(app, displacement, name="Quarter displacement")
+        app._set_workspace_mode("post_process")
+        app._update()
+        component = app.tab_panel.comp
+
+        assert component._deformation_uses_solution
+        component.symmetry_expanded.value = True
+        assert component.deformation is not None
+        assert component.deformation.dim == 3
+        point = (-0.4, 0.4, 0.3)
+        displayed = tuple(component.cf(component.mesh(*point)))
+        deformed = tuple(component.deformation(component.mesh(*point)))
+        assert deformed == pytest.approx(
+            displayed, abs=1e-8
+        )
+
+        component.symmetry_expanded.value = False
+        assert component.deformation is not None
+        assert component.mesh is mesh
+    finally:
+        if previous is missing:
+            del function_module.RegionVisibility
+        else:
+            function_module.RegionVisibility = previous
 
 
 @app_test("ngsolve_gui.appconfig")

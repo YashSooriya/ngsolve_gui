@@ -209,6 +209,32 @@ def test_complex_field_defaults_to_absolute_and_allows_component_selection(
     assert component.complex_mode.value == "imag"
 
 
+def test_complex_picked_values_follow_the_selected_display_mode() -> None:
+    class _ComplexField:
+        def __call__(self, _point):
+            return np.asarray((3 + 4j, 1 - 1j))
+
+    class _PickMesh:
+        dim = 2
+
+        def __call__(self, *coordinates):
+            return coordinates
+
+    for mode, expected in (
+        ("real", (3.0, 1.0)),
+        ("imag", (4.0, -1.0)),
+        ("abs", (5.0, np.sqrt(2.0))),
+        ("arg", (np.arctan2(4.0, 3.0), -np.pi / 4.0)),
+    ):
+        view = SimpleNamespace(
+            mesh=_PickMesh(),
+            cf=_ComplexField(),
+            complex_mode=SimpleNamespace(value=mode),
+        )
+        actual = FunctionComponent._eval_cf(view, (0.0, 0.0))
+        assert np.allclose(actual, expected)
+
+
 def test_complex_vector_deformation_extracts_real_and_imaginary_components() -> None:
     mesh = make_mesh_3d()
     displacement = ngs.GridFunction(

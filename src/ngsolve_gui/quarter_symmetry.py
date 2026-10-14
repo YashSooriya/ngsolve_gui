@@ -94,7 +94,9 @@ def find_quarter_symmetry_planes(mesh):
     return tuple(sorted(planes, key=lambda plane: plane["axis"])) if len(planes) == 2 else ()
 
 
-def mirror_quarter_gridfunction(grid_function, symmetry_planes, *, vector_kind="polar"):
+def mirror_quarter_gridfunction(
+    grid_function, symmetry_planes, *, vector_kind="polar", target_mesh=None
+):
     """Return ``(full_mesh, display_field)`` reflected across two tagged planes.
 
     Scalar values repeat unchanged. Polar vectors (for example displacement
@@ -122,21 +124,24 @@ def mirror_quarter_gridfunction(grid_function, symmetry_planes, *, vector_kind="
     if vector_kind not in {"polar", "axial"}:
         raise ValueError("Vector kind must be 'polar' or 'axial'")
 
-    mirrored_ngmesh = source_mesh.ngmesh.Copy()
-    for plane in planes:
-        axis = int(plane["axis"])
-        point = [0.0, 0.0, 0.0]
-        normal = [0.0, 0.0, 0.0]
-        point[axis] = float(plane["coordinate"])
-        normal[axis] = 1.0
-        mirrored_ngmesh = mirrored_ngmesh.Mirror(
-            ngm.Point3d(*point), ngm.Vec3d(*normal)
-        )
+    if target_mesh is None:
+        mirrored_ngmesh = source_mesh.ngmesh.Copy()
+        for plane in planes:
+            axis = int(plane["axis"])
+            point = [0.0, 0.0, 0.0]
+            normal = [0.0, 0.0, 0.0]
+            point[axis] = float(plane["coordinate"])
+            normal[axis] = 1.0
+            mirrored_ngmesh = mirrored_ngmesh.Mirror(
+                ngm.Point3d(*point), ngm.Vec3d(*normal)
+            )
 
-    target_mesh = ngs.Mesh(mirrored_ngmesh)
-    curve_order = int(source_mesh.GetCurveOrder())
-    if curve_order > 1:
-        target_mesh.Curve(curve_order)
+        target_mesh = ngs.Mesh(mirrored_ngmesh)
+        curve_order = int(source_mesh.GetCurveOrder())
+        if curve_order > 1:
+            target_mesh.Curve(curve_order)
+    elif target_mesh.dim != 3:
+        raise ValueError("The target mesh for symmetry expansion must be 3D.")
 
     scalar_space = ngs.H1(
         target_mesh,

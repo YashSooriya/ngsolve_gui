@@ -1019,6 +1019,8 @@ class SolveWorkspace(Div):
         return True
 
     def set_model(self, model, studies=None, layout=None):
+        if self._job_active:
+            raise RuntimeError("Cannot replace the problem while a mesh or solver job is running.")
         self._cancel_canvas_zoom_render()
         self._clear_mesh_preview()
         model = migrate_legacy_model(model)
@@ -1048,6 +1050,8 @@ class SolveWorkspace(Div):
         self._notify_history_changed()
         self.layout = copy.deepcopy(layout or {"schema_version": 1, "active_section": "geometry", "camera": "fit"})
         self._load_canvas_view_from_layout()
+        self._editor_drawer = None
+        self.hp_target_selection_active = False
         self.selected_material_id = None
         self.selected_boundary_id = None
         self.selected_source_id = None
@@ -6457,11 +6461,21 @@ class SolveWorkspace(Div):
                 if child.get("parent_id") == region_id:
                     child["parent_id"] = region.get("parent_id")
             self.model["geometry"]["regions"] = [item for item in self.model["geometry"]["regions"] if item["id"] != region_id]
+            for load in self.model.get("regional_loads", []):
+                load["region_ids"] = [
+                    assigned_id for assigned_id in load.get("region_ids", [])
+                    if assigned_id != region_id
+                ]
             self.selected_region_id = None
+            self.selected_region_ids = [
+                selected_id for selected_id in self.selected_region_ids
+                if selected_id != region_id
+            ]
             self.selected_edge_id = None
             self.selected_edge_ids = []
             self._recompute_parent_links()
             self._rebuild_edges()
+            self._sync_region_sources_from_loads()
             self._message(f"Deleted {region['name']}.")
             self._refresh_model_tree()
             self._render_inspector()

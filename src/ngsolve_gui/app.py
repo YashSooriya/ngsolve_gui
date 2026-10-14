@@ -534,6 +534,7 @@ class NGSolveGui(App):
         self._solver_job_active = False
         self._solver_cancel_requested = False
         self._solver_run_context = None
+        self._pending_problem_replacement = None
         self._loaded_mesh_path = None
         self._loaded_mesh_problem_sha256 = None
         self._solution_import_dirs = []
@@ -591,8 +592,8 @@ class NGSolveGui(App):
                     Div("Save changes?", ui_style="font-size:18px; font-weight:650;")
                 ),
                 QCardSection(
-                    "The current problem has unsaved changes. Save them before starting a new "
-                    "problem, discard them, or cancel to keep working."
+                    "The current problem has unsaved changes. Save them before replacing it, "
+                    "discard them, or cancel to keep working."
                 ),
                 QCardActions(
                     cancel_new_problem,
@@ -606,8 +607,8 @@ class NGSolveGui(App):
             ui_persistent=True,
         )
         cancel_new_problem.on_click(self._close_new_problem_dialog)
-        discard_new_problem.on_click(self._discard_and_start_new_problem)
-        save_new_problem.on_click(self._save_and_start_new_problem)
+        discard_new_problem.on_click(self._discard_and_continue_problem_replacement)
+        save_new_problem.on_click(self._save_and_continue_problem_replacement)
 
         # Preferences and application exit are available from the menus.
 
@@ -936,6 +937,9 @@ class NGSolveGui(App):
         )
 
     def _quit_application(self, *args):
+        return self._request_problem_replacement(self._close_application_now)
+
+    def _close_application_now(self):
         try:
             _request_guest_vm_shutdown()
         except Exception as error:
@@ -1080,22 +1084,92 @@ class NGSolveGui(App):
             return self.solve_workspace.redo()
         return False
 
+    def _replacement_job_active(self):
+        return bool(
+            self._solver_job_active
+            or getattr(getattr(self, "solve_workspace", None), "_job_active", False)
+        )
+
+    def _has_unsaved_problem_changes(self):
+        workspace = self.solve_workspace
+        return bool(
+            workspace.dirty
+            or getattr(workspace, "_editor_drawer", None) is not None
+        )
+
+    def _request_problem_replacement(self, action):
+        """Guard every operation that replaces the current problem document."""
+        if self._replacement_job_active():
+            self._notify(
+                "Wait for the current solve to finish before replacing the problem.",
+                type="warning",
+                timeout=4000,
+            )
+            return False
+        if self._has_unsaved_problem_changes():
+            self._pending_problem_replacement = action
+            self._new_problem_dialog.ui_model_value = True
+            return False
+        return action()
+
     def new_problem(self, *args):
         """Start a blank problem, asking before discarding unsaved edits."""
-        if self._solver_job_active or getattr(self.solve_workspace, "_job_active", False):
+        request = getattr(self, "_request_problem_replacement", None)
+        if callable(request):
+            return request(self._start_new_problem)
+        # Preserve the old direct-call behavior for lightweight integrations
+        # that invoke this handler on a proxy instead of an NGSolveGui instance.
+        if getattr(self, "_solver_job_active", False) or getattr(
+            getattr(self, "solve_workspace", None), "_job_active", False
+        ):
             self._notify(
                 "Wait for the current solve to finish before starting a new problem.",
                 type="warning",
                 timeout=4000,
             )
             return False
-        if self.solve_workspace.dirty:
+        if getattr(self.solve_workspace, "dirty", False):
             self._new_problem_dialog.ui_model_value = True
             return False
         return self._start_new_problem()
 
     def _close_new_problem_dialog(self, *args):
         self._new_problem_dialog.ui_model_value = False
+        self._pending_problem_replacement = None
+
+    def _continue_problem_replacement(self, save_changes):
+        action = self._pending_problem_replacement
+        self._close_new_problem_dialog()
+        if action is None:
+            return False
+        if save_changes:
+            if getattr(self.solve_workspace, "_editor_drawer", None) is not None:
+                self.solve_workspace._commit_editor()
+                if self.solve_workspace._editor_drawer is not None:
+                    return False
+            if not self.save_problem_file():
+                self._pending_problem_replacement = action
+                self._new_problem_dialog.ui_model_value = True
+                return False
+        return action()
+
+    def _discard_and_continue_problem_replacement(self, *args):
+        return self._continue_problem_replacement(save_changes=False)
+
+    def _save_and_continue_problem_replacement(self, *args):
+        return self._continue_problem_replacement(save_changes=True)
+
+    def _discard_and_start_new_problem(self, *args):
+        return self._start_new_problem()
+
+    def _save_and_start_new_problem(self, *args):
+        self._close_new_problem_dialog()
+        if not self.save_problem_file():
+            # Keep the decision available if the file picker was cancelled or
+            # saving failed; the current problem must remain intact.
+            self._new_problem_dialog.ui_model_value = True
+            return False
+        return self._start_new_problem()
 
     def _start_new_problem(self):
         if self._solver_job_active or getattr(self.solve_workspace, "_job_active", False):
@@ -1117,18 +1191,6 @@ class NGSolveGui(App):
             self._workspace_mode_toggle.select("solve")
         self._notify("Started a new problem.", type="positive", timeout=2500)
         return True
-
-    def _discard_and_start_new_problem(self, *args):
-        return self._start_new_problem()
-
-    def _save_and_start_new_problem(self, *args):
-        self._close_new_problem_dialog()
-        if not self.save_problem_file():
-            # Keep the decision available if the file picker was cancelled or
-            # saving failed; the current problem must remain intact.
-            self._new_problem_dialog.ui_model_value = True
-            return False
-        return self._start_new_problem()
 
     def _delete_selected_region_shortcut(self, *args):
         if not self._solve_shortcut_context_active():
@@ -1213,6 +1275,9 @@ class NGSolveGui(App):
         return path, data
 
     def _choose_legacy_problem_file(self, *args):
+        if self._replacement_job_active():
+            self._notify("Wait for the current solve to finish before replacing the problem.", type="warning", timeout=4000)
+            return False
         try:
             path, _data = self._pick_artifact(
                 title="Import legacy Python problem file",
@@ -1224,26 +1289,40 @@ class NGSolveGui(App):
             from .legacy_problem_import import import_legacy_problem_file
 
             model, studies, layout = import_legacy_problem_file(path)
-            self.solve_workspace.set_model(model, studies, layout)
-            self._loaded_mesh_path = None
-            self._loaded_mesh_problem_sha256 = None
-            if self._workspace_mode != "solve":
-                self._workspace_mode_toggle.select("solve")
-            region_count = len(model.get("geometry", {}).get("regions", []))
-            boundary_count = len(model.get("boundary_conditions", []))
-            self._notify(
-                f"Imported {region_count} regions and {boundary_count} boundary condition types. "
-                "Review the mesh and study settings, then save this problem as JSON.",
-                type="positive",
-                timeout=6500,
-            )
-            self.solve_workspace._message(f"Imported legacy problem: {Path(path).name}.")
+
+            def apply_imported_problem():
+                try:
+                    self.solve_workspace.set_model(model, studies, layout)
+                    self._loaded_mesh_path = None
+                    self._loaded_mesh_problem_sha256 = None
+                    if self._workspace_mode != "solve":
+                        self._workspace_mode_toggle.select("solve")
+                    region_count = len(model.get("geometry", {}).get("regions", []))
+                    boundary_count = len(model.get("boundary_conditions", []))
+                    self._notify(
+                        f"Imported {region_count} regions and {boundary_count} boundary condition types. "
+                        "Review the mesh and study settings, then save this problem as JSON.",
+                        type="positive",
+                        timeout=6500,
+                    )
+                    self.solve_workspace._message(f"Imported legacy problem: {Path(path).name}.")
+                    return True
+                except Exception as error:
+                    self._notify(f"Could not import legacy problem: {error}", type="negative", timeout=9000)
+                    self.solve_workspace._message(f"Legacy import failed: {error}", error=True)
+                    return False
+
+            return self._request_problem_replacement(apply_imported_problem)
         except Exception as error:
             self._notify(f"Could not import legacy problem: {error}", type="negative", timeout=9000)
             self.solve_workspace._message(f"Legacy import failed: {error}", error=True)
 
     def save_problem_file(self):
         """Save the problem definition and its study settings."""
+        if getattr(self.solve_workspace, "_editor_drawer", None) is not None:
+            self.solve_workspace._commit_editor()
+            if self.solve_workspace._editor_drawer is not None:
+                return False
         model = self.solve_workspace.model
         errors = self.solve_workspace.validation_errors()
         # Empty sketches are useful drafts; structural errors still prevent
@@ -1271,6 +1350,9 @@ class NGSolveGui(App):
 
     def load_problem_file(self):
         """Load a declarative JSON or legacy .ngsmodel problem file."""
+        if self._replacement_job_active():
+            self._notify("Wait for the current solve to finish before replacing the problem.", type="warning", timeout=4000)
+            return False
         try:
             path, data = self._pick_artifact(
                 title="Open MM-FEM problem file",
@@ -1281,12 +1363,22 @@ class NGSolveGui(App):
             if not path:
                 return
             model, studies, layout = unpack_model(data)
-            self.solve_workspace.set_model(model, studies, layout)
-            self._loaded_mesh_path = None
-            self._loaded_mesh_problem_sha256 = None
-            if self._workspace_mode != "solve":
-                self._workspace_mode_toggle.select("solve")
-            self._notify("Problem file loaded.", type="positive", timeout=2500)
+
+            def apply_problem_file():
+                try:
+                    self.solve_workspace.set_model(model, studies, layout)
+                    self._loaded_mesh_path = None
+                    self._loaded_mesh_problem_sha256 = None
+                    if self._workspace_mode != "solve":
+                        self._workspace_mode_toggle.select("solve")
+                    self._notify("Problem file loaded.", type="positive", timeout=2500)
+                    return True
+                except Exception as error:
+                    self._notify(f"Could not load problem file: {error}", type="negative", timeout=7000)
+                    self.solve_workspace._message(f"Load failed: {error}", error=True)
+                    return False
+
+            return self._request_problem_replacement(apply_problem_file)
         except Exception as error:
             self._notify(f"Could not load problem file: {error}", type="negative", timeout=7000)
             self.solve_workspace._message(f"Load failed: {error}", error=True)
@@ -1431,7 +1523,13 @@ class NGSolveGui(App):
             r"[^A-Za-z0-9_-]+", "_", model.get("name", "axisymmetric_model")
         ).strip("_") or "axisymmetric_model"
         stamp = _datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        output_dir = Path.home() / "NGSolve_results" / f"{model_name}_{stamp}"
+        output_root = os.environ.get("COUPLED_SOLVER_OUTPUT_DIR", "").strip()
+        if output_root:
+            # Match the VM runner's shared-output mapping so GUI logs, manifests,
+            # mesh previews, and result bundles all follow the actual run path.
+            output_dir = Path(output_root).expanduser() / "gui_runs" / f"{model_name}_{stamp}"
+        else:
+            output_dir = Path.home() / "NGSolve_results" / f"{model_name}_{stamp}"
         model_path = output_dir / f"{model_name}.ngsmodel"
         try:
             solver_root = self._find_solver_root()

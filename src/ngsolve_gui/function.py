@@ -257,6 +257,8 @@ class FunctionComponent(WebgpuTab):
         self.symmetry_expanded = Observable(False, "symmetry_expanded")
         self._symmetry_expanded_mesh = None
         self._symmetry_expanded_field = None
+        self._symmetry_expanded_deformation_source = None
+        self._symmetry_expanded_deformation = None
         self._symmetry_original_state = None
         self._symmetry_camera_state = None
         if self.mesh.dim == 3 and isinstance(cf, ngs.GridFunction):
@@ -1132,9 +1134,17 @@ class FunctionComponent(WebgpuTab):
         source = self._deformation_source
         if self.axisymmetric_revolved.value and self._deformation_uses_solution:
             source = self._axisymmetric_revolution_field
+        elif self.symmetry_expanded.value and self._deformation_uses_solution:
+            source = self._symmetry_expanded_deformation_source
+            if source is None:
+                source = self._symmetry_expanded_field
         self.deformation = self._resolve_deformation(source, val)
         if self._axisymmetric_original_state is not None:
             self._axisymmetric_original_state["deformation"] = self._resolve_deformation(
+                self._deformation_source, val
+            )
+        if self._symmetry_original_state is not None:
+            self._symmetry_original_state["deformation"] = self._resolve_deformation(
                 self._deformation_source, val
             )
         if self.mdata is not None:
@@ -1167,7 +1177,17 @@ class FunctionComponent(WebgpuTab):
         try:
             import numpy as np
             mip = self.mesh(*[float(P[i]) for i in range(self.mesh.dim)])
-            return np.real(np.asarray(self.cf(mip)))
+            value = np.asarray(self.cf(mip))
+            if np.iscomplexobj(value):
+                mode = getattr(getattr(self, "complex_mode", None), "value", "real")
+                if mode == "imag":
+                    return np.imag(value)
+                if mode == "abs":
+                    return np.abs(value)
+                if mode == "arg":
+                    return np.angle(value)
+                return np.real(value)
+            return np.asarray(value, dtype=float)
         except Exception:
             return None
 
@@ -1306,6 +1326,22 @@ class FunctionComponent(WebgpuTab):
                         self._quarter_symmetry_planes,
                         vector_kind=self._symmetry_vector_kind,
                     )
+                    source_deformation = self._deformation_source
+                    if (
+                        source_deformation is not None
+                        and isinstance(source_deformation, ngs.GridFunction)
+                        and source_deformation.dim == 3
+                    ):
+                        _, self._symmetry_expanded_deformation_source = mirror_quarter_gridfunction(
+                            source_deformation,
+                            self._quarter_symmetry_planes,
+                            vector_kind="polar",
+                            target_mesh=self._symmetry_expanded_mesh,
+                        )
+                        self._symmetry_expanded_deformation = self._resolve_deformation(
+                            self._symmetry_expanded_deformation_source,
+                            self.deformation_complex_part.value,
+                        )
                 except Exception as error:
                     print(f"Could not create full symmetry view: {error}")
                     self.symmetry_expanded.value = False
@@ -1324,7 +1360,7 @@ class FunctionComponent(WebgpuTab):
             self.region_or_mesh = self._symmetry_expanded_mesh
             self.cf = self._symmetry_expanded_field
             self.visualization_cf = visualization_cf(self.cf)
-            self.deformation = None
+            self.deformation = self._symmetry_expanded_deformation
         else:
             original = self._symmetry_original_state
             self.mesh = original["mesh"]

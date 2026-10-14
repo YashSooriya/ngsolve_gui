@@ -83,11 +83,24 @@ def test_loading_a_problem_sets_a_clean_saved_snapshot(standalone_components):
     workspace = SolveWorkspace()
     model = copy.deepcopy(workspace.model)
     model["name"] = "Loaded problem"
+    workspace._editor_drawer = {"kind": "source"}
+    workspace.hp_target_selection_active = True
 
     workspace.set_model(model)
 
     assert workspace.model["name"] == "Loaded problem"
     assert workspace.dirty is False
+    assert workspace._editor_drawer is None
+    assert workspace.hp_target_selection_active is False
+
+
+def test_problem_cannot_be_replaced_while_a_job_is_active(standalone_components):
+    workspace = SolveWorkspace()
+    model = copy.deepcopy(workspace.model)
+    workspace._job_active = True
+
+    with pytest.raises(RuntimeError, match="while a mesh or solver job is running"):
+        workspace.set_model(model)
 
 
 def test_geometry_and_physics_value_inputs_use_si_units(standalone_components):
@@ -2937,6 +2950,30 @@ def test_sources_are_defined_then_assigned_from_the_viewport(standalone_componen
     assert workspace.delete_regional_load(load["id"]) is True
     assert workspace.model["regional_loads"] == []
     assert second["sources"]["dc_current_density"] == "0"
+
+
+def test_deleting_region_removes_regional_load_assignment(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    workspace._open_sources_editor()
+    workspace._editor_drawer["draft"].update(
+        {"name": "Coil current", "dc_current_density": "1000"}
+    )
+    workspace._commit_editor()
+    load = workspace.model["regional_loads"][0]
+    workspace.select_regional_load(load["id"])
+    workspace._toggle_active_source_region(region["id"])
+    workspace.selected_region_ids = [region["id"]]
+
+    assert load["region_ids"] == [region["id"]]
+    assert region["sources"]["dc_current_density"] == "1000"
+
+    workspace.delete_region(region["id"])
+
+    assert workspace.model["regional_loads"][0]["region_ids"] == []
+    assert workspace.selected_region_ids == []
+    assert workspace.model["geometry"]["regions"] == []
 
 
 def test_model_and_properties_panels_can_be_collapsed_and_restored(standalone_components):
