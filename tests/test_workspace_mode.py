@@ -190,7 +190,7 @@ def test_problem_save_reports_success_and_marks_only_written_state(monkeypatch, 
         _save_artifact=lambda data, filename: save_succeeds,
         _notify=lambda *args, **kwargs: None,
     )
-    monkeypatch.setattr("ngsolve_gui.app.package_model", lambda *args: b"problem")
+    monkeypatch.setattr("ngsolve_gui.app.serialize_model_json", lambda *args: b"problem")
 
     result = NGSolveGui.save_problem_file(app)
 
