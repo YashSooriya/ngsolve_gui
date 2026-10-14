@@ -273,7 +273,11 @@ class WebgpuTab(PropertyPanelMixin, Div):
         excluded = {id(self._tool_dock)}
         if self._clip_toolbar is not None:
             excluded.add(id(self._clip_toolbar))
-        return [item for item in overlays if id(item) not in excluded]
+        visible = [item for item in overlays if id(item) not in excluded]
+        bookmark_popup = getattr(self, "_bm_pop", None)
+        if self._page_toolbar_enabled and bookmark_popup is not None:
+            visible.append(bookmark_popup)
+        return visible
 
     def _page_toolbar_children(self):
         """Return controls for the app row above navigator and properties."""
@@ -862,7 +866,7 @@ class WebgpuTab(PropertyPanelMixin, Div):
         self._projection_tooltip = None
         tools = [self._vtool("mdi-overscan", "Fit view  ·  r", self.reset_camera, label="Fit view")]
         self._link_tool = self._build_camera_link_tool()
-        if self._link_tool is not None:
+        if self._link_tool is not None and not self._page_toolbar_enabled:
             tools.append(self._link_tool)
         if self._supports_camera_view_buttons():
             self._projection_tool = self._build_projection_tool()
@@ -908,12 +912,14 @@ class WebgpuTab(PropertyPanelMixin, Div):
                 self.toggle_probe, label="Probe",
             )
             tools.append(self._probe_tool)
-        tools.append(Div(ui_class=str(cb.vp_sep)))
-        tools.append(self._vtool(
-            "mdi-fullscreen", "Expand the viewport to fullscreen",
-            self._toggle_fullscreen, label="Fullscreen",
-        ))
-        tools.append(self._build_bookmark_tool())
+        bookmark_tool = self._build_bookmark_tool()
+        if not self._page_toolbar_enabled:
+            tools.append(Div(ui_class=str(cb.vp_sep)))
+            tools.append(self._vtool(
+                "mdi-fullscreen", "Expand the viewport to fullscreen",
+                self._toggle_fullscreen, label="Fullscreen",
+            ))
+            tools.append(bookmark_tool)
         if getattr(self, "_page_toolbar_enabled", False):
             return Div(
                 *tools,
@@ -1010,22 +1016,9 @@ class WebgpuTab(PropertyPanelMixin, Div):
         self._bm_pop.ui_hidden = True
         self._bm_pop.on("mouseleave", lambda e=None: self._close_bookmarks())
         if getattr(self, "_page_toolbar_enabled", False):
-            action = QBtn(
-                QTooltip("Save, rename, or restore a camera view"),
-                ui_icon="mdi-bookmark-outline",
-                ui_label="Saved views",
-                ui_flat=True,
-                ui_dense=True,
-                ui_no_caps=True,
-                ui_class=str(cb.vp_tool),
-                ui_style=(
-                    "width:auto; min-width:max-content; flex:0 0 auto; height:34px; padding:0 10px; "
-                    "white-space:nowrap;"
-                ),
-            )
-            action.on_click(self._toggle_bookmarks)
-            btn = Div(action, self._bm_pop, ui_class="relative-position",
-                      ui_style="display:inline-flex; flex:none;")
+            # The app-level View menu owns the trigger; keep the popup mounted
+            # as a viewport overlay so it remains available without a toolbar icon.
+            btn = self._bm_pop
         else:
             btn = Div(
                 QIcon(ui_name="mdi-bookmark-outline"), QTooltip("Saved views"), self._bm_pop,

@@ -321,8 +321,8 @@ class Panel(StackHost):
         return info["cls"]
 
 
-class Settings(QMenu):
-    """Designer-styled settings dropdown (sections, segmented theme, switches)."""
+class Settings(Div):
+    """Designer-styled preferences panel (sections, segmented theme, switches)."""
 
     def __init__(self, app):
         self.app = app
@@ -461,6 +461,40 @@ class Settings(QMenu):
 
 
 
+def _app_menu_item(label, callback=None, icon=None, shortcut=None):
+    leading = []
+    if icon:
+        leading.append(QItemSection(QIcon(ui_name=icon, ui_size="xs"), ui_avatar=True))
+    text = label + (f"   {shortcut}" if shortcut else "")
+    item = QItem(*leading, QItemSection(text), ui_clickable=callback is not None, ui_dense=True)
+    if callback is not None:
+        item.on_click(lambda event=None, action=callback: action())
+    return item
+
+
+def _app_menu_button(label, entries):
+    items = [
+        QSeparator() if entry is None
+        else _app_menu_item(entry[0], entry[1], entry[2], entry[3])
+        for entry in entries
+    ]
+    menu = QMenu(
+        QList(*items, ui_dense=True),
+        ui_anchor="bottom left",
+        ui_self="top left",
+    )
+    return QBtn(
+        QTooltip(label), menu,
+        ui_label=label,
+        ui_flat=True, ui_dense=True, ui_no_caps=True,
+        ui_class="mmfem-app-menu-button",
+        ui_style=(
+            "height:32px; min-height:32px; padding:0 10px; "
+            "font-size:13px; font-weight:600;"
+        ),
+    )
+
+
 class NGSolveGui(App):
     def __init__(self, filename=None, local_path=None, script_args=None):
         self._local_path = local_path
@@ -475,7 +509,8 @@ class NGSolveGui(App):
         self._loaded_mesh_problem_sha256 = None
         self._solution_import_dirs = []
 
-        # -- Toolbar buttons (compact flat icon buttons, muted like the designer) --
+        # Frequent document and history actions stay one click away; the full
+        # artifact workflow lives in the application menus below.
         def _tbtn(icon, tip, handler=None):
             btn = QBtn(
                 QTooltip(tip), ui_flat=True, ui_dense=True, ui_icon=icon,
@@ -485,79 +520,29 @@ class NGSolveGui(App):
                 btn.on_click(handler)
             return btn
 
-        # Each artifact category has visible Save and Load actions, with its
-        # category label directly above the pair.
-        def _file_action(label, tip, handler):
-            button = QBtn(
-                QTooltip(tip), ui_label=label,
-                ui_flat=True, ui_dense=True, ui_no_caps=True,
-                ui_class="mmfem-file-action",
-                ui_style=(
-                    "height:28px; min-height:28px; padding:0 5px; "
-                    "font-size:12px; min-width:42px; white-space:nowrap;"
-                ),
-            )
-            button.on_click(handler)
-            return button
-
-        def _artifact_group(name, save_handler, load_handler, new_handler=None, extra_action=None):
-            actions = []
-            if new_handler is not None:
-                actions.append(_file_action("New", f"Start a new {name.lower()}", new_handler))
-            actions.extend((
-                _file_action("Save", f"Save {name.lower()}", save_handler),
-                _file_action("Load", f"Load {name.lower()}", load_handler),
-            ))
-            if extra_action is not None:
-                action_label, action_tip, action_handler = extra_action
-                actions.append(_file_action(action_label, action_tip, action_handler))
-            return Div(
-                Div(
-                    name,
-                    ui_style=(
-                        "font-size:10px; line-height:12px; font-weight:700; "
-                        "letter-spacing:.04em; text-transform:uppercase; "
-                        "text-align:center; color:var(--fg-subtle);"
-                    ),
-                ),
-                Div(
-                    *actions,
-                    ui_style="display:flex; align-items:center; justify-content:center; gap:1px;",
-                ),
-                ui_style=(
-                    "display:flex; flex-direction:column; align-items:center; "
-                    "justify-content:center; gap:2px; padding:0 4px;"
-                ),
-            )
-
-        problem_actions = _artifact_group(
-            "Problem", self.save_problem_file, self.load_problem_file,
-            new_handler=self.new_problem,
-            extra_action=("Import .py", "Import a legacy Python problem file", self._choose_legacy_problem_file),
+        new_problem_btn = _tbtn(
+            "mdi-file-plus-outline", "New problem (Ctrl+N)", self.new_problem
         )
-        mesh_actions = _artifact_group("Mesh", self.save_mesh_file, self.load_mesh_file)
-        solution_actions = _artifact_group(
-            "Solutions", self.save_solutions_file, self.load_solutions_file
+        open_problem_btn = _tbtn(
+            "mdi-folder-open-outline", "Open problem (Ctrl+O)", self.load_problem_file
         )
-        import_file_btn = _tbtn(
-            "mdi-file-import-outline",
-            "Import external geometry, mesh, Python script, or solution .pkl",
-            self._load_file,
+        save_problem_btn = _tbtn(
+            "mdi-content-save-outline", "Save problem (Ctrl+S)", self.save_problem_file
         )
-        self._undo_button = _tbtn("mdi-undo", "Undo model change", self._undo_solve_action)
-        self._redo_button = _tbtn("mdi-redo", "Redo model change", self._redo_solve_action)
+        self._undo_button = _tbtn(
+            "mdi-undo", "Undo model change (Ctrl+Z)", self._undo_solve_action
+        )
+        self._redo_button = _tbtn(
+            "mdi-redo", "Redo model change (Ctrl+Y)", self._redo_solve_action
+        )
         self._undo_button.ui_disable = True
         self._redo_button.ui_disable = True
-        file_group = Div(
-            problem_actions, mesh_actions, solution_actions,
-            ui_style=(
-                "display:flex; flex:0 1 auto; align-items:center; "
-                "gap:2px; min-width:0;"
-            ),
-        )
-        history_group = Div(
-            import_file_btn, self._undo_button, self._redo_button,
+        quick_actions = Div(
+            new_problem_btn, open_problem_btn, save_problem_btn,
+            Div(ui_class=cb.tb_sep),
+            self._undo_button, self._redo_button,
             ui_class=cb.tb_group,
+            ui_style="display:flex; align-items:center; gap:2px;",
         )
 
         cancel_new_problem = QBtn(
@@ -595,16 +580,7 @@ class NGSolveGui(App):
         discard_new_problem.on_click(self._discard_and_start_new_problem)
         save_new_problem.on_click(self._save_and_start_new_problem)
 
-        # Settings + quit (panel toggles removed — sidebars are draggable;
-        # theme lives in the settings menu).
-        settings_btn = QBtn(
-            Settings(self), QTooltip("User Settings"),
-            ui_flat=True, ui_dense=True, ui_icon="mdi-cog-outline",
-            ui_class=str(cb.topbar_icon),
-        )
-        close_btn = _tbtn("mdi-close", "Quit", self.quit)
-        close_btn.ui_class = str(cb.topbar_icon) + " " + str(cb.topbar_icon_danger)
-        view_group = Div(settings_btn, close_btn, ui_class=cb.tb_group)
+        # Preferences and application exit are available from the menus.
 
         ngs_logo = Div(
             QImg(
@@ -628,17 +604,14 @@ class NGSolveGui(App):
         self._last_redraw_time = 0.0
         self._redraw_interval = max(0, int(self.usersettings.get("redraw_interval_ms", 50))) / 1000.0
 
-        # Keep the full app header on one compact row: brand and workspace mode
-        # lead into explicit file actions; system status and app controls stay
-        # on the right.
+        # Keep the fixed app header compact: brand, workspace switch, common
+        # actions, and system status.
         bar = QBar(
             ngs_logo,
             self._workspace_mode_toggle,
-            file_group,
-            history_group,
+            quick_actions,
             QSpace(),
             *([self.system_monitor, Div(ui_class=cb.tb_sep)] if self.system_monitor is not None else []),
-            view_group,
             ui_class=str(cb.app_bar) + " mmfem-compact-app-bar",
             ui_style="height:60px; min-height:60px;",
         )
@@ -659,6 +632,15 @@ class NGSolveGui(App):
         )
         self.controls = ControlBar()
         self.footer = StatusFooter()
+        self._open_solutions_toolbar_button = QBtn(
+            QTooltip("Open a saved solution bundle or field pickle"),
+            ui_icon="mdi-folder-open-outline",
+            ui_label="Open solutions",
+            ui_flat=True, ui_dense=True, ui_no_caps=True,
+            ui_class=str(cb.topbar_icon),
+            ui_style="white-space:nowrap;",
+        )
+        self._open_solutions_toolbar_button.on_click(self.load_solutions_file)
 
         from .meshing_preview import install as _install_meshing_preview
 
@@ -734,9 +716,51 @@ class NGSolveGui(App):
             ui_class="cb-timer-card",
         ))
 
+        settings_close = QBtn(
+            ui_label="Close", ui_flat=True, ui_dense=True, ui_no_caps=True,
+        )
+        self._settings_dialog = QDialog(
+            QCard(
+                QCardSection(Div("Preferences", ui_class=cb.prop_title_text)),
+                QCardSection(
+                    Settings(self),
+                    ui_style="max-height:min(78vh, 760px); overflow:auto;",
+                ),
+                QCardActions(settings_close, ui_align="right"),
+                ui_style="width:min(560px, 94vw);",
+            ),
+            ui_model_value=False,
+        )
+        settings_close.on_click(lambda *a: setattr(self._settings_dialog, "ui_model_value", False))
+        about_close = QBtn(
+            ui_label="Close", ui_color="primary", ui_flat=True, ui_dense=True, ui_no_caps=True,
+        )
+        self._about_dialog = QDialog(
+            QCard(
+                QCardSection(
+                    QImg(
+                        ui_src=self.load_asset("mm-fem-logo.png"),
+                        ui_height="40px", ui_width="152px", ui_fit="contain",
+                    ),
+                    ui_style="display:flex; justify-content:center; padding:22px 22px 8px;",
+                ),
+                QCardSection(
+                    "MM-FEM",
+                    Div("Magneto-mechanical finite-element modelling", ui_class=cb.hint),
+                    ui_style="text-align:center;",
+                ),
+                QCardActions(about_close, ui_align="center"),
+                ui_style="width:min(380px, 92vw);",
+            ),
+            ui_model_value=False,
+        )
+        about_close.on_click(lambda *a: setattr(self._about_dialog, "ui_model_value", False))
+        self._menu_bar = self._build_application_menu_bar()
+
         super().__init__(
-            bar, self._post_process_workspace,
+            bar, self._menu_bar, self._post_process_workspace,
             self._solve_workspace, self._timer_dialog, self._new_problem_dialog,
+            self._settings_dialog, self._about_dialog,
             self.kb.indicator, self.kb.help_overlay,
             ui_class=str(cb.app_root),
         )
@@ -760,6 +784,9 @@ class NGSolveGui(App):
         # -- Global keybindings (always active) --
         kb = self.kb
         kb.add("h", kb.toggle_help, "Show keyboard shortcuts", "General")
+        kb.add("ctrl+n", lambda *a: self._run_menu_shortcut(self.new_problem), "New problem", "File")
+        kb.add("ctrl+o", lambda *a: self._run_menu_shortcut(self.load_problem_file), "Open problem", "File")
+        kb.add("ctrl+s", lambda *a: self._run_menu_shortcut(self.save_problem_file), "Save problem", "File")
         kb.add("delete", self._delete_selected_region_shortcut, "Delete selected region", "Solve")
         kb.add("ctrl+z", self._undo_solve_action, "Undo model change", "Solve")
         kb.add("ctrl+y", self._redo_solve_action, "Redo model change", "Solve")
@@ -783,6 +810,199 @@ class NGSolveGui(App):
                 self._load_with_status(f)
 
         self._refresh_solve_history_controls()
+
+    def _build_application_menu_bar(self):
+        menus = [
+            ("File", [
+                ("New problem", self.new_problem, "mdi-file-plus-outline", "Ctrl+N"),
+                ("Open problem...", self.load_problem_file, "mdi-folder-open-outline", "Ctrl+O"),
+                ("Save problem", self.save_problem_file, "mdi-content-save-outline", "Ctrl+S"),
+                None,
+                ("Import legacy Python problem...", self._choose_legacy_problem_file, "mdi-language-python", None),
+                ("Open external file...", self._load_file, "mdi-file-import-outline", None),
+                None,
+                ("Load mesh...", self.load_mesh_file, "mdi-folder-open-outline", None),
+                ("Save mesh", self.save_mesh_file, "mdi-content-save-outline", None),
+                ("Load solutions...", self.load_solutions_file, "mdi-folder-open-outline", None),
+                ("Save solutions", self.save_solutions_file, "mdi-content-save-outline", None),
+                None,
+                ("Exit", self.quit, "mdi-exit-to-app", None),
+            ]),
+            ("Edit", [
+                ("Undo", self._undo_solve_action, "mdi-undo", "Ctrl+Z"),
+                ("Redo", self._redo_solve_action, "mdi-redo", "Ctrl+Y"),
+                None,
+                ("Delete selected region", self._delete_selected_region_shortcut, "mdi-delete-outline", "Delete"),
+                ("Preferences...", self._open_settings, "mdi-cog-outline", None),
+            ]),
+            ("View", [
+                ("Fit view", self._menu_fit_view, "mdi-overscan", None),
+                None,
+                ("Isometric", lambda: self._menu_camera_view("isometric"), "mdi-cube-scan", None),
+                ("View from +X", lambda: self._menu_camera_view("right"), "mdi-axis-x-arrow", None),
+                ("View from -X", lambda: self._menu_camera_view("left"), "mdi-axis-x-arrow", None),
+                ("View from +Y", lambda: self._menu_camera_view("front"), "mdi-axis-y-arrow", None),
+                ("View from -Y", lambda: self._menu_camera_view("back"), "mdi-axis-y-arrow", None),
+                ("View from +Z", lambda: self._menu_camera_view("top"), "mdi-axis-z-arrow", None),
+                ("View from -Z", lambda: self._menu_camera_view("bottom"), "mdi-axis-z-arrow", None),
+                ("Toggle parallel projection", lambda: self._active_view_action("toggle_projection"), "mdi-perspective-less", None),
+                None,
+                ("Toggle axes", lambda: self._active_view_action("toggle_axes"), "mdi-axis-arrow", None),
+                ("Toggle navigation cube", lambda: self._active_view_action("toggle_navcube"), "mdi-cube-outline", None),
+                ("Link or detach camera", lambda: self._active_view_action("toggle_camera_link"), "mdi-link-variant", None),
+                ("Saved camera views", lambda: self._active_view_action("_toggle_bookmarks"), "mdi-bookmark-outline", None),
+                ("Fullscreen viewport", lambda: self._active_view_action("_toggle_fullscreen"), "mdi-fullscreen", None),
+                None,
+                ("Toggle model tree", self._menu_toggle_tree, "mdi-file-tree-outline", None),
+                ("Toggle properties", self._menu_toggle_properties, "mdi-tune-variant", None),
+                ("Messages", self._menu_toggle_messages, "mdi-message-alert-outline", None),
+                ("Solver log", self._menu_toggle_log, "mdi-console", None),
+            ]),
+            ("Model", [
+                ("Geometry", lambda: self._open_solve_section("geometry"), "mdi-vector-square", None),
+                ("Materials", lambda: self._open_solve_section("materials"), "mdi-cube-scan", None),
+                ("Physics & coupling", lambda: self._open_solve_section("physics"), "mdi-magnet", None),
+                ("Boundary conditions", lambda: self._open_solve_section("boundaries"), "mdi-vector-link", None),
+                ("Sources & loads", lambda: self._open_solve_section("sources"), "mdi-flash-outline", None),
+                ("Mesh settings", lambda: self._open_solve_section("mesh"), "mdi-vector-triangle", None),
+                ("Solver settings", lambda: self._open_solve_section("solver"), "mdi-tune-variant", None),
+                ("Study settings", lambda: self._open_solve_section("studies"), "mdi-play-box-multiple-outline", None),
+                ("Run history", lambda: self._open_solve_section("runs"), "mdi-history", None),
+                None,
+                ("Toggle snap to grid", self._menu_toggle_snap, "mdi-magnet", None),
+                ("Rename model...", self._menu_rename_model, "mdi-pencil-outline", None),
+                ("Preview geometry in 3D", self._menu_preview_geometry, "mdi-cube-scan", None),
+            ]),
+            ("Study", [
+                ("Check setup", self._menu_check_setup, "mdi-check-decagram-outline", None),
+                ("Generate mesh", self._menu_generate_mesh, "mdi-vector-triangle", None),
+                ("Run study", self._menu_run_study, "mdi-play", None),
+                ("Cancel current run", self._menu_cancel_run, "mdi-stop-circle-outline", None),
+            ]),
+            ("Results", [
+                ("Open solutions...", self.load_solutions_file, "mdi-folder-open-outline", None),
+                None,
+                ("Field & colour options", lambda: self._open_postprocess_controls("Field"), "mdi-palette", None),
+                ("Display & view options", lambda: self._open_postprocess_controls("Display & view"), "mdi-cube-scan", None),
+                ("Vectors & flow options", lambda: self._open_postprocess_controls("Vectors & flow"), "mdi-vector-triangle", None),
+                None,
+                ("Toggle wireframe", lambda: self._active_view_action("toggle_wireframe"), "mdi-grid", None),
+                ("Toggle clipping", lambda: self._active_view_action("toggle_clipping"), "mdi-content-cut", None),
+                ("Toggle probe", lambda: self._active_view_action("toggle_probe"), "mdi-crosshairs-gps", None),
+            ]),
+            ("Help", [
+                ("Keyboard shortcuts", self.kb.toggle_help, "mdi-keyboard-outline", "H"),
+                ("About MM-FEM", self._open_about, "mdi-information-outline", None),
+            ]),
+        ]
+        buttons = [_app_menu_button(label, entries) for label, entries in menus]
+        return Div(
+            *buttons,
+            ui_class="mmfem-app-menu-bar",
+            ui_style=(
+                "display:flex; align-items:center; gap:2px; flex:0 0 auto; "
+                "min-height:36px; padding:0 12px; box-sizing:border-box; "
+                "background:var(--panel-header); border-bottom:1px solid var(--border);"
+            ),
+        )
+
+    def _open_settings(self, *args):
+        self._settings_dialog.ui_model_value = True
+
+    def _open_about(self, *args):
+        self._about_dialog.ui_model_value = True
+
+    def _global_shortcut_context_active(self):
+        try:
+            focused = self.js.eval(
+                "(() => { const e = document.activeElement; return !!e && "
+                "(e.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(e.tagName)); })()"
+            )
+            return not bool(focused)
+        except Exception:
+            return True
+
+    def _run_menu_shortcut(self, callback):
+        if self._global_shortcut_context_active():
+            return callback()
+        return False
+
+    def _open_solve_section(self, section):
+        if self._workspace_mode != "solve":
+            self._workspace_mode_toggle.select("solve")
+        self.solve_workspace.select_section(section)
+
+    def _menu_fit_view(self, *args):
+        if self._workspace_mode == "solve":
+            return self.solve_workspace.fit_canvas_view()
+        return self._active_view_action("reset_camera")
+
+    def _menu_camera_view(self, view):
+        if self._workspace_mode == "solve":
+            if getattr(self.tab_panel, "comp", None) is None:
+                self._notify("Open a result in Post Process before choosing a camera view.", type="info", timeout=3000)
+                return False
+            self._workspace_mode_toggle.select("post_process")
+        return self._active_view_action("set_camera_view", view)
+
+    def _active_view_action(self, method, *args):
+        if self._workspace_mode != "post_process":
+            self._notify("Switch to Post Process to use this view command.", type="info", timeout=3000)
+            return False
+        comp = getattr(getattr(self, "tab_panel", None), "comp", None)
+        callback = getattr(comp, method, None) if comp is not None else None
+        if callable(callback):
+            return callback(*args)
+        self._notify("Load a compatible result in Post Process to use this view command.", type="info", timeout=3000)
+        return False
+
+    def _open_postprocess_controls(self, label):
+        if self._workspace_mode != "post_process":
+            self._workspace_mode_toggle.select("post_process")
+        return self._active_view_action("open_postprocess_controls", label)
+
+    def _menu_toggle_tree(self, *args):
+        if self._workspace_mode == "solve":
+            return self.solve_workspace._toggle_tree_panel()
+        return self._toggle_navigator()
+
+    def _menu_toggle_properties(self, *args):
+        if self._workspace_mode == "solve":
+            return self.solve_workspace._toggle_properties_panel()
+        return self._toggle_property_panel()
+
+    def _menu_toggle_messages(self, *args):
+        return self.solve_workspace.toggle_messages()
+
+    def _menu_toggle_log(self, *args):
+        return self.solve_workspace.toggle_log()
+
+    def _menu_toggle_snap(self, *args):
+        self._open_solve_section("geometry")
+        return self.solve_workspace.toggle_snap_to_grid()
+
+    def _menu_rename_model(self, *args):
+        self._open_solve_section("geometry")
+        return self.solve_workspace._begin_model_rename()
+
+    def _menu_preview_geometry(self, *args):
+        self._open_solve_section("geometry")
+        return self.solve_workspace.toggle_3d_preview()
+
+    def _menu_check_setup(self, *args):
+        self._open_solve_section("studies")
+        return self.solve_workspace.validate_action()
+
+    def _menu_generate_mesh(self, *args):
+        self._open_solve_section("mesh")
+        return self.solve_workspace.run_mesh_action()
+
+    def _menu_run_study(self, *args):
+        self._open_solve_section("studies")
+        return self.solve_workspace.run_study_action()
+
+    def _menu_cancel_run(self, *args):
+        return self.solve_workspace._cancel_solver_job()
 
     def _refresh_solve_history_controls(self):
         workspace = getattr(self, "solve_workspace", None)
@@ -1523,6 +1743,8 @@ class NGSolveGui(App):
         """Place active viewport controls above the full three-column page."""
         get_items = getattr(comp, "_page_toolbar_children", None)
         items = list(get_items()) if callable(get_items) else []
+        if items:
+            items = [self._open_solutions_toolbar_button, Div(ui_class=cb.vp_sep), *items]
         self._post_process_toolbar.ui_children = items
         self._post_process_toolbar.ui_hidden = not bool(items)
 
