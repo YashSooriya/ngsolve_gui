@@ -666,7 +666,7 @@ class SolveWorkspace(Div):
             style="flex:0 0 auto; white-space:nowrap;",
         )
         arc_button, arc_group = sketch_tool_group(
-            "Arc", "mdi-chart-bell-curve-cumulative", "arc",
+            "Arc", "mdi-vector-curve", "arc",
             (("three-point", "3-point arc"), ("centerpoint", "Centerpoint arc"), ("tangent", "Tangent arc")),
             "Choose a 3-point, centerpoint, or tangent arc.",
         )
