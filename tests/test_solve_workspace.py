@@ -1156,6 +1156,60 @@ def test_drag_sketches_dimensioned_rectangle_and_circle_regions(standalone_compo
     ]
 
 
+def test_circle_is_one_closed_boundary_and_legacy_circle_segments_collapse_on_load(standalone_components):
+    from ngsolve_gui.axisymmetric_model import validate_model
+
+    workspace = SolveWorkspace()
+    workspace._add_primitive("circle")
+    circle = workspace.model["geometry"]["regions"][0]
+    geometry = workspace.model["geometry"]
+    assert len(circle["edge_ids"]) == 1
+    assert len(geometry["edges"]) == 1
+    edge = geometry["edges"][0]
+    assert edge["curve"]["type"] == "circle"
+    assert edge["vertices"][0] == edge["vertices"][1]
+    assert edge["curve"]["sampled_points"][0] == edge["curve"]["sampled_points"][-1]
+    assert edge["point_ids"][0] == edge["point_ids"][1]
+    assert validate_model(workspace.model, scope="draft") == []
+
+    legacy = copy.deepcopy(workspace.model)
+    circle = legacy["geometry"]["regions"][0]
+    vertices = circle["vertices"]
+    old_edges = []
+    old_edge_ids = []
+    condition = {"id": "bc-circle", "name": "Circle boundary", "type": "natural"}
+    legacy["boundary_conditions"].append(condition)
+    for index, start in enumerate(vertices):
+        edge_id = f"old-circle-edge-{index}"
+        old_edge_ids.append(edge_id)
+        old_edges.append({
+            "id": edge_id,
+            "name": f"Old circle segment {index + 1}",
+            "vertices": [start, vertices[(index + 1) % len(vertices)]],
+            "curve": {
+                "type": "arc",
+                "center": [circle["shape"]["r_center"], circle["shape"]["z_center"]],
+                "radius": circle["shape"]["radius"],
+                "clockwise": False,
+            },
+            "boundary_condition_ids": [condition["id"]],
+        })
+    circle["edge_ids"] = old_edge_ids
+    legacy["geometry"]["edges"] = old_edges
+    legacy["mesh"]["hp_edge_ids"] = old_edge_ids
+
+    loaded = SolveWorkspace()
+    loaded.set_model(legacy)
+    loaded_circle = loaded.model["geometry"]["regions"][0]
+    loaded_edges = loaded.model["geometry"]["edges"]
+    assert len(loaded_circle["edge_ids"]) == 1
+    assert len(loaded_edges) == 1
+    assert loaded_edges[0]["curve"]["type"] == "circle"
+    assert loaded_edges[0]["boundary_condition_ids"] == [condition["id"]]
+    assert loaded.model["mesh"]["hp_edge_ids"] == loaded_circle["edge_ids"]
+    assert validate_model(loaded.model, scope="draft") == []
+
+
 def test_sketch_line_network_splits_faces_and_reuses_a_shared_boundary(standalone_components):
     workspace = SolveWorkspace()
     for first, second in (

@@ -682,7 +682,7 @@ def _upgrade_sketch_topology(model):
             references.append(point_id)
         edge["point_ids"] = references
         curve = edge.get("curve")
-        if isinstance(curve, dict) and curve.get("type") in {"line", "arc", "spline3"}:
+        if isinstance(curve, dict) and curve.get("type") in {"line", "arc", "circle", "spline3"}:
             continue
         circle = next((
             region for region in regions_by_edge.get(edge.get("id"), [])
@@ -1382,7 +1382,28 @@ def validate_model(model: dict, *, scope="solve") -> list[str]:
                 endpoint_values = [[float(value) for value in point] for point in edge_vertices]
                 if not all(math.isfinite(value) for point in endpoint_values for value in point):
                     raise ValueError("endpoints must be finite")
-                key = _coordinate_edge_key(endpoint_values)
+                curve = edge.get("curve")
+                if isinstance(curve, dict) and curve.get("type") == "circle":
+                    try:
+                        center = tuple(round(float(value), 12) for value in curve.get("center", []))
+                        radius = round(float(curve.get("radius")), 12)
+                        if len(center) != 2 or radius <= 0:
+                            raise ValueError("a circle needs a finite centre and positive radius")
+                        if tuple(round(value, 12) for value in endpoint_values[0]) != tuple(
+                            round(value, 12) for value in endpoint_values[1]
+                        ):
+                            raise ValueError("a full-circle edge must have coincident endpoints")
+                        key = ("circle", *center, radius)
+                    except (TypeError, ValueError, OverflowError) as error:
+                        errors.append(f"Edge '{edge.get('name', edge_id)}': {error}.")
+                        continue
+                else:
+                    if tuple(round(value, 12) for value in endpoint_values[0]) == tuple(
+                        round(value, 12) for value in endpoint_values[1]
+                    ):
+                        errors.append(f"Edge '{edge.get('name', edge_id)}' must have distinct endpoints.")
+                        continue
+                    key = _coordinate_edge_key(endpoint_values)
                 if key in edge_keys:
                     errors.append(f"Geometry edge '{edge.get('name', edge_id)}' duplicates another edge.")
                 edge_keys[key] = edge_id
@@ -1414,13 +1435,21 @@ def validate_model(model: dict, *, scope="solve") -> list[str]:
             errors.append(f"Edge '{edge.get('name', edge_id)}' has multiple mechanical conditions.")
         if scope == "solve" and isinstance(edge_vertices, list) and len(edge_vertices) == 2:
             try:
+                edge_curve = edge.get("curve")
+                sampled_path = (
+                    edge_curve.get("sampled_points")
+                    if isinstance(edge_curve, dict) else None
+                )
+                axis_points = sampled_path if isinstance(sampled_path, list) and len(sampled_path) >= 2 else edge_vertices
                 edge_scale = max(
-                    math.hypot(float(edge_vertices[1][0]) - float(edge_vertices[0][0]),
-                               float(edge_vertices[1][1]) - float(edge_vertices[0][1])),
-                    1e-12,
+                    (
+                        math.hypot(float(second[0]) - float(first[0]), float(second[1]) - float(first[1]))
+                        for first, second in zip(axis_points, axis_points[1:])
+                    ),
+                    default=1e-12,
                 )
                 axis_tol = max(1e-12, edge_scale * 1e-12)
-                on_axis = all(abs(float(point[0])) <= axis_tol for point in edge_vertices)
+                on_axis = all(abs(float(point[0])) <= axis_tol for point in axis_points)
             except (TypeError, ValueError, IndexError, OverflowError):
                 on_axis = False
             if "axis_of_symmetry" in assigned_types and not on_axis:

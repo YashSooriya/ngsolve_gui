@@ -1143,6 +1143,29 @@ class SolveWorkspace(Div):
         self.model.setdefault("region_groups", [])
         self._prune_region_groups()
         self.studies = studies
+        edge_by_id = {
+            edge.get("id"): edge
+            for edge in self.model.get("geometry", {}).get("edges", [])
+            if isinstance(edge, dict) and isinstance(edge.get("id"), str)
+        }
+        needs_circle_normalization = any(
+            isinstance(region, dict)
+            and isinstance(region.get("shape"), dict)
+            and region["shape"].get("type") == "circle"
+            and not (
+                isinstance(region.get("edge_ids"), list)
+                and len(region["edge_ids"]) == 1
+                and isinstance(edge_by_id.get(region["edge_ids"][0]), dict)
+                and isinstance(edge_by_id[region["edge_ids"][0]].get("curve"), dict)
+                and edge_by_id[region["edge_ids"][0]]["curve"].get("type") == "circle"
+            )
+            for region in self.model.get("geometry", {}).get("regions", [])
+        )
+        if needs_circle_normalization:
+            self._rebuild_edges()
+            normalized_errors = validate_model(self.model, scope="draft")
+            if normalized_errors:
+                raise ValueError("Invalid normalized model document: " + " ".join(normalized_errors))
         self.mark_saved()
         self._undo_history.clear()
         self._redo_history.clear()
@@ -4517,6 +4540,8 @@ class SolveWorkspace(Div):
         edges_by_key = {}
         used_old_ids = set()
         source_part_counts = {}
+        collapsed_edge_id_map = {}
+        selected_circle_edge_ids = set()
         condition_by_id = {
             item.get("id"): item
             for item in self.model.get("boundary_conditions", [])
@@ -4647,6 +4672,81 @@ class SolveWorkspace(Div):
                     region_loop_refs.append({"edge_id": edge["id"], "forward": forward})
                 region["edge_ids"] = list(dict.fromkeys(region_edge_ids))
                 region["boundary_loops"] = [{"role": "outer", "edges": region_loop_refs}] if region_loop_refs else []
+                continue
+            if isinstance(shape, dict) and shape.get("type") == "circle":
+                center = [float(shape["r_center"]), float(shape["z_center"])]
+                radius = float(shape["radius"])
+                circle_samples = [
+                    [float(point[0]), float(point[1])]
+                    for point in region.get("vertices", [])
+                    if isinstance(point, (list, tuple)) and len(point) >= 2
+                ]
+                if len(circle_samples) < 3 or radius <= 0:
+                    continue
+                if circle_samples[0] != circle_samples[-1]:
+                    circle_samples.append(list(circle_samples[0]))
+                else:
+                    circle_samples[-1] = list(circle_samples[0])
+                circle_key = (
+                    "circle", round(center[0], 12), round(center[1], 12), round(radius, 12)
+                )
+                source_ids = set(region.get("edge_ids", []))
+                candidates = [
+                    old for old in old_edges
+                    if isinstance(old, dict) and old.get("id") in source_ids
+                ]
+                if not candidates:
+                    candidates = [
+                        old for old in old_edges
+                        if isinstance(old, dict)
+                        and isinstance(old.get("curve"), dict)
+                        and old["curve"].get("type") in {"arc", "circle"}
+                        and old["curve"].get("center") == center
+                        and math.isclose(float(old["curve"].get("radius", -1)), radius, rel_tol=1e-10, abs_tol=1e-12)
+                    ]
+                candidates.sort(key=lambda old: (
+                    old.get("id") not in selected_before,
+                    not bool(_edge_condition_ids(old)),
+                    str(old.get("id", "")),
+                ))
+                source_edge = candidates[0] if candidates else None
+                edge = edges_by_key.get(circle_key)
+                if edge is None:
+                    edge = copy.deepcopy(source_edge) if source_edge else {}
+                    old_id = source_edge.get("id") if source_edge else None
+                    if old_id and old_id not in used_old_ids:
+                        edge_id = old_id
+                        used_old_ids.add(old_id)
+                    else:
+                        edge_id = new_id("edge")
+                    edge["id"] = edge_id
+                    edge["name"] = f"{region.get('name', 'Circle')} boundary"
+                    edge["vertices"] = [list(circle_samples[0]), list(circle_samples[0])]
+                    edge["curve"] = {
+                        "type": "circle",
+                        "center": center,
+                        "radius": radius,
+                        "sampled_points": circle_samples,
+                    }
+                    edge["boundary_condition_ids"] = merged_condition_ids(candidates)
+                    edge.pop("boundary_condition_id", None)
+                    edge.pop("sketch_entity_id", None)
+                    edge.pop("sketch_t0", None)
+                    edge.pop("sketch_t1", None)
+                    edges_by_key[circle_key] = edge
+                    edges.append(edge)
+                else:
+                    edge["boundary_condition_ids"] = merged_condition_ids([edge, *candidates])
+                for old in candidates:
+                    old_id = old.get("id")
+                    if isinstance(old_id, str) and old_id != edge["id"]:
+                        collapsed_edge_id_map[old_id] = edge["id"]
+                if any(old.get("id") in selected_before for old in candidates):
+                    selected_circle_edge_ids.add(edge["id"])
+                region_edge_ids.append(edge["id"])
+                region_loop_refs.append({"edge_id": edge["id"], "forward": True})
+                region["edge_ids"] = list(dict.fromkeys(region_edge_ids))
+                region["boundary_loops"] = [{"role": "outer", "edges": region_loop_refs}]
                 continue
             points = region.get("vertices", [])
             for index, raw_start in enumerate(points):
@@ -4799,7 +4899,7 @@ class SolveWorkspace(Div):
 
         # Keep a selected old edge selected across each of its split segments.
         if hasattr(self, "selected_edge_ids"):
-            selected_ids = set()
+            selected_ids = set(selected_circle_edge_ids)
             for edge in edges:
                 if edge["id"] in old_selected:
                     selected_ids.add(edge["id"])
@@ -4822,6 +4922,11 @@ class SolveWorkspace(Div):
 
         # Remove sizing and refinement assignments whose geometry was deleted.
         mesh = self.model.setdefault("mesh", {})
+        if collapsed_edge_id_map:
+            mesh["hp_edge_ids"] = list(dict.fromkeys(
+                collapsed_edge_id_map.get(edge_id, edge_id)
+                for edge_id in mesh.get("hp_edge_ids", [])
+            ))
         live_region_ids = {region["id"] for region in geometry.get("regions", [])}
         live_edge_ids = {edge["id"] for edge in edges}
         region_sizes = mesh.get("region_element_sizes", {})
@@ -8822,14 +8927,17 @@ def _edge_condition_ids(edge):
 
 
 def _edge_is_on_rotation_axis(edge):
-    """Return whether a straight sketch edge lies on the r = 0 axis."""
+    """Return whether the complete boundary curve lies on the r = 0 axis."""
     if not isinstance(edge, dict):
         return False
     vertices = edge.get("vertices", [])
     if not isinstance(vertices, (list, tuple)) or len(vertices) != 2:
         return False
+    curve = edge.get("curve")
+    sampled = curve.get("sampled_points") if isinstance(curve, dict) else None
+    points = sampled if isinstance(sampled, (list, tuple)) and len(sampled) >= 2 else vertices
     try:
-        return all(abs(float(point[0])) <= 1e-12 for point in vertices)
+        return all(abs(float(point[0])) <= 1e-12 for point in points)
     except (TypeError, ValueError, IndexError, OverflowError):
         return False
 
