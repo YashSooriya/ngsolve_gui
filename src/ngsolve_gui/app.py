@@ -779,7 +779,7 @@ class NGSolveGui(App):
         self._menu_bar = self._build_application_menu_bar()
 
         super().__init__(
-            bar, self._menu_bar, self._post_process_workspace,
+            self._menu_bar, bar, self._post_process_workspace,
             self._solve_workspace, self._timer_dialog, self._new_problem_dialog,
             self._settings_dialog, self._about_dialog,
             self.kb.indicator, self.kb.help_overlay,
