@@ -817,7 +817,7 @@ class NGSolveGui(App):
         kb.add("ctrl+n", lambda *a: self._run_menu_shortcut(self.new_problem), "New problem", "File")
         kb.add("ctrl+o", lambda *a: self._run_menu_shortcut(self.load_problem_file), "Open problem", "File")
         kb.add("ctrl+s", lambda *a: self._run_menu_shortcut(self.save_problem_file), "Save problem", "File")
-        kb.add("delete", self._delete_selected_region_shortcut, "Delete selected region", "Solve")
+        kb.add("delete", self._delete_selected_region_shortcut, "Delete selected geometry", "Solve")
         kb.add("ctrl+z", self._undo_solve_action, "Undo model change", "Solve")
         kb.add("ctrl+y", self._redo_solve_action, "Redo model change", "Solve")
         kb.add("ctrl+b", self._toggle_navigator, "Toggle navigator", "Panels")
@@ -862,7 +862,7 @@ class NGSolveGui(App):
                 ("Undo", self._undo_solve_action, "mdi-undo", "Ctrl+Z"),
                 ("Redo", self._redo_solve_action, "mdi-redo", "Ctrl+Y"),
                 None,
-                ("Delete selected region", self._delete_selected_region_shortcut, "mdi-delete-outline", "Delete"),
+                ("Delete selected geometry", self._delete_selected_region_shortcut, "mdi-delete-outline", "Delete"),
                 ("Preferences...", self._open_settings, "mdi-cog-outline", None),
             ]),
             ("View", [
@@ -1195,11 +1195,7 @@ class NGSolveGui(App):
     def _delete_selected_region_shortcut(self, *args):
         if not self._solve_shortcut_context_active():
             return False
-        region_id = self.solve_workspace.selected_region_id
-        if region_id:
-            self.solve_workspace.delete_region(region_id)
-            return True
-        return False
+        return self.solve_workspace.delete_selected_geometry()
 
     def _set_workspace_mode(self, mode):
         if mode not in WorkspaceModeToggle._MODES:

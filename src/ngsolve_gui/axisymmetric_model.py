@@ -754,6 +754,7 @@ def _upgrade_sketch_topology(model):
     geometry["points"] = points
     geometry["topology_version"] = 1
     geometry.setdefault("sketch_entities", [])
+    geometry.setdefault("voids", [])
 
 
 def migrate_legacy_model(model):
@@ -857,6 +858,7 @@ def new_model(name: str = "Untitled axisymmetric model") -> dict:
             "sketch_entities": [],
             "regions": [],
             "edges": [],
+            "voids": [],
             "constraints": [],
         },
         "materials": [],
@@ -1016,7 +1018,7 @@ def _validate_draft_structure(model: dict) -> list[str]:
     if not isinstance(geometry, dict):
         errors.append("Geometry section is missing.")
     else:
-        for key in ("regions", "edges"):
+        for key in ("regions", "edges", "voids"):
             if key in geometry and not isinstance(geometry[key], list):
                 errors.append(f"Geometry {key} must be a list.")
     studies = model.get("studies")
@@ -1166,6 +1168,10 @@ def validate_model(model: dict, *, scope="solve") -> list[str]:
     if not isinstance(regions, list):
         errors.append("Geometry regions must be a list.")
         return errors
+    voids = geometry.get("voids", [])
+    if not isinstance(voids, list):
+        errors.append("Geometry voids must be a list.")
+        voids = []
     ids = set()
     materials = set(materials_by_id)
     region_by_id = {}
@@ -1300,6 +1306,68 @@ def validate_model(model: dict, *, scope="solve") -> list[str]:
                     raise ValueError("expression and saved dimension disagree")
             except (TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError) as error:
                 errors.append(f"Region '{region.get('name')}' dimension {key}: {error}.")
+
+    valid_voids = []
+    void_ids = set()
+    valid_region_points = {region.get("id"): points for region, points in valid_regions}
+    for void in voids:
+        if not isinstance(void, dict):
+            errors.append("Each geometry void must be an object.")
+            continue
+        void_id = void.get("id")
+        if not isinstance(void_id, str) or not void_id or void_id in void_ids:
+            errors.append("Every geometry void must have a unique id.")
+            continue
+        void_ids.add(void_id)
+        parent_id = void.get("parent_id")
+        parent_points = valid_region_points.get(parent_id)
+        if not isinstance(parent_id, str) or parent_points is None:
+            errors.append(f"Void '{void.get('name', void_id)}' must name a containing region as its parent.")
+        try:
+            raw_points = void.get("vertices", [])
+            if not isinstance(raw_points, list) or len(raw_points) < 3:
+                raise ValueError("needs at least three vertices")
+            if any(not isinstance(point, (list, tuple)) or len(point) != 2 or any(isinstance(value, bool) for value in point) for point in raw_points):
+                raise ValueError("coordinates must be numeric pairs")
+            points = [(float(point[0]), float(point[1])) for point in raw_points]
+            if not all(math.isfinite(value) for point in points for value in point):
+                raise ValueError("coordinates must be finite")
+            if any(radius < 0 for radius, _ in points):
+                raise ValueError("must not cross the r=0 axis")
+            if abs(_signed_area(points)) <= 1e-14 or not _simple_polygon(points):
+                raise ValueError("must have a nonzero, non-self-intersecting outline")
+        except (TypeError, ValueError, IndexError, OverflowError) as error:
+            errors.append(f"Void '{void.get('name', void_id)}': {error}.")
+            continue
+        if parent_points is not None:
+            if not _contains_or_touches(parent_points, points):
+                errors.append(f"Void '{void.get('name', void_id)}' must lie inside its parent region.")
+            touches_parent = any(
+                _point_on_segment(
+                    point,
+                    parent_points[index],
+                    parent_points[(index + 1) % len(parent_points)],
+                    1e-10,
+                )
+                for point in points
+                for index in range(len(parent_points))
+            )
+            if touches_parent:
+                errors.append(f"Void '{void.get('name', void_id)}' must not touch its parent boundary.")
+        void_edge_ids = void.get("edge_ids")
+        if not isinstance(void_edge_ids, list) or not void_edge_ids:
+            errors.append(f"Void '{void.get('name', void_id)}' must reference its boundary edges.")
+            continue
+        if any(not isinstance(edge_id, str) or not edge_id for edge_id in void_edge_ids):
+            errors.append(f"Void '{void.get('name', void_id)}' boundary references must be edge ids.")
+            continue
+        if len(void_edge_ids) != len(set(void_edge_ids)):
+            errors.append(f"Void '{void.get('name', void_id)}' repeats a boundary edge id.")
+            continue
+        if any(edge_id not in {edge.get("id") for edge in geometry.get("edges", []) if isinstance(edge, dict)} for edge_id in void_edge_ids):
+            errors.append(f"Void '{void.get('name', void_id)}' references a missing boundary edge.")
+            continue
+        valid_voids.append((void, points))
 
     conditions = model.get("boundary_conditions", [])
     if not isinstance(conditions, list):
@@ -1467,8 +1535,15 @@ def validate_model(model: dict, *, scope="solve") -> list[str]:
 
     expected_edge_keys = set()
     outline_tolerance = 1e-9
-    for region_data, points in valid_regions:
-        expected_region_ids = set()
+    outline_records = [
+        (region, points, f"Region '{region.get('name')}'")
+        for region, points in valid_regions
+    ] + [
+        (void, points, f"Void '{void.get('name', void.get('id'))}'")
+        for void, points in valid_voids
+    ]
+    for outline, points, label in outline_records:
+        expected_outline_ids = set()
         for index, start_point in enumerate(points):
             end_point = points[(index + 1) % len(points)]
             dx = end_point[0] - start_point[0]
@@ -1515,22 +1590,32 @@ def validate_model(model: dict, *, scope="solve") -> list[str]:
                 if upper > cursor + outline_tolerance:
                     cursor = upper
                     if isinstance(edge_id, str):
-                        expected_region_ids.add(edge_id)
+                        expected_outline_ids.add(edge_id)
                     if key is not None:
                         expected_edge_keys.add(key)
             if cursor < 1.0 - outline_tolerance:
-                errors.append(
-                    f"Region '{region_data.get('name')}' has a sketch edge without complete boundary coverage."
-                )
-        region_edge_ids = region_data.get("edge_ids")
-        if not isinstance(region_edge_ids, list):
-            errors.append(f"Region '{region_data.get('name')}' must reference its sketch edges.")
-        elif len(region_edge_ids) != len(set(region_edge_ids)):
-            errors.append(f"Region '{region_data.get('name')}' repeats a sketch edge id.")
-        elif any(edge_id not in edge_ids for edge_id in region_edge_ids):
-            errors.append(f"Region '{region_data.get('name')}' references a missing sketch edge.")
-        elif set(region_edge_ids) != expected_region_ids:
-            errors.append(f"Region '{region_data.get('name')}' edge ids do not match its sketch geometry.")
+                errors.append(f"{label} has a sketch edge without complete boundary coverage.")
+        outline_edge_ids = outline.get("edge_ids")
+        if not isinstance(outline_edge_ids, list):
+            errors.append(f"{label} must reference its sketch edges.")
+        elif len(outline_edge_ids) != len(set(outline_edge_ids)):
+            errors.append(f"{label} repeats a sketch edge id.")
+        elif any(edge_id not in edge_ids for edge_id in outline_edge_ids):
+            errors.append(f"{label} references a missing sketch edge.")
+        elif set(outline_edge_ids) != expected_outline_ids:
+            errors.append(f"{label} edge ids do not match its sketch geometry.")
+
+    # Open sketch curves remain editable and need not bound a material region.
+    sketch_entity_ids = {
+        entity.get("id") for entity in geometry.get("sketch_entities", [])
+        if isinstance(entity, dict) and isinstance(entity.get("id"), str)
+    }
+    for edge in edge_list:
+        if edge.get("sketch_entity_id") in sketch_entity_ids:
+            key = edge_key_by_id.get(edge.get("id"))
+            if key is not None:
+                expected_edge_keys.add(key)
+
     if set(edge_keys) != expected_edge_keys:
         errors.append("Geometry edge list does not match the region outlines.")
 

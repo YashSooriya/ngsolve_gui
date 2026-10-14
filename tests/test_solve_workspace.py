@@ -3806,3 +3806,89 @@ def test_grouped_region_toggles_source_assignment_for_every_member(standalone_co
     assert set(workspace.model["regional_loads"][0]["region_ids"]) == {first["id"], second["id"]}
     assert workspace._toggle_active_source_region(second["id"])
     assert workspace.model["regional_loads"][0]["region_ids"] == []
+
+
+
+def test_delete_key_removes_only_marquee_selected_edge(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    edge = next(item for item in workspace.model["geometry"]["edges"] if item["id"] == region["edge_ids"][0])
+    project, _ = workspace._canvas_projection()
+    first, second = [project(point) for point in edge["vertices"]]
+    box = (
+        min(first[0], second[0]) - 2,
+        min(first[1], second[1]) - 2,
+        max(first[0], second[0]) + 2,
+        max(first[1], second[1]) + 2,
+    )
+
+    workspace._select_edges_in_canvas_box(
+        (box[0], box[1]), (box[2], box[3])
+    )
+
+    assert workspace.selected_region_ids == []
+    assert workspace.selected_edge_ids == [edge["id"]]
+    assert workspace.delete_selected_geometry()
+
+    geometry = workspace.model["geometry"]
+    assert geometry["regions"] == []
+    assert len(geometry["edges"]) == 3
+    assert all(item.get("sketch_entity_id") for item in geometry["edges"])
+    assert edge["id"] not in {item["id"] for item in geometry["edges"]}
+
+
+def test_delete_inner_region_preserves_a_valid_hole(standalone_components):
+    from ngsolve_gui.axisymmetric_model import validate_model
+
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    outer = workspace.model["geometry"]["regions"][0]
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.003,
+        ("rectangle", "z_min"): 0.003,
+        ("rectangle", "width"): 0.004,
+        ("rectangle", "height"): 0.005,
+    })
+    workspace._add_primitive("rectangle")
+    inner = workspace.model["geometry"]["regions"][1]
+    assert inner["parent_id"] == outer["id"]
+
+    workspace.select_region(inner["id"])
+    assert workspace.delete_selected_geometry()
+
+    geometry = workspace.model["geometry"]
+    assert [region["id"] for region in geometry["regions"]] == [outer["id"]]
+    assert len(geometry["voids"]) == 1
+    hole = geometry["voids"][0]
+    assert hole["parent_id"] == outer["id"]
+    assert set(hole["edge_ids"]).issubset({edge["id"] for edge in geometry["edges"]})
+    outer = geometry["regions"][0]
+    assert any(
+        loop.get("role") == "hole"
+        and loop.get("void_id") == hole["id"]
+        for loop in outer.get("boundary_loops", [])
+    )
+    assert validate_model(workspace.model, scope="mesh") == []
+
+
+
+def test_delete_key_removes_all_selected_regions(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    first = workspace.model["geometry"]["regions"][0]
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.02,
+        ("rectangle", "z_min"): 0.0,
+        ("rectangle", "width"): 0.004,
+        ("rectangle", "height"): 0.005,
+    })
+    workspace._add_primitive("rectangle")
+    second = workspace.model["geometry"]["regions"][1]
+
+    workspace.select_region(first["id"])
+    workspace.select_region(second["id"], additive=True)
+
+    assert set(workspace._selected_region_ids_live()) == {first["id"], second["id"]}
+    assert workspace.delete_selected_geometry()
+    assert workspace.model["geometry"]["regions"] == []

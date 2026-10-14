@@ -723,12 +723,6 @@ class SolveWorkspace(Div):
             tooltip="Trim an open line at its intersections with other sketch curves.",
             style="flex:0 0 auto; white-space:nowrap;",
         )
-        delete_edge_button = _button(
-            "Delete edge", "mdi-delete-outline",
-            self.delete_selected_sketch_edges,
-            tooltip="Delete the selected sketch curve(s).",
-            style="flex:0 0 auto; white-space:nowrap;",
-        )
         snap_button = _button("Snap", "mdi-magnet", self.toggle_snap_to_grid, tooltip="Snap sketch points to grid intersections", style="flex:0 0 auto; white-space:nowrap;")
         sketch_toolbar_separator = QSeparator(ui_vertical=True)
         fit_view_button = _button(
@@ -758,7 +752,6 @@ class SolveWorkspace(Div):
             line_button,
             arc_group,
             trim_button,
-            delete_edge_button,
             snap_button,
             sketch_toolbar_separator,
             fit_view_button,
@@ -780,7 +773,7 @@ class SolveWorkspace(Div):
         self._snap_button = snap_button
         self._sketch_view_controls = [
             select_button, rectangle_group, circle_group, line_button, arc_group,
-            trim_button, delete_edge_button, snap_button,
+            trim_button, snap_button,
             sketch_toolbar_separator, fit_view_button, zoom_out_button,
             zoom_in_button, self._mesh_preview_button,
         ]
@@ -4244,6 +4237,16 @@ class SolveWorkspace(Div):
             if self._has_unsupported_overlap(vertices, parent_id):
                 continue
             signature = self._sketch_region_signature(loop["entity_ids"], loop["boundary"])
+            if any(
+                void.get("parent_id") == parent_id
+                and self._sketch_region_signature(
+                    void.get("shape", {}).get("entity_ids", []),
+                    void.get("shape", {}).get("boundary", []),
+                ) == signature
+                for void in geometry.get("voids", [])
+                if isinstance(void.get("shape"), dict)
+            ):
+                continue
             matched = generated_by_entities.pop(signature, None)
             if matched is None:
                 loop_entities = set(loop["entity_ids"])
@@ -4294,37 +4297,115 @@ class SolveWorkspace(Div):
 
     @_history_tracked
     def delete_selected_sketch_edges(self):
-        edge_ids = set(self.selected_edge_ids or ([self.selected_edge_id] if self.selected_edge_id else []))
-        entity_ids = {
-            edge.get("sketch_entity_id")
-            for edge in self.model["geometry"].get("edges", [])
-            if edge.get("id") in edge_ids and edge.get("sketch_entity_id")
-        }
-        if not entity_ids:
-            self._message("Select one or more sketch edges to delete.", error=True)
-            return False
+        """Delete selected edges, leaving unselected straight outline segments editable."""
         geometry = self.model["geometry"]
+        geometry.setdefault("voids", [])
+        requested_ids = set(
+            self.selected_edge_ids
+            or ([self.selected_edge_id] if self.selected_edge_id else [])
+        )
+        edges_by_id = {
+            edge.get("id"): edge for edge in geometry.get("edges", [])
+            if isinstance(edge, dict) and isinstance(edge.get("id"), str)
+        }
+        delete_ids = requested_ids.intersection(edges_by_id)
+        if not delete_ids:
+            self._message("Select one or more edges to delete.", error=True)
+            return False
+
+        entity_ids = {
+            edges_by_id[edge_id].get("sketch_entity_id")
+            for edge_id in delete_ids
+            if edges_by_id[edge_id].get("sketch_entity_id")
+        }
+        # A selected segment belongs to its original sketch curve. Remove the
+        # whole curve so its other cached edge segments cannot come back.
+        delete_ids.update(
+            edge.get("id")
+            for edge in geometry.get("edges", [])
+            if edge.get("sketch_entity_id") in entity_ids
+        )
+        affected_regions = {
+            region.get("id")
+            for region in geometry.get("regions", [])
+            if set(region.get("edge_ids", [])).intersection(delete_ids)
+        }
+        affected_voids = [
+            void for void in geometry.get("voids", [])
+            if set(void.get("edge_ids", [])).intersection(delete_ids)
+        ]
+
+        def preserve_as_sketch(edge):
+            if not isinstance(edge, dict) or edge.get("sketch_entity_id"):
+                return
+            vertices = edge.get("vertices", [])
+            if len(vertices) != 2:
+                return
+            curve = edge.get("curve", {})
+            if isinstance(curve, dict) and curve.get("type") not in {None, "line"}:
+                return
+            entity_id = new_id("curve")
+            points = copy.deepcopy(vertices)
+            entity = {
+                "id": entity_id,
+                "type": "line",
+                "points": points,
+                "sampled_points": points,
+                "curve": {"type": "line"},
+            }
+            geometry.setdefault("sketch_entities", []).append(entity)
+            edge["sketch_entity_id"] = entity_id
+
+        for region in geometry.get("regions", []):
+            if region.get("id") not in affected_regions:
+                continue
+            for edge_id in region.get("edge_ids", []):
+                if edge_id in delete_ids:
+                    continue
+                edge = edges_by_id.get(edge_id)
+                if edge is None:
+                    continue
+                used_elsewhere = any(
+                    other.get("id") not in affected_regions
+                    and edge_id in other.get("edge_ids", [])
+                    for other in geometry.get("regions", [])
+                )
+                if not used_elsewhere:
+                    preserve_as_sketch(edge)
+
+        for void in affected_voids:
+            for edge_id in void.get("edge_ids", []):
+                if edge_id not in delete_ids:
+                    preserve_as_sketch(edges_by_id.get(edge_id))
+
         geometry["sketch_entities"] = [
-            item for item in geometry.get("sketch_entities", []) if item.get("id") not in entity_ids
+            entity for entity in geometry.get("sketch_entities", [])
+            if entity.get("id") not in entity_ids
         ]
         geometry["edges"] = [
-            edge for edge in geometry.get("edges", []) if edge.get("sketch_entity_id") not in entity_ids
+            edge for edge in geometry.get("edges", [])
+            if edge.get("id") not in delete_ids
         ]
-        geometry["regions"] = [
-            region for region in geometry.get("regions", [])
-            if not (
-                isinstance(region.get("shape"), dict)
-                and region["shape"].get("type") == "sketch"
-                and entity_ids.intersection(region["shape"].get("entity_ids", []))
+        geometry["voids"] = [
+            void for void in geometry.get("voids", [])
+            if not set(void.get("edge_ids", [])).intersection(delete_ids)
+        ]
+
+        if affected_regions:
+            self._delete_regions(
+                affected_regions,
+                create_holes=False,
+                notify=False,
             )
-        ]
         self._refresh_sketch_generated_regions()
         self.selected_edge_id = None
         self.selected_edge_ids = []
+        self.selected_region_id = None
+        self.selected_region_ids = []
         self._refresh_model_tree()
         self._render_inspector()
         self.render_canvas()
-        self._message(f"Deleted {len(entity_ids)} sketch curve(s).")
+        self._message(f"Deleted {len(delete_ids)} selected edge(s).")
         return True
 
     @_history_tracked
@@ -4479,12 +4560,48 @@ class SolveWorkspace(Div):
                     for index in range(segments)
                 ]
 
+            # Move cutouts with their containing region so a hole stays in place
+            # relative to the material boundary.
+            edge_ids = set(region.get("edge_ids", []))
+            for void in self.model["geometry"].get("voids", []):
+                if void.get("parent_id") != region_id:
+                    continue
+                void["vertices"] = [
+                    [point[0] + dr, point[1] + dz]
+                    for point in void.get("vertices", [])
+                ]
+                edge_ids.update(void.get("edge_ids", []))
+                void_shape = void.get("shape", {})
+                if isinstance(void_shape, dict):
+                    if void_shape.get("type") == "rectangle":
+                        void_shape["r_min"] = float(void_shape.get("r_min", 0.0)) + dr
+                        void_shape["z_min"] = float(void_shape.get("z_min", 0.0)) + dz
+                    elif void_shape.get("type") == "circle":
+                        void_shape["r_center"] = float(void_shape.get("r_center", 0.0)) + dr
+                        void_shape["z_center"] = float(void_shape.get("z_center", 0.0)) + dz
+                    elif void_shape.get("type") == "sketch":
+                        entity_ids = set(void_shape.get("entity_ids", []))
+                        for entity in self.model["geometry"].get("sketch_entities", []):
+                            if entity.get("id") not in entity_ids:
+                                continue
+                            for key in ("points", "sampled_points"):
+                                entity[key] = [
+                                    [point[0] + dr, point[1] + dz]
+                                    for point in entity.get(key, [])
+                                ]
+                            if isinstance(entity.get("center"), list):
+                                entity["center"] = [entity["center"][0] + dr, entity["center"][1] + dz]
             # Moving existing edges before rebuilding preserves their IDs,
             # names, and electromagnetic/mechanical boundary assignments.
-            edge_ids = set(region.get("edge_ids", []))
             for edge in self.model["geometry"].get("edges", []):
                 if edge["id"] in edge_ids:
                     edge["vertices"] = [[point[0] + dr, point[1] + dz] for point in edge["vertices"]]
+                    curve = edge.get("curve")
+                    if isinstance(curve, dict) and isinstance(curve.get("sampled_points"), list):
+                        curve["sampled_points"] = [
+                            [point[0] + dr, point[1] + dz]
+                            for point in curve["sampled_points"]
+                        ]
             self._recompute_parent_links()
             self._rebuild_edges()
             self.selected_region_id = region_id
@@ -5096,6 +5213,11 @@ class SolveWorkspace(Div):
             and len(point.get("coordinates")) == 2
             and isinstance(point.get("id"), str)
         }
+        geometry.setdefault("voids", [])
+        old_edges_by_id = {
+            edge.get("id"): edge for edge in old_edges
+            if isinstance(edge, dict) and isinstance(edge.get("id"), str)
+        }
         selected_before = set(getattr(self, "selected_edge_ids", []))
         old_selected = {
             edge["id"]: edge.get("vertices")
@@ -5107,6 +5229,12 @@ class SolveWorkspace(Div):
             all_points.extend(
                 tuple(float(value) for value in point)
                 for point in region.get("vertices", [])
+                if isinstance(point, (list, tuple)) and len(point) >= 2
+            )
+        for void in geometry.get("voids", []):
+            all_points.extend(
+                tuple(float(value) for value in point)
+                for point in void.get("vertices", [])
                 if isinstance(point, (list, tuple)) and len(point) >= 2
             )
 
@@ -5435,6 +5563,50 @@ class SolveWorkspace(Div):
             })
 
         current_edge_ids = {edge.get("id") for edge in edges}
+        for void in geometry.get("voids", []):
+            if not isinstance(void, dict):
+                continue
+            parent = regions_by_id.get(void.get("parent_id"))
+            if not isinstance(parent, dict):
+                continue
+            outer = next(
+                (loop for loop in void.get("boundary_loops", []) if loop.get("role") == "outer"),
+                None,
+            )
+            if not isinstance(outer, dict):
+                continue
+            outer_refs = []
+            for reference in outer.get("edges", []):
+                if not isinstance(reference, dict):
+                    continue
+                edge_id = reference.get("edge_id")
+                source = old_edges_by_id.get(edge_id)
+                if source is None:
+                    continue
+                if edge_id not in current_edge_ids:
+                    edge = copy.deepcopy(source)
+                    edges.append(edge)
+                    current_edge_ids.add(edge_id)
+                    edge_key = (
+                        "circle",
+                        *[round(float(value), 12) for value in edge.get("curve", {}).get("center", [])],
+                        round(float(edge.get("curve", {}).get("radius")), 12),
+                    ) if isinstance(edge.get("curve"), dict) and edge["curve"].get("type") == "circle" else _edge_key(edge.get("vertices", []))
+                    edges_by_key.setdefault(edge_key, edge)
+                outer_refs.append({
+                    "edge_id": edge_id,
+                    "forward": bool(reference.get("forward", True)),
+                })
+            if outer_refs:
+                parent.setdefault("boundary_loops", []).append({
+                    "role": "hole",
+                    "void_id": void.get("id"),
+                    "edges": [
+                        {"edge_id": item["edge_id"], "forward": not item["forward"]}
+                        for item in reversed(outer_refs)
+                    ],
+                })
+
         for old in old_edges:
             if (
                 not isinstance(old, dict)
@@ -6107,18 +6279,79 @@ class SolveWorkspace(Div):
     def delete_selected_regions(self, *args):
         return self.delete_regions(self._selected_region_ids_live())
 
+    def delete_selected_geometry(self, *args):
+        """Delete the active region selection, or selected edges when no regions are active."""
+        region_ids = self._selected_region_ids_live()
+        if region_ids:
+            return self.delete_regions(region_ids)
+        if self.selected_edge_ids or self.selected_edge_id:
+            return self.delete_selected_sketch_edges()
+        self._message("Select one or more regions or edges to delete.", error=True)
+        return False
+
     @_history_tracked
     def delete_regions(self, region_ids):
-        regions = self.model.get("geometry", {}).get("regions", [])
+        return self._delete_regions(region_ids, create_holes=True)
+
+    def _delete_regions(self, region_ids, *, create_holes=True, notify=True):
+        geometry = self.model.setdefault("geometry", {})
+        geometry.setdefault("voids", [])
+        regions = geometry.get("regions", [])
         region_by_id = {region.get("id"): region for region in regions}
         removed_ids = {region_id for region_id in region_ids if region_id in region_by_id}
         if not removed_ids:
-            self._message("Select one or more regions to delete.", error=True)
+            if notify:
+                self._message("Select one or more regions to delete.", error=True)
             return False
         removed_names = [
             region.get("name", "Region") for region in regions
             if region.get("id") in removed_ids
         ]
+
+        # A nested material region is a cutout in its surviving container once
+        # deleted. Preserve its contour as a void rather than letting the parent
+        # fill reclaim the area.
+        if create_holes:
+            for region in regions:
+                if region.get("id") not in removed_ids:
+                    continue
+                parent_id = region.get("parent_id")
+                parent = region_by_id.get(parent_id)
+                if parent is None or parent_id in removed_ids:
+                    continue
+                parent_points = parent.get("vertices", [])
+                child_points = region.get("vertices", [])
+                if not parent_points or not child_points or not _contains_or_touches(parent_points, child_points):
+                    continue
+                touches_parent = any(
+                    _point_on_segment(
+                        tuple(point),
+                        tuple(parent_points[index]),
+                        tuple(parent_points[(index + 1) % len(parent_points)]),
+                        1e-10,
+                    )
+                    for point in child_points
+                    for index in range(len(parent_points))
+                )
+                if touches_parent:
+                    continue
+                outer = next(
+                    (loop for loop in region.get("boundary_loops", []) if loop.get("role") == "outer"),
+                    None,
+                )
+                if not isinstance(outer, dict) or not outer.get("edges"):
+                    continue
+                geometry["voids"].append({
+                    "id": new_id("void"),
+                    "name": f"{region.get('name', 'Region')} opening",
+                    "source_region_id": region.get("id"),
+                    "parent_id": parent_id,
+                    "vertices": copy.deepcopy(child_points),
+                    "shape": copy.deepcopy(region.get("shape", {})),
+                    "edge_ids": list(region.get("edge_ids", [])),
+                    "boundary_loops": [copy.deepcopy(outer)],
+                })
+
         self._preserve_canvas_view()
         with self._batch_frontend_updates():
             def surviving_parent(parent_id):
@@ -6133,6 +6366,10 @@ class SolveWorkspace(Div):
                     region["parent_id"] = surviving_parent(region.get("parent_id"))
             self.model["geometry"]["regions"] = [
                 region for region in regions if region.get("id") not in removed_ids
+            ]
+            geometry["voids"] = [
+                void for void in geometry.get("voids", [])
+                if void.get("parent_id") not in removed_ids
             ]
             for load in self.model.get("regional_loads", []):
                 load["region_ids"] = [
@@ -6156,7 +6393,8 @@ class SolveWorkspace(Div):
             self._recompute_parent_links()
             self._rebuild_edges()
             self._sync_region_sources_from_loads()
-            self._message("Deleted " + ", ".join(removed_names) + ".")
+            if notify:
+                self._message("Deleted " + ", ".join(removed_names) + ".")
             self._refresh_model_tree()
             self._render_inspector()
             self.render_canvas()
@@ -7938,9 +8176,17 @@ class SolveWorkspace(Div):
                 for child in regions
                 if child.get("parent_id") == region_id
             ]
+            void_loops = [
+                void.get("vertices", [])
+                for void in self.model.get("geometry", {}).get("voids", [])
+                if void.get("parent_id") == region_id
+            ]
             path_data = " ".join(
-                item for item in [subpath(region.get("vertices", [])), *(subpath(loop) for loop in child_loops)]
-                if item
+                item for item in [
+                    subpath(region.get("vertices", [])),
+                    *(subpath(loop) for loop in child_loops),
+                    *(subpath(loop) for loop in void_loops),
+                ] if item
             )
             color = _MATERIAL_COLORS[material_index.get(region.get("material_id"), 0) % len(_MATERIAL_COLORS)]
             selected = region_id in set(self._selected_region_ids_live())
@@ -8141,6 +8387,36 @@ class SolveWorkspace(Div):
             for child in regions:
                 if child.get("parent_id") == region["id"]:
                     solid = solid - revolved[child["id"]]
+            for void in self.model.get("geometry", {}).get("voids", []):
+                if void.get("parent_id") != region["id"]:
+                    continue
+                void_shape = void.get("shape", {})
+                void_vertices = void.get("vertices", [])
+                if void_shape.get("type") == "circle":
+                    void_profile = Face(Wire(Circle(
+                        Pnt(
+                            float(void_shape["r_center"]),
+                            0.0,
+                            float(void_shape["z_center"]),
+                        ),
+                        Dir(0.0, 1.0, 0.0),
+                        float(void_shape["radius"]),
+                    )))
+                else:
+                    void_profile_vertices = [
+                        Vertex(Pnt(float(radius), 0.0, float(axial)))
+                        for radius, axial in void_vertices
+                    ]
+                    if len(void_profile_vertices) >= 3:
+                        void_profile_vertices.append(void_profile_vertices[0])
+                        void_profile = Face(MakePolygon(void_profile_vertices))
+                    else:
+                        continue
+                solid = solid - Revolve(
+                    void_profile,
+                    Axis(Pnt(0.0, 0.0, 0.0), Vec(0.0, 0.0, 1.0)),
+                    360.0,
+                )
             solid = solid.mat(material_names.get(region.get("material_id")) or region.get("name", "Region"))
             preview_solids.append(solid)
 
