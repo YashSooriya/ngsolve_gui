@@ -46,6 +46,7 @@ def _legacy_test_problem():
     return {
         "geometry": geometry,
         "mechSubdom": "Copper",
+        "dirkeysMech": "DirMechFix",
         "Edict": {"Air": 0, "Copper": 110e9},
         "nudict": {"Air": 0.3, "Copper": 0.34},
         "rhodict": {"Air": 0, "Copper": 8960},
@@ -107,52 +108,33 @@ def test_legacy_problem_conversion_preserves_supported_model_data(standalone_com
     assert all(edge["boundary_condition_ids"] for edge in coil_edges.values())
 
 
-def test_empty_legacy_dirichlet_keys_anchor_outer_boundary_except_axis(standalone_components):
+def test_empty_legacy_dirichlet_keys_remain_natural_and_axis_is_preserved(standalone_components):
     problem = _legacy_test_problem()
     problem["dirkeysADC"] = ""
     problem["dirkeysAAC"] = ""
     model, _studies, _layout = legacy_problem_to_model(problem)
 
-    assert model["legacy_import"]["magnetic_dirichlet_fallback"] == "all_exterior_except_axis"
     conditions = {condition["id"]: condition for condition in model["boundary_conditions"]}
     magnetic_zero_ids = {
-        condition_id
-        for condition_id, condition in conditions.items()
+        condition_id for condition_id, condition in conditions.items()
         if condition["type"] == "magnetic_potential_zero"
     }
-    assert len(magnetic_zero_ids) == 1
-
     outer = model["geometry"]["regions"][0]
     outer_edges = [
         edge for edge in model["geometry"]["edges"]
         if edge["id"] in outer["edge_ids"]
     ]
-    assert len(outer_edges) == 4
     axis_edges = [
         edge for edge in outer_edges
         if all(abs(point[0]) <= 1e-12 for point in edge["vertices"])
     ]
     assert len(axis_edges) == 1
-    assert [
-        conditions[condition_id]["type"]
-        for condition_id in axis_edges[0]["boundary_condition_ids"]
-    ] == ["axis_of_symmetry"]
-    non_axis_edges = [edge for edge in outer_edges if edge not in axis_edges]
-    assert len(non_axis_edges) == 3
-    assert all(
+    assert [conditions[item]["type"] for item in axis_edges[0]["boundary_condition_ids"]] == ["axis_of_symmetry"]
+    assert not any(
         magnetic_zero_ids & set(edge["boundary_condition_ids"])
-        for edge in non_axis_edges
+        for edge in outer_edges if edge not in axis_edges
     )
 
-    coil = model["geometry"]["regions"][1]
-    coil_edges = [
-        edge for edge in model["geometry"]["edges"]
-        if edge["id"] in coil["edge_ids"]
-    ]
-    assert all(
-        not (magnetic_zero_ids & set(edge["boundary_condition_ids"]))
-        for edge in coil_edges
-    )
 
 def test_explicit_legacy_local_mesh_size_survives_global_target_changes(standalone_components):
     problem = _legacy_test_problem()
@@ -190,7 +172,16 @@ def test_json_problem_file_roundtrips_and_ngsmodel_remains_supported(standalone_
     assert archive_layout == layout
 
 
-def test_legacy_capture_rejects_curved_boundaries():
+def test_legacy_capture_preserves_rational_spline3_control_points():
     geometry = LegacySplineGeometryCapture()
-    with pytest.raises(ValueError, match="straight line"):
-        geometry.Append(["spline3", 0, 1, 2])
+    first = geometry.AppendPoint(0.5, -0.5)
+    control = geometry.AppendPoint(1.0, 0.5)
+    end = geometry.AppendPoint(1.5, -0.5)
+
+    geometry.Append(["spline3", first, control, end], leftdomain=2, rightdomain=1, bc="default")
+
+    segment = geometry.segments[0]
+    assert segment["type"] == "spline3"
+    assert segment["start"] == first
+    assert segment["control"] == control
+    assert segment["end"] == end

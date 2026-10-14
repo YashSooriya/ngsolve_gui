@@ -1300,27 +1300,31 @@ def validate_model(model: dict, *, scope="solve") -> list[str]:
                 edge_points = edge.get("vertices")
                 if not isinstance(edge_points, list) or len(edge_points) != 2:
                     continue
-                try:
-                    first_point = (float(edge_points[0][0]), float(edge_points[0][1]))
-                    second_point = (float(edge_points[1][0]), float(edge_points[1][1]))
-                except (TypeError, ValueError, IndexError, OverflowError):
-                    continue
-                if not (
-                    _point_on_segment(first_point, start_point, end_point, outline_tolerance)
-                    and _point_on_segment(second_point, start_point, end_point, outline_tolerance)
-                ):
-                    continue
-                first_t = (
-                    (first_point[0] - start_point[0]) * dx
-                    + (first_point[1] - start_point[1]) * dy
-                ) / length_squared
-                second_t = (
-                    (second_point[0] - start_point[0]) * dx
-                    + (second_point[1] - start_point[1]) * dy
-                ) / length_squared
-                lower, upper = sorted((first_t, second_t))
-                if upper - lower > outline_tolerance:
-                    candidates.append((lower, upper, edge_id, edge_key_by_id.get(edge_id)))
+                curve = edge.get("curve")
+                sampled = curve.get("sampled_points") if isinstance(curve, dict) else None
+                path_points = sampled if isinstance(sampled, list) and len(sampled) >= 2 else edge_points
+                for path_start, path_end in zip(path_points, path_points[1:]):
+                    try:
+                        first_point = (float(path_start[0]), float(path_start[1]))
+                        second_point = (float(path_end[0]), float(path_end[1]))
+                    except (TypeError, ValueError, IndexError, OverflowError):
+                        continue
+                    if not (
+                        _point_on_segment(first_point, start_point, end_point, outline_tolerance)
+                        and _point_on_segment(second_point, start_point, end_point, outline_tolerance)
+                    ):
+                        continue
+                    first_t = (
+                        (first_point[0] - start_point[0]) * dx
+                        + (first_point[1] - start_point[1]) * dy
+                    ) / length_squared
+                    second_t = (
+                        (second_point[0] - start_point[0]) * dx
+                        + (second_point[1] - start_point[1]) * dy
+                    ) / length_squared
+                    lower, upper = sorted((first_t, second_t))
+                    if upper - lower > outline_tolerance:
+                        candidates.append((lower, upper, edge_id, edge_key_by_id.get(edge_id)))
             candidates.sort(key=lambda item: (item[0], item[1]))
             cursor = 0.0
             for lower, upper, edge_id, key in candidates:
