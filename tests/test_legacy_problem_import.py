@@ -172,6 +172,35 @@ def test_json_problem_file_roundtrips_and_ngsmodel_remains_supported(standalone_
     assert archive_layout == layout
 
 
+def test_legacy_spline3_import_preserves_control_curve_for_render_and_solver(standalone_components):
+    problem = _legacy_test_problem()
+    geometry = problem["geometry"]
+    control = geometry.AppendPoint(1.0, -1.5)
+    segment = geometry.segments[0]
+    segment.update({"type": "spline3", "control": control})
+
+    model, studies, layout = legacy_problem_to_model(problem)
+    spline_edge = next(
+        edge for edge in model["geometry"]["edges"]
+        if edge["curve"].get("type") == "spline3"
+    )
+
+    assert model["legacy_import"]["topology_mode"] == "direct_curve_edges"
+    assert spline_edge["curve"]["control_point"] == [1.0, -1.5]
+    assert len(spline_edge["curve"]["sampled_points"]) == 33
+    assert spline_edge["vertices"] == [[0.0, -1.0], [2.0, -1.0]]
+    assert set(spline_edge["legacy_domain_sides"]) == {"left_region_id", "right_region_id"}
+
+    workspace = SolveWorkspace()
+    workspace.set_model(model, studies, layout)
+    reloaded_edge = next(
+        edge for edge in workspace.model["geometry"]["edges"]
+        if edge["id"] == spline_edge["id"]
+    )
+    assert reloaded_edge["curve"]["type"] == "spline3"
+    assert reloaded_edge["curve"]["control_point"] == [1.0, -1.5]
+
+
 def test_legacy_capture_preserves_rational_spline3_control_points():
     geometry = LegacySplineGeometryCapture()
     first = geometry.AppendPoint(0.5, -0.5)

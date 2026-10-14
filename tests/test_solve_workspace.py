@@ -1335,6 +1335,47 @@ def test_arc_three_point_click_order_is_start_end_then_through(standalone_compon
     assert math.dist(entity["center"], end) == pytest.approx(entity["radius"])
 
 
+def test_spline3_arc_uses_start_end_then_control_and_preserves_exact_curve(standalone_components):
+    workspace = SolveWorkspace()
+    start, end, control = (0.004, 0.001), (0.010, 0.001), (0.007, 0.005)
+    workspace.set_sketch_tool("arc", announce=False, variant="spline3")
+
+    assert workspace._accept_arc_sketch_point(start, variant="spline3")
+    assert workspace._accept_arc_sketch_point(end, variant="spline3")
+    assert workspace._pending_arc_points == [start, end]
+    assert workspace._accept_arc_sketch_point(control, variant="spline3")
+
+    entity = workspace.model["geometry"]["sketch_entities"][-1]
+    edge = next(item for item in workspace.model["geometry"]["edges"] if item.get("sketch_entity_id") == entity["id"])
+    assert entity["type"] == "spline3"
+    assert entity["points"] == [list(start), list(control), list(end)]
+    assert entity["control_point"] == list(control)
+    assert edge["curve"]["type"] == "spline3"
+    assert edge["curve"]["control_point"] == list(control)
+    assert edge["vertices"] == [list(start), list(end)]
+    expected = SolveWorkspace._sample_spline3(start, control, end)
+    assert entity["sampled_points"] == expected
+    assert len(expected) == 65
+    assert expected[0] == list(start)
+    assert expected[-1] == list(end)
+
+
+def test_escape_cancels_arc_without_committing_geometry(standalone_components):
+    from types import SimpleNamespace
+
+    workspace = SolveWorkspace()
+    workspace.set_sketch_tool("arc", announce=False, variant="spline3")
+    workspace._accept_arc_sketch_point((0.004, 0.001), variant="spline3")
+    workspace._accept_arc_sketch_point((0.010, 0.001), variant="spline3")
+
+    workspace._on_canvas_keydown(SimpleNamespace(value={"key": "Escape"}))
+
+    assert workspace.sketch_tool == "select"
+    assert workspace._pending_arc_points == []
+    assert workspace.model["geometry"]["sketch_entities"] == []
+    assert workspace.model["geometry"]["edges"] == []
+
+
 def test_centerpoint_arc_projects_end_to_start_radius(standalone_components):
     workspace = SolveWorkspace()
     center, start, cursor = (0.006, 0.001), (0.010, 0.001), (0.006, 0.005)
@@ -1390,7 +1431,9 @@ def test_live_preview_supports_arc_construction_and_point_markers(standalone_com
     script = scripts[0]
     assert "arcPathThroughThreePoints" in script
     assert "arcPathFromCenter" in script
+    assert "spline3Path" in script
     assert "arcPathTangent" in script
+    assert "const cancelArc" in script
     assert "solve-sketch-construction-points" in script
     assert "window.__ngsolveRefreshConstructionPreview" in script
     assert "hasPending" in script and "updateConstructionPreview" in script

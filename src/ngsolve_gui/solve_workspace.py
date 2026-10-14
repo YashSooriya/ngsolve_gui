@@ -674,15 +674,18 @@ class SolveWorkspace(Div):
             menu_items = []
             for variant, option_label in options:
                 item = QItem(QItemSection(option_label), ui_clickable=True, ui_dense=True)
-                item.on_click(
-                    lambda event=None, active_tool=tool, selected_variant=variant:
-                        self.set_sketch_tool(active_tool, variant=selected_variant)
-                )
+
+                def choose_variant(event=None, active_tool=tool, selected_variant=variant):
+                    self.set_sketch_tool(active_tool, variant=selected_variant)
+                    menu.ui_hide()
+
+                item.on_click(choose_variant)
                 menu_items.append(item)
             menu = QMenu(
                 QList(*menu_items, ui_dense=True),
                 ui_anchor="bottom left",
                 ui_self="top left",
+                ui_auto_close=True,
             )
             arrow = QBtn(
                 QTooltip(f"More {label.lower()} options"), menu,
@@ -711,8 +714,8 @@ class SolveWorkspace(Div):
         )
         arc_button, arc_group = sketch_tool_group(
             "Arc", "mdi-vector-curve", "arc",
-            (("three-point", "3-point arc"), ("centerpoint", "Centerpoint arc"), ("tangent", "Tangent arc")),
-            "Choose a 3-point, centerpoint, or tangent arc.",
+            (("three-point", "3-point arc"), ("centerpoint", "Centerpoint arc"), ("tangent", "Tangent arc"), ("spline3", "Spline")),
+            "Choose a 3-point, centerpoint, tangent, or spline arc.",
         )
         trim_button = _button(
             "Trim", "mdi-content-cut",
@@ -1436,6 +1439,7 @@ class SolveWorkspace(Div):
                     "three-point": "Click the start, click the end, then place a point on the live arc preview.",
                     "centerpoint": "Click the center, click the start point, then place the end on the live fixed-radius preview.",
                     "tangent": "Click an existing curve endpoint, then place the end on the live tangent preview.",
+                    "spline3": "Click the start and end points, then place the spline control point on the live preview.",
                 }.get(variant, "Choose an arc construction method."),
                 "spline": "Drag to draw a smooth spline. Closed curve loops become regions automatically.",
                 "trim": "Drag the trim pencil across sketch edges to remove the touched curve segments.",
@@ -1860,13 +1864,13 @@ class SolveWorkspace(Div):
     const target = event.target;
     const editingText = Boolean(target && target.closest
       && target.closest('input, textarea, select, [contenteditable="true"]'));
-    if (svg && !editingText
-        && window.__ngsolveSketchTool === 'line'
-        && (event.key === 'Enter' || event.key === 'Escape')
-        && Array.isArray(state.linePoints) && state.linePoints.length) {
+    const finishLine = window.__ngsolveSketchTool === 'line'
+      && (event.key === 'Enter' || event.key === 'Escape')
+      && Array.isArray(state.linePoints) && state.linePoints.length;
+    const cancelArc = window.__ngsolveSketchTool === 'arc' && event.key === 'Escape';
+    if (svg && !editingText && (finishLine || cancelArc)) {
       // Some WebView/remote-desktop combinations leave focus outside SVG even
-      // after a sketch click. Forward the key to the canvas event callback so
-      // Enter/Escape work consistently without requiring a focus workaround.
+      // after a sketch click. Forward Enter/Escape to the canvas event callback.
       if (!targetIsSvg(event, svg)) {
         const forwarded = new KeyboardEvent('keydown', {
           key: event.key, code: event.code, bubbles: true, cancelable: true,
@@ -2291,11 +2295,32 @@ class SolveWorkspace(Div):
     if (!(radius > 0) || !(cursorRadius > 1e-9)) return "";
     const a0 = Math.atan2(start[1] - center[1], start[0] - center[0]);
     const a1 = Math.atan2(cursor[1] - center[1], cursor[0] - center[0]);
-    const sweep = (a1 - a0 + 2 * Math.PI) % (2 * Math.PI);
+    // The viewport's y axis is inverted from world z. A positive
+    // counter-clockwise world sweep therefore uses SVG's negative sweep.
+    const sweep = -((a0 - a1 + 2 * Math.PI) % (2 * Math.PI));
     const end = [center[0] + radius * Math.cos(a1), center[1] + radius * Math.sin(a1)];
     if (Math.hypot(end[0] - start[0], end[1] - start[1]) < 1e-7) return "";
     return "M" + start[0] + "," + start[1] + " A" + radius + "," + radius + " 0 "
-      + (sweep > Math.PI ? "1" : "0") + " 1 " + end[0] + "," + end[1];
+      + (Math.abs(sweep) > Math.PI ? "1" : "0") + " " + (sweep >= 0 ? "1" : "0")
+      + " " + end[0] + "," + end[1];
+  };
+  const spline3Path = (start, control, end) => {
+    const chord = Math.hypot(end[0] - start[0], end[1] - start[1]);
+    const firstLeg = Math.hypot(control[0] - start[0], control[1] - start[1]);
+    const secondLeg = Math.hypot(end[0] - control[0], end[1] - control[1]);
+    const controlWeight = Math.sqrt(0.5 * (firstLeg * firstLeg + secondLeg * secondLeg));
+    if (!(chord > 1e-12) || !(controlWeight > 1e-12)) return "";
+    const weight = chord / controlWeight;
+    const pieces = [];
+    for (let index = 0; index <= 64; index += 1) {
+      const t = index / 64;
+      const b0 = (1 - t) * (1 - t), b1 = weight * t * (1 - t), b2 = t * t;
+      const denominator = b0 + b1 + b2;
+      const x = (b0 * start[0] + b1 * control[0] + b2 * end[0]) / denominator;
+      const y = (b0 * start[1] + b1 * control[1] + b2 * end[1]) / denominator;
+      pieces.push((index ? "L" : "M") + x + "," + y);
+    }
+    return pieces.join(" ");
   };
   const arcPathTangent = (start, tangent, end) => {
     const dx = end[0] - start[0], dy = end[1] - start[1];
@@ -2346,6 +2371,7 @@ class SolveWorkspace(Div):
     if (tool === "arc" && point) {
       const variant = state.arcVariant || "three-point";
       if (variant === "three-point" && arcPoints.length >= 2) arc = arcPathThroughThreePoints(arcPoints[0], point, arcPoints[1]);
+      else if (variant === "spline3" && arcPoints.length >= 2) arc = spline3Path(arcPoints[0], point, arcPoints[1]);
       else if (variant === "centerpoint" && arcPoints.length >= 2) arc = arcPathFromCenter(arcPoints[0], arcPoints[1], point);
       else if (variant === "tangent" && arcPoints.length >= 1 && Array.isArray(state.arcTangent)) arc = arcPathTangent(arcPoints[0], state.arcTangent, point);
     }
@@ -3406,6 +3432,11 @@ class SolveWorkspace(Div):
         if not key and isinstance(payload, str):
             key = payload
         key = str(key or "").lower()
+        if self.sketch_tool == "arc" and key == "escape":
+            self._pending_arc_points = []
+            self.set_sketch_tool("select", announce=False)
+            self._message("Arc cancelled.")
+            return
         if self.sketch_tool != "line" or not self._pending_line_points:
             return
         if key in {"enter", "numpadenter", "escape"}:
@@ -3674,15 +3705,46 @@ class SolveWorkspace(Div):
                 sampled.append(value)
         return sampled
 
+    @staticmethod
+    def _sample_spline3(start, control, end, subdivisions=64):
+        """Sample Netgen's rational quadratic spline3 for display and topology."""
+        start = tuple(float(value) for value in start)
+        control = tuple(float(value) for value in control)
+        end = tuple(float(value) for value in end)
+        chord = math.dist(start, end)
+        control_weight = math.sqrt(0.5 * (
+            math.dist(start, control) ** 2 + math.dist(control, end) ** 2
+        ))
+        if chord <= 1e-14 or control_weight <= 1e-14:
+            raise ValueError("Spline endpoints must differ and its control geometry must be finite.")
+        weight = chord / control_weight
+        if not math.isfinite(weight) or weight <= 0:
+            raise ValueError("Spline3 requires a positive finite rational weight.")
+        sampled = []
+        for step in range(subdivisions + 1):
+            t = step / subdivisions
+            b0 = (1.0 - t) ** 2
+            b1 = weight * t * (1.0 - t)
+            b2 = t * t
+            denominator = b0 + b1 + b2
+            sampled.append([
+                (b0 * start[axis] + b1 * control[axis] + b2 * end[axis]) / denominator
+                for axis in range(2)
+            ])
+        return sampled
+
     @_history_tracked
     def _add_sketch_entity(self, curve_type, points, *, arc_geometry=None):
-        if curve_type not in {"line", "arc", "spline"}:
+        if curve_type not in {"line", "arc", "spline", "spline3"}:
             return False
         cleaned = []
         for point in points:
             value = (_round_sketch_m(float(point[0])), _round_sketch_m(float(point[1])))
-            if not cleaned or math.dist(value, cleaned[-1]) > 1e-12:
+            if curve_type == "spline3" or not cleaned or math.dist(value, cleaned[-1]) > 1e-12:
                 cleaned.append(value)
+        if curve_type == "spline3" and len(cleaned) != 3:
+            self._message("A Spline3 needs a start point, control point, and end point.", error=True)
+            return False
         if len(cleaned) < 2:
             self._message("Sketch curves need two distinct points.", error=True)
             return False
@@ -3717,6 +3779,16 @@ class SolveWorkspace(Div):
                 "points": [list(cleaned[0]), list(cleaned[1]), list(cleaned[-1])],
                 "sampled_points": samples,
             })
+        elif curve_type == "spline3":
+            if math.dist(cleaned[0], cleaned[-1]) <= 1e-12:
+                self._message("Spline start and end points must be different.", error=True)
+                return False
+            try:
+                entity["control_point"] = list(cleaned[1])
+                entity["sampled_points"] = self._sample_spline3(*cleaned)
+            except ValueError as exc:
+                self._message(str(exc), error=True)
+                return False
         else:
             # Thin freehand noise before smoothing; retain enough points to keep
             # corners and the original endpoints stable.
@@ -3747,6 +3819,11 @@ class SolveWorkspace(Div):
         elif curve_type == "spline":
             curve = {
                 "type": "spline", "control_points": copy.deepcopy(entity["points"]),
+                "sampled_points": copy.deepcopy(samples),
+            }
+        elif curve_type == "spline3":
+            curve = {
+                "type": "spline3", "control_point": copy.deepcopy(entity["control_point"]),
                 "sampled_points": copy.deepcopy(samples),
             }
         edges.append({
@@ -3879,25 +3956,28 @@ class SolveWorkspace(Div):
                 self._message(str(exc), error=True)
                 return False
 
-        if variant == "three-point":
+        if variant in {"three-point", "spline3"}:
             point = tuple(self._snap_sketch_endpoint(point))
+            label = "Spline" if variant == "spline3" else "3-point arc"
             if not pending:
                 self._pending_arc_points = [point]
                 self._sync_pending_construction_preview()
-                self._message("3-point arc: click the start point; next click the end point.")
+                self._message(f"{label}: click the start point; next click the end point.")
                 return True
             if len(pending) == 1:
                 self._pending_arc_points.append(point)
                 self._sync_pending_construction_preview()
-                self._message("3-point arc: move the pointer to preview through-point C, then click.")
+                preview_point = "control point" if variant == "spline3" else "through-point C"
+                self._message(f"{label}: move the pointer to preview the {preview_point}, then click.")
                 return True
             start, end = pending[:2]
-            through = point
             self._pending_arc_points = []
             self._sync_pending_construction_preview()
+            if variant == "spline3":
+                return self._add_sketch_entity("spline3", [start, point, end])
             try:
-                self._arc_from_three_points(start, through, end)
-                return self._add_sketch_entity("arc", [start, through, end])
+                self._arc_from_three_points(start, point, end)
+                return self._add_sketch_entity("arc", [start, point, end])
             except ValueError as exc:
                 self._message(str(exc), error=True)
                 return False
