@@ -113,9 +113,17 @@ def _save_hidden_run_history(root, paths):
     temporary.replace(destination)
 
 
+def default_run_history_root():
+    """Return the output root shared by run creation and run-history discovery."""
+    configured_root = os.environ.get("COUPLED_SOLVER_OUTPUT_DIR", "").strip()
+    if configured_root:
+        return Path(configured_root).expanduser() / "gui_runs"
+    return Path.home() / "NGSolve_results"
+
+
 def _load_saved_run_history(root=None, limit=40):
     """Recover prior GUI runs from their manifests or legacy output folders."""
-    root = Path(root) if root is not None else Path.home() / "NGSolve_results"
+    root = Path(root) if root is not None else default_run_history_root()
     try:
         directories = [path for path in root.iterdir() if path.is_dir()]
         directories.sort(key=lambda path: path.stat().st_mtime)
@@ -390,7 +398,7 @@ class SolveWorkspace(Div):
         self.message_is_error = False
         self._log_visible = False
         self._log_messages = ["Axisymmetric model editor ready."]
-        self._run_history_root = Path.home() / "NGSolve_results"
+        self._run_history_root = default_run_history_root()
         self.runs = _load_saved_run_history(self._run_history_root)
         self.mesh_preview_edges = []
         self.mesh_preview_visible = False
@@ -531,7 +539,7 @@ class SolveWorkspace(Div):
             ),
             _svg(
                 "path", id="solve-sketch-drag-trim", d="", display="none",
-                fill="none", stroke="#737b85", stroke_width="3",
+                fill="none", stroke="#737b85", stroke_width="1.5",
                 stroke_linecap="round", stroke_linejoin="round",
                 style="pointer-events:none;",
             ),
@@ -673,7 +681,22 @@ class SolveWorkspace(Div):
             )
             menu_items = []
             for variant, option_label in options:
-                item = QItem(QItemSection(option_label), ui_clickable=True, ui_dense=True)
+                option_icons = {
+                    "rectangle": {"corner": "mdi-rectangle-outline", "center": "mdi-crosshairs"},
+                    "circle": {"center-radius": "mdi-circle-outline", "three-point": "mdi-triangle-outline"},
+                    "arc": {
+                        "three-point": "mdi-vector-arc",
+                        "centerpoint": "mdi-target",
+                        "tangent": "mdi-vector-curve",
+                        "spline3": "mdi-sine-wave",
+                    },
+                }
+                option_icon = option_icons.get(tool, {}).get(variant, icon)
+                item = QItem(
+                    QItemSection(QIcon(ui_name=option_icon, ui_size="xs"), ui_avatar=True),
+                    QItemSection(option_label),
+                    ui_clickable=True, ui_dense=True,
+                )
 
                 def choose_variant(event=None, active_tool=tool, selected_variant=variant):
                     self.set_sketch_tool(active_tool, variant=selected_variant)
@@ -1861,17 +1884,24 @@ class SolveWorkspace(Div):
       && (event.key === 'Enter' || event.key === 'Escape')
       && Array.isArray(state.linePoints) && state.linePoints.length;
     const cancelArc = window.__ngsolveSketchTool === 'arc' && event.key === 'Escape';
-    if (svg && !editingText && (finishLine || cancelArc)) {
-      // Some WebView/remote-desktop combinations leave focus outside SVG even
-      // after a sketch click. Forward Enter/Escape to the canvas event callback.
-      if (!targetIsSvg(event, svg)) {
-        const forwarded = new KeyboardEvent('keydown', {
-          key: event.key, code: event.code, bubbles: true, cancelable: true,
-        });
-        svg.dispatchEvent(forwarded);
-      }
-      event.preventDefault();
-    }
+    if (!svg || editingText || (!finishLine && !cancelArc)) return;
+    // Route these shortcuts through the same component event bridge as pointer
+    // release. Synthetic KeyboardEvents do not reliably cross the WebView
+    // component boundary on Windows Remote Desktop.
+    const pointer = window.__ngsolveSketchPointer || [0, 0];
+    window.__ngsolveSketchCompletedGesture = [
+      finishLine ? 'line_finish' : 'arc_cancel',
+      finishLine ? 'line' : 'arc',
+      0, 0, 0, 0, '', false, false,
+      visualScale, visualTranslateX, visualTranslateY, viewVersion,
+      '', [], window.__ngsolveSketchToolVariant || '', event.key.toLowerCase(),
+    ];
+    svg.dispatchEvent(new MouseEvent('mouseup', {
+      bubbles: true, cancelable: true, button: 0,
+      clientX: pointer[0], clientY: pointer[1],
+    }));
+    event.preventDefault();
+    event.stopImmediatePropagation();
   }, true);
   document.addEventListener('click', (event) => {
     const menu = document.querySelector('.solve-sketch-context-menu');
@@ -2346,7 +2376,10 @@ class SolveWorkspace(Div):
     const tool = window.__ngsolveSketchTool || "select";
     const linePoints = Array.isArray(state.linePoints) ? state.linePoints : [];
     const arcPoints = Array.isArray(state.arcPoints) ? state.arcPoints : [];
-    const markers = tool === "line" ? linePoints.slice() : (tool === "arc" ? arcPoints.slice() : []);
+    const circlePoints = Array.isArray(state.circlePoints) ? state.circlePoints : [];
+    const markers = tool === "line" ? linePoints.slice()
+      : (tool === "arc" ? arcPoints.slice()
+        : (tool === "circle" ? circlePoints.slice() : []));
     if (active && dragMode === "draw" && dragStart && (tool === "line" || tool === "arc")) markers.push(dragStart);
     const fixedLine = linePoints.map((point, index) => (index ? "L" : "M") + point[0] + "," + point[1]).join(" ");
     setPreviewPath(svg, "solve-sketch-line-chain-halo", fixedLine, tool === "line");
@@ -2370,6 +2403,33 @@ class SolveWorkspace(Div):
     }
     setPreviewPath(svg, "solve-sketch-drag-arc-halo", arc, tool === "arc");
     setPreviewPath(svg, "solve-sketch-drag-arc", arc, tool === "arc");
+    const previewCircle = svg && svg.querySelector("#solve-sketch-drag-circle");
+    const circleVariant = state.circleVariant || "center-radius";
+    if (previewCircle && tool === "circle" && circleVariant === "three-point" && circlePoints.length >= 2 && point) {
+      const first = circlePoints[0], second = circlePoints[1], third = point;
+      const denominator = 2 * (first[0] * (second[1] - third[1])
+        + second[0] * (third[1] - first[1]) + third[0] * (first[1] - second[1]));
+      if (Math.abs(denominator) > 1e-9) {
+        const aa = first[0] * first[0] + first[1] * first[1];
+        const bb = second[0] * second[0] + second[1] * second[1];
+        const cc = third[0] * third[0] + third[1] * third[1];
+        const cx = (aa * (second[1] - third[1]) + bb * (third[1] - first[1])
+          + cc * (first[1] - second[1])) / denominator;
+        const cy = (aa * (third[0] - second[0]) + bb * (first[0] - third[0])
+          + cc * (second[0] - first[0])) / denominator;
+        const radius = Math.hypot(first[0] - cx, first[1] - cy);
+        if (Number.isFinite(radius) && radius > 0) {
+          previewCircle.setAttribute("cx", String(cx));
+          previewCircle.setAttribute("cy", String(cy));
+          previewCircle.setAttribute("r", String(radius));
+          previewCircle.setAttribute("fill", "none");
+          previewCircle.setAttribute("stroke-dasharray", "7 4");
+          previewCircle.setAttribute("display", "inline");
+        } else previewCircle.setAttribute("display", "none");
+      } else previewCircle.setAttribute("display", "none");
+    } else if (previewCircle && tool === "circle" && circleVariant === "three-point") {
+      previewCircle.setAttribute("display", "none");
+    }
     const cross = constructionCrosses(markers);
     setPreviewPath(svg, "solve-sketch-construction-halo", cross, true);
     setPreviewPath(svg, "solve-sketch-construction-points", cross, true);
@@ -2474,6 +2534,8 @@ class SolveWorkspace(Div):
       if (rect) rect.setAttribute('display', 'none');
       if (!circle) return;
       circle.setAttribute('display', 'inline');
+      circle.setAttribute('fill', '#2385bd20');
+      circle.setAttribute('stroke-dasharray', '6 4');
       const variant = window.__ngsolveSketchToolVariant || 'center-radius';
       circle.setAttribute('cx', variant === 'center-radius' ? dragStart[0] : (dragStart[0] + point[0]) / 2);
       circle.setAttribute('cy', variant === 'center-radius' ? dragStart[1] : (dragStart[1] + point[1]) / 2);
@@ -2832,7 +2894,10 @@ class SolveWorkspace(Div):
         const tool = window.__ngsolveSketchTool || 'select';
         const hasPending = tool === 'line'
           ? (Array.isArray(state.linePoints) && state.linePoints.length > 0)
-          : (tool === 'arc' && Array.isArray(state.arcPoints) && state.arcPoints.length > 0);
+          : (tool === 'arc'
+            ? (Array.isArray(state.arcPoints) && state.arcPoints.length > 0)
+            : (tool === 'circle' && state.circleVariant === 'three-point'
+              && Array.isArray(state.circlePoints) && state.circlePoints.length > 0));
         if (hasPending) {
           const screen = svgPoint(svg, event);
           if (screen) updateConstructionPreview(svg, sketchPoint(toScenePoint(screen)));
@@ -3044,7 +3109,11 @@ class SolveWorkspace(Div):
             "arcPoints": [],
             "arcTangent": None,
             "arcVariant": self._sketch_tool_variant.get("arc", "three-point"),
+            "circlePoints": [],
+            "circleVariant": self._sketch_tool_variant.get("circle", "center-radius"),
         }
+        if self.sketch_tool == "circle" and self._pending_circle_points:
+            payload["circlePoints"] = [list(project(point)) for point in self._pending_circle_points]
         if self.sketch_tool == "arc" and self._pending_arc_points:
             points = self._pending_arc_points
             if self._sketch_tool_variant.get("arc") == "tangent" and len(points) >= 2:
@@ -3140,6 +3209,19 @@ class SolveWorkspace(Div):
             else:
                 pending_drag = self._canvas_drag or {}
                 pending_operation = pending_drag.get("operation")
+                special_command = str(completed[16]).lower() if len(completed) >= 17 else ""
+                if operation == "line_finish":
+                    self._canvas_drag = None
+                    self._screen_to_svg = None
+                    self._finish_line_sketch_chain(select_tool=(special_command == "escape"))
+                    return
+                if operation == "arc_cancel":
+                    self._canvas_drag = None
+                    self._screen_to_svg = None
+                    self._pending_arc_points = []
+                    self.set_sketch_tool("select", announce=False)
+                    self._message("Arc cancelled.")
+                    return
                 if operation == "trim":
                     self._canvas_drag = None
                     self._screen_to_svg = None
@@ -4115,10 +4197,15 @@ class SolveWorkspace(Div):
     def _accept_circle_sketch_point(self, point):
         self._pending_circle_points.append(tuple(point))
         if len(self._pending_circle_points) < 3:
-            self._message("Circle: click the second point, then the third point on the circumference.")
+            self._sync_pending_construction_preview()
+            if len(self._pending_circle_points) == 1:
+                self._message("Circle: click a second point on the circumference.")
+            else:
+                self._message("Circle: move the pointer to preview the circle, then click the third circumference point.")
             return
         first, second, third = self._pending_circle_points[:3]
         self._pending_circle_points = []
+        self._sync_pending_construction_preview()
         ax, ay = first
         bx, by = second
         cx, cy = third
@@ -4140,55 +4227,180 @@ class SolveWorkspace(Div):
 
     @_history_tracked
     def _trim_sketch_entities_along_stroke(self, world_stroke):
+        """Trim only sketch sections intersected by the freehand trim stroke."""
         if not isinstance(world_stroke, (list, tuple)) or len(world_stroke) < 2:
             self._message("Draw a short trim stroke across one or more sketch edges.", error=True)
             return False
+
         project, _ = self._canvas_projection()
         stroke = [project(point) for point in world_stroke]
-        tolerance = 6.0
+        entities = self.model["geometry"].get("sketch_entities", [])
+        tolerance_px = 6.0
+
+        def cross(a, b):
+            return a[0] * b[1] - a[1] * b[0]
+
+        def segment_hit_parameter(a, b, c, d):
+            r = (b[0] - a[0], b[1] - a[1])
+            s = (d[0] - c[0], d[1] - c[1])
+            denominator = cross(r, s)
+            if abs(denominator) <= 1e-12:
+                return None
+            offset = (c[0] - a[0], c[1] - a[1])
+            along_stroke = cross(offset, s) / denominator
+            along_curve = cross(offset, r) / denominator
+            if -1e-9 <= along_stroke <= 1.0 + 1e-9 and -1e-9 <= along_curve <= 1.0 + 1e-9:
+                return max(0.0, min(1.0, along_curve))
+            return None
 
         def point_segment_distance(point, first, second):
             dx, dy = second[0] - first[0], second[1] - first[1]
             length2 = dx * dx + dy * dy
             if length2 <= 1e-16:
-                return math.hypot(point[0] - first[0], point[1] - first[1])
+                return math.hypot(point[0] - first[0], point[1] - first[1]), 0.0
             fraction = min(1.0, max(0.0, ((point[0] - first[0]) * dx + (point[1] - first[1]) * dy) / length2))
-            return math.hypot(point[0] - first[0] - fraction * dx, point[1] - first[1] - fraction * dy)
+            closest = (first[0] + fraction * dx, first[1] + fraction * dy)
+            return math.hypot(point[0] - closest[0], point[1] - closest[1]), fraction
 
-        def segments_touch(a, b, c, d):
-            def orient(p, q, r):
-                return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
-            boxes_overlap = not (
-                max(a[0], b[0]) < min(c[0], d[0]) - tolerance
-                or max(c[0], d[0]) < min(a[0], b[0]) - tolerance
-                or max(a[1], b[1]) < min(c[1], d[1]) - tolerance
-                or max(c[1], d[1]) < min(a[1], b[1]) - tolerance
-            )
-            oa, ob, oc, od = orient(a, b, c), orient(a, b, d), orient(c, d, a), orient(c, d, b)
-            if boxes_overlap and oa * ob <= 0 and oc * od <= 0:
-                return True
-            return min(
-                point_segment_distance(a, c, d), point_segment_distance(b, c, d),
-                point_segment_distance(c, a, b), point_segment_distance(d, a, b),
-            ) <= tolerance
+        def curve_samples(entity):
+            return entity.get("sampled_points") or entity.get("points") or []
 
-        touched = set()
-        for entity in self.model["geometry"].get("sketch_entities", []):
-            samples = entity.get("sampled_points") or entity.get("points") or []
-            projected = [project(point) for point in samples]
-            if any(
-                segments_touch(stroke_a, stroke_b, edge_a, edge_b)
-                for stroke_a, stroke_b in zip(stroke, stroke[1:])
-                for edge_a, edge_b in zip(projected, projected[1:])
-            ):
-                touched.add(entity.get("id"))
-        touched.discard(None)
-        if not touched:
+        def curve_intersections(first_samples, second_samples):
+            values = []
+            first_count = max(1, len(first_samples) - 1)
+            for first_index, (a, b) in enumerate(zip(first_samples, first_samples[1:])):
+                for c, d in zip(second_samples, second_samples[1:]):
+                    local = segment_hit_parameter(c, d, a, b)
+                    if local is not None:
+                        values.append((first_index + local) / first_count)
+            return values
+
+        def sample_interval(samples, start_t, end_t):
+            count = len(samples) - 1
+            if count <= 0:
+                return [list(samples[0])] if samples else []
+            start_t = max(0.0, min(1.0, start_t))
+            end_t = max(0.0, min(1.0, end_t))
+
+            def at(fraction):
+                position = fraction * count
+                index = min(count - 1, max(0, int(math.floor(position))))
+                local = position - index
+                a, b = samples[index], samples[index + 1]
+                return [float(a[axis]) + local * (float(b[axis]) - float(a[axis])) for axis in range(2)]
+
+            result = [at(start_t)]
+            for index in range(1, count):
+                fraction = index / count
+                if start_t + 1e-10 < fraction < end_t - 1e-10:
+                    result.append([float(value) for value in samples[index]])
+            result.append(at(end_t))
+            return result
+
+        def entity_fragment(entity, samples, start_t, end_t, fragment_id):
+            fragment_samples = sample_interval(samples, start_t, end_t)
+            if len(fragment_samples) < 2 or math.dist(fragment_samples[0], fragment_samples[-1]) <= 1e-12:
+                return None
+            fragment = copy.deepcopy(entity)
+            fragment["id"] = fragment_id
+            curve_type = entity.get("type")
+            if curve_type == "line":
+                fragment["points"] = [fragment_samples[0], fragment_samples[-1]]
+                fragment["sampled_points"] = [fragment_samples[0], fragment_samples[-1]]
+            elif curve_type == "arc" and entity.get("center") and entity.get("radius"):
+                center = [float(value) for value in entity["center"]]
+                radius = float(entity["radius"])
+                first_angle = math.atan2(samples[0][1] - center[1], samples[0][0] - center[0])
+                last_angle = math.atan2(samples[-1][1] - center[1], samples[-1][0] - center[0])
+                clockwise = bool(entity.get("clockwise"))
+                sweep = -((first_angle - last_angle) % (2.0 * math.pi)) if clockwise else ((last_angle - first_angle) % (2.0 * math.pi))
+                angle_a = first_angle + start_t * sweep
+                angle_b = first_angle + end_t * sweep
+                middle_angle = 0.5 * (angle_a + angle_b)
+                start = [center[0] + radius * math.cos(angle_a), center[1] + radius * math.sin(angle_a)]
+                through = [center[0] + radius * math.cos(middle_angle), center[1] + radius * math.sin(middle_angle)]
+                end = [center[0] + radius * math.cos(angle_b), center[1] + radius * math.sin(angle_b)]
+                steps = max(2, int(math.ceil((end_t - start_t) * max(2, len(samples) - 1))))
+                fragment["points"] = [start, through, end]
+                fragment["sampled_points"] = [
+                    [center[0] + radius * math.cos(angle_a + (angle_b - angle_a) * index / steps),
+                     center[1] + radius * math.sin(angle_a + (angle_b - angle_a) * index / steps)]
+                    for index in range(steps + 1)
+                ]
+            else:
+                fragment["type"] = "spline"
+                fragment["points"] = copy.deepcopy(fragment_samples)
+                fragment["sampled_points"] = copy.deepcopy(fragment_samples)
+                fragment.pop("center", None)
+                fragment.pop("radius", None)
+                fragment.pop("clockwise", None)
+                fragment.pop("control_point", None)
+            return fragment
+
+        replacement_entities = []
+        removed_sections = 0
+        touched_curves = 0
+        for entity in entities:
+            samples_world = curve_samples(entity)
+            if len(samples_world) < 2:
+                replacement_entities.append(entity)
+                continue
+            samples_screen = [project(point) for point in samples_world]
+            hit_parameters = []
+            for stroke_a, stroke_b in zip(stroke, stroke[1:]):
+                for index, (curve_a, curve_b) in enumerate(zip(samples_screen, samples_screen[1:])):
+                    local = segment_hit_parameter(stroke_a, stroke_b, curve_a, curve_b)
+                    if local is not None:
+                        hit_parameters.append((index + local) / (len(samples_screen) - 1))
+            if not hit_parameters:
+                best = None
+                for stroke_a, stroke_b in zip(stroke, stroke[1:]):
+                    for index, (curve_a, curve_b) in enumerate(zip(samples_screen, samples_screen[1:])):
+                        for point in (stroke_a, stroke_b):
+                            distance, local = point_segment_distance(point, curve_a, curve_b)
+                            candidate = (distance, (index + local) / (len(samples_screen) - 1))
+                            if best is None or candidate[0] < best[0]:
+                                best = candidate
+                if best is not None and best[0] <= tolerance_px:
+                    hit_parameters.append(best[1])
+            if not hit_parameters:
+                replacement_entities.append(entity)
+                continue
+
+            touched_curves += 1
+            cuts = [0.0, 1.0]
+            for other in entities:
+                if other is entity:
+                    continue
+                other_samples = curve_samples(other)
+                if len(other_samples) >= 2:
+                    cuts.extend(curve_intersections(samples_screen, [project(point) for point in other_samples]))
+            cuts = sorted({round(max(0.0, min(1.0, value)), 9) for value in cuts})
+            sections = list(zip(cuts, cuts[1:]))
+            removed = {
+                index for index, (lo, hi) in enumerate(sections)
+                if any(lo - 1e-8 <= hit <= hi + 1e-8 for hit in hit_parameters)
+            }
+            if not removed:
+                replacement_entities.append(entity)
+                continue
+            removed_sections += len(removed)
+            retained = [(lo, hi) for index, (lo, hi) in enumerate(sections)
+                        if index not in removed and hi - lo > 1e-8]
+            for fragment_index, (lo, hi) in enumerate(retained):
+                fragment_id = entity.get("id") if fragment_index == 0 else new_id("curve")
+                fragment = entity_fragment(entity, samples_world, lo, hi, fragment_id)
+                if fragment is not None:
+                    replacement_entities.append(fragment)
+
+        if not touched_curves:
             self._message("The trim stroke did not cross any sketch edges.", error=True)
             return False
         geometry = self.model["geometry"]
-        geometry["sketch_entities"] = [item for item in geometry.get("sketch_entities", []) if item.get("id") not in touched]
-        geometry["edges"] = [item for item in geometry.get("edges", []) if item.get("sketch_entity_id") not in touched]
+        geometry["sketch_entities"] = replacement_entities
+        retained_entity_ids = {item.get("id") for item in replacement_entities}
+        geometry["edges"] = [item for item in geometry.get("edges", [])
+                             if item.get("sketch_entity_id") in retained_entity_ids]
         self._refresh_sketch_generated_regions()
         self.selected_edge_ids = []
         self.selected_edge_id = None
@@ -4196,8 +4408,9 @@ class SolveWorkspace(Div):
         self._refresh_model_tree()
         self._render_inspector()
         self.render_canvas()
-        self._message(f"Trimmed {len(touched)} sketch curve(s).")
+        self._message(f"Trimmed {removed_sections} sketch section(s) across {touched_curves} curve(s).")
         return True
+
 
     @staticmethod
     def _sketch_region_signature(entity_ids, boundary=None):
@@ -4213,7 +4426,7 @@ class SolveWorkspace(Div):
             intervals.append((entity_id, round(min(start, end), 9), round(max(start, end), 9)))
         return tuple(sorted(intervals)) if intervals else tuple(sorted(set(entity_ids)))
 
-    def _refresh_sketch_generated_regions(self):
+    def _refresh_sketch_generated_regions(self, *, source_templates=None):
         geometry = self.model["geometry"]
         old_generated = [
             region for region in geometry.get("regions", [])
@@ -4227,14 +4440,23 @@ class SolveWorkspace(Div):
             for region in old_generated
         }
         unused_generated = list(old_generated)
+        source_templates = [
+            copy.deepcopy(item) for item in (source_templates or [])
+            if isinstance(item, dict) and isinstance(item.get("vertices"), list)
+        ]
+        template_uses = {item.get("id"): 1 for item in old_generated if item.get("id")}
         geometry["regions"] = [
             region for region in geometry.get("regions", [])
             if not (isinstance(region.get("shape"), dict) and region["shape"].get("type") == "sketch")
         ]
+        # Ignore sketch faces already materialized from this same planar
+        # arrangement: adjacent faces share vertices and edges, but are not
+        # overlapping source regions.
+        source_regions = list(geometry.get("regions", []))
         for loop in find_closed_sketch_loops(geometry.get("sketch_entities", [])):
             vertices = loop["vertices"]
             parent_id = self._find_containing_region(vertices)
-            if self._has_unsupported_overlap(vertices, parent_id):
+            if self._has_unsupported_overlap(vertices, parent_id, regions=source_regions):
                 continue
             signature = self._sketch_region_signature(loop["entity_ids"], loop["boundary"])
             if any(
@@ -4264,24 +4486,40 @@ class SolveWorkspace(Div):
             if matched in unused_generated:
                 unused_generated.remove(matched)
             if matched is not None:
+                template_uses[matched.get("id")] = max(1, template_uses.get(matched.get("id"), 0))
                 generated_by_entities = {
                     key: value for key, value in generated_by_entities.items() if value is not matched
                 }
             region = copy.deepcopy(matched or {})
             if not region:
-                region = {
-                    "id": new_id("region"),
-                    "name": f"Region {1 + sum(1 for item in geometry['regions'] if item.get('name', '').startswith('Region '))}",
-                    "material_id": None,
-                    "mechanical": False,
-                    "sources": {
-                        "dc_current_density": "0",
-                        "ac_current_density_real": "0",
-                        "ac_current_density_imaginary": "0",
-                        "mechanical_body_force": {"r": "0", "z": "0"},
-                    },
-                    "constraints": [],
-                }
+                probe = self._sketch_loop_interior_point(vertices)
+                owners = [
+                    item for item in source_templates
+                    if _point_in_or_on_polygon(probe, item.get("vertices", []))
+                ]
+                template = owners[-1] if owners else None
+                if template is not None:
+                    region = copy.deepcopy(template)
+                    template_id = template.get("id")
+                    template_uses[template_id] = template_uses.get(template_id, 0) + 1
+                    part_number = template_uses[template_id]
+                    if part_number > 1:
+                        region["id"] = new_id("region")
+                        region["name"] = f"{template.get('name', 'Region')} part {part_number}"
+                else:
+                    region = {
+                        "id": new_id("region"),
+                        "name": f"Region {1 + sum(1 for item in geometry['regions'] if item.get('name', '').startswith('Region '))}",
+                        "material_id": None,
+                        "mechanical": False,
+                        "sources": {
+                            "dc_current_density": "0",
+                            "ac_current_density_real": "0",
+                            "ac_current_density_imaginary": "0",
+                            "mechanical_body_force": {"r": "0", "z": "0"},
+                        },
+                        "constraints": [],
+                    }
             region["vertices"] = copy.deepcopy(vertices)
             region["shape"] = {
                 "type": "sketch",
@@ -4294,6 +4532,54 @@ class SolveWorkspace(Div):
         self._recompute_parent_links()
         self._rebuild_edges()
         self._prune_region_groups()
+
+    @staticmethod
+    def _sketch_loop_interior_point(vertices):
+        """Choose an interior probe for assigning split faces to source regions."""
+        if len(vertices) < 3:
+            return tuple(vertices[0]) if vertices else (0.0, 0.0)
+        signed_twice_area = sum(
+            vertices[index][0] * vertices[(index + 1) % len(vertices)][1]
+            - vertices[(index + 1) % len(vertices)][0] * vertices[index][1]
+            for index in range(len(vertices))
+        )
+        if abs(signed_twice_area) > 1e-24:
+            cx = sum(
+                (vertices[index][0] + vertices[(index + 1) % len(vertices)][0])
+                * (vertices[index][0] * vertices[(index + 1) % len(vertices)][1]
+                   - vertices[(index + 1) % len(vertices)][0] * vertices[index][1])
+                for index in range(len(vertices))
+            ) / (3.0 * signed_twice_area)
+            cy = sum(
+                (vertices[index][1] + vertices[(index + 1) % len(vertices)][1])
+                * (vertices[index][0] * vertices[(index + 1) % len(vertices)][1]
+                   - vertices[(index + 1) % len(vertices)][0] * vertices[index][1])
+                for index in range(len(vertices))
+            ) / (3.0 * signed_twice_area)
+            centroid = (cx, cy)
+            if _point_in_or_on_polygon(centroid, vertices):
+                return centroid
+        span = max(
+            max(point[0] for point in vertices) - min(point[0] for point in vertices),
+            max(point[1] for point in vertices) - min(point[1] for point in vertices),
+            1e-12,
+        )
+        orientation = 1.0 if signed_twice_area >= 0 else -1.0
+        for index, start in enumerate(vertices):
+            end = vertices[(index + 1) % len(vertices)]
+            dx, dy = end[0] - start[0], end[1] - start[1]
+            length = math.hypot(dx, dy)
+            if length <= 1e-15:
+                continue
+            for fraction in (1e-5, 1e-7, 1e-9):
+                offset = span * fraction
+                probe = (
+                    0.5 * (start[0] + end[0]) - orientation * dy / length * offset,
+                    0.5 * (start[1] + end[1]) + orientation * dx / length * offset,
+                )
+                if _point_in_or_on_polygon(probe, vertices):
+                    return probe
+        return tuple(vertices[0])
 
     @_history_tracked
     def delete_selected_sketch_edges(self):
@@ -5035,6 +5321,106 @@ class SolveWorkspace(Div):
     def open_circle_dialog(self, *args):
         self._circle_dialog.ui_model_value = True
 
+    def _materialize_primitive_as_sketch(self, region):
+        """Represent a primitive outline as editable line/arc entities."""
+        geometry = self.model["geometry"]
+        shape = region.get("shape", {})
+        shape_type = shape.get("type") if isinstance(shape, dict) else None
+        if shape_type not in {"rectangle", "circle"}:
+            raise ValueError(f"Cannot split the outline of {region.get('name', 'this region')} automatically.")
+        region_edge_ids = set(region.get("edge_ids", []))
+        edge_records = geometry.setdefault("edges", [])
+        old_edges = {
+            edge.get("id"): edge for edge in edge_records
+            if isinstance(edge, dict) and edge.get("id") in region_edge_ids
+        }
+        entities = geometry.setdefault("sketch_entities", [])
+        made = []
+
+        def add_entity(curve_type, start, end, sampled, *, center=None, radius=None, through=None, source=None):
+            entity_id = new_id("curve")
+            start = [float(value) for value in start]
+            end = [float(value) for value in end]
+            sampled = [[float(value) for value in point] for point in sampled]
+            entity = {
+                "id": entity_id,
+                "type": curve_type,
+                "points": [start, end] if curve_type == "line" else [start, list(through), end],
+                "sampled_points": sampled,
+            }
+            curve = {"type": curve_type, "sampled_points": copy.deepcopy(sampled)}
+            if curve_type == "arc":
+                entity.update({"center": list(center), "radius": float(radius), "clockwise": False})
+                curve.update({"center": list(center), "radius": float(radius), "clockwise": False})
+            entities.append(entity)
+            made.append(entity_id)
+            edge = copy.deepcopy(source) if source else {
+                "id": new_id("edge"), "name": f"{curve_type.title()} edge",
+                "boundary_condition_ids": [],
+            }
+            edge["vertices"] = [start, end]
+            edge["sketch_entity_id"] = entity_id
+            edge["curve"] = curve
+            if source:
+                for index, old in enumerate(edge_records):
+                    if old.get("id") == source.get("id"):
+                        edge_records[index] = edge
+                        break
+                else:
+                    edge_records.append(edge)
+            else:
+                edge_records.append(edge)
+            return edge
+
+        if shape_type == "rectangle":
+            vertices = region.get("vertices", [])
+            if len(vertices) < 4:
+                raise ValueError(f"{region.get('name', 'Rectangle')} has an invalid outline.")
+            region_edges = [old_edges[item] for item in region.get("edge_ids", []) if item in old_edges]
+            for index, side_start in enumerate(vertices):
+                side_end = vertices[(index + 1) % len(vertices)]
+                side = [edge for edge in region_edges if len(edge.get("vertices", [])) == 2
+                        and all(_point_on_segment(point, side_start, side_end, 1e-10)
+                                for point in edge["vertices"])]
+                if not side:
+                    add_entity("line", side_start, side_end, [side_start, side_end])
+                    continue
+                dx, dy = side_end[0] - side_start[0], side_end[1] - side_start[1]
+                denominator = dx * dx + dy * dy
+                side.sort(key=lambda edge: sum(
+                    ((point[0] - side_start[0]) * dx + (point[1] - side_start[1]) * dy) / max(denominator, 1e-30)
+                    for point in edge["vertices"]
+                ))
+                for edge in side:
+                    a, b = edge["vertices"]
+                    add_entity("line", a, b, [a, b], source=edge)
+        else:
+            center = [float(shape["r_center"]), float(shape["z_center"])]
+            radius = float(shape["radius"])
+            if radius <= 0:
+                raise ValueError(f"{region.get('name', 'Circle')} has an invalid radius.")
+            source = next((old_edges[item] for item in region.get("edge_ids", [])
+                           if item in old_edges), None)
+            for quadrant in range(4):
+                angle_a = quadrant * math.pi / 2.0
+                angle_b = (quadrant + 1) * math.pi / 2.0
+                middle = 0.5 * (angle_a + angle_b)
+                start = [center[0] + radius * math.cos(angle_a), center[1] + radius * math.sin(angle_a)]
+                end = [center[0] + radius * math.cos(angle_b), center[1] + radius * math.sin(angle_b)]
+                through = [center[0] + radius * math.cos(middle), center[1] + radius * math.sin(middle)]
+                sampled = [
+                    [center[0] + radius * math.cos(angle_a + (angle_b - angle_a) * step / 32),
+                     center[1] + radius * math.sin(angle_a + (angle_b - angle_a) * step / 32)]
+                    for step in range(33)
+                ]
+                old = copy.deepcopy(source) if source else None
+                if old is not None and quadrant > 0:
+                    old["id"] = new_id("edge")
+                    old["name"] = f"{region.get('name', 'Circle')} edge {quadrant + 1}"
+                add_entity("arc", start, end, sampled, center=center, radius=radius,
+                           through=through, source=old)
+        return made
+
     @_history_tracked
     def _add_primitive(self, kind):
         try:
@@ -5070,12 +5456,24 @@ class SolveWorkspace(Div):
                 }
                 label = "circle"
             parent_id = self._find_containing_region(vertices)
-            if self._has_unsupported_overlap(vertices, parent_id):
-                raise ValueError("Regions may touch, but their interiors cannot overlap.")
+            overlapping = []
+            candidate_area = abs(_polygon_area(vertices))
+            for existing in self.model["geometry"]["regions"]:
+                existing_vertices = existing.get("vertices", [])
+                if len(existing_vertices) < 3 or not _polygons_overlap_interior(vertices, existing_vertices):
+                    continue
+                existing_area = abs(_polygon_area(existing_vertices))
+                nested = (
+                    existing_area > candidate_area + _area_tolerance(existing_vertices, vertices)
+                    and _contains_or_touches(existing_vertices, vertices)
+                ) or (
+                    candidate_area > existing_area + _area_tolerance(existing_vertices, vertices)
+                    and _contains_or_touches(vertices, existing_vertices)
+                )
+                if not nested:
+                    overlapping.append(existing)
             used_indices = []
             for existing in self.model["geometry"]["regions"]:
-                if existing.get("shape", {}).get("type") != primitive_data["type"]:
-                    continue
                 match = re.fullmatch(rf"{label} (\d+)", existing.get("name", ""))
                 if match:
                     used_indices.append(int(match.group(1)))
@@ -5099,13 +5497,38 @@ class SolveWorkspace(Div):
             }
             self._preserve_canvas_view()
             with self._batch_frontend_updates():
-                self.model["geometry"]["regions"].append(region)
-                try:
-                    self._recompute_parent_links()
-                except ValueError:
-                    self.model["geometry"]["regions"].pop()
-                    raise
-                self._rebuild_edges()
+                geometry = self.model["geometry"]
+                if overlapping:
+                    allowed_types = {"rectangle", "circle", "sketch"}
+                    unsupported = [item for item in overlapping
+                                   if item.get("shape", {}).get("type") not in allowed_types]
+                    if unsupported:
+                        raise ValueError("This overlap involves imported geometry that cannot yet be split safely.")
+                    geometry_snapshot = copy.deepcopy(geometry)
+                    templates = [copy.deepcopy(item) for item in overlapping] + [copy.deepcopy(region)]
+                    try:
+                        for existing in overlapping:
+                            if existing.get("shape", {}).get("type") in {"rectangle", "circle"}:
+                                self._materialize_primitive_as_sketch(existing)
+                        self._materialize_primitive_as_sketch(region)
+                        overlapping_ids = {item["id"] for item in overlapping}
+                        geometry["regions"] = [item for item in geometry.get("regions", [])
+                                                if item.get("id") not in overlapping_ids]
+                        self._refresh_sketch_generated_regions(source_templates=templates)
+                        if not any(item.get("id") == region["id"] for item in geometry.get("regions", [])):
+                            raise ValueError("Overlapping outlines did not produce a bounded region.")
+                    except Exception:
+                        geometry.clear()
+                        geometry.update(geometry_snapshot)
+                        raise
+                else:
+                    geometry["regions"].append(region)
+                    try:
+                        self._recompute_parent_links()
+                    except ValueError:
+                        geometry["regions"].pop()
+                        raise
+                    self._rebuild_edges()
                 self.selected_region_id = region["id"]
                 self.selected_edge_id = None
                 self.selected_edge_ids = []
@@ -5113,7 +5536,10 @@ class SolveWorkspace(Div):
                 self.active_section = "geometry"
                 self.layout["active_section"] = self.active_section
                 self._close_dialog(kind)
-                self._message(f"Created {region['name']} with {len(region['constraints'])} driving sketch constraints.")
+                if overlapping:
+                    self._message(f"Created {region['name']}; intersecting outlines are split into editable subregions.")
+                else:
+                    self._message(f"Created {region['name']} with {len(region['constraints'])} driving sketch constraints.")
                 self._refresh_model_tree()
                 self._render_inspector()
                 self.render_canvas()
@@ -5153,9 +5579,9 @@ class SolveWorkspace(Div):
                 candidates.append((outer_area, region["id"]))
         return min(candidates)[1] if candidates else None
 
-    def _has_unsupported_overlap(self, vertices, parent_id):
+    def _has_unsupported_overlap(self, vertices, parent_id, *, regions=None):
         candidate_area = abs(_polygon_area(vertices))
-        for region in self.model["geometry"]["regions"]:
+        for region in (self.model["geometry"]["regions"] if regions is None else regions):
             existing = region["vertices"]
             existing_area = abs(_polygon_area(existing))
             area_tolerance = _area_tolerance(existing, vertices)
@@ -5727,10 +6153,15 @@ class SolveWorkspace(Div):
                 edges.append(edge)
                 current_edge_ids.add(edge_id)
 
+        live_sketch_entity_ids = {
+            entity.get("id") for entity in geometry.get("sketch_entities", [])
+            if isinstance(entity, dict) and isinstance(entity.get("id"), str)
+        }
         for old in old_edges:
             if (
                 not isinstance(old, dict)
                 or not old.get("sketch_entity_id")
+                or old.get("sketch_entity_id") not in live_sketch_entity_ids
                 or old.get("id") in used_old_ids
                 or old.get("id") in current_edge_ids
                 or len(old.get("vertices", [])) != 2
@@ -6427,6 +6858,14 @@ class SolveWorkspace(Div):
             region.get("name", "Region") for region in regions
             if region.get("id") in removed_ids
         ]
+        removed_sketch_entity_ids = {
+            entity_id
+            for region in regions
+            if region.get("id") in removed_ids and isinstance(region.get("shape"), dict)
+            and region["shape"].get("type") == "sketch"
+            for entity_id in region["shape"].get("entity_ids", [])
+            if isinstance(entity_id, str)
+        }
 
         # A nested material region is a cutout in its surviving container once
         # deleted. Preserve its contour as a void rather than letting the parent
@@ -6491,6 +6930,19 @@ class SolveWorkspace(Div):
                 void for void in geometry.get("voids", [])
                 if void.get("parent_id") not in removed_ids
             ]
+            retained_sketch_entity_ids = {
+                entity_id
+                for item in [*self.model["geometry"].get("regions", []), *geometry.get("voids", [])]
+                if isinstance(item.get("shape"), dict) and item["shape"].get("type") == "sketch"
+                for entity_id in item["shape"].get("entity_ids", [])
+                if isinstance(entity_id, str)
+            }
+            orphaned_sketch_entity_ids = removed_sketch_entity_ids - retained_sketch_entity_ids
+            if orphaned_sketch_entity_ids:
+                geometry["sketch_entities"] = [
+                    entity for entity in geometry.get("sketch_entities", [])
+                    if entity.get("id") not in orphaned_sketch_entity_ids
+                ]
             for load in self.model.get("regional_loads", []):
                 load["region_ids"] = [
                     region_id for region_id in load.get("region_ids", [])
@@ -9865,15 +10317,50 @@ def _polygons_overlap_interior(first, second):
 
     # Detect coincident polygons and interior containment whose vertices all
     # lie on the other boundary (for example, identical rectangles).
-    first_center = (
-        sum(point[0] for point in first) / len(first),
-        sum(point[1] for point in first) / len(first),
+    first_probe = _polygon_interior_probe(first)
+    second_probe = _polygon_interior_probe(second)
+    return _point_in_polygon(first_probe, second) or _point_in_polygon(second_probe, first)
+
+
+def _polygon_interior_probe(polygon):
+    """Return a point inside a simple polygon, including concave outlines."""
+    if len(polygon) < 3:
+        return tuple(polygon[0]) if polygon else (0.0, 0.0)
+    twice_area = sum(
+        polygon[index][0] * polygon[(index + 1) % len(polygon)][1]
+        - polygon[(index + 1) % len(polygon)][0] * polygon[index][1]
+        for index in range(len(polygon))
     )
-    second_center = (
-        sum(point[0] for point in second) / len(second),
-        sum(point[1] for point in second) / len(second),
-    )
-    return _point_in_polygon(first_center, second) or _point_in_polygon(second_center, first)
+    if abs(twice_area) > 1e-30:
+        cx = sum(
+            (polygon[index][0] + polygon[(index + 1) % len(polygon)][0])
+            * (polygon[index][0] * polygon[(index + 1) % len(polygon)][1]
+               - polygon[(index + 1) % len(polygon)][0] * polygon[index][1])
+            for index in range(len(polygon))
+        ) / (3.0 * twice_area)
+        cy = sum(
+            (polygon[index][1] + polygon[(index + 1) % len(polygon)][1])
+            * (polygon[index][0] * polygon[(index + 1) % len(polygon)][1]
+               - polygon[(index + 1) % len(polygon)][0] * polygon[index][1])
+            for index in range(len(polygon))
+        ) / (3.0 * twice_area)
+        centroid = (cx, cy)
+        if _point_in_polygon(centroid, polygon):
+            return centroid
+    y_levels = sorted({float(point[1]) for point in polygon})
+    candidates = [(first + second) / 2 for first, second in zip(y_levels, y_levels[1:]) if second > first]
+    for y in candidates:
+        crossings = []
+        for index, start in enumerate(polygon):
+            end = polygon[(index + 1) % len(polygon)]
+            if (start[1] > y) != (end[1] > y):
+                crossings.append(start[0] + (y - start[1]) * (end[0] - start[0]) / (end[1] - start[1]))
+        crossings.sort()
+        for left, right in zip(crossings[::2], crossings[1::2]):
+            probe = ((left + right) / 2, y)
+            if _point_in_polygon(probe, polygon):
+                return probe
+    return tuple(polygon[0])
 
 def _polygons_overlap(first, second):
     a, b = _bounds(first), _bounds(second)

@@ -4,7 +4,11 @@ import pytest
 
 from ngapp import utils
 from ngsolve_gui.axisymmetric_model import package_model, serialize_model_json, unpack_model, validate_model
-from ngsolve_gui.legacy_problem_import import LegacySplineGeometryCapture, legacy_problem_to_model
+from ngsolve_gui.legacy_problem_import import (
+    LegacySplineGeometryCapture,
+    import_legacy_problem_file,
+    legacy_problem_to_model,
+)
 from ngsolve_gui.solve_workspace import SolveWorkspace
 
 
@@ -95,6 +99,7 @@ def test_legacy_problem_conversion_preserves_supported_model_data(standalone_com
     assert studies["studies"][0]["frequency_hz"] == ["500"]
     assert model["physics"]["mechanics"]["rayleigh_alpha"] == "12.5"
     assert model["physics"]["mechanics"]["rayleigh_beta"] == "4e-08"
+    assert model["solver"]["maximum_iterations"] == 10
     assert layout["active_section"] == "geometry"
 
     workspace = SolveWorkspace()
@@ -106,6 +111,25 @@ def test_legacy_problem_conversion_preserves_supported_model_data(standalone_com
         if edge["id"] in coil["edge_ids"]
     }
     assert all(edge["boundary_condition_ids"] for edge in coil_edges.values())
+
+
+def test_legacy_solver_ramp_and_transmission_settings_are_preserved(standalone_components):
+    problem = _legacy_test_problem()
+    problem.update({
+        "transmissionExteriorSubdom": "Vac",
+        "ramp_time": 1.25,
+        "ramp_type": "sigmoid",
+        "source_type": "sine",
+        "coupled_approach": "linearised",
+    })
+    model, _studies, _layout = legacy_problem_to_model(problem)
+    assert model["legacy_import"]["solver_parameters"] == {
+        "transmission_exterior_subdomain": "Vac",
+        "ramp_time": 1.25,
+        "ramp_type": "sigmoid",
+        "source_type": "sine",
+        "coupled_approach": "linearised",
+    }
 
 
 def test_empty_legacy_dirichlet_keys_remain_natural_and_axis_is_preserved(standalone_components):
@@ -145,6 +169,25 @@ def test_explicit_legacy_local_mesh_size_survives_global_target_changes(standalo
     coil = model["geometry"]["regions"][1]
     assert model["mesh"]["element_size"] == "0.01"
     assert model["mesh"]["region_element_sizes"][coil["id"]] == "0.01"
+
+
+def test_legacy_file_import_uses_solver_default_mesh_controls():
+    defaults = import_legacy_problem_file.__kwdefaults__
+    assert defaults["element_size"] == 1.0
+    assert defaults["legacy_h_local"] == 0.1
+    assert defaults["polynomial_order"] == 3
+
+
+def test_legacy_domain_mesh_overrides_are_preserved_per_region(standalone_components):
+    problem = _legacy_test_problem()
+    problem["geometry"].SetDomainMaxH(1, 0.125)
+    problem["geometry"].SetDomainMaxH(2, 0.025)
+    model, _studies, _layout = legacy_problem_to_model(problem, element_size=0.5)
+    regions = {region["legacy_domain"]: region for region in model["geometry"]["regions"]}
+
+    assert model["mesh"]["element_size"] == "0.5"
+    assert model["mesh"]["region_element_sizes"][regions[1]["id"]] == "0.125"
+    assert model["mesh"]["region_element_sizes"][regions[2]["id"]] == "0.025"
 
 
 def test_legacy_dc_and_ac_dirichlet_selections_must_match(standalone_components):

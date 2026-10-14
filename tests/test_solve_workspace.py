@@ -3,6 +3,7 @@ import os
 import json
 import math
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -13,7 +14,11 @@ from ngapp.components import Div
 import ngsolve_gui.app as app_module
 from ngsolve_gui.app import NGSolveGui
 from ngsolve_gui.axisymmetric_model import builtin_materials
-from ngsolve_gui.solve_workspace import SolveWorkspace, _load_saved_run_history
+from ngsolve_gui.solve_workspace import (
+    SolveWorkspace,
+    _load_saved_run_history,
+    default_run_history_root,
+)
 from ngsolve_gui.webgpu_tab import WebgpuTab
 
 
@@ -1493,6 +1498,27 @@ def test_trim_pencil_stroke_removes_only_curves_it_crosses(standalone_components
     remaining = workspace.model["geometry"]["sketch_entities"]
     assert len(remaining) == 1
     assert remaining[0]["points"] == [[0.02, 0.004], [0.026, 0.004]]
+
+
+
+def test_trim_stroke_removes_only_the_intersection_bounded_section(standalone_components):
+    workspace = SolveWorkspace()
+    assert workspace._add_sketch_entity("line", [(0.001, 0.0), (0.009, 0.0)])
+    assert workspace._add_sketch_entity("line", [(0.003, -0.002), (0.003, 0.002)])
+    assert workspace._add_sketch_entity("line", [(0.007, -0.002), (0.007, 0.002)])
+
+    assert workspace._trim_sketch_entities_along_stroke([(0.005, -0.001), (0.005, 0.001)])
+    horizontal = [
+        entity for entity in workspace.model["geometry"]["sketch_entities"]
+        if entity.get("type") == "line"
+        and abs(entity["points"][0][1]) < 1e-10
+        and abs(entity["points"][-1][1]) < 1e-10
+    ]
+    assert len(horizontal) == 2
+    spans = sorted((entity["points"][0][0], entity["points"][-1][0]) for entity in horizontal)
+    assert spans[0] == pytest.approx((0.001, 0.003))
+    assert spans[1] == pytest.approx((0.007, 0.009))
+
 
 
 def test_mouse_drawn_geometry_uses_si_values_with_0_01mm_precision(standalone_components):
@@ -3500,38 +3526,127 @@ def test_adjacent_mechanical_regions_share_locked_default_boundary(standalone_co
     )
 
 
-def test_tangent_regions_are_allowed_and_interior_overlap_is_rejected(standalone_components):
+def test_concave_touching_faces_are_not_misclassified_as_overlapping(standalone_components):
+    from ngsolve_gui.solve_workspace import _polygons_overlap_interior
+
+    left_face = [
+        (0.004, 0.0), (0.014, 0.0), (0.014, 0.005),
+        (0.009, 0.005), (0.009, 0.01), (0.004, 0.01),
+    ]
+    overlap_face = [(0.009, 0.005), (0.014, 0.005), (0.014, 0.01), (0.009, 0.01)]
+    assert not _polygons_overlap_interior(left_face, overlap_face)
+    assert _polygons_overlap_interior(overlap_face, overlap_face)
+
+
+def test_partial_rectangle_overlap_is_split_into_editable_subregions(standalone_components):
     workspace = SolveWorkspace()
     workspace._primitive_values.update({
-        ("rectangle", "r_min"): 0.0,
-        ("rectangle", "z_min"): 0.0,
-        ("rectangle", "width"): 0.01,
-        ("rectangle", "height"): 0.01,
+        ("rectangle", "r_min"): 0.004, ("rectangle", "z_min"): 0.0,
+        ("rectangle", "width"): 0.010, ("rectangle", "height"): 0.010,
     })
     workspace._add_primitive("rectangle")
-    workspace._primitive_values.update({
-        ("rectangle", "r_min"): 0.01,
-        ("rectangle", "z_min"): 0.003,
-        ("rectangle", "width"): 0.004,
-        ("rectangle", "height"): 0.004,
-    })
-    workspace._add_primitive("rectangle")
-    first, second = workspace.model["geometry"]["regions"]
-    assert set(first["edge_ids"]) & set(second["edge_ids"])
+    first = workspace.model["geometry"]["regions"][0]
+    first["material_id"] = "material-copper"
+    first["sources"]["dc_current_density"] = "1e6"
 
-    overlapping_vertices = [
-        [0.009, 0.003], [0.013, 0.003], [0.013, 0.007], [0.009, 0.007]
-    ]
-    assert workspace._has_unsupported_overlap(overlapping_vertices, None)
     workspace._primitive_values.update({
-        ("rectangle", "r_min"): 0.009,
-        ("rectangle", "z_min"): 0.003,
-        ("rectangle", "width"): 0.004,
-        ("rectangle", "height"): 0.004,
+        ("rectangle", "r_min"): 0.009, ("rectangle", "z_min"): 0.005,
+        ("rectangle", "width"): 0.010, ("rectangle", "height"): 0.010,
     })
     workspace._add_primitive("rectangle")
-    assert len(workspace.model["geometry"]["regions"]) == 2
-    assert "interiors cannot overlap" in workspace.message
+
+    regions = workspace.model["geometry"]["regions"]
+    from ngsolve_gui.axisymmetric_model import find_closed_sketch_loops
+    loops = find_closed_sketch_loops(workspace.model["geometry"].get("sketch_entities", []))
+    assert len(regions) == 3, {"message": workspace.message, "regions": [(item["name"], item["vertices"], item.get("shape")) for item in regions]}
+    assert all(region["shape"]["type"] == "sketch" for region in regions)
+    assert len({region["id"] for region in regions}) == 3
+    assert any(region["material_id"] == "material-copper" for region in regions)
+    assert any(region["name"].startswith("square 2") for region in regions)
+    assert workspace.message.startswith("Created square 2")
+    assert all(len(region["edge_ids"]) >= 3 for region in regions)
+
+
+def test_partial_circle_overlap_is_split_and_keeps_curved_edges(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._primitive_values.update({
+        ("circle", "r_center"): 0.010, ("circle", "z_center"): 0.0,
+        ("circle", "radius"): 0.004,
+    })
+    workspace._add_primitive("circle")
+    workspace._primitive_values.update({
+        ("circle", "r_center"): 0.013, ("circle", "z_center"): 0.0,
+        ("circle", "radius"): 0.004,
+    })
+    workspace._add_primitive("circle")
+
+    regions = workspace.model["geometry"]["regions"]
+    assert len(regions) == 3
+    assert all(region["shape"]["type"] == "sketch" for region in regions)
+    assert any(edge.get("curve", {}).get("type") == "arc"
+               for edge in workspace.model["geometry"]["edges"])
+
+
+def test_deleting_a_simple_region_removes_its_outline(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region_id = workspace.model["geometry"]["regions"][0]["id"]
+    assert workspace.delete_regions([region_id])
+    assert workspace.model["geometry"]["regions"] == []
+    assert workspace.model["geometry"]["edges"] == []
+
+
+def test_sketch_tangent_and_spline3_arcs_close_regions(standalone_components):
+    for variant in ("tangent", "spline3"):
+        workspace = SolveWorkspace()
+        start, end = (0.006, 0.0), (0.006, 0.004)
+        assert workspace._add_sketch_entity("line", [(0.002, 0.0), start])
+        if variant == "tangent":
+            workspace._accept_arc_sketch_point(start, variant="tangent")
+            assert workspace._accept_arc_sketch_point(end, variant="tangent")
+        else:
+            assert workspace._accept_arc_sketch_point(start, variant="spline3")
+            assert workspace._accept_arc_sketch_point(end, variant="spline3")
+            assert workspace._accept_arc_sketch_point((0.008, 0.002), variant="spline3")
+        assert workspace._add_sketch_entity("line", [end, (0.002, 0.004)])
+        assert workspace._add_sketch_entity("line", [(0.002, 0.004), (0.002, 0.0)])
+        regions = [item for item in workspace.model["geometry"]["regions"]
+                   if item.get("shape", {}).get("type") == "sketch"]
+        assert len(regions) == 1
+        arc_type = "arc" if variant == "tangent" else "spline3"
+        assert any(edge.get("curve", {}).get("type") == arc_type
+                   for edge in workspace.model["geometry"]["edges"])
+
+
+def test_circle_three_point_preview_uses_three_circumference_points(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    scripts = []
+    monkeypatch.setattr(SolveWorkspace, "js", property(lambda self: SimpleNamespace(eval=scripts.append)), raising=False)
+    workspace._install_canvas_pointer_capture()
+    script = scripts[0]
+    assert "circlePoints" in script
+    assert "solve-sketch-drag-circle" in script
+    assert "const denominator = 2 * (first[0]" in script
+    assert 'previewCircle.setAttribute("cx"' in script
+    assert 'previewCircle.setAttribute("cy"' in script
+    assert 'previewCircle.setAttribute("r"' in script
+
+
+def test_delete_region_after_select_removes_orphaned_sketch_curves(standalone_components):
+    workspace = SolveWorkspace()
+    for first, second in (
+        ((0.002, 0.0), (0.008, 0.0)),
+        ((0.008, 0.0), (0.008, 0.006)),
+        ((0.008, 0.006), (0.002, 0.006)),
+        ((0.002, 0.006), (0.002, 0.0)),
+    ):
+        assert workspace._add_sketch_entity("line", [first, second])
+    region_id = next(item["id"] for item in workspace.model["geometry"]["regions"]
+                     if item.get("shape", {}).get("type") == "sketch")
+    assert workspace.delete_regions([region_id])
+    assert not workspace.model["geometry"]["regions"]
+    assert not workspace.model["geometry"]["edges"]
+    assert not workspace.model["geometry"]["sketch_entities"]
 
 
 def test_boundary_stage_blank_drag_is_marquee_and_shape_tool_remains_drawable(standalone_components):
@@ -3796,7 +3911,8 @@ def test_canvas_context_menu_offers_group_delete_ungroup_for_current_selection(s
     assert "[data-sketch-region-selected=\"true\"]" in scripts[0]
     assert "event.clientX - bounds.left" in scripts[0]
     assert "event.key === 'Escape'" in scripts[0]
-    assert "new KeyboardEvent('keydown'" in scripts[0]
+    assert "__ngsolveSketchCompletedGesture" in scripts[0]
+    assert "new MouseEvent('mouseup'" in scripts[0]
     assert "svg.dispatchEvent(forwarded)" in scripts[0]
     assert "svg.focus({preventScroll: true})" in scripts[0]
 
@@ -3938,3 +4054,34 @@ def test_delete_key_removes_all_selected_regions(standalone_components):
     assert set(workspace._selected_region_ids_live()) == {first["id"], second["id"]}
     assert workspace.delete_selected_geometry()
     assert workspace.model["geometry"]["regions"] == []
+
+
+
+def test_run_history_uses_configured_shared_vm_output_root(monkeypatch, tmp_path):
+    shared_root = tmp_path / "shared-results"
+    monkeypatch.setenv("COUPLED_SOLVER_OUTPUT_DIR", str(shared_root))
+    run_root = shared_root / "gui_runs"
+    run_directory = run_root / "imported_model_20261014"
+    run_directory.mkdir(parents=True)
+    (run_directory / "run_manifest.json").write_text(
+        json.dumps({
+            "schema": "mm-fem.run",
+            "kind": "study",
+            "status": "complete",
+            "model_name": "Imported model",
+        }),
+        encoding="utf-8",
+    )
+
+    assert default_run_history_root() == run_root
+    runs = _load_saved_run_history()
+    assert [run["output_path"] for run in runs] == [str(run_directory)]
+
+
+def test_run_history_defaults_to_home_results_directory_without_vm_override(
+    monkeypatch, tmp_path
+):
+    monkeypatch.delenv("COUPLED_SOLVER_OUTPUT_DIR", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    assert default_run_history_root() == tmp_path / "NGSolve_results"

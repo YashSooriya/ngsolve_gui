@@ -76,7 +76,10 @@ class LegacySplineGeometryCapture:
         self.materials[int(domain)] = str(name)
 
     def SetDomainMaxH(self, domain, maxh):
-        self.domain_maxh[int(domain)] = float(maxh)
+        value = float(maxh)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("Legacy domain maxh must be finite and positive.")
+        self.domain_maxh[int(domain)] = value
 
 
 def _number(value, label):
@@ -441,6 +444,11 @@ def legacy_problem_to_model(problem, *, name="Imported legacy problem", element_
             "constraints": [],
             "legacy_domain": domain,
         }
+        domain_maxh = geometry.domain_maxh.get(domain)
+        if domain_maxh is not None:
+            mesh["region_element_sizes"][region_id] = _expression(
+                _number(domain_maxh, f"Domain {domain} maximum element size")
+            )
         regions_by_id[region_id] = region
         model["geometry"]["regions"].append(region)
 
@@ -599,6 +607,9 @@ def legacy_problem_to_model(problem, *, name="Imported legacy problem", element_
     if solver_name not in {"direct", "iterative", "gmres", "cg"}:
         raise ValueError(f"Legacy linear solver {solver_name!r} is not supported by the GUI yet.")
     model["solver"]["linear_solver"] = "direct" if solver_name == "direct" else "iterative"
+    # Match settings_axis() defaults so the imported run begins with the same
+    # fixed-point budget as the established problem-file route.
+    model["solver"]["maximum_iterations"] = max(1, int(problem.get("Nfixpoint", 10)))
     model["legacy_import"] = {
         "source_name": str(name),
         "topology_mode": "direct_curve_edges",
@@ -606,6 +617,13 @@ def legacy_problem_to_model(problem, *, name="Imported legacy problem", element_
             "dc_magnetic": sorted(adc_dirichlet),
             "harmonic_electromagnetic": sorted(aac_dirichlet),
             "mechanics": sorted(mech_dirichlet),
+        },
+        "solver_parameters": {
+            "transmission_exterior_subdomain": str(problem.get("transmissionExteriorSubdom", "") or ""),
+            "ramp_time": _number(problem.get("ramp_time", 0), "Ramp time"),
+            "ramp_type": str(problem.get("ramp_type", "linear") or "linear"),
+            "source_type": str(problem.get("source_type", "sine") or "sine"),
+            "coupled_approach": str(problem.get("coupled_approach", "linearised") or "linearised"),
         },
     }
     model["geometry"]["dimension_expression_unit"] = "m"
@@ -619,7 +637,7 @@ def legacy_problem_to_model(problem, *, name="Imported legacy problem", element_
     return model, studies, {"schema_version": 1, "active_section": "geometry", "camera": "fit"}
 
 
-def import_legacy_problem_file(path, *, element_size=0.01, polynomial_order=3):
+def import_legacy_problem_file(path, *, element_size=1.0, polynomial_order=3, legacy_h_local=0.1):
     """Execute a trusted legacy ``.py`` problem and convert its data to MM-FEM."""
     source = Path(path).expanduser().resolve()
     if not source.is_file() or source.suffix.lower() != ".py":
@@ -632,7 +650,10 @@ def import_legacy_problem_file(path, *, element_size=0.01, polynomial_order=3):
     namespace["SplineGeometry"] = LegacySplineGeometryCapture
     factory.__globals__["SplineGeometry"] = LegacySplineGeometryCapture
     signature = inspect.signature(factory)
-    supplied = {"RHS": "midpoint", "dt": 1e-3, "h_local": float(element_size)}
+    # Legacy problem files commonly set per-domain maxh from this parameter.
+    # Keep it aligned with main()'s historical default so the import reproduces
+    # the original mesh density even when the GUI's global target is different.
+    supplied = {"RHS": "midpoint", "dt": 1e-3, "h_local": float(legacy_h_local)}
     positional = []
     keyword = {}
     for parameter in signature.parameters.values():

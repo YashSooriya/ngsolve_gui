@@ -25,7 +25,7 @@ from . import cerbsim_style as cb
 from .cerbsim_style import theme, kb_theme, flex_fill, panel_full
 from .system_monitor import SystemMonitor, available as system_monitor_available
 from .footer import StatusFooter
-from .solve_workspace import SolveWorkspace
+from .solve_workspace import SolveWorkspace, default_run_history_root
 from .axisymmetric_model import new_model, new_studies, unpack_model, package_model, serialize_model_json
 from .result_files import (
     MESH_SUFFIX,
@@ -511,6 +511,7 @@ def _app_menu_button(label, entries):
         QList(*items, ui_dense=True),
         ui_anchor="bottom left",
         ui_self="top left",
+        ui_auto_close=True,
     )
     return QBtn(
         QTooltip(label), menu,
@@ -1547,13 +1548,9 @@ class NGSolveGui(App):
             r"[^A-Za-z0-9_-]+", "_", model.get("name", "axisymmetric_model")
         ).strip("_") or "axisymmetric_model"
         stamp = _datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        output_root = os.environ.get("COUPLED_SOLVER_OUTPUT_DIR", "").strip()
-        if output_root:
-            # Match the VM runner's shared-output mapping so GUI logs, manifests,
-            # mesh previews, and result bundles all follow the actual run path.
-            output_dir = Path(output_root).expanduser() / "gui_runs" / f"{model_name}_{stamp}"
-        else:
-            output_dir = Path.home() / "NGSolve_results" / f"{model_name}_{stamp}"
+        # Use the same root as run-history discovery. A VM-provided output root
+        # points at its shared folder; standalone runs use the user's home folder.
+        output_dir = default_run_history_root() / f"{model_name}_{stamp}"
         model_path = output_dir / f"{model_name}.ngsmodel"
         try:
             solver_root = self._find_solver_root()
