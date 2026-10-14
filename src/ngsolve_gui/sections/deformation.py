@@ -23,7 +23,14 @@ class DeformationSection(Section):
             ui_style="width: 110px;",
         )
         presets = Segmented(
-            [("1", "1×"), ("10", "10×"), ("100", "100×"), ("1000", "1000×")],
+            [
+                ("1", "1x"),
+                ("10", "10x"),
+                ("100", "100x"),
+                ("1000", "1000x"),
+                ("10000", "10kx"),
+                ("100000", "100kx"),
+            ],
             "1", self._set_scale,
         )
         controls = [

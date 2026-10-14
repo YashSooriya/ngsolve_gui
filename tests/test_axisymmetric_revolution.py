@@ -322,6 +322,8 @@ def test_vector_displacement_deforms_axisymmetric_revolution(page: Page, app) ->
         component.deformation_scale.value = 1000.0
         component.deformation_scale2.value = 0.5
         assert component.mdata.deformation_scale == pytest.approx(500.0)
+        component.deformation_scale.value = 100000.0
+        assert component.mdata.deformation_scale == pytest.approx(50000.0)
     finally:
         if previous is missing:
             del function_module.RegionVisibility
