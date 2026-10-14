@@ -54,6 +54,122 @@ _EXPRESSION_UNITS = ("kg/m^3", "A/m^2", "N/m^3", "N/m^2", "S/m", "Pa", "Hz", "m"
 _LEGACY_EXPRESSION_UNITS = (*_EXPRESSION_UNITS[:-1], "mm", "m")
 
 
+
+def find_closed_sketch_loops(entities, *, tolerance=1e-12):
+    """Return bounded polygonal faces formed by connected sampled sketch curves.
+
+    Entities are polylines with stable ids. A planar half-edge walk extracts
+    each bounded face once, including adjacent faces in a branched sketch.
+    """
+    if not isinstance(entities, list) or not math.isfinite(float(tolerance)) or tolerance <= 0:
+        return []
+    nodes = {}
+    adjacency = {}
+    segments = []
+    for entity in entities:
+        if not isinstance(entity, dict) or not isinstance(entity.get("id"), str):
+            continue
+        raw = entity.get("sampled_points") or entity.get("points")
+        if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+            continue
+        path = []
+        for point in raw:
+            try:
+                value = (float(point[0]), float(point[1]))
+            except (TypeError, ValueError, IndexError, OverflowError):
+                continue
+            if not all(math.isfinite(component) for component in value):
+                continue
+            key = (round(value[0] / tolerance), round(value[1] / tolerance))
+            if not path or path[-1] != key:
+                nodes.setdefault(key, value)
+                path.append(key)
+        for segment_index, (first, second) in enumerate(zip(path, path[1:])):
+            if first == second:
+                continue
+            index = len(segments)
+            segments.append((first, second, entity["id"], segment_index, len(path) - 1))
+            adjacency.setdefault(first, []).append((second, index))
+            adjacency.setdefault(second, []).append((first, index))
+    if len(segments) < 3:
+        return []
+
+    ordered = {}
+    for origin, neighbors in adjacency.items():
+        ordered[origin] = sorted(
+            neighbors,
+            key=lambda item: math.atan2(
+                nodes[item[0]][1] - nodes[origin][1],
+                nodes[item[0]][0] - nodes[origin][0],
+            ),
+        )
+
+    visited = set()
+    loops = []
+    seen_loops = set()
+    for index, (first, second, _entity_id, _segment_index, _segment_count) in enumerate(segments):
+        for origin, destination in ((first, second), (second, first)):
+            initial = (origin, index)
+            if initial in visited:
+                continue
+            current = initial
+            cycle_nodes = []
+            cycle_entities = []
+            closed = False
+            for _ in range(2 * len(segments) + 1):
+                start, edge_index = current
+                if current in visited:
+                    closed = current == initial
+                    break
+                visited.add(current)
+                cycle_nodes.append(start)
+                edge_start, edge_end, entity_id, segment_index, _segment_count = segments[edge_index]
+                forward = start == edge_start
+                cycle_entities.append((entity_id, forward))
+                end = edge_end if forward else edge_start
+                outgoing = ordered.get(end, [])
+                reverse_position = next(
+                    (slot for slot, item in enumerate(outgoing) if item[0] == start and item[1] == edge_index),
+                    None,
+                )
+                if reverse_position is None or not outgoing:
+                    break
+                # Taking the preceding ray keeps the traversed face on the left.
+                next_neighbor, next_edge_index = outgoing[(reverse_position - 1) % len(outgoing)]
+                current = (end, next_edge_index)
+                if current == initial:
+                    closed = True
+                    break
+            if not closed or len(cycle_nodes) < 3:
+                continue
+            polygon = [nodes[key] for key in cycle_nodes]
+            area = 0.5 * sum(
+                polygon[i][0] * polygon[(i + 1) % len(polygon)][1]
+                - polygon[(i + 1) % len(polygon)][0] * polygon[i][1]
+                for i in range(len(polygon))
+            )
+            if area <= tolerance * tolerance:
+                continue
+            canonical = tuple(cycle_nodes)
+            rotations = [canonical[i:] + canonical[:i] for i in range(len(canonical))]
+            signature = min(rotations)
+            if signature in seen_loops:
+                continue
+            seen_loops.add(signature)
+            boundary = []
+            for entity_id, forward in cycle_entities:
+                if boundary and boundary[-1] == {"entity_id": entity_id, "forward": forward}:
+                    continue
+                boundary.append({"entity_id": entity_id, "forward": forward})
+            if len(boundary) > 1 and boundary[0] == boundary[-1]:
+                boundary.pop()
+            loops.append({
+                "vertices": [[float(point[0]), float(point[1])] for point in polygon],
+                "boundary": boundary,
+                "entity_ids": list(dict.fromkeys(item["entity_id"] for item in boundary)),
+            })
+    return loops
+
 def builtin_materials() -> list[dict]:
     """Return the material presets represented in the current problem files.
 
@@ -484,6 +600,7 @@ def _upgrade_sketch_topology(model):
         })
     geometry["points"] = points
     geometry["topology_version"] = 1
+    geometry.setdefault("sketch_entities", [])
 
 
 def migrate_legacy_model(model):
@@ -584,6 +701,7 @@ def new_model(name: str = "Untitled axisymmetric model") -> dict:
             "dimension_expression_unit": "m",
             "topology_version": 1,
             "points": [],
+            "sketch_entities": [],
             "regions": [],
             "edges": [],
             "constraints": [],

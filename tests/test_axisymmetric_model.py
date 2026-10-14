@@ -7,6 +7,7 @@ import pytest
 from ngsolve_gui.axisymmetric_model import (
     builtin_materials,
     evaluate_expression,
+    find_closed_sketch_loops,
     new_model,
     migrate_regional_loads,
     migrate_legacy_model,
@@ -499,3 +500,54 @@ def test_validate_studies_handles_malformed_physics_sections():
         physics={"harmonic_electromagnetic": "invalid", "mechanics": None},
         for_solve=True,
     ) == []
+
+
+def test_closed_sketch_loop_detection_finds_only_bounded_faces():
+    entities = [
+        {"id": "bottom", "type": "line", "sampled_points": [[0, 0], [2, 0]]},
+        {"id": "right", "type": "line", "sampled_points": [[2, 0], [2, 1]]},
+        {"id": "top", "type": "line", "sampled_points": [[2, 1], [0, 1]]},
+        {"id": "left", "type": "line", "sampled_points": [[0, 1], [0, 0]]},
+    ]
+    loops = find_closed_sketch_loops(entities)
+    assert len(loops) == 1
+    assert len(loops[0]["vertices"]) == 4
+    assert set(loops[0]["entity_ids"]) == {"bottom", "right", "top", "left"}
+
+
+def test_closed_sketch_loop_detection_supports_curved_samples_and_open_chains():
+    entities = [
+        {"id": "arc", "type": "arc", "sampled_points": [[0, 0], [1, 0.5], [2, 0]]},
+        {"id": "base", "type": "line", "sampled_points": [[2, 0], [0, 0]]},
+        {"id": "open", "type": "line", "sampled_points": [[3, 0], [4, 0]]},
+    ]
+    loops = find_closed_sketch_loops(entities)
+    assert len(loops) == 1
+    assert len(loops[0]["vertices"]) == 3
+    assert set(loops[0]["entity_ids"]) == {"arc", "base"}
+    assert len(loops[0]["boundary"]) == 2
+    assert {item["entity_id"] for item in loops[0]["boundary"]} == {"arc", "base"}
+
+
+def test_new_and_migrated_models_have_a_sketch_entity_collection():
+    model = new_model()
+    assert model["geometry"]["sketch_entities"] == []
+    legacy = _nested_model()
+    legacy["geometry"].pop("sketch_entities", None)
+    migrated = migrate_legacy_model(legacy)
+    assert migrated["geometry"]["sketch_entities"] == []
+
+
+def test_sketch_curve_geometry_survives_problem_file_round_trip():
+    model = new_model()
+    model["geometry"]["sketch_entities"] = [{
+        "id": "curve-arc",
+        "type": "arc",
+        "points": [[0.01, 0.0], [0.015, 0.005], [0.02, 0.0]],
+        "center": [0.015, 0.0],
+        "radius": 0.005,
+        "clockwise": False,
+        "sampled_points": [[0.01, 0.0], [0.015, 0.005], [0.02, 0.0]],
+    }]
+    restored, _, _ = unpack_model(package_model(model))
+    assert restored["geometry"]["sketch_entities"] == model["geometry"]["sketch_entities"]
