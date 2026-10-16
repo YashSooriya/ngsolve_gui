@@ -1,6 +1,7 @@
 """Pointer-centred zoom and orbit behavior for the bundled WebGPU camera."""
 
 _PATCH_MARKER = "  // MM-FEM: map the pointer to a view-parallel focal plane."
+_CLIPPING_PATCH_MARKER = "    // MM-FEM: adapt the near plane to deep zoom."
 
 
 def patch_engine_source(source):
@@ -70,8 +71,38 @@ def patch_engine_source(source):
     return patched, True
 
 
+def patch_camera_clipping(source):
+    """Tighten the perspective near plane as the user zooms into a scene."""
+    if _CLIPPING_PATCH_MARKER in source:
+        return source, True
+
+    replacements = (
+        (
+            "    this.transform = new Transform();\n    this.orthographic = false;",
+            "    this.transform = new Transform();\n    this._fitScale = 1;\n    this.orthographic = false;",
+        ),
+        (
+            "    this.transform.init(pmin, pmax);\n    this._notify();",
+            "    this.transform.init(pmin, pmax);\n    this._fitScale = this.transform._currentScale();\n    this._notify();",
+        ),
+        (
+            "    const near = 0.1, far = 10, fov = 45, focal = 3;",
+            "    // MM-FEM: adapt the near plane to deep zoom.\n"
+            "    const zoomRatio = this.transform._currentScale() / Math.max(1e-12, this._fitScale || 1);\n"
+            "    const near = Math.max(0.001, Math.min(0.1, 3 - 1.02 * zoomRatio));\n"
+            "    const far = 10, fov = 45, focal = 3;",
+        ),
+    )
+    patched = source
+    for old, new in replacements:
+        if patched.count(old) != 1:
+            return source, False
+        patched = patched.replace(old, new, 1)
+    return patched, True
+
+
 def install_webgpu_pointer_focus():
-    """Install the camera patch before WebGPU injects its JS engine bundle."""
+    """Install camera interaction and deep-zoom clipping patches in WebGPU."""
     try:
         import webgpu.engine as engine
     except Exception as error:  # pragma: no cover - environment-specific fallback
@@ -81,5 +112,8 @@ def install_webgpu_pointer_focus():
     if not ok:
         print("Pointer-focused camera controls unavailable: WebGPU input code changed.")
         return False
+    patched, clipping_ok = patch_camera_clipping(patched)
+    if not clipping_ok:
+        print("Adaptive camera clipping unavailable: WebGPU camera code changed.")
     engine.engine_js = patched
-    return True
+    return clipping_ok
