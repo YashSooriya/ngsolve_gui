@@ -1,4 +1,6 @@
+import copy
 import math
+from types import SimpleNamespace
 
 import pytest
 
@@ -242,6 +244,92 @@ def test_legacy_spline3_import_preserves_control_curve_for_render_and_solver(sta
     )
     assert reloaded_edge["curve"]["type"] == "spline3"
     assert reloaded_edge["curve"]["control_point"] == [1.0, -1.5]
+
+
+def test_dragging_nested_legacy_contour_preserves_spline_topology_and_updates_parent(standalone_components, monkeypatch):
+    problem = _legacy_test_problem()
+    geometry = problem["geometry"]
+    segment = next(item for item in geometry.segments if item["leftdomain"] == 2)
+    start = geometry.points[segment["start"]]["coordinates"]
+    end = geometry.points[segment["end"]]["coordinates"]
+    control = geometry.AppendPoint(
+        (start[0] + end[0]) / 2,
+        (start[1] + end[1]) / 2 + 0.03,
+    )
+    segment.update({"type": "spline3", "control": control})
+    model, studies, layout = legacy_problem_to_model(problem)
+    workspace = SolveWorkspace()
+    workspace.set_model(model, studies, layout)
+    outer = next(item for item in workspace.model["geometry"]["regions"] if item["legacy_domain"] == 1)
+    inner = next(item for item in workspace.model["geometry"]["regions"] if item["legacy_domain"] == 2)
+    spline = next(
+        edge for edge in workspace.model["geometry"]["edges"]
+        if edge["curve"].get("type") == "spline3"
+    )
+    spline_id = spline["id"]
+    edge_ids = list(inner["edge_ids"])
+    edge_count = len(workspace.model["geometry"]["edges"])
+    original_curve = copy.deepcopy(spline["curve"])
+    original_condition_ids = list(spline["boundary_condition_ids"])
+    original_domain_sides = copy.deepcopy(spline["legacy_domain_sides"])
+    original_control_id = original_curve["control_point_id"]
+    original_control_record = next(
+        item for item in workspace.model["geometry"]["points"]
+        if item["id"] == original_control_id
+    )
+    original_control_coordinates = list(original_control_record["coordinates"])
+    path_before = workspace._canvas_region_path_data(outer)
+    scripts = []
+    workspace.js = SimpleNamespace(eval=lambda script: scripts.append(script))
+    rendered = []
+    monkeypatch.setattr(workspace, "render_canvas", lambda: rendered.append(True))
+    project, _ = workspace._canvas_projection()
+
+    moved = workspace._move_region_from_canvas_drag(
+        inner["id"], project((0.75, 0.0)), project((0.77, 0.02)),
+        preserve_canvas=True,
+    )
+
+    moved_spline = next(
+        edge for edge in workspace.model["geometry"]["edges"]
+        if edge["id"] == spline_id
+    )
+    assert moved is True
+    assert inner["shape"]["type"] == "imported_contour"
+    assert inner["parent_id"] == outer["id"]
+    assert inner["edge_ids"] == edge_ids
+    assert len(workspace.model["geometry"]["edges"]) == edge_count
+    assert moved_spline["curve"]["type"] == "spline3"
+    assert moved_spline["curve"]["control_point"] == pytest.approx([
+        original_curve["control_point"][0] + 0.02,
+        original_curve["control_point"][1] + 0.02,
+    ])
+    assert moved_spline["curve"]["sampled_points"][0] == pytest.approx([
+        original_curve["sampled_points"][0][0] + 0.02,
+        original_curve["sampled_points"][0][1] + 0.02,
+    ])
+    assert moved_spline["boundary_condition_ids"] == original_condition_ids
+    assert moved_spline["legacy_domain_sides"] == original_domain_sides
+    assert moved_spline["curve"]["control_point_id"] == original_control_id
+    assert original_control_record["coordinates"] == pytest.approx([
+        original_control_coordinates[0] + 0.02,
+        original_control_coordinates[1] + 0.02,
+    ])
+    moved_control_record = next(
+        item for item in workspace.model["geometry"]["points"]
+        if item["id"] == moved_spline["curve"]["control_point_id"]
+    )
+    assert moved_control_record is original_control_record
+    assert len(workspace.model["geometry"]["points"]) == len(model["geometry"]["points"])
+    parent_hole = next(
+        loop for loop in outer["boundary_loops"]
+        if loop.get("role") == "hole" and loop.get("region_id") == inner["id"]
+    )
+    assert {item["edge_id"] for item in parent_hole["edges"]} == set(inner["edge_ids"])
+    path_after = workspace._canvas_region_path_data(outer)
+    assert path_after != path_before
+    assert scripts and json.dumps({"id": outer["id"], "d": path_after}) in scripts[0]
+    assert rendered == []
 
 
 def test_legacy_capture_preserves_rational_spline3_control_points():

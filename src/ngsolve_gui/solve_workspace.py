@@ -1807,8 +1807,8 @@ class SolveWorkspace(Div):
         script = r"""
 (() => {
   window.__ngsolveSketchTool = '__SKETCH_TOOL__';
-  if (window.__ngsolveSketchPointerCaptureVersion === 13) return;
-  window.__ngsolveSketchPointerCaptureVersion = 13;
+  if (window.__ngsolveSketchPointerCaptureVersion === 14) return;
+  window.__ngsolveSketchPointerCaptureVersion = 14;
   let active = false;
   let activePointerId = null;
   let dragStart = null;
@@ -2235,6 +2235,12 @@ class SolveWorkspace(Div):
   const setRegionOffset = (svg, regionId, offset) => {
     if (!svg || !regionId) return;
     for (const shape of regionElements(svg, regionId)) {
+      // The filled region path is refreshed from the model after each move.
+      // Only its boundary paths still need the accumulated DOM offset.
+      if (shape.getAttribute('data-sketch-region-role') === 'shape') {
+        shape.removeAttribute('transform');
+        continue;
+      }
       if (offset && (offset[0] !== 0 || offset[1] !== 0)) {
         shape.setAttribute('transform', 'translate(' + offset[0] + ' ' + offset[1] + ')');
       } else {
@@ -2448,8 +2454,9 @@ class SolveWorkspace(Div):
       const dy = grid && grid.enabled ? end[1] - start[1] : quantize(end[1] - start[1]);
       const baseOffset = committedRegionOffsets.get(dragRegionId) || [0, 0];
       for (const shape of regionElements(svg, dragRegionId)) {
-        const totalX = baseOffset[0] + dx;
-        const totalY = baseOffset[1] + dy;
+        const isFilledRegion = shape.getAttribute('data-sketch-region-role') === 'shape';
+        const totalX = (isFilledRegion ? 0 : baseOffset[0]) + dx;
+        const totalY = (isFilledRegion ? 0 : baseOffset[1]) + dy;
         if (totalX === 0 && totalY === 0) shape.removeAttribute('transform');
         else shape.setAttribute('transform', `translate(${totalX} ${totalY})`);
       }
@@ -2738,12 +2745,20 @@ class SolveWorkspace(Div):
     }
   };
   window.__ngsolveCancelSketchGesture = () => cancelGesture(true);
-  window.__ngsolveCommitSketchRegionMove = (regionId, dx, dy) => {
+  window.__ngsolveCommitSketchRegionMove = (regionId, dx, dy, fillUpdates = []) => {
     if (!regionId || !Number.isFinite(dx) || !Number.isFinite(dy)) return;
     const previous = committedRegionOffsets.get(regionId) || [0, 0];
     const offset = [previous[0] + dx, previous[1] + dy];
     committedRegionOffsets.set(regionId, offset);
     const svg = currentSvg();
+    if (svg) {
+      for (const update of fillUpdates || []) {
+        if (!update || !update.id || typeof update.d !== 'string') continue;
+        const shape = Array.from(svg.querySelectorAll('[data-sketch-region-role="shape"]'))
+          .find((node) => node.getAttribute('data-sketch-region-id') === String(update.id));
+        if (shape) shape.setAttribute('d', update.d);
+      }
+    }
     setRegionOffset(svg, regionId, offset);
     const dimensions = svg && svg.querySelector('#solve-sketch-dimensions');
     if (dimensions) dimensions.removeAttribute('transform');
@@ -4793,14 +4808,19 @@ class SolveWorkspace(Div):
             return False
 
         self._preserve_canvas_view()
+        old_geometry_points = copy.deepcopy(self.model["geometry"].get("points", []))
+        old_boundary_loops = {
+            item["id"]: copy.deepcopy(item.get("boundary_loops", []))
+            for item in self.model["geometry"].get("regions", [])
+        }
         old_shape = copy.deepcopy(region["shape"])
         old_vertices = copy.deepcopy(region["vertices"])
         old_parents = {item["id"]: item.get("parent_id") for item in self.model["geometry"]["regions"]}
         old_edges = copy.deepcopy(self.model["geometry"].get("edges", []))
         try:
             shape = region["shape"]
-            expressions = shape.setdefault("dimension_expressions", {})
             if shape["type"] == "rectangle":
+                expressions = shape.setdefault("dimension_expressions", {})
                 shape["r_min"] += dr
                 shape["z_min"] += dz
                 if shape["r_min"] < -1e-12:
@@ -4829,7 +4849,10 @@ class SolveWorkspace(Div):
                         entity[key] = [[point[0] + dr, point[1] + dz] for point in entity.get(key, [])]
                     if isinstance(entity.get("center"), list):
                         entity["center"] = [entity["center"][0] + dr, entity["center"][1] + dz]
-            else:
+            elif shape.get("type") == "imported_contour":
+                self._move_imported_contour(region, dr, dz)
+            elif shape.get("type") == "circle":
+                expressions = shape.setdefault("dimension_expressions", {})
                 shape["r_center"] += dr
                 shape["z_center"] += dz
                 if shape["r_center"] < shape["radius"] - 1e-12:
@@ -4845,6 +4868,8 @@ class SolveWorkspace(Div):
                      zcenter + radius * math.sin(2 * math.pi * index / segments)]
                     for index in range(segments)
                 ]
+            else:
+                raise ValueError(f"Dragging is not supported for {shape.get('type', 'unknown')} regions.")
 
             # Move cutouts with their containing region so a hole stays in place
             # relative to the material boundary.
@@ -4889,7 +4914,12 @@ class SolveWorkspace(Div):
                             for point in curve["sampled_points"]
                         ]
             self._recompute_parent_links()
-            self._rebuild_edges()
+            if shape.get("type") == "imported_contour":
+                self._rebuild_imported_parent_loops()
+                _sync_axis_boundary_conditions(self.model)
+                _sync_mechanical_boundary_conditions(self.model)
+            else:
+                self._rebuild_edges()
             self.selected_region_id = region_id
             self.selected_edge_id = None
             self.selected_edge_ids = []
@@ -4902,17 +4932,24 @@ class SolveWorkspace(Div):
                 if preserve_canvas:
                     self._sync_canvas_selection()
                     self._render_canvas_dimensions()
-                    self._commit_canvas_region_move(region_id, dr, dz)
+                    affected_fills = [
+                        region_id,
+                        old_parents.get(region_id),
+                        region.get("parent_id"),
+                    ]
+                    self._commit_canvas_region_move(region_id, dr, dz, affected_fills)
                 else:
                     self.render_canvas()
             self._message(f"Moved {region['name']} by {dr:g} m radially and {dz:g} m axially.")
             return True
-        except (ValueError, TypeError, OverflowError) as error:
+        except (KeyError, ValueError, TypeError, OverflowError) as error:
             region["shape"] = old_shape
             region["vertices"] = old_vertices
             self.model["geometry"]["edges"] = old_edges
+            self.model["geometry"]["points"] = old_geometry_points
             for item in self.model["geometry"]["regions"]:
                 item["parent_id"] = old_parents[item["id"]]
+                item["boundary_loops"] = old_boundary_loops[item["id"]]
             self._message(str(error), error=True)
             if preserve_canvas:
                 self._rollback_canvas_region_move(region_id)
@@ -4920,16 +4957,163 @@ class SolveWorkspace(Div):
                 self.render_canvas()
             return False
 
-    def _commit_canvas_region_move(self, region_id, dr, dz):
+    def _move_imported_contour(self, region, dr, dz):
+        """Translate an imported contour without rebuilding its exact legacy curves."""
+        geometry = self.model["geometry"]
+        region_id = region["id"]
+        edge_ids = set(region.get("edge_ids", []))
+        if not edge_ids:
+            raise ValueError("This imported region has no movable boundary edges.")
+        if any(
+            edge_ids.intersection(other.get("edge_ids", []))
+            for other in geometry.get("regions", [])
+            if other.get("id") != region_id
+        ):
+            raise ValueError("This imported region shares boundary edges with another region and cannot be moved independently.")
+
+        edges = [edge for edge in geometry.get("edges", []) if edge.get("id") in edge_ids]
+        if len(edges) != len(edge_ids):
+            raise ValueError("The imported region references a missing boundary edge.")
+        old_points = {
+            point.get("id"): point for point in geometry.get("points", [])
+            if isinstance(point, dict) and isinstance(point.get("id"), str)
+        }
+        externally_referenced_point_ids = set()
+        for edge in geometry.get("edges", []):
+            if edge.get("id") in edge_ids:
+                continue
+            externally_referenced_point_ids.update(
+                point_id for point_id in edge.get("point_ids", [])
+                if isinstance(point_id, str)
+            )
+            curve = edge.get("curve")
+            if isinstance(curve, dict) and isinstance(curve.get("control_point_id"), str):
+                externally_referenced_point_ids.add(curve["control_point_id"])
+        coordinates_by_id = {}
+        for edge in edges:
+            vertices = edge.get("vertices", [])
+            point_ids = edge.get("point_ids", [])
+            if len(vertices) != 2 or len(point_ids) != 2:
+                raise ValueError("The imported region has incomplete point topology and cannot be moved safely.")
+            for point_id, point in zip(point_ids, vertices):
+                if isinstance(point_id, str) and isinstance(point, (list, tuple)) and len(point) >= 2:
+                    coordinates_by_id.setdefault(point_id, [float(point[0]), float(point[1])])
+            curve = edge.get("curve")
+            if isinstance(curve, dict):
+                control_id = curve.get("control_point_id")
+                control = curve.get("control_point")
+                if isinstance(control_id, str) and isinstance(control, (list, tuple)) and len(control) >= 2:
+                    coordinates_by_id[control_id] = [float(control[0]), float(control[1])]
+
+        point_id_map = {}
+        moved_points = []
+
+        def moved_coordinate(point):
+            radial = float(point[0]) + dr
+            if radial < -1e-12:
+                raise ValueError("A region cannot be moved left of the r = 0 axis.")
+            return [0.0 if abs(radial) <= 1e-12 else radial, float(point[1]) + dz]
+
+        def remap_point_id(point_id):
+            if not isinstance(point_id, str) or not point_id:
+                raise ValueError("The imported region has an invalid point reference.")
+            if point_id not in point_id_map:
+                point = coordinates_by_id.get(point_id)
+                if point is None:
+                    stored = old_points.get(point_id, {}).get("coordinates")
+                    if isinstance(stored, (list, tuple)) and len(stored) == 2:
+                        point = [float(stored[0]), float(stored[1])]
+                if point is None:
+                    raise ValueError("The imported region references a point that is missing from the geometry.")
+                moved = moved_coordinate(point)
+                if point_id in externally_referenced_point_ids:
+                    new_point_id = new_id("point")
+                    moved_points.append({"id": new_point_id, "coordinates": moved})
+                else:
+                    new_point_id = point_id
+                    point_record = old_points.get(point_id)
+                    if point_record is None:
+                        moved_points.append({"id": new_point_id, "coordinates": moved})
+                    else:
+                        point_record["coordinates"] = moved
+                point_id_map[point_id] = new_point_id
+            return point_id_map[point_id]
+
+        moved_vertices = [moved_coordinate(point) for point in region.get("vertices", [])]
+        for edge in edges:
+            edge["point_ids"] = [remap_point_id(point_id) for point_id in edge["point_ids"]]
+            edge["vertices"] = [moved_coordinate(point) for point in edge["vertices"]]
+            curve = edge.get("curve")
+            if not isinstance(curve, dict):
+                continue
+            if isinstance(curve.get("sampled_points"), list):
+                curve["sampled_points"] = [moved_coordinate(point) for point in curve["sampled_points"]]
+            for key in ("control_point", "center"):
+                if isinstance(curve.get(key), (list, tuple)) and len(curve[key]) >= 2:
+                    curve[key] = moved_coordinate(curve[key])
+            if curve.get("control_point_id"):
+                curve["control_point_id"] = remap_point_id(curve["control_point_id"])
+        region["vertices"] = moved_vertices
+        geometry.setdefault("points", []).extend(moved_points)
+
+    def _rebuild_imported_parent_loops(self):
+        """Refresh nested-region hole references while retaining legacy edge IDs."""
+        regions = self.model["geometry"].get("regions", [])
+        regions_by_id = {item.get("id"): item for item in regions if item.get("id")}
+        for parent in regions:
+            loops = parent.get("boundary_loops")
+            if not isinstance(loops, list):
+                loops = []
+            parent["boundary_loops"] = [
+                loop for loop in loops
+                if not (
+                    isinstance(loop, dict)
+                    and loop.get("role") == "hole"
+                    and loop.get("region_id") in regions_by_id
+                )
+            ]
+        for child in regions:
+            parent = regions_by_id.get(child.get("parent_id"))
+            if not isinstance(parent, dict):
+                continue
+            outer = next((
+                loop for loop in child.get("boundary_loops", [])
+                if isinstance(loop, dict) and loop.get("role") == "outer"
+            ), None)
+            if not isinstance(outer, dict):
+                continue
+            references = [
+                item for item in outer.get("edges", [])
+                if isinstance(item, dict) and item.get("edge_id")
+            ]
+            if references:
+                parent.setdefault("boundary_loops", []).append({
+                    "role": "hole",
+                    "region_id": child.get("id"),
+                    "edges": [
+                        {"edge_id": item["edge_id"], "forward": not bool(item.get("forward", True))}
+                        for item in reversed(references)
+                    ],
+                })
+
+    def _commit_canvas_region_move(self, region_id, dr, dz, fill_region_ids=()):
         """Keep the live SVG scene mounted and commit its region preview offset."""
         project, _ = self._canvas_projection()
         origin = project((0.0, 0.0))
         moved = project((dr, dz))
         dx, dy = moved[0] - origin[0], moved[1] - origin[1]
+        regions_by_id = {
+            item.get("id"): item for item in self.model["geometry"].get("regions", [])
+        }
+        fill_updates = [
+            {"id": affected_id, "d": self._canvas_region_path_data(regions_by_id[affected_id])}
+            for affected_id in dict.fromkeys(fill_region_ids)
+            if affected_id in regions_by_id
+        ]
         try:
             self.js.eval(
                 "(() => { const commit = window.__ngsolveCommitSketchRegionMove; "
-                f"if (commit) commit({json.dumps(region_id)}, {dx!r}, {dy!r}); "
+                f"if (commit) commit({json.dumps(region_id)}, {dx!r}, {dy!r}, {json.dumps(fill_updates)}); "
                 "})()"
             )
         except Exception:
@@ -8668,6 +8852,35 @@ class SolveWorkspace(Div):
             # Standalone tests and non-browser frontends do not expose JS.
             pass
 
+    def _canvas_region_path_data(self, region, project=None):
+        if project is None:
+            project, _ = self._canvas_projection()
+
+        def subpath(points):
+            projected = [project(point) for point in points]
+            if not projected:
+                return ""
+            commands = [f"M{projected[0][0]:.3f},{projected[0][1]:.3f}"]
+            commands.extend(f"L{x:.3f},{y:.3f}" for x, y in projected[1:])
+            return " ".join(commands) + " Z"
+
+        regions = self.model["geometry"].get("regions", [])
+        child_loops = [
+            child.get("vertices", []) for child in regions
+            if child.get("parent_id") == region.get("id")
+        ]
+        void_loops = [
+            void.get("vertices", []) for void in self.model.get("geometry", {}).get("voids", [])
+            if void.get("parent_id") == region.get("id")
+        ]
+        return " ".join(
+            item for item in [
+                subpath(region.get("vertices", [])),
+                *(subpath(loop) for loop in child_loops),
+                *(subpath(loop) for loop in void_loops),
+            ] if item
+        )
+
     def render_canvas(self):
         width, height = self._canvas_width, self._canvas_height
         _update_svg_props(self._canvas, **{"viewBox": f"0 0 {width} {height}"})
@@ -8735,31 +8948,7 @@ class SolveWorkspace(Div):
         for region in regions:
             region_id = region["id"]
             live_region_ids.add(region_id)
-            def subpath(points):
-                projected = [xy(point) for point in points]
-                if not projected:
-                    return ""
-                commands = [f"M{projected[0][0]:.3f},{projected[0][1]:.3f}"]
-                commands.extend(f"L{x:.3f},{y:.3f}" for x, y in projected[1:])
-                return " ".join(commands) + " Z"
-
-            child_loops = [
-                child.get("vertices", [])
-                for child in regions
-                if child.get("parent_id") == region_id
-            ]
-            void_loops = [
-                void.get("vertices", [])
-                for void in self.model.get("geometry", {}).get("voids", [])
-                if void.get("parent_id") == region_id
-            ]
-            path_data = " ".join(
-                item for item in [
-                    subpath(region.get("vertices", [])),
-                    *(subpath(loop) for loop in child_loops),
-                    *(subpath(loop) for loop in void_loops),
-                ] if item
-            )
+            path_data = self._canvas_region_path_data(region, xy)
             color = _MATERIAL_COLORS[material_index.get(region.get("material_id"), 0) % len(_MATERIAL_COLORS)]
             selected = region_id in set(self._selected_region_ids_live())
             props = {

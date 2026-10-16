@@ -1826,6 +1826,67 @@ def test_browser_region_move_keeps_canvas_mounted(standalone_components, monkeyp
     assert rendered == []
 
 
+def test_moving_nested_region_refreshes_parent_cutout_without_redrawing(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    outer = workspace.model["geometry"]["regions"][0]
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.003,
+        ("rectangle", "z_min"): 0.003,
+        ("rectangle", "width"): 0.004,
+        ("rectangle", "height"): 0.005,
+    })
+    workspace._add_primitive("rectangle")
+    inner = workspace.model["geometry"]["regions"][1]
+    assert inner["parent_id"] == outer["id"]
+    vertices_before = copy.deepcopy(inner["vertices"])
+    edges_before = {
+        item["id"]: copy.deepcopy(item["vertices"])
+        for item in workspace.model["geometry"]["edges"]
+        if item["id"] in inner["edge_ids"]
+    }
+    path_before = workspace._canvas_region_path_data(outer)
+    scripts = []
+    workspace.js = SimpleNamespace(eval=lambda script: scripts.append(script))
+    rendered = []
+    monkeypatch.setattr(workspace, "render_canvas", lambda: rendered.append(True))
+    monkeypatch.setattr(workspace, "_refresh_model_tree", lambda: None)
+    monkeypatch.setattr(workspace, "_render_inspector", lambda: None)
+    project, _ = workspace._canvas_projection()
+
+    moved = workspace._move_region_from_canvas_drag(
+        inner["id"], project((0.004, 0.004)), project((0.005, 0.004)),
+        preserve_canvas=True,
+    )
+
+    path_after = workspace._canvas_region_path_data(outer)
+    assert moved is True
+    assert path_after != path_before
+    assert inner["parent_id"] == outer["id"]
+    assert inner["vertices"] != vertices_before
+    for vertex, before in zip(inner["vertices"], vertices_before):
+        assert vertex == pytest.approx([before[0] + 0.001, before[1]])
+    for edge in workspace.model["geometry"]["edges"]:
+        if edge["id"] not in edges_before:
+            continue
+        for point, before in zip(edge["vertices"], edges_before[edge["id"]]):
+            assert point == pytest.approx([before[0] + 0.001, before[1]])
+    assert scripts and "__ngsolveCommitSketchRegionMove" in scripts[0]
+    assert json.dumps({"id": outer["id"], "d": path_after}) in scripts[0]
+
+    # Moving fully outside the container must remove its now-stale cutout too.
+    moved_outside = workspace._move_region_from_canvas_drag(
+        inner["id"], project((0.005, 0.004)), project((0.022, 0.004)),
+        preserve_canvas=True,
+    )
+    path_outside = workspace._canvas_region_path_data(outer)
+    assert moved_outside is True
+    assert inner["parent_id"] is None
+    assert path_outside.count("M") == 1
+    assert json.dumps({"id": outer["id"], "d": path_outside}) in scripts[-1]
+    assert rendered == []
+
+
 def test_dragging_region_rejects_axis_crossing_and_restores_geometry(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
