@@ -1487,6 +1487,105 @@ def test_tangent_arc_starts_at_endpoint_and_has_common_tangent(standalone_compon
     assert edge["vertices"][0] == list(endpoint)
 
 
+@pytest.mark.parametrize(
+    ("line_points", "endpoint", "expected_tangent"),
+    [
+        ([(0.004, 0.002), (0.008, 0.002)], (0.004, 0.002), (-1.0, 0.0)),
+        ([(0.004, 0.002), (0.008, 0.002)], (0.008, 0.002), (1.0, 0.0)),
+        ([(0.006, 0.004), (0.006, 0.008)], (0.006, 0.004), (0.0, -1.0)),
+        ([(0.006, 0.004), (0.006, 0.008)], (0.006, 0.008), (0.0, 1.0)),
+    ],
+)
+def test_tangent_arc_uses_outward_direction_at_both_curve_endpoints(
+    standalone_components, line_points, endpoint, expected_tangent
+):
+    workspace = SolveWorkspace()
+    assert workspace._add_sketch_entity("line", line_points)
+
+    tangent_start = workspace._tangent_at_sketch_endpoint(endpoint)
+
+    assert tangent_start is not None
+    assert tangent_start[0] == pytest.approx(endpoint)
+    assert tangent_start[1] == pytest.approx(expected_tangent)
+
+
+def test_tangent_arc_from_first_endpoint_uses_short_tangent_sweep(standalone_components):
+    workspace = SolveWorkspace()
+    start = (0.008, 0.002)
+    assert workspace._add_sketch_entity("line", [(0.008, 0.002), (0.014, 0.002)])
+    assert workspace._accept_arc_sketch_point(start, variant="tangent")
+    assert workspace._accept_arc_sketch_point((0.006, 0.0005), variant="tangent")
+
+    arc = next(item for item in workspace.model["geometry"]["sketch_entities"] if item["type"] == "arc")
+    samples = arc["sampled_points"]
+    derivative = (samples[1][0] - samples[0][0], samples[1][1] - samples[0][1])
+    tangent_dot = derivative[0] * -1.0 + derivative[1] * 0.0
+    start_angle = math.atan2(start[1] - arc["center"][1], start[0] - arc["center"][0])
+    end = arc["points"][-1]
+    end_angle = math.atan2(end[1] - arc["center"][1], end[0] - arc["center"][0])
+    positive_sweep = (end_angle - start_angle) % (2 * math.pi)
+    sweep = positive_sweep - 2 * math.pi if arc["clockwise"] else positive_sweep
+
+    assert tangent_dot > 0
+    assert abs(sweep) < math.pi
+
+
+def test_selected_sketch_region_does_not_show_a_false_bounding_box(standalone_components):
+    workspace = SolveWorkspace()
+    start, through, end = (0.006, 0.003), (0.009, 0.006), (0.012, 0.003)
+    assert workspace._add_sketch_entity("line", [start, end])
+    assert workspace._add_sketch_entity("arc", [start, through, end])
+    region = next(
+        item for item in workspace.model["geometry"]["regions"]
+        if item.get("shape", {}).get("type") == "sketch"
+    )
+
+    # The curved edge and its filled region contour must be present on the
+    # first render after the arc closes the sketch, without requiring a click.
+    arc_edge = next(
+        edge for edge in workspace.model["geometry"]["edges"]
+        if edge.get("curve", {}).get("type") == "arc"
+    )
+    visible_edge, _hit_edge = workspace._canvas_edge_nodes[arc_edge["id"]]
+    assert visible_edge in workspace._canvas_scene.ui_children
+    assert visible_edge._props["d"].count("L") >= 20
+    contour = workspace._canvas_region_path_data(
+        region, project=lambda point: (point[0] * 1e6, point[1] * 1e6)
+    )
+    assert contour.count("L") >= 20
+
+    workspace.render_canvas()
+
+    props = workspace._canvas_region_nodes[region["id"]]._props
+    assert "outline:none" in props["style"]
+    assert "tabindex" not in props
+
+
+@pytest.mark.parametrize(
+    ("curve_type", "curve_points"),
+    [
+        ("arc", [(0.006, 0.003), (0.009, 0.006), (0.012, 0.003)]),
+        ("spline3", [(0.006, 0.003), (0.009, 0.006), (0.012, 0.003)]),
+        ("spline", [(0.006, 0.003), (0.008, 0.006), (0.010, 0.006), (0.012, 0.003)]),
+    ],
+)
+def test_shared_endpoints_do_not_merge_a_chord_with_a_curve(
+    standalone_components, curve_type, curve_points
+):
+    workspace = SolveWorkspace()
+    start, end = curve_points[0], curve_points[-1]
+
+    assert workspace._add_sketch_entity("line", [start, end])
+    assert workspace._add_sketch_entity(curve_type, curve_points)
+
+    edges = workspace.model["geometry"]["edges"]
+    line_edge = next(edge for edge in edges if edge.get("curve", {}).get("type") == "line")
+    curve_edge = next(edge for edge in edges if edge.get("curve", {}).get("type") == curve_type)
+
+    assert line_edge["id"] != curve_edge["id"]
+    assert len(curve_edge["curve"]["sampled_points"]) >= 3
+
+
 def test_selected_arc_radius_is_editable_and_preserves_endpoints(standalone_components):
     workspace = SolveWorkspace()
     for point in ((0.004, 0.002), (0.010, 0.002), (0.007, 0.005)):
@@ -1922,7 +2021,8 @@ def test_moving_nested_region_refreshes_parent_cutout_without_redrawing(standalo
     }
     path_before = workspace._canvas_region_path_data(outer)
     scripts = []
-    workspace.js = SimpleNamespace(eval=lambda script: scripts.append(script))
+    workspace_js = SimpleNamespace(eval=lambda script: scripts.append(script))
+    monkeypatch.setattr(SolveWorkspace, "js", property(lambda _self: workspace_js))
     rendered = []
     monkeypatch.setattr(workspace, "render_canvas", lambda: rendered.append(True))
     monkeypatch.setattr(workspace, "_refresh_model_tree", lambda: None)
@@ -1946,8 +2046,8 @@ def test_moving_nested_region_refreshes_parent_cutout_without_redrawing(standalo
             continue
         for point, before in zip(edge["vertices"], edges_before[edge["id"]]):
             assert point == pytest.approx([before[0] + 0.001, before[1]])
-    assert scripts and "__ngsolveCommitSketchRegionMove" in scripts[0]
-    assert json.dumps({"id": outer["id"], "d": path_after}) in scripts[0]
+    assert any("__ngsolveCommitSketchRegionMove" in script for script in scripts)
+    assert any(json.dumps({"id": outer["id"], "d": path_after}) in script for script in scripts)
 
     # Moving fully outside the container must remove its now-stale cutout too.
     moved_outside = workspace._move_region_from_canvas_drag(
@@ -2077,6 +2177,31 @@ def test_drag_box_selects_enclosed_or_crossed_edges_and_shift_adds(standalone_co
     assert set(workspace.selected_edge_ids) == {
         item["id"] for item in workspace.model["geometry"]["edges"]
     }
+
+
+def test_line_drag_finishes_even_when_browser_movement_flag_is_stale(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    completed = [
+        "draw", "line", 100.0, 100.0, 180.0, 100.0, "",
+        False, False, 1.0, 0.0, 0.0, 0,
+        "", [], "", "", False,
+    ]
+    fake_js = SimpleNamespace(eval=lambda _script: completed)
+    monkeypatch.setattr(SolveWorkspace, "js", property(lambda _self: fake_js), raising=False)
+    monkeypatch.setattr(workspace, "_commit_browser_canvas_view", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        workspace, "_sketch_screen_points_to_world",
+        lambda points, snap=True: [(0.004, 0.002), (0.008, 0.002)],
+    )
+    finished = []
+    monkeypatch.setattr(
+        workspace, "_finish_line_sketch_chain",
+        lambda *, select_tool=False: finished.append(select_tool),
+    )
+
+    workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
+
+    assert finished == [True]
 
 
 def test_canvas_mouse_gesture_creates_rectangle_and_maps_screen_coordinates(standalone_components):
@@ -3766,6 +3891,49 @@ def test_circle_crossing_square_creates_clean_curved_regions(standalone_componen
     assert intersection_heights == pytest.approx(
         [-expected_intersection_z, expected_intersection_z], abs=1e-12
     )
+
+    # Adjacent faces reference the same split arc interval. Its sampled path
+    # must remain ordered and both faces must reuse one selectable edge.
+    shared_intervals = {}
+    entities_by_id = {
+        entity["id"]: entity
+        for entity in workspace.model["geometry"].get("sketch_entities", [])
+    }
+    for region in regions:
+        boundary = region.get("shape", {}).get("boundary", [])
+        loop_edges = region.get("boundary_loops", [{}])[0].get("edges", [])
+        for reference, loop_edge in zip(boundary, loop_edges):
+            entity = entities_by_id.get(reference.get("entity_id"), {})
+            if entity.get("type") != "arc":
+                continue
+            interval = tuple(sorted((
+                round(float(reference.get("start_t", 0.0)), 12),
+                round(float(reference.get("end_t", 1.0)), 12),
+            )))
+            key = (reference["entity_id"], interval)
+            edge = next(
+                edge for edge in workspace.model["geometry"]["edges"]
+                if edge["id"] == loop_edge["edge_id"]
+            )
+            if key in shared_intervals:
+                assert edge["id"] == shared_intervals[key]["id"]
+            else:
+                shared_intervals[key] = edge
+            samples = edge["curve"].get("sampled_points", [])
+            assert all(
+                math.dist(first, second) < 0.001
+                for first, second in zip(samples, samples[1:])
+            )
+
+    # The overlap face must be filled from its sampled arc boundary, not just
+    # the two intersection endpoints joined by a straight chord.
+    parent_id = next(region["id"] for region in regions if region["shape"]["type"] == "sketch"
+                     and region.get("parent_id") is None)
+    overlap = next(region for region in regions if region.get("parent_id") == parent_id)
+    contour = workspace._canvas_region_path_data(
+        overlap, project=lambda point: (point[0] * 1e6, point[1] * 1e6)
+    )
+    assert contour.count("L") >= 40
 
 
 @pytest.mark.parametrize("curve_kind", ["three-point-arc", "tangent-arc", "spline3", "spline"])

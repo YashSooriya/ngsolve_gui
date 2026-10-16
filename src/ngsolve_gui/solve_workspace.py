@@ -700,8 +700,10 @@ class SolveWorkspace(Div):
                 )
 
                 def choose_variant(event=None, active_tool=tool, selected_variant=variant):
-                    self.set_sketch_tool(active_tool, variant=selected_variant)
+                    # Hide before refreshing the toolbar; refresh can replace the
+                    # menu component and leave its old popup visible.
                     menu.ui_hide()
+                    self.set_sketch_tool(active_tool, variant=selected_variant)
 
                 item.on_click(choose_variant)
                 menu_items.append(item)
@@ -3250,7 +3252,7 @@ class SolveWorkspace(Div):
                 end = (float(completed[4]), float(completed[5]))
                 region_id = str(completed[6]) or None
                 additive = bool(completed[7])
-                moved = bool(completed[8])
+                moved = bool(completed[8]) or math.hypot(end[0] - start[0], end[1] - start[1]) >= 4.0
                 view = tuple(float(completed[index]) for index in (9, 10, 11)) + (int(completed[12]),)
                 edge_id = (str(completed[13]) or None) if len(completed) >= 14 else None
                 sketch_screen_points = completed[14] if len(completed) >= 15 and isinstance(completed[14], (list, tuple)) else []
@@ -4138,15 +4140,18 @@ class SolveWorkspace(Div):
             if len(samples) >= 2:
                 sources.append(samples)
         for samples in sources:
-            for endpoint, neighbor, direction in (
-                (samples[0], samples[1], -1.0),
-                (samples[-1], samples[-2], 1.0),
+            # Tangent arcs continue outward from whichever endpoint the user
+            # chooses. At the first sample this points opposite the curve's
+            # parameter direction; at the last sample it follows it.
+            for endpoint, neighbor in (
+                (samples[0], samples[1]),
+                (samples[-1], samples[-2]),
             ):
                 screen = project(endpoint)
                 distance = math.hypot(target[0] - screen[0], target[1] - screen[1])
                 tangent = (
-                    direction * (endpoint[0] - neighbor[0]),
-                    direction * (endpoint[1] - neighbor[1]),
+                    endpoint[0] - neighbor[0],
+                    endpoint[1] - neighbor[1],
                 )
                 norm = math.hypot(*tangent)
                 if distance <= tolerance_px and norm > 1e-15:
@@ -6371,6 +6376,9 @@ class SolveWorkspace(Div):
         def source_edges_for(start, end, key):
             matches = []
             for old in old_edges:
+                old_curve = old.get("curve", {})
+                if isinstance(old_curve, dict) and old_curve.get("type", "line") != "line":
+                    continue
                 old_points = old.get("vertices", [])
                 if len(old_points) != 2:
                     continue
@@ -6380,7 +6388,7 @@ class SolveWorkspace(Div):
                 ):
                     matches.append(old)
             matches.sort(key=lambda old: (
-                _edge_key(old["vertices"]) != key,
+                sketch_edge_key("line", old["vertices"]) != key,
                 not bool(_edge_condition_ids(old)),
             ))
             return matches
@@ -6407,6 +6415,21 @@ class SolveWorkspace(Div):
                 *by_physics.values(),
                 *other_ids[-1:],
             ]))
+
+        def sketch_edge_key(curve_type, samples):
+            # Endpoint-only keys merge distinct curves that happen to share
+            # endpoints (for example, a straight chord and a closing arc).
+            # Keep identical shared curve fragments merged, but preserve
+            # different curve geometry between the same nodes.
+            kind = str(curve_type or "line")
+            points = tuple(
+                (round(float(point[0]), 12), round(float(point[1]), 12))
+                for point in samples
+            )
+            if kind == "line":
+                return kind, tuple(sorted((points[0], points[-1])))
+            reverse = tuple(reversed(points))
+            return kind, min(points, reverse)
 
         for region in geometry.get("regions", []):
             region_edge_ids = []
@@ -6453,20 +6476,23 @@ class SolveWorkspace(Div):
                         )
 
                     def sample_interval(first_t, last_t):
+                        # Edge samples use a stable low-to-high parameter order.
+                        # Region traversal direction is stored separately in
+                        # the boundary-loop reference. Reversing the whole
+                        # sample list after collecting interior points in
+                        # ascending order scrambled every descending interval.
                         low, high = sorted((first_t, last_t))
-                        values = [sample_at(first_t)]
+                        values = [sample_at(low)]
                         for sample_index in range(1, len(path) - 1):
                             parameter = sample_index / (len(path) - 1)
                             if low + 1e-12 < parameter < high - 1e-12:
                                 values.append(path[sample_index])
-                        values.append(sample_at(last_t))
-                        if last_t < first_t:
-                            values.reverse()
+                        values.append(sample_at(high))
                         return [list(point) for point in values]
 
                     interval_samples = sample_interval(start_t, end_t)
                     edge_start, edge_end = interval_samples[0], interval_samples[-1]
-                    key = _edge_key([edge_start, edge_end])
+                    key = sketch_edge_key(entity.get("type"), interval_samples)
                     forward = bool(reference.get("forward", end_t >= start_t))
                     if key in edges_by_key:
                         edge = edges_by_key[key]
@@ -6604,7 +6630,7 @@ class SolveWorkspace(Div):
                         ordered.append(point)
 
                 for first, second in zip(ordered, ordered[1:]):
-                    key = _edge_key([first, second])
+                    key = sketch_edge_key("line", [first, second])
                     if key in edges_by_key:
                         edge = edges_by_key[key]
                         region_edge_ids.append(edge["id"])
@@ -6623,8 +6649,16 @@ class SolveWorkspace(Div):
                         edge_id = new_id("edge")
                     edge["id"] = edge_id
                     edge["vertices"] = [list(first), list(second)]
-                    source_curve_key = _edge_key(source_edge["vertices"]) if source_edge else None
-                    if source_edge and source_edge.get("curve") and source_curve_key == key:
+                    source_curve = source_edge.get("curve", {}) if source_edge else {}
+                    source_samples = (
+                        source_curve.get("sampled_points")
+                        if isinstance(source_curve, dict) else None
+                    ) or (source_edge.get("vertices", []) if source_edge else [])
+                    source_curve_key = (
+                        sketch_edge_key(source_curve.get("type", "line"), source_samples)
+                        if source_edge else None
+                    )
+                    if source_edge and source_curve_key == key:
                         edge["curve"] = copy.deepcopy(source_edge["curve"])
                     else:
                         shape = region.get("shape", {})
@@ -6646,7 +6680,7 @@ class SolveWorkspace(Div):
                         edge["name"] = f"Edge {len(edges) + 1}"
                         edge["boundary_condition_ids"] = []
                     else:
-                        source_key = _edge_key(source_edge["vertices"])
+                        source_key = sketch_edge_key("line", source_edge["vertices"])
                         if source_key != key:
                             part = source_part_counts.get(old_id, 0) + 1
                             source_part_counts[old_id] = part
@@ -6712,7 +6746,10 @@ class SolveWorkspace(Div):
                         "circle",
                         *[round(float(value), 12) for value in edge.get("curve", {}).get("center", [])],
                         round(float(edge.get("curve", {}).get("radius")), 12),
-                    ) if isinstance(edge.get("curve"), dict) and edge["curve"].get("type") == "circle" else _edge_key(edge.get("vertices", []))
+                    ) if isinstance(edge.get("curve"), dict) and edge["curve"].get("type") == "circle" else sketch_edge_key(
+                        edge.get("curve", {}).get("type", "line"),
+                        edge.get("curve", {}).get("sampled_points") or edge.get("vertices", []),
+                    )
                     edges_by_key.setdefault(edge_key, edge)
                 outer_refs.append({
                     "edge_id": edge_id,
@@ -6868,7 +6905,7 @@ class SolveWorkspace(Div):
                     continue
                 start = (first[0] + start_t * dx, first[1] + start_t * dy)
                 end = (first[0] + end_t * dx, first[1] + end_t * dy)
-                key = _edge_key([start, end])
+                key = sketch_edge_key("line", [start, end])
                 if key in edges_by_key:
                     continue
                 candidates = source_edges_for(start, end, key)
@@ -6915,7 +6952,15 @@ class SolveWorkspace(Div):
                 or len(old.get("vertices", [])) != 2
             ):
                 continue
-            key = _edge_key(old["vertices"])
+            old_curve = old.get("curve", {})
+            old_samples = (
+                old_curve.get("sampled_points")
+                if isinstance(old_curve, dict) else None
+            ) or old["vertices"]
+            key = sketch_edge_key(
+                old_curve.get("type", "line") if isinstance(old_curve, dict) else "line",
+                old_samples,
+            )
             if key in edges_by_key:
                 continue
             edge = copy.deepcopy(old)
@@ -9476,6 +9521,49 @@ class SolveWorkspace(Div):
         if project is None:
             project, _ = self._canvas_projection()
 
+        geometry = self.model.get("geometry", {})
+        edges_by_id = {
+            edge.get("id"): edge
+            for edge in geometry.get("edges", [])
+            if isinstance(edge, dict) and edge.get("id")
+        }
+
+        def contour_points(item):
+            # Use the same sampled curve records used to draw selectable edges.
+            # Region vertices are a topology polygon and can be much coarser
+            # than an arc/spline boundary; drawing them directly creates
+            # straight chords across curved faces.
+            loops = item.get("boundary_loops", [])
+            outer = next(
+                (loop for loop in loops if isinstance(loop, dict) and loop.get("role") == "outer"),
+                None,
+            )
+            references = outer.get("edges", []) if isinstance(outer, dict) else []
+            points = []
+            for reference in references:
+                if not isinstance(reference, dict):
+                    continue
+                edge = edges_by_id.get(reference.get("edge_id"))
+                if not isinstance(edge, dict):
+                    continue
+                curve = edge.get("curve", {})
+                samples = curve.get("sampled_points") if isinstance(curve, dict) else None
+                samples = samples if isinstance(samples, list) and len(samples) >= 2 else edge.get("vertices", [])
+                try:
+                    segment = [(float(point[0]), float(point[1])) for point in samples]
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    continue
+                if len(segment) < 2:
+                    continue
+                if not reference.get("forward", True):
+                    segment.reverse()
+                if points and math.dist(points[-1], segment[0]) <= 1e-12:
+                    segment = segment[1:]
+                points.extend(segment)
+            if len(points) > 1 and math.dist(points[0], points[-1]) <= 1e-12:
+                points.pop()
+            return points if len(points) >= 3 else item.get("vertices", [])
+
         def subpath(points):
             projected = [project(point) for point in points]
             if not projected:
@@ -9484,18 +9572,18 @@ class SolveWorkspace(Div):
             commands.extend(f"L{x:.3f},{y:.3f}" for x, y in projected[1:])
             return " ".join(commands) + " Z"
 
-        regions = self.model["geometry"].get("regions", [])
+        regions = geometry.get("regions", [])
         child_loops = [
-            child.get("vertices", []) for child in regions
+            contour_points(child) for child in regions
             if child.get("parent_id") == region.get("id")
         ]
         void_loops = [
-            void.get("vertices", []) for void in self.model.get("geometry", {}).get("voids", [])
+            contour_points(void) for void in geometry.get("voids", [])
             if void.get("parent_id") == region.get("id")
         ]
         return " ".join(
             item for item in [
-                subpath(region.get("vertices", [])),
+                subpath(contour_points(region)),
                 *(subpath(loop) for loop in child_loops),
                 *(subpath(loop) for loop in void_loops),
             ] if item
@@ -9581,8 +9669,7 @@ class SolveWorkspace(Div):
                 "data_sketch_region_id": region_id,
                 "data_sketch_region_role": "shape",
                 "data_sketch_region_selected": "true" if selected else "false",
-                "tabindex": "0",
-                "style": f"cursor:{region_cursor}; fill-rule:evenodd;",
+                "style": f"cursor:{region_cursor}; fill-rule:evenodd; outline:none;",
             }
             shape = self._canvas_region_nodes.get(region_id)
             if shape is None:
