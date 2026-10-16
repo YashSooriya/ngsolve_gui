@@ -3648,6 +3648,51 @@ def test_partial_circle_overlap_is_split_and_keeps_curved_edges(standalone_compo
                for edge in workspace.model["geometry"]["edges"])
 
 
+def test_circle_crossing_square_creates_clean_curved_regions(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.004,
+        ("rectangle", "z_min"): -0.010,
+        ("rectangle", "width"): 0.016,
+        ("rectangle", "height"): 0.020,
+    })
+    workspace._add_primitive("rectangle")
+    workspace._primitive_values.update({
+        ("circle", "r_center"): 0.017,
+        ("circle", "z_center"): 0.0,
+        ("circle", "radius"): 0.006,
+    })
+    workspace._add_primitive("circle")
+
+    regions = workspace.model["geometry"]["regions"]
+    assert len(regions) == 3
+    assert all(region["shape"]["type"] == "sketch" for region in regions)
+    arc_edges = [
+        edge for edge in workspace.model["geometry"]["edges"]
+        if edge.get("curve", {}).get("type") == "arc"
+    ]
+    assert arc_edges
+    for edge in arc_edges:
+        curve = edge["curve"]
+        center = curve["center"]
+        radius = curve["radius"]
+        for point in curve["sampled_points"]:
+            assert math.hypot(point[0] - center[0], point[1] - center[1]) == pytest.approx(
+                radius, abs=1e-12
+            )
+
+    expected_intersection_z = math.sqrt(0.006**2 - 0.003**2)
+    intersection_heights = sorted({
+        round(point[1], 12)
+        for edge in arc_edges
+        for point in (edge["curve"]["sampled_points"][0], edge["curve"]["sampled_points"][-1])
+        if math.isclose(point[0], 0.020, abs_tol=1e-12)
+    })
+    assert intersection_heights == pytest.approx(
+        [-expected_intersection_z, expected_intersection_z], abs=1e-12
+    )
+
+
 def test_sketch_diameter_splits_a_primitive_circle_into_two_regions(standalone_components):
     workspace = SolveWorkspace()
     workspace._primitive_values.update({

@@ -6227,6 +6227,26 @@ class SolveWorkspace(Div):
                         fraction = scaled - index
                         if parameter >= 1.0:
                             return path[-1]
+                        if entity.get("type") == "arc":
+                            try:
+                                center = tuple(float(value) for value in entity.get("center", []))
+                                radius = float(entity.get("radius"))
+                                if len(center) == 2 and math.isfinite(radius) and radius > 0:
+                                    first = path[index]
+                                    second = path[index + 1]
+                                    angle_first = math.atan2(first[1] - center[1], first[0] - center[0])
+                                    angle_second = math.atan2(second[1] - center[1], second[0] - center[0])
+                                    delta = math.atan2(
+                                        math.sin(angle_second - angle_first),
+                                        math.cos(angle_second - angle_first),
+                                    )
+                                    angle = angle_first + fraction * delta
+                                    return (
+                                        center[0] + radius * math.cos(angle),
+                                        center[1] + radius * math.sin(angle),
+                                    )
+                            except (TypeError, ValueError, OverflowError):
+                                pass
                         return (
                             path[index][0] + fraction * (path[index + 1][0] - path[index][0]),
                             path[index][1] + fraction * (path[index + 1][1] - path[index][1]),

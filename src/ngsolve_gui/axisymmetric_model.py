@@ -58,10 +58,10 @@ _LEGACY_EXPRESSION_UNITS = (*_EXPRESSION_UNITS[:-1], "mm", "m")
 def find_closed_sketch_loops(entities, *, tolerance=1e-12):
     """Return bounded faces after noding all intersections in sampled curves.
 
-    Each sampled curve is treated as a polyline. Proper crossings, T-junctions,
-    and coincident endpoints are inserted as graph vertices before the
-    half-edge walk, so a line that bisects an existing outline creates two
-    selectable faces instead of remaining a visual overlay.
+    Sampled curves are noded as polylines; circular-arc/straight-line crossings
+    use exact circle intersections so clipped arc endpoints remain on the circle.
+    Crossings, T-junctions, and coincident endpoints become graph vertices
+    before the half-edge walk, allowing dividers to create selectable faces.
     """
     if not isinstance(entities, list):
         return []
@@ -73,6 +73,7 @@ def find_closed_sketch_loops(entities, *, tolerance=1e-12):
         return []
 
     paths = {}
+    entities_by_id = {}
     raw_segments = []
     nodes = {}
     adjacency = {}
@@ -99,6 +100,7 @@ def find_closed_sketch_loops(entities, *, tolerance=1e-12):
         if len(path) < 2:
             continue
         paths[entity["id"]] = path
+        entities_by_id[entity["id"]] = entity
         segment_count = len(path) - 1
         for segment_index, (first, second) in enumerate(zip(path, path[1:])):
             if math.dist(first, second) <= tolerance:
@@ -137,6 +139,86 @@ def find_closed_sketch_loops(entities, *, tolerance=1e-12):
             return None
         return min(1.0, max(0.0, fraction))
 
+    def exact_arc_line_pair(first, second):
+        """Return exact circle/straight-line intersections for one segment pair."""
+        first_entity = entities_by_id.get(first["entity_id"], {})
+        second_entity = entities_by_id.get(second["entity_id"], {})
+        if first_entity.get("type") == "arc" and second_entity.get("type") == "line":
+            arc_segment, line_segment = first, second
+            arc_is_first = True
+        elif second_entity.get("type") == "arc" and first_entity.get("type") == "line":
+            arc_segment, line_segment = second, first
+            arc_is_first = False
+        else:
+            return None
+        if len(paths.get(line_segment["entity_id"], [])) != 2:
+            return None
+        arc_entity = entities_by_id[arc_segment["entity_id"]]
+        try:
+            center = tuple(float(value) for value in arc_entity.get("center", []))
+            radius = float(arc_entity.get("radius"))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if len(center) != 2 or not math.isfinite(radius) or radius <= 0:
+            return None
+
+        line_start = line_segment["a"]
+        line_end = line_segment["b"]
+        dx, dy = line_end[0] - line_start[0], line_end[1] - line_start[1]
+        fx, fy = line_start[0] - center[0], line_start[1] - center[1]
+        quadratic_a = dx * dx + dy * dy
+        if quadratic_a <= tolerance * tolerance:
+            return []
+        quadratic_b = 2.0 * (fx * dx + fy * dy)
+        quadratic_c = fx * fx + fy * fy - radius * radius
+        discriminant = quadratic_b * quadratic_b - 4.0 * quadratic_a * quadratic_c
+        discriminant_tolerance = max(
+            1e-30,
+            1e-12 * (quadratic_b * quadratic_b + abs(4.0 * quadratic_a * quadratic_c)),
+        )
+        if discriminant < -discriminant_tolerance:
+            return []
+        root = math.sqrt(max(0.0, discriminant))
+        line_tolerance = max(1e-10, tolerance / math.sqrt(quadratic_a))
+        hits = []
+        for line_fraction in sorted({
+            (-quadratic_b - root) / (2.0 * quadratic_a),
+            (-quadratic_b + root) / (2.0 * quadratic_a),
+        }):
+            if not -line_tolerance <= line_fraction <= 1.0 + line_tolerance:
+                continue
+            line_fraction = min(1.0, max(0.0, line_fraction))
+            point = (line_start[0] + line_fraction * dx, line_start[1] + line_fraction * dy)
+            start_vector = (
+                arc_segment["a"][0] - center[0],
+                arc_segment["a"][1] - center[1],
+            )
+            end_vector = (
+                arc_segment["b"][0] - center[0],
+                arc_segment["b"][1] - center[1],
+            )
+            point_vector = (point[0] - center[0], point[1] - center[1])
+            arc_delta = math.atan2(
+                cross(start_vector, end_vector),
+                start_vector[0] * end_vector[0] + start_vector[1] * end_vector[1],
+            )
+            if abs(arc_delta) <= 1e-15:
+                continue
+            arc_offset = math.atan2(
+                cross(start_vector, point_vector),
+                start_vector[0] * point_vector[0] + start_vector[1] * point_vector[1],
+            )
+            arc_fraction = arc_offset / arc_delta
+            arc_length = math.dist(arc_segment["a"], arc_segment["b"])
+            arc_tolerance = max(1e-10, tolerance / max(arc_length, tolerance))
+            if not -arc_tolerance <= arc_fraction <= 1.0 + arc_tolerance:
+                continue
+            arc_fraction = min(1.0, max(0.0, arc_fraction))
+            arc_path_t = (arc_segment["segment_index"] + arc_fraction) / arc_segment["segment_count"]
+            line_path_t = (line_segment["segment_index"] + line_fraction) / line_segment["segment_count"]
+            hits.append((arc_path_t, line_path_t, point))
+        return [(arc_t, line_t, point, arc_is_first) for arc_t, line_t, point in hits]
+
     for first_index, first in enumerate(raw_segments):
         a, b = first["a"], first["b"]
         rx, ry = b[0] - a[0], b[1] - a[1]
@@ -144,6 +226,21 @@ def find_closed_sketch_loops(entities, *, tolerance=1e-12):
         for second_index in range(first_index + 1, len(raw_segments)):
             second = raw_segments[second_index]
             c, d = second["a"], second["b"]
+            if first["entity_id"] == second["entity_id"]:
+                gap = abs(first["segment_index"] - second["segment_index"])
+                closed_path = math.dist(paths[first["entity_id"]][0], paths[first["entity_id"]][-1]) <= tolerance
+                if gap <= 1 or (closed_path and gap == first["segment_count"] - 1):
+                    continue
+            exact_hits = exact_arc_line_pair(first, second)
+            if exact_hits is not None:
+                for arc_t, line_t, point, arc_is_first in exact_hits:
+                    if arc_is_first:
+                        add_cut(first_index, arc_t * first["segment_count"] - first["segment_index"], point)
+                        add_cut(second_index, line_t * second["segment_count"] - second["segment_index"], point)
+                    else:
+                        add_cut(first_index, line_t * first["segment_count"] - first["segment_index"], point)
+                        add_cut(second_index, arc_t * second["segment_count"] - second["segment_index"], point)
+                continue
             if (
                 max(a[0], b[0]) < min(c[0], d[0]) - tolerance
                 or max(c[0], d[0]) < min(a[0], b[0]) - tolerance
@@ -151,11 +248,6 @@ def find_closed_sketch_loops(entities, *, tolerance=1e-12):
                 or max(c[1], d[1]) < min(a[1], b[1]) - tolerance
             ):
                 continue
-            if first["entity_id"] == second["entity_id"]:
-                gap = abs(first["segment_index"] - second["segment_index"])
-                closed_path = math.dist(paths[first["entity_id"]][0], paths[first["entity_id"]][-1]) <= tolerance
-                if gap <= 1 or (closed_path and gap == first["segment_count"] - 1):
-                    continue
             sx, sy = d[0] - c[0], d[1] - c[1]
             qx, qy = c[0] - a[0], c[1] - a[1]
             denominator = cross((rx, ry), (sx, sy))
