@@ -490,21 +490,35 @@ class Settings(Div):
 
 
 
-def _app_menu_item(label, callback=None, icon=None, shortcut=None):
+def _app_menu_item(label, callback=None, icon=None, shortcut=None, close_menu=None):
     leading = []
     if icon:
         leading.append(QItemSection(QIcon(ui_name=icon, ui_size="xs"), ui_avatar=True))
     text = label + (f"   {shortcut}" if shortcut else "")
     item = QItem(*leading, QItemSection(text), ui_clickable=callback is not None, ui_dense=True)
     if callback is not None:
-        item.on_click(lambda event=None, action=callback: action())
+        def run_action(event=None, action=callback, close=close_menu):
+            try:
+                action()
+            finally:
+                if close is not None:
+                    close()
+
+        item.on_click(run_action)
     return item
 
 
 def _app_menu_button(label, entries):
+    menu_ref = {}
+
+    def close_menu():
+        menu = menu_ref.get("menu")
+        if menu is not None:
+            menu.ui_hide()
+
     items = [
         QSeparator() if entry is None
-        else _app_menu_item(entry[0], entry[1], entry[2], entry[3])
+        else _app_menu_item(entry[0], entry[1], entry[2], entry[3], close_menu)
         for entry in entries
     ]
     menu = QMenu(
@@ -513,6 +527,7 @@ def _app_menu_button(label, entries):
         ui_self="top left",
         ui_auto_close=True,
     )
+    menu_ref["menu"] = menu
     return QBtn(
         QTooltip(label), menu,
         ui_label=label,
