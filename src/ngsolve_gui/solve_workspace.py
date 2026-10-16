@@ -3742,10 +3742,39 @@ class SolveWorkspace(Div):
         target = project(point)
         candidates = []
         sources = []
+        sketch_endpoint_sources = []
+        analytic_curves = []
+
+        def add_analytic_curve(kind, curve, endpoints):
+            if kind not in {"arc", "circle"} or not isinstance(curve, dict):
+                return
+            center = curve.get("center")
+            radius = curve.get("radius")
+            if not isinstance(center, (list, tuple)) or len(center) < 2:
+                return
+            try:
+                center = (float(center[0]), float(center[1]))
+                radius = float(radius)
+            except (TypeError, ValueError, OverflowError):
+                return
+            if not math.isfinite(radius) or radius <= 0:
+                return
+            endpoints = endpoints if isinstance(endpoints, (list, tuple)) else []
+            start = endpoints[0] if endpoints else center
+            end = endpoints[-1] if endpoints else center
+            through = endpoints[1] if kind == "arc" and len(endpoints) > 2 else None
+            analytic_curves.append((
+                kind, center, radius, tuple(start),
+                tuple(through) if through is not None else None,
+                tuple(end), bool(curve.get("clockwise", False)),
+            ))
+
         for entity in self.model["geometry"].get("sketch_entities", []):
             samples = entity.get("sampled_points") or entity.get("points") or []
             if len(samples) >= 2:
                 sources.append(samples)
+                sketch_endpoint_sources.append(samples)
+                add_analytic_curve(entity.get("type"), entity, entity.get("points"))
         represented = {
             edge.get("sketch_entity_id")
             for edge in self.model["geometry"].get("edges", [])
@@ -3759,6 +3788,73 @@ class SolveWorkspace(Div):
             samples = samples if isinstance(samples, list) and len(samples) >= 2 else edge.get("vertices", [])
             if len(samples) >= 2:
                 sources.append(samples)
+                add_analytic_curve(
+                    curve.get("type") if isinstance(curve, dict) else None,
+                    curve,
+                    edge.get("vertices", []),
+                )
+        endpoint_candidates = []
+        for samples in sketch_endpoint_sources:
+            projected = [project(candidate) for candidate in samples]
+            # Prefer endpoints of authored sketch entities when the pointer is
+            # close. Sampled points on primitive circles/curves are not topology
+            # vertices: treating them as endpoints can move a true curve
+            # intersection and prevent the curve from splitting correctly.
+            for endpoint_index in (0, -1):
+                endpoint = samples[endpoint_index]
+                screen_endpoint = projected[endpoint_index]
+                distance = math.hypot(
+                    target[0] - screen_endpoint[0],
+                    target[1] - screen_endpoint[1],
+                )
+                if distance <= 8.0:
+                    endpoint_candidates.append((distance, tuple(endpoint)))
+        for kind, center, radius, start, through, end, clockwise in analytic_curves:
+            dx, dy = float(point[0]) - center[0], float(point[1]) - center[1]
+            if dx * dx + dy * dy <= 1e-24:
+                continue
+            angle = math.atan2(dy, dx)
+            if kind == "arc":
+                start_angle = math.atan2(start[1] - center[1], start[0] - center[0])
+                end_angle = math.atan2(end[1] - center[1], end[0] - center[0])
+                tau = 2.0 * math.pi
+                if clockwise:
+                    total = (start_angle - end_angle) % tau
+                    offset = (start_angle - angle) % tau
+                else:
+                    total = (end_angle - start_angle) % tau
+                    offset = (angle - start_angle) % tau
+                if through is not None:
+                    through_angle = math.atan2(
+                        through[1] - center[1], through[0] - center[0]
+                    )
+                    through_offset = (
+                        (start_angle - through_angle) % tau
+                        if clockwise else (through_angle - start_angle) % tau
+                    )
+                    if through_offset > total + 1e-10:
+                        clockwise = not clockwise
+                        total = (
+                            (start_angle - end_angle) % tau
+                            if clockwise else (end_angle - start_angle) % tau
+                        )
+                        offset = (
+                            (start_angle - angle) % tau
+                            if clockwise else (angle - start_angle) % tau
+                        )
+                if offset > total + 1e-10:
+                    continue
+            world_nearest = (
+                center[0] + radius * math.cos(angle),
+                center[1] + radius * math.sin(angle),
+            )
+            screen_nearest = project(world_nearest)
+            distance = math.hypot(
+                target[0] - screen_nearest[0],
+                target[1] - screen_nearest[1],
+            )
+            if distance <= 8.0:
+                candidates.append((distance, tuple(world_nearest)))
         for samples in sources:
             projected = [project(candidate) for candidate in samples]
             for first, second, screen_first, screen_second in zip(samples, samples[1:], projected, projected[1:]):
@@ -3776,6 +3872,8 @@ class SolveWorkspace(Div):
                         first[1] + fraction * (second[1] - first[1]),
                     )
                     candidates.append((distance, tuple(world_nearest)))
+        if endpoint_candidates:
+            return min(endpoint_candidates, key=lambda item: item[0])[1]
         if candidates:
             return min(candidates)[1]
         return tuple(point)
@@ -6665,6 +6763,59 @@ class SolveWorkspace(Div):
             for other in sketch_entities:
                 if other.get("id") == entity_id:
                     continue
+                if other.get("type") == "arc":
+                    try:
+                        arc_points = other.get("points") or []
+                        center = tuple(float(value) for value in other.get("center", []))
+                        radius = float(other.get("radius"))
+                        arc_start = tuple(float(value) for value in arc_points[0][:2])
+                        arc_through = tuple(float(value) for value in arc_points[1][:2])
+                        arc_end = tuple(float(value) for value in arc_points[-1][:2])
+                    except (TypeError, ValueError, IndexError, OverflowError):
+                        center = ()
+                    if len(center) == 2 and math.isfinite(radius) and radius > 0:
+                        quadratic_a = length_squared
+                        fx, fy = first[0] - center[0], first[1] - center[1]
+                        quadratic_b = 2.0 * (fx * dx + fy * dy)
+                        quadratic_c = fx * fx + fy * fy - radius * radius
+                        discriminant = quadratic_b * quadratic_b - 4.0 * quadratic_a * quadratic_c
+                        discriminant_tolerance = max(
+                            1e-30,
+                            1e-12 * (quadratic_b * quadratic_b + abs(4.0 * quadratic_a * quadratic_c)),
+                        )
+                        if discriminant >= -discriminant_tolerance:
+                            root = math.sqrt(max(0.0, discriminant))
+                            clockwise = bool(other.get("clockwise", False))
+                            start_angle = math.atan2(arc_start[1] - center[1], arc_start[0] - center[0])
+                            through_angle = math.atan2(arc_through[1] - center[1], arc_through[0] - center[0])
+                            end_angle = math.atan2(arc_end[1] - center[1], arc_end[0] - center[0])
+                            tau = 2.0 * math.pi
+
+                            def directed_offset(first_angle, second_angle, is_clockwise):
+                                return (
+                                    (first_angle - second_angle) % tau
+                                    if is_clockwise else (second_angle - first_angle) % tau
+                                )
+
+                            sweep = directed_offset(start_angle, end_angle, clockwise)
+                            through_offset = directed_offset(start_angle, through_angle, clockwise)
+                            if through_offset > sweep + 1e-10:
+                                clockwise = not clockwise
+                                sweep = directed_offset(start_angle, end_angle, clockwise)
+                            line_tolerance = max(1e-10, 1e-12 / max(length, 1e-12))
+                            for t in sorted({
+                                (-quadratic_b - root) / (2.0 * quadratic_a),
+                                (-quadratic_b + root) / (2.0 * quadratic_a),
+                            }):
+                                if not -line_tolerance <= t <= 1.0 + line_tolerance:
+                                    continue
+                                t = min(1.0, max(0.0, t))
+                                hit = (first[0] + t * dx, first[1] + t * dy)
+                                hit_angle = math.atan2(hit[1] - center[1], hit[0] - center[0])
+                                offset = directed_offset(start_angle, hit_angle, clockwise)
+                                if offset <= sweep + 1e-10:
+                                    split_parameters[entity_id].add(round(t, 12))
+                        continue
                 samples = other.get("sampled_points") or other.get("points") or []
                 try:
                     path = [tuple(float(value) for value in point[:2]) for point in samples]

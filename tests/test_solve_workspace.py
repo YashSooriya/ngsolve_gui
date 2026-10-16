@@ -1309,6 +1309,29 @@ def test_sketch_endpoints_snap_to_nearby_edge_interiors(standalone_components):
     assert len(regions) == 2
 
 
+def test_nearby_arc_endpoint_snaps_exactly_and_closes_sketch_region(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    scale = 100_000.0
+    project = lambda point: (point[0] * scale, point[1] * scale)
+    unproject = lambda point: (point[0] / scale, point[1] / scale)
+    monkeypatch.setattr(workspace, "_canvas_projection", lambda: (project, unproject))
+
+    start, through, end = (0.006, 0.0), (0.010, 0.004), (0.014, 0.0)
+    assert workspace._add_sketch_entity("arc", [start, through, end])
+    assert workspace._add_sketch_entity("line", [start, (0.01399, 0.00001)])
+
+    line = next(
+        entity for entity in workspace.model["geometry"]["sketch_entities"]
+        if entity["type"] == "line"
+    )
+    assert line["sampled_points"][-1] == pytest.approx(end, abs=1e-12)
+    regions = [
+        item for item in workspace.model["geometry"]["regions"]
+        if item.get("shape", {}).get("type") == "sketch"
+    ]
+    assert len(regions) == 1
+
+
 def test_line_and_trim_preview_paths_are_separate_from_marquee(standalone_components, monkeypatch):
     workspace = SolveWorkspace()
     scripts = []
