@@ -1542,6 +1542,7 @@ def validate_model(model: dict, *, scope="solve") -> list[str]:
         (void, points, f"Void '{void.get('name', void.get('id'))}'")
         for void, points in valid_voids
     ]
+    referenced_outline_edge_ids = set()
     for outline, points, label in outline_records:
         expected_outline_ids = set()
         for index, start_point in enumerate(points):
@@ -1595,6 +1596,7 @@ def validate_model(model: dict, *, scope="solve") -> list[str]:
                         expected_edge_keys.add(key)
             if cursor < 1.0 - outline_tolerance:
                 errors.append(f"{label} has a sketch edge without complete boundary coverage.")
+        referenced_outline_edge_ids.update(expected_outline_ids)
         outline_edge_ids = outline.get("edge_ids")
         if not isinstance(outline_edge_ids, list):
             errors.append(f"{label} must reference its sketch edges.")
@@ -1604,6 +1606,25 @@ def validate_model(model: dict, *, scope="solve") -> list[str]:
             errors.append(f"{label} references a missing sketch edge.")
         elif set(outline_edge_ids) != expected_outline_ids:
             errors.append(f"{label} edge ids do not match its sketch geometry.")
+
+    # Open sketch curves remain editable in a draft, but they cannot be sent
+    # to the mesher: every geometry edge must bound a region or a declared void.
+    if scope in {"mesh", "solve"}:
+        unattached_edges = [
+            edge for edge in edge_list
+            if isinstance(edge, dict)
+            and isinstance(edge.get("id"), str)
+            and edge.get("id") not in referenced_outline_edge_ids
+        ]
+        if unattached_edges:
+            names = [str(edge.get("name") or edge.get("id")) for edge in unattached_edges]
+            preview = ", ".join(repr(name) for name in names[:5])
+            if len(names) > 5:
+                preview += f", and {len(names) - 5} more"
+            errors.append(
+                "Every sketch edge must bound a region or void before meshing. "
+                f"Unattached edge(s): {preview}. Complete the geometry or delete these edges."
+            )
 
     # Open sketch curves remain editable and need not bound a material region.
     sketch_entity_ids = {

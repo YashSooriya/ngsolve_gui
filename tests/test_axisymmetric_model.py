@@ -354,6 +354,30 @@ def test_drafts_can_save_multiple_studies_but_solver_reports_unsupported_count()
     assert any("one study at a time" in error for error in errors)
 
 
+def test_unattached_sketch_edges_block_mesh_and_solve_but_remain_draft_editable():
+    model = _nested_model()
+    entity = {
+        "id": "stray-line",
+        "type": "line",
+        "points": [[0.03, 0.03], [0.04, 0.03]],
+        "sampled_points": [[0.03, 0.03], [0.04, 0.03]],
+    }
+    model["geometry"]["sketch_entities"].append(entity)
+    model["geometry"]["edges"].append({
+        "id": "stray-edge",
+        "name": "Unattached line",
+        "vertices": [[0.03, 0.03], [0.04, 0.03]],
+        "boundary_condition_ids": [],
+        "sketch_entity_id": entity["id"],
+        "curve": {"type": "line", "sampled_points": entity["sampled_points"]},
+    })
+
+    assert validate_model(model, scope="draft") == []
+    for scope in ("mesh", "solve"):
+        errors = validate_model(model, scope=scope)
+        assert any("must bound a region or void" in error and "Unattached line" in error for error in errors)
+
+
 def test_mesh_scope_ignores_incomplete_physics_materials_and_boundary_data():
     model = _nested_model()
     model["materials"] = "unfinished"
