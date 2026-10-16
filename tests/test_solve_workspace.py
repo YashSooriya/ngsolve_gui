@@ -3693,6 +3693,76 @@ def test_circle_crossing_square_creates_clean_curved_regions(standalone_componen
     )
 
 
+@pytest.mark.parametrize("curve_kind", ["three-point-arc", "tangent-arc", "spline3", "spline"])
+def test_sketch_curve_dividers_intersect_the_exact_curve(curve_kind):
+    from ngsolve_gui.axisymmetric_model import evaluate_sketch_entity, find_closed_sketch_loops
+
+    start = (0.002, 0.002)
+    if curve_kind == "three-point-arc":
+        end = (0.008, 0.002)
+        entity = {
+            "id": "curve", "type": "arc",
+            "points": [start, (0.005, 0.005), end],
+            "center": (0.005, 0.002), "radius": 0.003, "clockwise": True,
+        }
+    elif curve_kind == "tangent-arc":
+        end = (0.005, 0.005)
+        entity = {
+            "id": "curve", "type": "arc",
+            "points": [start, (0.00412132034356, 0.00287867965644), end],
+            "center": (0.002, 0.005), "radius": 0.003, "clockwise": False,
+        }
+    elif curve_kind == "spline3":
+        end = (0.008, 0.002)
+        entity = {"id": "curve", "type": "spline3", "points": [start, (0.005, 0.009), end]}
+    else:
+        end = (0.008, 0.002)
+        entity = {
+            "id": "curve", "type": "spline",
+            "points": [start, (0.003, 0.006), (0.006, 0.007), end],
+        }
+
+    subdivisions = 256 if entity["type"] in {"arc", "spline3"} else 5 * (len(entity["points"]) - 1)
+    entity["sampled_points"] = [
+        list(evaluate_sketch_entity(entity, index / subdivisions))
+        for index in range(subdivisions + 1)
+    ]
+    expected_t = 0.37
+    expected_cut = evaluate_sketch_entity(entity, expected_t)
+    base_midpoint = ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0)
+    divider_end = (
+        expected_cut[0] + 0.5 * (expected_cut[0] - base_midpoint[0]),
+        expected_cut[1] + 0.5 * (expected_cut[1] - base_midpoint[1]),
+    )
+    base = {
+        "id": "base", "type": "line", "points": [end, start],
+        "sampled_points": [end, start],
+    }
+    divider = {
+        "id": "divider", "type": "line",
+        "points": [base_midpoint, divider_end],
+        "sampled_points": [base_midpoint, divider_end],
+    }
+
+    loops = find_closed_sketch_loops([entity, base, divider])
+    assert len(loops) == 2
+    cut_vertices = [
+        point for loop in loops for point in loop["vertices"]
+        if math.dist(point, expected_cut) < 1e-12
+    ]
+    assert cut_vertices
+    assert min(math.dist(point, expected_cut) for point in cut_vertices) < 1e-12
+    cut_parameters = [
+        value
+        for loop in loops
+        for reference in loop["boundary"]
+        if reference["entity_id"] == "curve"
+        for value in (reference["start_t"], reference["end_t"])
+        if math.isclose(value, expected_t, abs_tol=1e-9)
+    ]
+    assert cut_parameters
+
+
 def test_sketch_diameter_splits_a_primitive_circle_into_two_regions(standalone_components):
     workspace = SolveWorkspace()
     workspace._primitive_values.update({

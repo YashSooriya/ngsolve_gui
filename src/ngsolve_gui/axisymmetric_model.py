@@ -55,11 +55,97 @@ _LEGACY_EXPRESSION_UNITS = (*_EXPRESSION_UNITS[:-1], "mm", "m")
 
 
 
+def evaluate_sketch_entity(entity, parameter):
+    """Evaluate a sketch curve at its normalized path parameter.
+
+    The parameter follows the same 0..1 mapping as ``sampled_points``. This
+    keeps topology cuts and rendered edge samples on the original analytic
+    arc/spline rather than on the chords used to find candidate intersections.
+    """
+    if not isinstance(entity, dict):
+        return None
+    try:
+        t = min(1.0, max(0.0, float(parameter)))
+        if not math.isfinite(t):
+            return None
+        curve_type = entity.get("type")
+        points = entity.get("points")
+        if not isinstance(points, (list, tuple)) or len(points) < 2:
+            points = entity.get("sampled_points")
+        points = [tuple(float(value) for value in point[:2]) for point in points or []
+                  if isinstance(point, (list, tuple)) and len(point) >= 2]
+        if len(points) < 2 or any(not all(math.isfinite(value) for value in point) for point in points):
+            return None
+
+        if curve_type == "line":
+            return tuple(points[0][axis] + t * (points[-1][axis] - points[0][axis]) for axis in range(2))
+
+        if curve_type == "arc":
+            center = tuple(float(value) for value in entity.get("center", []))
+            radius = float(entity.get("radius"))
+            if len(center) != 2 or not all(math.isfinite(value) for value in center):
+                return None
+            if not math.isfinite(radius) or radius <= 0:
+                return None
+            start, end = points[0], points[-1]
+            start_angle = math.atan2(start[1] - center[1], start[0] - center[0])
+            end_angle = math.atan2(end[1] - center[1], end[0] - center[0])
+            sweep = (end_angle - start_angle) % (2.0 * math.pi)
+            if entity.get("clockwise"):
+                sweep -= 2.0 * math.pi
+            if abs(sweep) <= 1e-14:
+                return None
+            angle = start_angle + t * sweep
+            return (center[0] + radius * math.cos(angle), center[1] + radius * math.sin(angle))
+
+        if curve_type == "spline3" and len(points) >= 3:
+            start, control, end = points[0], points[1], points[-1]
+            chord = math.dist(start, end)
+            control_weight = math.sqrt(0.5 * (math.dist(start, control) ** 2 + math.dist(control, end) ** 2))
+            if chord <= 1e-14 or control_weight <= 1e-14:
+                return None
+            weight = chord / control_weight
+            if not math.isfinite(weight) or weight <= 0:
+                return None
+            b0 = (1.0 - t) ** 2
+            b1 = weight * t * (1.0 - t)
+            b2 = t * t
+            denominator = b0 + b1 + b2
+            return tuple((b0 * start[axis] + b1 * control[axis] + b2 * end[axis]) / denominator for axis in range(2))
+
+        if curve_type == "spline" and len(points) >= 2:
+            scaled = t * (len(points) - 1)
+            index = min(len(points) - 2, int(math.floor(scaled)))
+            local = 1.0 if t >= 1.0 else scaled - index
+            p0 = points[max(0, index - 1)]
+            p1 = points[index]
+            p2 = points[index + 1]
+            p3 = points[min(len(points) - 1, index + 2)]
+            t2, t3 = local * local, local * local * local
+            return tuple(0.5 * (
+                2.0 * p1[axis]
+                + (-p0[axis] + p2[axis]) * local
+                + (2.0 * p0[axis] - 5.0 * p1[axis] + 4.0 * p2[axis] - p3[axis]) * t2
+                + (-p0[axis] + 3.0 * p1[axis] - 3.0 * p2[axis] + p3[axis]) * t3
+            ) for axis in range(2))
+
+        samples = entity.get("sampled_points")
+        if not isinstance(samples, (list, tuple)) or len(samples) < 2:
+            samples = points
+        samples = [tuple(float(value) for value in point[:2]) for point in samples]
+        scaled = t * (len(samples) - 1)
+        index = min(len(samples) - 2, int(math.floor(scaled)))
+        fraction = 1.0 if t >= 1.0 else scaled - index
+        return tuple(samples[index][axis] + fraction * (samples[index + 1][axis] - samples[index][axis]) for axis in range(2))
+    except (TypeError, ValueError, IndexError, OverflowError, ZeroDivisionError):
+        return None
+
+
 def find_closed_sketch_loops(entities, *, tolerance=1e-12):
     """Return bounded faces after noding all intersections in sampled curves.
 
-    Sampled curves are noded as polylines; circular-arc/straight-line crossings
-    use exact circle intersections so clipped arc endpoints remain on the circle.
+    Samples locate candidate intersections, which are then refined on their source
+    arcs/splines so clipped curve endpoints remain on the original geometry.
     Crossings, T-junctions, and coincident endpoints become graph vertices
     before the half-edge walk, allowing dividers to create selectable faces.
     """
@@ -219,6 +305,72 @@ def find_closed_sketch_loops(entities, *, tolerance=1e-12):
             hits.append((arc_path_t, line_path_t, point))
         return [(arc_t, line_t, point, arc_is_first) for arc_t, line_t, point in hits]
 
+    def refine_curve_intersection(first, second, first_fraction, second_fraction):
+        """Refine a sampled-chord crossing onto its two source curves."""
+        first_entity = entities_by_id.get(first["entity_id"], {})
+        second_entity = entities_by_id.get(second["entity_id"], {})
+        curved_types = {"arc", "spline", "spline3"}
+        if first_entity.get("type") not in curved_types and second_entity.get("type") not in curved_types:
+            return None
+        first_count = max(1, first["segment_count"])
+        second_count = max(1, second["segment_count"])
+        first_low = first["segment_index"] / first_count
+        first_high = (first["segment_index"] + 1) / first_count
+        second_low = second["segment_index"] / second_count
+        second_high = (second["segment_index"] + 1) / second_count
+        first_t = (first["segment_index"] + first_fraction) / first_count
+        second_t = (second["segment_index"] + second_fraction) / second_count
+
+        def evaluate(entity, value):
+            return evaluate_sketch_entity(entity, value)
+
+        # Only refine when both source curves have a reliable evaluator. Legacy
+        # or unknown curve records continue through the sampled-polyline path.
+        if evaluate(first_entity, first_t) is None or evaluate(second_entity, second_t) is None:
+            return None
+
+        def derivative(entity, value, low, high):
+            step = min(1e-5, max(1e-8, 0.01 * (high - low)))
+            low, high = max(0.0, value - step), min(1.0, value + step)
+            if high <= low:
+                return (0.0, 0.0)
+            a, b = evaluate(entity, low), evaluate(entity, high)
+            if a is None or b is None:
+                return (0.0, 0.0)
+            return ((b[0] - a[0]) / (high - low), (b[1] - a[1]) / (high - low))
+
+        for _ in range(20):
+            point_a = evaluate(first_entity, first_t)
+            point_b = evaluate(second_entity, second_t)
+            if point_a is None or point_b is None:
+                return None
+            residual = (point_a[0] - point_b[0], point_a[1] - point_b[1])
+            if math.hypot(*residual) <= max(tolerance * 0.05, 1e-15):
+                break
+            da = derivative(first_entity, first_t, first_low, first_high)
+            db = derivative(second_entity, second_t, second_low, second_high)
+            a, b, c, d = da[0], -db[0], da[1], -db[1]
+            determinant = a * d - b * c
+            scale = math.hypot(*da) * math.hypot(*db)
+            if abs(determinant) <= max(1e-24, scale * 1e-12):
+                return None
+            delta_first = ((-residual[0]) * d - b * (-residual[1])) / determinant
+            delta_second = (a * (-residual[1]) - (-residual[0]) * c) / determinant
+            next_first = min(first_high, max(first_low, first_t + delta_first))
+            next_second = min(second_high, max(second_low, second_t + delta_second))
+            if abs(next_first - first_t) + abs(next_second - second_t) <= 1e-15:
+                return None
+            first_t, second_t = next_first, next_second
+
+        point_a = evaluate(first_entity, first_t)
+        point_b = evaluate(second_entity, second_t)
+        if point_a is None or point_b is None or math.dist(point_a, point_b) > max(tolerance * 0.2, 1e-14):
+            return None
+        first_local = min(1.0, max(0.0, first_t * first_count - first["segment_index"]))
+        second_local = min(1.0, max(0.0, second_t * second_count - second["segment_index"]))
+        point = ((point_a[0] + point_b[0]) * 0.5, (point_a[1] + point_b[1]) * 0.5)
+        return first_local, second_local, point
+
     for first_index, first in enumerate(raw_segments):
         a, b = first["a"], first["b"]
         rx, ry = b[0] - a[0], b[1] - a[1]
@@ -267,9 +419,28 @@ def find_closed_sketch_loops(entities, *, tolerance=1e-12):
                 ):
                     t = min(1.0, max(0.0, t))
                     u = min(1.0, max(0.0, u))
-                    point_a = (a[0] + t * rx, a[1] + t * ry)
-                    point_b = (c[0] + u * sx, c[1] + u * sy)
-                    point = ((point_a[0] + point_b[0]) / 2.0, (point_a[1] + point_b[1]) / 2.0)
+                    refined = refine_curve_intersection(first, second, t, u)
+                    if refined is not None:
+                        t, u, point = refined
+                    else:
+                        first_entity = entities_by_id.get(first["entity_id"], {})
+                        second_entity = entities_by_id.get(second["entity_id"], {})
+                        first_curve_t = (first["segment_index"] + t) / first["segment_count"]
+                        second_curve_t = (second["segment_index"] + u) / second["segment_count"]
+                        has_refinable_curve = (
+                            (first_entity.get("type") in {"arc", "spline", "spline3"}
+                             or second_entity.get("type") in {"arc", "spline", "spline3"})
+                            and evaluate_sketch_entity(first_entity, first_curve_t) is not None
+                            and evaluate_sketch_entity(second_entity, second_curve_t) is not None
+                        )
+                        if has_refinable_curve:
+                            # A crossing of sampled chords is not necessarily a
+                            # crossing of the original curves (for example, a
+                            # close near-tangent). Do not invent a straight kink.
+                            continue
+                        point_a = (a[0] + t * rx, a[1] + t * ry)
+                        point_b = (c[0] + u * sx, c[1] + u * sy)
+                        point = ((point_a[0] + point_b[0]) / 2.0, (point_a[1] + point_b[1]) / 2.0)
                     add_cut(first_index, t, point)
                     add_cut(second_index, u, point)
                 continue
