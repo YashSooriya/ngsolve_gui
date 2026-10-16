@@ -3648,6 +3648,46 @@ def test_partial_circle_overlap_is_split_and_keeps_curved_edges(standalone_compo
                for edge in workspace.model["geometry"]["edges"])
 
 
+def test_sketch_diameter_splits_a_primitive_circle_into_two_regions(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._primitive_values.update({
+        ("circle", "r_center"): 0.010,
+        ("circle", "z_center"): 0.0,
+        ("circle", "radius"): 0.004,
+    })
+    workspace._add_primitive("circle")
+    original = workspace.model["geometry"]["regions"][0]
+    original_id = original["id"]
+    original["material_id"] = "material-copper"
+    original["mechanical"] = True
+    original["sources"]["dc_current_density"] = "2e6"
+
+    angle = math.radians(33.0)
+    half_chord = (0.004 * math.cos(angle), 0.004 * math.sin(angle))
+    line_start = (0.010 - half_chord[0], -half_chord[1])
+    line_end = (0.010 + half_chord[0], half_chord[1])
+    assert workspace._add_sketch_entity("line", [line_start, line_end])
+
+    regions = workspace.model["geometry"]["regions"]
+    assert len(regions) == 2
+    assert all(region["shape"]["type"] == "sketch" for region in regions)
+    assert original_id in {region["id"] for region in regions}
+    assert all(region["material_id"] == "material-copper" for region in regions)
+    assert all(region["mechanical"] is True for region in regions)
+    assert all(region["sources"]["dc_current_density"] == "2e6" for region in regions)
+
+    line_entity = next(entity for entity in workspace.model["geometry"]["sketch_entities"]
+                       if entity.get("type") == "line")
+    line_edges = [edge for edge in workspace.model["geometry"]["edges"]
+                  if edge.get("sketch_entity_id") == line_entity["id"]]
+    assert len(line_edges) == 1
+    assert all(line_edges[0]["id"] in region["edge_ids"] for region in regions)
+    assert all(any(reference["entity_id"] == line_entity["id"]
+                   for reference in region["shape"]["boundary"]) for region in regions)
+    assert any(edge.get("curve", {}).get("type") == "arc"
+               for edge in workspace.model["geometry"]["edges"])
+
+
 def test_deleting_a_simple_region_removes_its_outline(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")

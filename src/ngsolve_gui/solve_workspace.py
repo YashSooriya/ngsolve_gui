@@ -3896,6 +3896,43 @@ class SolveWorkspace(Div):
             return False
         self._preserve_canvas_view()
         geometry = self.model["geometry"]
+        split_templates = []
+        if curve_type == "line":
+            for region in geometry.get("regions", []):
+                shape = region.get("shape", {})
+                if not isinstance(shape, dict) or shape.get("type") not in {"rectangle", "circle"}:
+                    continue
+                intersections, enters_interior = _polyline_polygon_intersections(
+                    samples, region.get("vertices", [])
+                )
+                if len(intersections) >= 2 and enters_interior:
+                    split_templates.append(copy.deepcopy(region))
+
+        if split_templates:
+            geometry_snapshot = copy.deepcopy(geometry)
+            try:
+                templates_by_id = {item.get("id"): item for item in split_templates}
+                for region in list(geometry.get("regions", [])):
+                    if region.get("id") in templates_by_id:
+                        self._materialize_primitive_as_sketch(region)
+                geometry["regions"] = [
+                    region for region in geometry.get("regions", [])
+                    if region.get("id") not in templates_by_id
+                ]
+                # Primitive outlines become true sketch curves here. Re-snap
+                # the new line endpoints to those curves so its endpoints stay
+                # topologically connected even when the old circle was shown
+                # with a coarser polygonal approximation.
+                for endpoint_index in (0, -1):
+                    endpoint = self._snap_sketch_endpoint(samples[endpoint_index])
+                    samples[endpoint_index] = list(endpoint)
+                    entity["points"][endpoint_index] = list(endpoint)
+            except (KeyError, TypeError, ValueError, OverflowError) as error:
+                geometry.clear()
+                geometry.update(geometry_snapshot)
+                self._message(f"Could not split the intersected region: {error}", error=True)
+                return False
+
         entities = geometry.setdefault("sketch_entities", [])
         entities.append(entity)
         edges = geometry.setdefault("edges", [])
@@ -3924,7 +3961,7 @@ class SolveWorkspace(Div):
             "sketch_entity_id": entity["id"],
             "boundary_condition_ids": [],
         })
-        self._refresh_sketch_generated_regions()
+        self._refresh_sketch_generated_regions(source_templates=split_templates or None)
         self.selected_edge_ids = [
             edge["id"] for edge in geometry.get("edges", [])
             if edge.get("sketch_entity_id") == entity["id"]
@@ -10761,6 +10798,69 @@ def _point_in_or_on_polygon(point, polygon):
         _point_on_segment(point, polygon[index], polygon[(index + 1) % len(polygon)])
         for index in range(len(polygon))
     )
+
+
+def _polyline_polygon_intersections(path, polygon, tolerance=1e-10):
+    """Return distinct path/boundary intersections and whether the path enters the polygon."""
+    if len(path) < 2 or len(polygon) < 3:
+        return [], False
+
+    def cross(first, second):
+        return first[0] * second[1] - first[1] * second[0]
+
+    intersections = []
+    enters_interior = False
+    boundary = list(polygon) + [polygon[0]]
+    for raw_start, raw_end in zip(path, path[1:]):
+        start = tuple(float(value) for value in raw_start[:2])
+        end = tuple(float(value) for value in raw_end[:2])
+        direction = (end[0] - start[0], end[1] - start[1])
+        length = math.hypot(*direction)
+        if length <= tolerance:
+            continue
+        cuts = [0.0, 1.0]
+        for raw_first, raw_second in zip(boundary, boundary[1:]):
+            first = tuple(float(value) for value in raw_first[:2])
+            second = tuple(float(value) for value in raw_second[:2])
+            edge_direction = (second[0] - first[0], second[1] - first[1])
+            edge_length = math.hypot(*edge_direction)
+            if edge_length <= tolerance:
+                continue
+            offset = (first[0] - start[0], first[1] - start[1])
+            denominator = cross(direction, edge_direction)
+            cross_tolerance = tolerance * max(length, edge_length, tolerance)
+            if abs(denominator) > cross_tolerance:
+                t = cross(offset, edge_direction) / denominator
+                u = cross(offset, direction) / denominator
+                t_tolerance = tolerance / length
+                u_tolerance = tolerance / edge_length
+                if -t_tolerance <= t <= 1.0 + t_tolerance and -u_tolerance <= u <= 1.0 + u_tolerance:
+                    t = min(1.0, max(0.0, t))
+                    cuts.append(t)
+                    point = (start[0] + t * direction[0], start[1] + t * direction[1])
+                    if all(math.dist(point, previous) > tolerance for previous in intersections):
+                        intersections.append(point)
+                continue
+
+            if abs(cross(offset, direction)) > cross_tolerance:
+                continue
+            for point in (first, second, start, end):
+                if _point_on_segment(point, start, end, tolerance) and _point_on_segment(point, first, second, tolerance):
+                    t = ((point[0] - start[0]) * direction[0] + (point[1] - start[1]) * direction[1]) / (length * length)
+                    cuts.append(min(1.0, max(0.0, t)))
+                    if all(math.dist(point, previous) > tolerance for previous in intersections):
+                        intersections.append(point)
+
+        cuts = sorted(cuts)
+        for first_t, second_t in zip(cuts, cuts[1:]):
+            if second_t - first_t <= tolerance / length:
+                continue
+            middle_t = 0.5 * (first_t + second_t)
+            middle = (start[0] + middle_t * direction[0], start[1] + middle_t * direction[1])
+            if _point_in_polygon(middle, polygon):
+                enters_interior = True
+                break
+    return intersections, enters_interior
 
 
 def _segments_intersect(a, b, c, d, tolerance=1e-12):
