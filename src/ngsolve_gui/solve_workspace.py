@@ -770,12 +770,12 @@ class SolveWorkspace(Div):
         self._preview_3d_tooltip = self._preview_3d_button.ui_slots["default"][0]
         toolbar = Div(
             select_button,
+            snap_button,
             rectangle_group,
             circle_group,
             line_button,
             arc_group,
             trim_button,
-            snap_button,
             sketch_toolbar_separator,
             fit_view_button,
             zoom_out_button,
@@ -795,9 +795,8 @@ class SolveWorkspace(Div):
         }
         self._snap_button = snap_button
         self._sketch_view_controls = [
-            select_button, rectangle_group, circle_group, line_button, arc_group,
-            trim_button, snap_button,
-            sketch_toolbar_separator, fit_view_button, zoom_out_button,
+            select_button, snap_button, rectangle_group, circle_group, line_button, arc_group,
+            trim_button, sketch_toolbar_separator, fit_view_button, zoom_out_button,
             zoom_in_button, self._mesh_preview_button,
         ]
 
