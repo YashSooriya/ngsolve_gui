@@ -345,3 +345,70 @@ def test_legacy_capture_preserves_rational_spline3_control_points():
     assert segment["start"] == first
     assert segment["control"] == control
     assert segment["end"] == end
+
+
+def test_imported_contour_bounds_and_spline_points_are_editable(standalone_components, monkeypatch):
+    problem = _legacy_test_problem()
+    geometry = problem["geometry"]
+    segment = next(item for item in geometry.segments if item["leftdomain"] == 2)
+    start = geometry.points[segment["start"]]["coordinates"]
+    end = geometry.points[segment["end"]]["coordinates"]
+    control = geometry.AppendPoint(
+        (start[0] + end[0]) / 2,
+        (start[1] + end[1]) / 2 + 0.03,
+    )
+    segment.update({"type": "spline3", "control": control})
+    model, studies, layout = legacy_problem_to_model(problem)
+    workspace = SolveWorkspace()
+    workspace.set_model(model, studies, layout)
+    monkeypatch.setattr(workspace, "render_canvas", lambda: None)
+    inner = next(item for item in workspace.model["geometry"]["regions"] if item["legacy_domain"] == 2)
+    spline = next(edge for edge in workspace.model["geometry"]["edges"] if edge["curve"].get("type") == "spline3")
+    old_vertices = copy.deepcopy(inner["vertices"])
+    old_curve = copy.deepcopy(spline["curve"])
+    old_r_min = min(point[0] for point in old_vertices)
+    old_r_max = max(point[0] for point in old_vertices)
+
+    workspace._set_region_dimension(inner["id"], "width", "0.8")
+
+    new_r = [point[0] for point in inner["vertices"]]
+    assert max(new_r) - min(new_r) == pytest.approx(0.8)
+    assert spline["curve"]["type"] == "spline3"
+    assert spline["curve"]["control_point"][0] == pytest.approx(
+        min(new_r) + (old_curve["control_point"][0] - old_r_min) * 0.8 / (old_r_max - old_r_min)
+    )
+    assert len(spline["curve"]["sampled_points"]) == len(old_curve["sampled_points"])
+
+    workspace.active_section = "geometry"
+    workspace.selected_edge_id = spline["id"]
+    workspace.selected_edge_ids = [spline["id"]]
+    workspace._render_inspector()
+    assert "imported_contour" in workspace._region_dimension_groups
+    assert workspace._imported_edge_geometry.ui_hidden is False
+    old_control_z = spline["curve"]["control_point"][1]
+    workspace._set_imported_edge_coordinate(spline["id"], "control", "z", str(old_control_z + 0.01))
+    assert spline["curve"]["control_point"][1] == pytest.approx(old_control_z + 0.01)
+    assert len(spline["curve"]["sampled_points"]) == 33
+
+
+def test_imported_edge_endpoint_edit_updates_connected_edges_and_rejects_negative_radius(standalone_components, monkeypatch):
+    model, studies, layout = legacy_problem_to_model(_legacy_test_problem())
+    workspace = SolveWorkspace()
+    workspace.set_model(model, studies, layout)
+    monkeypatch.setattr(workspace, "render_canvas", lambda: None)
+    edge = next(item for item in workspace.model["geometry"]["edges"] if item.get("legacy_domain_sides"))
+    point_id = edge["point_ids"][0]
+    point = next(item for item in workspace.model["geometry"]["points"] if item["id"] == point_id)
+    old_point = copy.deepcopy(point["coordinates"])
+    workspace._set_imported_edge_coordinate(edge["id"], "start", "z", str(old_point[1] + 0.01))
+    assert point["coordinates"] == pytest.approx([old_point[0], old_point[1] + 0.01])
+    for connected in workspace.model["geometry"]["edges"]:
+        for index, connected_id in enumerate(connected.get("point_ids", [])):
+            if connected_id == point_id:
+                assert connected["vertices"][index] == pytest.approx(point["coordinates"])
+
+    before_invalid_edit = copy.deepcopy(point["coordinates"])
+    workspace._set_imported_edge_coordinate(edge["id"], "start", "r", "-1")
+    restored_point = next(item for item in workspace.model["geometry"]["points"] if item["id"] == point_id)
+    assert restored_point["coordinates"] == pytest.approx(before_invalid_edit)
+    assert workspace.message_is_error
