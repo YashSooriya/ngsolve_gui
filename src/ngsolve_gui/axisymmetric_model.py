@@ -181,8 +181,10 @@ def find_closed_sketch_loops(entities, *, tolerance=1e-12):
                 continue
             if not all(math.isfinite(component) for component in value):
                 continue
-            if not path or math.dist(path[-1], value) > tolerance:
-                path.append(value)
+            # Keep the source sample index stable: curve parameters are
+            # normalized over the original sample sequence. Zero-length
+            # adjacent segments are ignored when raw_segments are built below.
+            path.append(value)
         if len(path) < 2:
             continue
         paths[entity["id"]] = path
