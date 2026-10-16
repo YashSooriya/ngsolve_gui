@@ -3109,7 +3109,7 @@ class SolveWorkspace(Div):
             if tool not in {"select", "trim"}:
                 point = self._snap_canvas_point(point)
             else:
-                if self.active_section == "boundaries" or hp_selection:
+                if self.active_section == "boundaries" or hp_selection or tool == "trim":
                     edge_id = edge_id or self._edge_at_canvas_point(point)
                 if not region_id and not browser_hit_is_known:
                     region_id = self._region_at_canvas_point(point)
@@ -4320,21 +4320,28 @@ class SolveWorkspace(Div):
         self.set_sketch_tool("select", announce=False)
 
     @_history_tracked
-    def _trim_sketch_entities_along_stroke(self, world_stroke):
-        """Trim only sketch sections intersected by the freehand trim stroke."""
+    def _trim_sketch_entities_along_stroke(
+        self, world_stroke, *, target_entity_ids=None, target_edge_id=None
+    ):
+        """Power-trim curve sections crossed by the trim trace, up to intersections."""
         if not isinstance(world_stroke, (list, tuple)) or len(world_stroke) < 2:
-            self._message("Draw a short trim stroke across one or more sketch edges.", error=True)
+            self._message("Drag the trim pencil across a sketch curve.", error=True)
             return False
 
         project, _ = self._canvas_projection()
         stroke = [project(point) for point in world_stroke]
-        entities = self.model["geometry"].get("sketch_entities", [])
+        geometry = self.model["geometry"]
+        target_entity_ids = set(target_entity_ids or ())
+        primitive_snapshot = None
+        source_templates = []
         tolerance_px = 6.0
+        parameter_epsilon = 1e-7
 
         def cross(a, b):
             return a[0] * b[1] - a[1] * b[0]
 
         def segment_hit_parameter(a, b, c, d):
+            """Return the parameter on c-d where the two finite segments meet."""
             r = (b[0] - a[0], b[1] - a[1])
             s = (d[0] - c[0], d[1] - c[1])
             denominator = cross(r, s)
@@ -4368,6 +4375,84 @@ class SolveWorkspace(Div):
                     if local is not None:
                         values.append((first_index + local) / first_count)
             return values
+
+        def stroke_touches_curve(samples):
+            if len(samples) < 2:
+                return False
+            screen_samples = [project(point) for point in samples]
+            nearest_distance = None
+            for stroke_a, stroke_b in zip(stroke, stroke[1:]):
+                for curve_a, curve_b in zip(screen_samples, screen_samples[1:]):
+                    if segment_hit_parameter(stroke_a, stroke_b, curve_a, curve_b) is not None:
+                        return True
+                    for point in (stroke_a, stroke_b):
+                        distance, _ = point_segment_distance(point, curve_a, curve_b)
+                        nearest_distance = distance if nearest_distance is None else min(nearest_distance, distance)
+                    for point in (curve_a, curve_b):
+                        distance, _ = point_segment_distance(point, stroke_a, stroke_b)
+                        nearest_distance = distance if nearest_distance is None else min(nearest_distance, distance)
+            return nearest_distance is not None and nearest_distance <= tolerance_px
+
+        # Primitive rectangles are displayed as regions rather than sketch
+        # entities. Convert only the rectangle whose outline was crossed so
+        # Power Trim can cut its individual sides without disturbing other
+        # primitive regions in the model.
+        edges_by_id = {
+            edge.get("id"): edge for edge in geometry.get("edges", [])
+            if isinstance(edge, dict) and edge.get("id")
+        }
+        primitive_regions = []
+        for region in geometry.get("regions", []):
+            shape = region.get("shape", {})
+            if not isinstance(shape, dict) or shape.get("type") != "rectangle":
+                continue
+            region_edge_ids = set(region.get("edge_ids", []))
+            if target_edge_id and target_edge_id in region_edge_ids:
+                primitive_regions.append(region)
+                continue
+            if target_edge_id:
+                continue
+            if any(
+                edge_id in edges_by_id
+                and stroke_touches_curve(
+                    (edges_by_id[edge_id].get("curve", {}).get("sampled_points")
+                     if isinstance(edges_by_id[edge_id].get("curve"), dict) else None)
+                    or edges_by_id[edge_id].get("vertices", [])
+                )
+                for edge_id in region_edge_ids
+            ):
+                primitive_regions.append(region)
+
+        if primitive_regions:
+            primitive_snapshot = copy.deepcopy(geometry)
+            source_templates = [copy.deepcopy(region) for region in primitive_regions]
+            primitive_ids = {region.get("id") for region in primitive_regions}
+            for region in primitive_regions:
+                self._materialize_primitive_as_sketch(region)
+            geometry["regions"] = [
+                region for region in geometry.get("regions", [])
+                if region.get("id") not in primitive_ids
+            ]
+            if target_edge_id and not target_entity_ids:
+                target_edge = next((edge for edge in geometry.get("edges", [])
+                                   if edge.get("id") == target_edge_id), None)
+                entity_id = target_edge.get("sketch_entity_id") if target_edge else None
+                if entity_id:
+                    target_entity_ids = {entity_id}
+        if target_edge_id and not target_entity_ids:
+            if primitive_snapshot is not None:
+                geometry.clear()
+                geometry.update(primitive_snapshot)
+            self._message("That edge cannot be trimmed as an editable sketch curve.", error=True)
+            return False
+
+        entities = geometry.get("sketch_entities", [])
+        def unique_parameters(values):
+            result = []
+            for value in sorted(max(0.0, min(1.0, float(item))) for item in values):
+                if not result or value - result[-1] > parameter_epsilon:
+                    result.append(value)
+            return result
 
         def sample_interval(samples, start_t, end_t):
             count = len(samples) - 1
@@ -4422,6 +4507,7 @@ class SolveWorkspace(Div):
                     for index in range(steps + 1)
                 ]
             else:
+                # The original control points no longer describe this clipped spline.
                 fragment["type"] = "spline"
                 fragment["points"] = copy.deepcopy(fragment_samples)
                 fragment["sampled_points"] = copy.deepcopy(fragment_samples)
@@ -4433,78 +4519,123 @@ class SolveWorkspace(Div):
 
         replacement_entities = []
         removed_sections = 0
+        changed_curves = 0
         touched_curves = 0
         for entity in entities:
+            if target_entity_ids and entity.get("id") not in target_entity_ids:
+                replacement_entities.append(entity)
+                continue
             samples_world = curve_samples(entity)
             if len(samples_world) < 2:
                 replacement_entities.append(entity)
                 continue
             samples_screen = [project(point) for point in samples_world]
             hit_parameters = []
+            nearest = None
             for stroke_a, stroke_b in zip(stroke, stroke[1:]):
                 for index, (curve_a, curve_b) in enumerate(zip(samples_screen, samples_screen[1:])):
                     local = segment_hit_parameter(stroke_a, stroke_b, curve_a, curve_b)
                     if local is not None:
                         hit_parameters.append((index + local) / (len(samples_screen) - 1))
-            if not hit_parameters:
-                best = None
-                for stroke_a, stroke_b in zip(stroke, stroke[1:]):
-                    for index, (curve_a, curve_b) in enumerate(zip(samples_screen, samples_screen[1:])):
-                        for point in (stroke_a, stroke_b):
-                            distance, local = point_segment_distance(point, curve_a, curve_b)
-                            candidate = (distance, (index + local) / (len(samples_screen) - 1))
-                            if best is None or candidate[0] < best[0]:
-                                best = candidate
-                if best is not None and best[0] <= tolerance_px:
-                    hit_parameters.append(best[1])
+                        continue
+                    for point in (stroke_a, stroke_b):
+                        distance, local = point_segment_distance(point, curve_a, curve_b)
+                        candidate = (distance, (index + local) / (len(samples_screen) - 1))
+                        if nearest is None or candidate[0] < nearest[0]:
+                            nearest = candidate
+                    for point, parameter in ((curve_a, index / (len(samples_screen) - 1)),
+                                             (curve_b, (index + 1) / (len(samples_screen) - 1))):
+                        distance, _ = point_segment_distance(point, stroke_a, stroke_b)
+                        candidate = (distance, parameter)
+                        if nearest is None or candidate[0] < nearest[0]:
+                            nearest = candidate
+            if not hit_parameters and nearest is not None and nearest[0] <= tolerance_px:
+                hit_parameters.append(nearest[1])
+            hit_parameters = unique_parameters(hit_parameters)
             if not hit_parameters:
                 replacement_entities.append(entity)
                 continue
-
             touched_curves += 1
-            cuts = [0.0, 1.0]
+
+            intersections = []
             for other in entities:
                 if other is entity:
                     continue
                 other_samples = curve_samples(other)
                 if len(other_samples) >= 2:
-                    cuts.extend(curve_intersections(samples_screen, [project(point) for point in other_samples]))
-            cuts = sorted({round(max(0.0, min(1.0, value)), 9) for value in cuts})
+                    intersections.extend(curve_intersections(
+                        samples_screen, [project(point) for point in other_samples]
+                    ))
+            intersections = unique_parameters(intersections)
+            # A free-standing entity has no trim boundary. SolidWorks Power
+            # Trim leaves it untouched; whole-entity deletion is a separate
+            # operation in MM-FEM as well.
+            if not intersections:
+                replacement_entities.append(entity)
+                continue
+
+            cuts = unique_parameters([0.0, 1.0, *intersections])
             sections = list(zip(cuts, cuts[1:]))
-            removed = {
-                index for index, (lo, hi) in enumerate(sections)
-                if any(lo - 1e-8 <= hit <= hi + 1e-8 for hit in hit_parameters)
-            }
+            removed = set()
+            for hit in hit_parameters:
+                # A hit exactly on an interior intersection does not identify
+                # which adjacent segment the user intended to remove.
+                if any(parameter_epsilon < boundary < 1.0 - parameter_epsilon
+                       and abs(hit - boundary) <= parameter_epsilon
+                       for boundary in intersections):
+                    continue
+                for index, (lo, hi) in enumerate(sections):
+                    if lo - parameter_epsilon <= hit <= hi + parameter_epsilon:
+                        if abs(hit - lo) <= parameter_epsilon and index > 0:
+                            continue
+                        if abs(hit - hi) <= parameter_epsilon and index < len(sections) - 1:
+                            continue
+                        removed.add(index)
+                        break
             if not removed:
                 replacement_entities.append(entity)
                 continue
+
             removed_sections += len(removed)
+            changed_curves += 1
             retained = [(lo, hi) for index, (lo, hi) in enumerate(sections)
-                        if index not in removed and hi - lo > 1e-8]
+                        if index not in removed and hi - lo > parameter_epsilon]
             for fragment_index, (lo, hi) in enumerate(retained):
                 fragment_id = entity.get("id") if fragment_index == 0 else new_id("curve")
                 fragment = entity_fragment(entity, samples_world, lo, hi, fragment_id)
                 if fragment is not None:
                     replacement_entities.append(fragment)
 
-        if not touched_curves:
-            self._message("The trim stroke did not cross any sketch edges.", error=True)
+        if not removed_sections:
+            if primitive_snapshot is not None:
+                geometry.clear()
+                geometry.update(primitive_snapshot)
+            if not touched_curves:
+                self._message("The trim trace did not touch a sketch curve.", error=True)
+            else:
+                self._message(
+                    "Power Trim needs an intersecting curve to stop at. "
+                    "Drag across a section between intersections; use Delete to remove a whole isolated curve.",
+                    error=True,
+                )
             return False
+
         geometry = self.model["geometry"]
         geometry["sketch_entities"] = replacement_entities
         retained_entity_ids = {item.get("id") for item in replacement_entities}
-        geometry["edges"] = [item for item in geometry.get("edges", [])
-                             if item.get("sketch_entity_id") in retained_entity_ids]
-        self._refresh_sketch_generated_regions()
+        geometry["edges"] = [
+            item for item in geometry.get("edges", [])
+            if not item.get("sketch_entity_id") or item.get("sketch_entity_id") in retained_entity_ids
+        ]
+        self._refresh_sketch_generated_regions(source_templates=source_templates or None)
         self.selected_edge_ids = []
         self.selected_edge_id = None
         self.selected_region_id = None
         self._refresh_model_tree()
         self._render_inspector()
         self.render_canvas()
-        self._message(f"Trimmed {removed_sections} sketch section(s) across {touched_curves} curve(s).")
+        self._message(f"Power Trim removed {removed_sections} section(s) from {changed_curves} curve(s).")
         return True
-
 
     @staticmethod
     def _sketch_region_signature(entity_ids, boundary=None):
@@ -4788,76 +4919,21 @@ class SolveWorkspace(Div):
         self._message(f"Deleted {len(delete_ids)} selected edge(s).")
         return True
 
-    @_history_tracked
     def _trim_sketch_edge_at_canvas_point(self, edge_id, canvas_point):
         edge = next((item for item in self.model["geometry"].get("edges", []) if item.get("id") == edge_id), None)
         entity_id = edge.get("sketch_entity_id") if edge else None
-        entity = next(
-            (item for item in self.model["geometry"].get("sketch_entities", []) if item.get("id") == entity_id),
-            None,
-        )
-        if not entity or entity.get("type") != "line" or len(entity.get("points", [])) != 2:
-            self._message("Trim currently applies to straight sketch lines.", error=True)
+        if not edge:
+            self._message("Select a sketch curve to trim.", error=True)
             return False
         _, unproject = self._canvas_projection()
         click = unproject(canvas_point)
-        start, end = entity["points"]
-        dx, dy = end[0] - start[0], end[1] - start[1]
-        length2 = dx * dx + dy * dy
-        total_length = math.sqrt(length2)
-        intersections = []
-        for other in self.model["geometry"].get("sketch_entities", []):
-            if other.get("id") == entity_id:
-                continue
-            samples = other.get("sampled_points") or other.get("points") or []
-            for a, b in zip(samples, samples[1:]):
-                ox, oy = b[0] - a[0], b[1] - a[1]
-                denominator = dx * oy - dy * ox
-                if abs(denominator) <= 1e-18:
-                    continue
-                qx, qy = a[0] - start[0], a[1] - start[1]
-                t = (qx * oy - qy * ox) / denominator
-                u = (qx * dy - qy * dx) / denominator
-                if 1e-8 < t < 1.0 - 1e-8 and -1e-8 <= u <= 1.0 + 1e-8:
-                    intersections.append(t)
-        intersections = sorted({round(value, 10) for value in intersections})
-        if not intersections:
-            self._message("No intersection was found on this line to trim.", error=True)
-            return False
-        clicked_t = max(0.0, min(1.0, ((click[0] - start[0]) * dx + (click[1] - start[1]) * dy) / length2))
-        cuts = [0.0, *intersections, 1.0]
-        interval = next(
-            (index for index, (lo, hi) in enumerate(zip(cuts, cuts[1:])) if lo - 1e-8 <= clicked_t <= hi + 1e-8),
-            None,
+        if entity_id:
+            return self._trim_sketch_entities_along_stroke(
+                [click, click], target_entity_ids={entity_id}
+            )
+        return self._trim_sketch_entities_along_stroke(
+            [click, click], target_edge_id=edge_id
         )
-        if interval is None:
-            self._message("Move the pointer onto the section of line to trim.", error=True)
-            return False
-        remove_lo, remove_hi = cuts[interval], cuts[interval + 1]
-        pieces = []
-        if remove_lo > 1e-8:
-            pieces.append([list(start), [start[0] + remove_lo * dx, start[1] + remove_lo * dy]])
-        if remove_hi < 1.0 - 1e-8:
-            pieces.append([[start[0] + remove_hi * dx, start[1] + remove_hi * dy], list(end)])
-        geometry = self.model["geometry"]
-        geometry["sketch_entities"] = [item for item in geometry.get("sketch_entities", []) if item.get("id") != entity_id]
-        geometry["edges"] = [item for item in geometry.get("edges", []) if item.get("sketch_entity_id") != entity_id]
-        for piece in pieces:
-            new_entity = {"id": new_id("curve"), "type": "line", "points": piece, "sampled_points": piece}
-            geometry["sketch_entities"].append(new_entity)
-            geometry["edges"].append({
-                "id": new_id("edge"), "name": "Trimmed line", "vertices": copy.deepcopy(piece),
-                "curve": {"type": "line"}, "sketch_entity_id": new_entity["id"],
-                "boundary_condition_ids": [],
-            })
-        self._refresh_sketch_generated_regions()
-        self.selected_edge_ids = []
-        self.selected_edge_id = None
-        self._refresh_model_tree()
-        self._render_inspector()
-        self.render_canvas()
-        self._message("Trimmed the selected line at its intersection.")
-        return True
 
     @staticmethod
     def _dimension_literal_m(value_m):

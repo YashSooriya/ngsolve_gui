@@ -1500,16 +1500,57 @@ def test_live_preview_supports_arc_construction_and_point_markers(standalone_com
     assert "window.__ngsolveRefreshConstructionPreview" in script
     assert "hasPending" in script and "updateConstructionPreview" in script
 
-def test_trim_pencil_stroke_removes_only_curves_it_crosses(standalone_components):
+def test_power_trim_leaves_curves_without_intersections_unchanged(standalone_components):
     workspace = SolveWorkspace()
     assert workspace._add_sketch_entity("line", [(0.002, 0.0), (0.008, 0.0)])
     assert workspace._add_sketch_entity("line", [(0.020, 0.004), (0.026, 0.004)])
 
-    assert workspace._trim_sketch_entities_along_stroke([(0.005, -0.001), (0.005, 0.001)])
+    assert not workspace._trim_sketch_entities_along_stroke([(0.005, -0.001), (0.005, 0.001)])
     remaining = workspace.model["geometry"]["sketch_entities"]
-    assert len(remaining) == 1
-    assert remaining[0]["points"] == [[0.02, 0.004], [0.026, 0.004]]
+    assert len(remaining) == 2
+    assert remaining[0]["points"] == [[0.002, 0.0], [0.008, 0.0]]
+    assert remaining[1]["points"] == [[0.02, 0.004], [0.026, 0.004]]
 
+
+def test_power_trim_click_supports_arc_segments(standalone_components):
+    workspace = SolveWorkspace()
+    assert workspace._add_sketch_entity("arc", [(0.004, 0.0), (0.008, 0.004), (0.012, 0.0)])
+    arc = workspace.model["geometry"]["sketch_entities"][0]
+    assert workspace._add_sketch_entity("line", [(0.003, 0.002), (0.013, 0.002)])
+
+    edge = next(edge for edge in workspace.model["geometry"]["edges"]
+                if edge.get("sketch_entity_id") == arc["id"])
+    project, _ = workspace._canvas_projection()
+    assert workspace._trim_sketch_edge_at_canvas_point(edge["id"], project((0.008, 0.004)))
+
+    arc_fragments = [
+        entity for entity in workspace.model["geometry"]["sketch_entities"]
+        if entity.get("type") == "arc"
+    ]
+    assert len(arc_fragments) == 2
+    assert all(len(entity["sampled_points"]) >= 2 for entity in arc_fragments)
+    assert any(entity.get("type") == "line" for entity in workspace.model["geometry"]["sketch_entities"])
+
+
+def test_power_trim_can_cut_a_primitive_rectangle_edge(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.003,
+        ("rectangle", "z_min"): 0.003,
+        ("rectangle", "width"): 0.010,
+        ("rectangle", "height"): 0.010,
+    })
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    edge = next(edge for edge in workspace.model["geometry"]["edges"]
+                if edge["id"] == region["edge_ids"][0])
+    first, second = edge["vertices"]
+    project, _ = workspace._canvas_projection()
+    midpoint = project(((first[0] + second[0]) / 2, (first[1] + second[1]) / 2))
+
+    assert workspace._trim_sketch_edge_at_canvas_point(edge["id"], midpoint)
+    assert workspace.model["geometry"]["regions"] == []
+    assert len(workspace.model["geometry"]["sketch_entities"]) == 3
 
 
 def test_trim_stroke_removes_only_the_intersection_bounded_section(standalone_components):
