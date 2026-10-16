@@ -1427,17 +1427,24 @@ def test_escape_cancels_arc_without_committing_geometry(standalone_components):
     assert workspace.model["geometry"]["edges"] == []
 
 
-def test_centerpoint_arc_projects_end_to_start_radius(standalone_components):
+@pytest.mark.parametrize(("clockwise", "expected_midpoint_sign"), [(False, 1), (True, -1)])
+def test_centerpoint_arc_projects_end_to_start_radius_and_follows_direction(
+    standalone_components, clockwise, expected_midpoint_sign
+):
     workspace = SolveWorkspace()
     center, start, cursor = (0.006, 0.001), (0.010, 0.001), (0.006, 0.005)
     workspace._accept_arc_sketch_point(center, variant="centerpoint")
     workspace._accept_arc_sketch_point(start, variant="centerpoint")
-    assert workspace._accept_arc_sketch_point(cursor, variant="centerpoint")
+    assert workspace._accept_arc_sketch_point(
+        cursor, variant="centerpoint", centerpoint_clockwise=clockwise
+    )
 
     entity = workspace.model["geometry"]["sketch_entities"][0]
     assert math.dist(center, start) == pytest.approx(math.dist(center, entity["points"][-1]))
     assert math.dist(center, start) == pytest.approx(entity["radius"])
     assert math.dist(start, entity["points"][-1]) > 0
+    assert entity["clockwise"] is clockwise
+    assert math.copysign(1, entity["points"][1][1] - center[1]) == expected_midpoint_sign
 
 
 def test_tangent_arc_starts_at_endpoint_and_has_common_tangent(standalone_components):
@@ -1482,6 +1489,10 @@ def test_live_preview_supports_arc_construction_and_point_markers(standalone_com
     script = scripts[0]
     assert "arcPathThroughThreePoints" in script
     assert "arcPathFromCenter" in script
+    assert "centerArcTrace" in script
+    assert "centerArcTrace.travel" in script
+    assert "__ngsolveSketchCenterArcClockwise" in script
+    assert "Boolean(window.__ngsolveSketchCenterArcClockwise)" in script
     assert "spline3Path" in script
     assert "arcPathTangent" in script
     assert "const cancelArc" in script

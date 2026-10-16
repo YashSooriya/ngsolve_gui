@@ -1453,7 +1453,7 @@ class SolveWorkspace(Div):
                 "line": "Drag to draw one line and return to Select; click points to chain lines, then click an edge or press Enter/Esc to finish.",
                 "arc": {
                     "three-point": "Click the start, click the end, then place a point on the live arc preview.",
-                    "centerpoint": "Click the center, click the start point, then place the end on the live fixed-radius preview.",
+                    "centerpoint": "Click the center and start point, then move clockwise or counter-clockwise to preview the fixed-radius arc before placing its end.",
                     "tangent": "Click an existing curve endpoint, then place the end on the live tangent preview.",
                     "spline3": "Click the start and end points, then place the spline control point on the live preview.",
                 }.get(variant, "Choose an arc construction method."),
@@ -2318,15 +2318,36 @@ class SolveWorkspace(Div):
       + (Math.abs(sweep) > Math.PI ? "1" : "0") + " " + (sweep >= 0 ? "1" : "0")
       + " " + cx + "," + cy;
   };
+  let centerArcTrace = null;
+  const resetCenterArcTrace = () => {
+    centerArcTrace = null;
+    window.__ngsolveSketchCenterArcClockwise = false;
+  };
   const arcPathFromCenter = (center, start, cursor) => {
     const radius = Math.hypot(start[0] - center[0], start[1] - center[1]);
     const cursorRadius = Math.hypot(cursor[0] - center[0], cursor[1] - center[1]);
     if (!(radius > 0) || !(cursorRadius > 1e-9)) return "";
     const a0 = Math.atan2(start[1] - center[1], start[0] - center[0]);
     const a1 = Math.atan2(cursor[1] - center[1], cursor[0] - center[0]);
-    // The viewport's y axis is inverted from world z. A positive
-    // counter-clockwise world sweep therefore uses SVG's negative sweep.
-    const sweep = -((a0 - a1 + 2 * Math.PI) % (2 * Math.PI));
+    const key = center.join(",") + "|" + start.join(",");
+    if (!centerArcTrace || centerArcTrace.key !== key) {
+      centerArcTrace = {key, lastAngle: a0, direction: 0, travel: 0};
+    }
+    // The viewport's y axis points down, so increasing screen angle is
+    // clockwise to the user. Follow angular pointer movement for both the
+    // preview and the final sweep instead of always taking one orientation.
+    const delta = Math.atan2(Math.sin(a1 - centerArcTrace.lastAngle), Math.cos(a1 - centerArcTrace.lastAngle));
+    centerArcTrace.travel += delta;
+    if (Math.abs(centerArcTrace.travel) > 0.035) centerArcTrace.direction = Math.sign(centerArcTrace.travel);
+    centerArcTrace.lastAngle = a1;
+    let direction = centerArcTrace.direction;
+    if (!direction) {
+      const shortest = Math.atan2(Math.sin(a1 - a0), Math.cos(a1 - a0));
+      direction = Math.abs(shortest) > 1e-9 ? Math.sign(shortest) : -1;
+    }
+    const positiveSweep = (a1 - a0 + 2 * Math.PI) % (2 * Math.PI);
+    const sweep = direction > 0 ? positiveSweep : positiveSweep - 2 * Math.PI;
+    window.__ngsolveSketchCenterArcClockwise = direction > 0;
     const end = [center[0] + radius * Math.cos(a1), center[1] + radius * Math.sin(a1)];
     if (Math.hypot(end[0] - start[0], end[1] - start[1]) < 1e-7) return "";
     return "M" + start[0] + "," + start[1] + " A" + radius + "," + radius + " 0 "
@@ -2383,6 +2404,16 @@ class SolveWorkspace(Div):
     const linePoints = Array.isArray(state.linePoints) ? state.linePoints : [];
     const arcPoints = Array.isArray(state.arcPoints) ? state.arcPoints : [];
     const circlePoints = Array.isArray(state.circlePoints) ? state.circlePoints : [];
+    const centerpointArcPending = tool === "arc" && (state.arcVariant || "three-point") === "centerpoint" && arcPoints.length >= 2;
+    if (!centerpointArcPending) resetCenterArcTrace();
+    else {
+      const center = arcPoints[0], start = arcPoints[1];
+      const key = center.join(",") + "|" + start.join(",");
+      if (!centerArcTrace || centerArcTrace.key !== key) {
+        centerArcTrace = {key, lastAngle: Math.atan2(start[1] - center[1], start[0] - center[0]), direction: 0, travel: 0};
+        window.__ngsolveSketchCenterArcClockwise = false;
+      }
+    }
     const markers = tool === "line" ? linePoints.slice()
       : (tool === "arc" ? arcPoints.slice()
         : (tool === "circle" ? circlePoints.slice() : []));
@@ -2598,6 +2629,10 @@ class SolveWorkspace(Div):
       ? event.target.closest('[data-sketch-edge-id]')
       : null;
     const tool = window.__ngsolveSketchTool || 'select';
+    if (tool === 'arc' && (window.__ngsolveSketchToolVariant || '') === 'centerpoint') {
+      const state = window.__ngsolveSketchConstruction || {};
+      if (!Array.isArray(state.arcPoints) || state.arcPoints.length < 2) resetCenterArcTrace();
+    }
     const selectionEnabled = ['select', 'trim'].includes(tool);
     dragRegionId = selectionEnabled && region
       ? region.getAttribute('data-sketch-region-id')
@@ -2681,7 +2716,8 @@ class SolveWorkspace(Div):
         dragRegionId || '', Boolean(event.shiftKey || event.ctrlKey), moved,
         visualScale, visualTranslateX, visualTranslateY, viewVersion,
         finishedEdgeId || '', finishedSketchPoints,
-        window.__ngsolveSketchToolVariant || '',
+        window.__ngsolveSketchToolVariant || '', '',
+        Boolean(window.__ngsolveSketchCenterArcClockwise),
       ];
       if (wheelCommitTimer) window.clearTimeout(wheelCommitTimer);
       wheelCommitTimer = 0;
@@ -3219,6 +3255,7 @@ class SolveWorkspace(Div):
                 edge_id = (str(completed[13]) or None) if len(completed) >= 14 else None
                 sketch_screen_points = completed[14] if len(completed) >= 15 and isinstance(completed[14], (list, tuple)) else []
                 tool_variant = str(completed[15]) if len(completed) >= 16 else self._sketch_tool_variant.get(tool, "")
+                centerpoint_clockwise = bool(completed[17]) if len(completed) >= 18 else None
             except (TypeError, ValueError, OverflowError):
                 completed = None
             else:
@@ -3278,7 +3315,10 @@ class SolveWorkspace(Div):
                                 self._render_canvas_after_interaction()
                     elif tool == "arc" and not moved:
                         world_point = self._sketch_screen_points_to_world([start], snap=True)[0]
-                        self._accept_arc_sketch_point(world_point, variant=tool_variant)
+                        self._accept_arc_sketch_point(
+                            world_point, variant=tool_variant,
+                            centerpoint_clockwise=centerpoint_clockwise,
+                        )
                         if view_changed:
                             self._render_canvas_after_interaction()
                     elif tool == "circle" and tool_variant == "three-point" and not moved:
@@ -4018,7 +4058,7 @@ class SolveWorkspace(Div):
         _, endpoint, tangent = min(candidates, key=lambda item: item[0])
         return endpoint, tangent
 
-    def _accept_arc_sketch_point(self, point, *, variant=None):
+    def _accept_arc_sketch_point(self, point, *, variant=None, centerpoint_clockwise=None):
         variant = variant or self._sketch_tool_variant.get("arc", "three-point")
         point = tuple(float(value) for value in point)
         pending = self._pending_arc_points
@@ -4124,7 +4164,7 @@ class SolveWorkspace(Div):
                     return False
                 self._pending_arc_points.append(start)
                 self._sync_pending_construction_preview()
-                self._message("Centerpoint arc: move the pointer to preview the fixed-radius arc, then click its end.")
+                self._message("Centerpoint arc: move clockwise or counter-clockwise from the start to preview the fixed-radius arc, then click its end.")
                 return True
             center, start = pending[:2]
             radius = math.dist(center, start)
@@ -4139,7 +4179,9 @@ class SolveWorkspace(Div):
             if math.dist(start, end) <= 1e-12:
                 self._message("The arc start and end must define a nonzero angular span.", error=True)
                 return False
-            sweep = (end_angle - start_angle) % (2.0 * math.pi)
+            positive_sweep = (end_angle - start_angle) % (2.0 * math.pi)
+            clockwise = bool(centerpoint_clockwise) if centerpoint_clockwise is not None else False
+            sweep = positive_sweep - 2.0 * math.pi if clockwise else positive_sweep
             through_angle = start_angle + sweep / 2.0
             through = (
                 center[0] + radius * math.cos(through_angle),
@@ -4158,7 +4200,7 @@ class SolveWorkspace(Div):
                     "arc", [start, through, end],
                     arc_geometry={
                         "start": start, "through": through, "end": end,
-                        "center": center, "radius": radius, "clockwise": False,
+                        "center": center, "radius": radius, "clockwise": sweep < 0,
                         "samples": samples,
                     },
                 )
