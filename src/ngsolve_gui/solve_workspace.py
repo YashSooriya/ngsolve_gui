@@ -4897,6 +4897,31 @@ class SolveWorkspace(Div):
         self, world_stroke, *, target_entity_ids=None, target_edge_id=None,
         target_intervals=None,
     ):
+        """Apply Power Trim as one undoable geometry transaction."""
+        before = copy.deepcopy(self.model)
+        try:
+            return self._trim_sketch_entities_along_stroke_impl(
+                world_stroke,
+                target_entity_ids=target_entity_ids,
+                target_edge_id=target_edge_id,
+                target_intervals=target_intervals,
+            )
+        except Exception:
+            self.model.clear()
+            self.model.update(before)
+            try:
+                self._refresh_model_tree()
+                self._render_inspector()
+                self.render_canvas()
+            except Exception:
+                pass
+            self._message("Power Trim failed. The original geometry was restored.", error=True)
+            return False
+
+    def _trim_sketch_entities_along_stroke_impl(
+        self, world_stroke, *, target_entity_ids=None, target_edge_id=None,
+        target_intervals=None,
+    ):
         """Power-trim curve sections crossed by the trim trace, up to intersections."""
         if not isinstance(world_stroke, (list, tuple)) or len(world_stroke) < 2:
             self._message("Drag the trim pencil across a sketch curve.", error=True)
@@ -4922,7 +4947,8 @@ class SolveWorkspace(Div):
                 boundary.get("entity_id") for boundary in shape.get("boundary", [])
                 if isinstance(boundary, dict) and isinstance(boundary.get("entity_id"), str)
             )
-        target_entity_ids = set(target_entity_ids or ())
+        requested_target_entity_ids = set(target_entity_ids or ())
+        target_entity_ids = set(requested_target_entity_ids)
         target_intervals = target_intervals or {}
         primitive_snapshot = None
         source_templates = []
@@ -4964,7 +4990,11 @@ class SolveWorkspace(Div):
             return math.hypot(point[0] - closest[0], point[1] - closest[1]), fraction
 
         def curve_samples(entity):
-            return entity.get("sampled_points") or entity.get("points") or []
+            points = entity.get("sampled_points") or entity.get("points") or []
+            if entity.get("type") == "line":
+                return points
+            count = max(65, min(513, max(2, len(points) - 1) * 32 + 1))
+            return sample_sketch_entity(entity, count=count) or points
 
         def exact_arc_line_parameters(first_entity, second_entity):
             """Return exact parameters where one authored line meets an arc."""
@@ -5037,6 +5067,61 @@ class SolveWorkspace(Div):
                 arc_fraction = min(1.0, max(0.0, offset / total_sweep))
                 parameters.append(line_fraction if parameter_on_first else arc_fraction)
             return parameters
+
+        def arc_fraction_for_point(entity, point):
+            try:
+                center = tuple(float(value) for value in entity.get("center", []))
+                radius = float(entity.get("radius"))
+                points = entity.get("points", [])
+                start = tuple(float(value) for value in points[0][:2])
+                end = tuple(float(value) for value in points[-1][:2])
+            except (TypeError, ValueError, IndexError, OverflowError):
+                return None
+            if len(center) != 2 or radius <= 0:
+                return None
+            start_angle = math.atan2(start[1] - center[1], start[0] - center[0])
+            end_angle = math.atan2(end[1] - center[1], end[0] - center[0])
+            point_angle = math.atan2(point[1] - center[1], point[0] - center[0])
+            clockwise = bool(entity.get("clockwise", False))
+            sweep = (start_angle - end_angle) % (2.0 * math.pi) if clockwise else (end_angle - start_angle) % (2.0 * math.pi)
+            offset = (start_angle - point_angle) % (2.0 * math.pi) if clockwise else (point_angle - start_angle) % (2.0 * math.pi)
+            if sweep <= 1e-14 or offset > sweep + 1e-9:
+                return None
+            return max(0.0, min(1.0, offset / sweep))
+
+        def exact_arc_arc_parameters(first_entity, second_entity):
+            if first_entity.get("type") != "arc" or second_entity.get("type") != "arc":
+                return None
+            try:
+                c1 = tuple(float(value) for value in first_entity.get("center", []))
+                c2 = tuple(float(value) for value in second_entity.get("center", []))
+                r1, r2 = float(first_entity.get("radius")), float(second_entity.get("radius"))
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if len(c1) != 2 or len(c2) != 2 or r1 <= 0 or r2 <= 0:
+                return None
+            dx, dy = c2[0] - c1[0], c2[1] - c1[1]
+            distance = math.hypot(dx, dy)
+            scale = max(r1, r2, distance, 1e-12)
+            tolerance = max(1e-12, scale * 1e-10)
+            if distance <= tolerance or distance > r1 + r2 + tolerance or distance < abs(r1 - r2) - tolerance:
+                return []
+            along = (r1 * r1 - r2 * r2 + distance * distance) / (2.0 * distance)
+            height_squared = r1 * r1 - along * along
+            if height_squared < -tolerance * scale:
+                return []
+            height = math.sqrt(max(0.0, height_squared))
+            base_x = c1[0] + along * dx / distance
+            base_y = c1[1] + along * dy / distance
+            offset_x = -dy * height / distance
+            offset_y = dx * height / distance
+            result = []
+            for point in ((base_x + offset_x, base_y + offset_y), (base_x - offset_x, base_y - offset_y)):
+                first_parameter = arc_fraction_for_point(first_entity, point)
+                second_parameter = arc_fraction_for_point(second_entity, point)
+                if first_parameter is not None and second_parameter is not None:
+                    result.append((first_parameter, second_parameter))
+            return result
 
         def exact_spline_line_parameters(first_entity, second_entity):
             """Refine spline/line crossings so trimmed endpoints stay connected."""
@@ -5119,15 +5204,46 @@ class SolveWorkspace(Div):
             if exact is None:
                 exact = exact_spline_line_parameters(first_entity, second_entity)
             if exact is not None:
-                return exact
-            values = []
+                pairs = []
+                for first_parameter in exact:
+                    point = evaluate_sketch_entity(first_entity, first_parameter)
+                    if point is None:
+                        continue
+                    _, second_parameter = nearest_entity_parameter(point, second_entity, second_samples)
+                    pairs.append((first_parameter, second_parameter))
+                return pairs
+            exact_arcs = exact_arc_arc_parameters(first_entity, second_entity)
+            if exact_arcs is not None:
+                return exact_arcs
+
+            pairs = []
             first_count = max(1, len(first_samples) - 1)
+            second_count = max(1, len(second_samples) - 1)
             for first_index, (a, b) in enumerate(zip(first_samples, first_samples[1:])):
-                for c, d in zip(second_samples, second_samples[1:]):
-                    local = segment_hit_parameter(c, d, a, b)
-                    if local is not None:
-                        values.append((first_index + local) / first_count)
-            return values
+                for second_index, (c, d) in enumerate(zip(second_samples, second_samples[1:])):
+                    first_local = segment_hit_parameter(c, d, a, b)
+                    second_local = segment_hit_parameter(a, b, c, d)
+                    if first_local is None or second_local is None:
+                        continue
+                    first_parameter = (first_index + first_local) / first_count
+                    second_parameter = (second_index + second_local) / second_count
+                    first_parameter, second_parameter = refine_curve_pair(
+                        first_entity, second_entity, first_parameter, second_parameter
+                    )
+                    first_point = evaluate_sketch_entity(first_entity, first_parameter)
+                    second_point = evaluate_sketch_entity(second_entity, second_parameter)
+                    if first_point is None or second_point is None:
+                        continue
+                    first_length = sum(math.dist(a, b) for a, b in zip(first_samples, first_samples[1:]))
+                    second_length = sum(math.dist(a, b) for a, b in zip(second_samples, second_samples[1:]))
+                    tolerance = max(1e-12, min(first_length, second_length) * 1e-8)
+                    if math.dist(first_point, second_point) <= tolerance:
+                        pairs.append((first_parameter, second_parameter))
+            unique = []
+            for first_parameter, second_parameter in sorted(pairs):
+                if not unique or abs(first_parameter - unique[-1][0]) > 1e-8 or abs(second_parameter - unique[-1][1]) > 1e-8:
+                    unique.append((first_parameter, second_parameter))
+            return unique
 
         def sample_at(samples, parameter):
             position = max(0.0, min(1.0, float(parameter))) * (len(samples) - 1)
@@ -5148,6 +5264,74 @@ class SolveWorkspace(Div):
                     best = (distance, (index + fraction) / segment_count)
             return best
 
+        def nearest_entity_parameter(point, entity, samples):
+            distance, parameter = nearest_parameter(point, samples)
+            half_window = 2.0 / max(2, len(samples) - 1)
+            low = max(0.0, parameter - half_window)
+            high = min(1.0, parameter + half_window)
+            if high - low <= 1e-14:
+                return distance, parameter
+            ratio = (math.sqrt(5.0) - 1.0) / 2.0
+            left = high - ratio * (high - low)
+            right = low + ratio * (high - low)
+
+            def squared(candidate):
+                value = evaluate_sketch_entity(entity, candidate)
+                return float("inf") if value is None else (value[0] - point[0]) ** 2 + (value[1] - point[1]) ** 2
+
+            left_value, right_value = squared(left), squared(right)
+            for _ in range(36):
+                if left_value <= right_value:
+                    high, right, right_value = right, left, left_value
+                    left = high - ratio * (high - low)
+                    left_value = squared(left)
+                else:
+                    low, left, left_value = left, right, right_value
+                    right = low + ratio * (high - low)
+                    right_value = squared(right)
+            parameter = 0.5 * (low + high)
+            value = evaluate_sketch_entity(entity, parameter)
+            return (math.dist(point, value), parameter) if value is not None else (distance, parameter)
+
+        def refine_curve_pair(first_entity, second_entity, first_parameter, second_parameter):
+            first_parameter = max(0.0, min(1.0, float(first_parameter)))
+            second_parameter = max(0.0, min(1.0, float(second_parameter)))
+            for _ in range(20):
+                first_point = evaluate_sketch_entity(first_entity, first_parameter)
+                second_point = evaluate_sketch_entity(second_entity, second_parameter)
+                if first_point is None or second_point is None:
+                    break
+                rx, ry = first_point[0] - second_point[0], first_point[1] - second_point[1]
+                if math.hypot(rx, ry) <= 1e-13:
+                    break
+                step = 1e-5
+                first_before = evaluate_sketch_entity(first_entity, max(0.0, first_parameter - step))
+                first_after = evaluate_sketch_entity(first_entity, min(1.0, first_parameter + step))
+                second_before = evaluate_sketch_entity(second_entity, max(0.0, second_parameter - step))
+                second_after = evaluate_sketch_entity(second_entity, min(1.0, second_parameter + step))
+                if None in (first_before, first_after, second_before, second_after):
+                    break
+                first_den = max(1e-15, min(1.0, first_parameter + step) - max(0.0, first_parameter - step))
+                second_den = max(1e-15, min(1.0, second_parameter + step) - max(0.0, second_parameter - step))
+                first_tangent = ((first_after[0] - first_before[0]) / first_den,
+                                 (first_after[1] - first_before[1]) / first_den)
+                second_tangent = ((second_after[0] - second_before[0]) / second_den,
+                                  (second_after[1] - second_before[1]) / second_den)
+                determinant = cross(first_tangent, second_tangent)
+                tangent_scale = math.hypot(*first_tangent) * math.hypot(*second_tangent)
+                if abs(determinant) <= max(1e-24, tangent_scale * 1e-12):
+                    break
+                delta_first = -cross((rx, ry), second_tangent) / determinant
+                delta_second = -cross((rx, ry), first_tangent) / determinant
+                next_first, next_second = first_parameter + delta_first, second_parameter + delta_second
+                if not (-1e-8 <= next_first <= 1.0 + 1e-8 and -1e-8 <= next_second <= 1.0 + 1e-8):
+                    break
+                next_first, next_second = max(0.0, min(1.0, next_first)), max(0.0, min(1.0, next_second))
+                if abs(next_first - first_parameter) + abs(next_second - second_parameter) <= 1e-13:
+                    break
+                first_parameter, second_parameter = next_first, next_second
+            return first_parameter, second_parameter
+
         def sample_tangent(samples, parameter):
             step = min(0.04, max(0.002, 1.0 / max(2, len(samples) - 1)))
             first = sample_at(samples, max(0.0, parameter - step))
@@ -5156,35 +5340,21 @@ class SolveWorkspace(Div):
             magnitude = math.hypot(dx, dy)
             return (dx / magnitude, dy / magnitude) if magnitude > 1e-12 else None
 
-        def is_overlapping_curve_intersection(parameter, first_samples, second_samples):
-            """Ignore tessellation crossings between curves that follow the same edge."""
-            if min(len(first_samples), len(second_samples)) < 3:
-                return False
-            point = sample_at(first_samples, parameter)
-            distance, other_parameter = nearest_parameter(point, second_samples)
-            if distance > 1.5:
-                return False
-            step = min(0.08, max(0.02, 2.0 / max(len(first_samples), len(second_samples))))
-            probes = [
-                value for value in (parameter - step, parameter + step)
-                if 0.0 <= value <= 1.0
-            ]
+        def is_overlapping_curve_intersection(parameter, other_parameter, first_entity, second_entity, first_samples, second_samples):
+            first_length = sum(math.dist(a, b) for a, b in zip(first_samples, first_samples[1:]))
+            second_length = sum(math.dist(a, b) for a, b in zip(second_samples, second_samples[1:]))
+            tolerance = max(1e-12, min(2.5e-5, min(first_length, second_length) * 2e-3))
+            step = 2.0 / max(2, len(first_samples) - 1)
+            probes = [value for value in (parameter - step, parameter + step) if 0.0 <= value <= 1.0]
             if not probes:
                 return False
             for probe in probes:
-                probe_point = sample_at(first_samples, probe)
-                probe_distance, probe_other_parameter = nearest_parameter(probe_point, second_samples)
-                if probe_distance > 1.5:
+                point = evaluate_sketch_entity(first_entity, probe)
+                if point is None:
                     return False
-                first_tangent = sample_tangent(first_samples, probe)
-                second_tangent = sample_tangent(second_samples, probe_other_parameter)
-                if first_tangent is None or second_tangent is None:
-                    return False
-                tangent_alignment = abs(
-                    first_tangent[0] * second_tangent[0]
-                    + first_tangent[1] * second_tangent[1]
-                )
-                if tangent_alignment < 0.97:
+                _, nearby_parameter = nearest_entity_parameter(point, second_entity, second_samples)
+                nearby = evaluate_sketch_entity(second_entity, nearby_parameter)
+                if nearby is None or math.dist(point, nearby) > tolerance:
                     return False
             return True
 
@@ -5261,39 +5431,26 @@ class SolveWorkspace(Div):
                 entity_id = target_edge.get("sketch_entity_id") if target_edge else None
                 if entity_id:
                     target_entity_ids = {entity_id}
-        # Recover visible edge fragments left by older/imported models when
-        # their stale entity ID now points to a source curve that no longer
-        # covers them. This prevents trim cleanup from deleting those fragments.
-        reconciliation_snapshot = None
         entities = geometry.get("sketch_entities", [])
-        edge_points = [
-            (float(point[0]), float(point[1]))
+        entities_by_id = {
+            entity.get("id"): entity for entity in entities
+            if isinstance(entity, dict) and isinstance(entity.get("id"), str)
+        }
+        reconciliation_snapshot = None
+        all_edge_points = [
+            tuple(float(value) for value in point[:2])
             for edge in geometry.get("edges", []) if isinstance(edge, dict)
             for point in edge.get("vertices", [])
             if isinstance(point, (list, tuple)) and len(point) >= 2
         ]
-        geometry_span = max(
-            max((point[0] for point in edge_points), default=0.0)
-            - min((point[0] for point in edge_points), default=0.0),
-            max((point[1] for point in edge_points), default=0.0)
-            - min((point[1] for point in edge_points), default=0.0),
+        edge_scale = max(
+            max((point[0] for point in all_edge_points), default=0.0)
+            - min((point[0] for point in all_edge_points), default=0.0),
+            max((point[1] for point in all_edge_points), default=0.0)
+            - min((point[1] for point in all_edge_points), default=0.0),
+            1e-12,
         )
-        match_tolerance = max(1e-12, min(1e-7, geometry_span * 2.5e-5))
-
-        def distance_to_curve(point, samples):
-            result = float("inf")
-            for first, second in zip(samples, samples[1:]):
-                dx, dy = second[0] - first[0], second[1] - first[1]
-                length2 = dx * dx + dy * dy
-                fraction = 0.0 if length2 <= 1e-24 else min(
-                    1.0, max(0.0, ((point[0] - first[0]) * dx + (point[1] - first[1]) * dy) / length2)
-                )
-                result = min(result, math.hypot(
-                    point[0] - first[0] - fraction * dx,
-                    point[1] - first[1] - fraction * dy,
-                ))
-            return result
-
+        source_match_tolerance = max(1e-12, edge_scale * 1e-9)
         for edge in geometry.get("edges", []):
             if not isinstance(edge, dict) or not edge.get("sketch_entity_id"):
                 continue
@@ -5301,51 +5458,69 @@ class SolveWorkspace(Div):
             raw_samples = (
                 edge_curve.get("sampled_points") if isinstance(edge_curve, dict) else None
             ) or edge.get("vertices", [])
+            edge_vertices = edge.get("vertices", [])
+            if len(edge_vertices) != 2:
+                continue
             try:
-                edge_samples = [(float(p[0]), float(p[1])) for p in raw_samples if len(p) >= 2]
-            except (TypeError, ValueError, OverflowError):
+                edge_start = tuple(float(value) for value in edge_vertices[0][:2])
+                edge_end = tuple(float(value) for value in edge_vertices[1][:2])
+                source_start = float(edge.get("sketch_t0", 0.0))
+                source_end = float(edge.get("sketch_t1", 1.0))
+            except (TypeError, ValueError, IndexError, OverflowError):
+                continue
+            source_entity = entities_by_id.get(edge.get("sketch_entity_id"))
+            represented = False
+            if source_entity is not None:
+                expected_start = evaluate_sketch_entity(source_entity, source_start)
+                expected_end = evaluate_sketch_entity(source_entity, source_end)
+                represented = (
+                    expected_start is not None and expected_end is not None
+                    and math.dist(edge_start, expected_start) <= source_match_tolerance
+                    and math.dist(edge_end, expected_end) <= source_match_tolerance
+                )
+            if represented:
+                continue
+            try:
+                edge_samples = [(float(point[0]), float(point[1])) for point in raw_samples if len(point) >= 2]
+            except (TypeError, ValueError, IndexError, OverflowError):
                 continue
             if len(edge_samples) < 2:
                 continue
-            represented = False
-            for entity in entities:
-                try:
-                    samples = [(float(p[0]), float(p[1])) for p in curve_samples(entity)]
-                except (TypeError, ValueError, OverflowError):
-                    continue
-                if len(samples) >= 2 and all(
-                    distance_to_curve(point, samples) <= match_tolerance for point in edge_samples
-                ):
-                    represented = True
-                    break
-            if represented:
-                continue
-
             curve_type = edge_curve.get("type") if isinstance(edge_curve, dict) else None
-            recovered_type = "line" if curve_type == "line" else "spline"
-            recovered_points = (
-                [list(edge_samples[0]), list(edge_samples[-1])]
-                if recovered_type == "line" else [list(p) for p in edge_samples]
-            )
+            if curve_type not in {"line", "arc", "spline3", "spline"}:
+                continue
             if reconciliation_snapshot is None:
                 reconciliation_snapshot = copy.deepcopy(geometry)
             recovered_id = new_id("curve")
-            recovered_samples = copy.deepcopy(recovered_points)
-            entities.append({
-                "id": recovered_id, "type": recovered_type,
-                "points": recovered_points, "sampled_points": recovered_samples,
-            })
-            # This curve was already visible as an edge before the trim. Keep
-            # it eligible to complete its existing region when repairing stale
-            # legacy/imported entity references.
+            if curve_type == "line":
+                recovered = {
+                    "id": recovered_id,
+                    "type": "line",
+                    "points": [list(edge_start), list(edge_end)],
+                    "sampled_points": [list(edge_start), list(edge_end)],
+                }
+            else:
+                recovered = copy.deepcopy(edge_curve)
+                recovered["id"] = recovered_id
+                recovered["_parameter_source_entity"] = copy.deepcopy(edge_curve)
+                recovered["_parameter_source_interval"] = [source_start, source_end]
+                recovered["points"] = [
+                    list(edge_start),
+                    *copy.deepcopy(recovered.get("points", [])[1:-1]),
+                    list(edge_end),
+                ]
+                recovered["sampled_points"] = copy.deepcopy(edge_samples)
+            entities.append(recovered)
+            entities_by_id[recovered_id] = recovered
             refresh_entity_ids.add(recovered_id)
             edge["sketch_entity_id"] = recovered_id
             edge["sketch_t0"], edge["sketch_t1"] = 0.0, 1.0
-            if isinstance(edge_curve, dict):
-                edge_curve["type"] = recovered_type
-                edge_curve["sampled_points"] = copy.deepcopy(recovered_samples)
+            edge_curve = copy.deepcopy(edge_curve) if isinstance(edge_curve, dict) else {}
+            edge_curve["type"] = curve_type
+            edge_curve["sampled_points"] = copy.deepcopy(edge_samples)
+            edge["curve"] = edge_curve
 
-        if target_edge_id and not target_entity_ids:
+        if target_edge_id:
             target_edge = next(
                 (edge for edge in geometry.get("edges", []) if edge.get("id") == target_edge_id),
                 None,
@@ -5353,14 +5528,13 @@ class SolveWorkspace(Div):
             entity_id = target_edge.get("sketch_entity_id") if target_edge else None
             if entity_id:
                 target_entity_ids = {entity_id}
-                if not target_intervals:
-                    try:
-                        first = float(target_edge.get("sketch_t0", 0.0))
-                        second = float(target_edge.get("sketch_t1", 1.0))
-                        if math.isfinite(first) and math.isfinite(second):
-                            target_intervals = {entity_id: (first, second)}
-                    except (TypeError, ValueError, OverflowError):
-                        pass
+                try:
+                    first = float(target_edge.get("sketch_t0", 0.0))
+                    second = float(target_edge.get("sketch_t1", 1.0))
+                    if math.isfinite(first) and math.isfinite(second):
+                        target_intervals = {entity_id: (first, second)}
+                except (TypeError, ValueError, OverflowError):
+                    pass
         if target_edge_id and not target_entity_ids:
             rollback_snapshot = primitive_snapshot if primitive_snapshot is not None else reconciliation_snapshot
             if rollback_snapshot is not None:
@@ -5374,9 +5548,39 @@ class SolveWorkspace(Div):
             for entity in entities if isinstance(entity, dict) and isinstance(entity.get("id"), str)
         }
 
-        # Imported and previously edited geometry can contain multiple sketch
-        # entities tracing the same visible edge. Treat those as one trim target
-        # so clipping one source does not leave a duplicate curve on screen.
+        selected_group_id = None
+        group_members_by_index = {}
+        if target_edge_id and target_entity_ids:
+            selected_id = next(iter(target_entity_ids))
+            selected_entity = next(
+                (item for item in entities if isinstance(item, dict) and item.get("id") == selected_id),
+                None,
+            )
+            selected_group_id = selected_entity.get("curve_group_id") if selected_entity else None
+            if selected_group_id:
+                group_size = int(selected_entity.get("curve_group_size", 0) or 0)
+                for item in entities:
+                    if item.get("curve_group_id") != selected_group_id:
+                        continue
+                    try:
+                        group_index = int(item.get("curve_group_index"))
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    group_members_by_index[group_index] = item
+                    target_entity_ids.add(item.get("id"))
+                    if item.get("id") != selected_id:
+                        target_intervals[item.get("id")] = (0.0, 1.0)
+                selected_group_index = int(selected_entity.get("curve_group_index", 0))
+                ordered_group = sorted(
+                    group_members_by_index.values(),
+                    key=lambda item: (int(item.get("curve_group_index", 0)) - selected_group_index)
+                    % max(1, group_size),
+                )
+                group_ids = {item.get("id") for item in ordered_group}
+                entities = ordered_group + [item for item in entities if item.get("id") not in group_ids]
+
+        # Expand a picked trim target to genuinely coincident legacy fragments
+        # using a fixed model-space tolerance, never a zoom-dependent pixel test.
         if target_edge_id and target_entity_ids:
             entities_by_id = {
                 item.get("id"): item for item in entities
@@ -5384,63 +5588,60 @@ class SolveWorkspace(Div):
             }
             selected_id = next(iter(target_entity_ids))
             selected_entity = entities_by_id.get(selected_id)
-            selected_samples = (
-                [project(point) for point in curve_samples(selected_entity)]
-                if selected_entity is not None else []
-            )
             selected_interval = target_intervals.get(selected_id, (0.0, 1.0))
-            try:
-                interval_start, interval_end = sorted(float(value) for value in selected_interval)
-            except (TypeError, ValueError, OverflowError):
-                interval_start, interval_end = 0.0, 1.0
-            interval_start = max(0.0, min(1.0, interval_start))
-            interval_end = max(0.0, min(1.0, interval_end))
-            if len(selected_samples) >= 3 and interval_end - interval_start > parameter_epsilon:
+            selected_samples = curve_samples(selected_entity) if selected_entity else []
+            if selected_entity is not None and len(selected_samples) >= 3:
+                try:
+                    interval_start, interval_end = sorted(float(value) for value in selected_interval)
+                except (TypeError, ValueError, OverflowError):
+                    interval_start, interval_end = 0.0, 1.0
+                interval_start = max(0.0, min(1.0, interval_start))
+                interval_end = max(0.0, min(1.0, interval_end))
+                selected_length = sum(math.dist(a, b) for a, b in zip(selected_samples, selected_samples[1:]))
                 for other in entities:
                     other_id = other.get("id") if isinstance(other, dict) else None
                     if not other_id or other_id in target_entity_ids:
                         continue
-                    other_samples = [project(point) for point in curve_samples(other)]
+                    other_samples = curve_samples(other)
                     if len(other_samples) < 3:
                         continue
-                    corresponding_parameters = []
-                    close_and_parallel = True
+                    other_length = sum(math.dist(a, b) for a, b in zip(other_samples, other_samples[1:]))
+                    coincidence_tolerance = max(1e-12, min(2.5e-5, min(selected_length, other_length) * 2e-3))
+                    mapped_parameters = []
+                    coincident = True
                     for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
-                        selected_parameter = interval_start + fraction * (interval_end - interval_start)
-                        point = sample_at(selected_samples, selected_parameter)
-                        distance, other_parameter = nearest_parameter(point, other_samples)
-                        first_tangent = sample_tangent(selected_samples, selected_parameter)
-                        second_tangent = sample_tangent(other_samples, other_parameter)
+                        parameter = interval_start + fraction * (interval_end - interval_start)
+                        point = evaluate_sketch_entity(selected_entity, parameter)
+                        if point is None:
+                            coincident = False
+                            break
+                        distance, other_parameter = nearest_entity_parameter(point, other, other_samples)
                         other_active = active_intervals_by_id.get(other_id, [(0.0, 1.0)])
+                        first_tangent = sample_tangent(selected_samples, parameter)
+                        second_tangent = sample_tangent(other_samples, other_parameter)
                         if (
-                            distance > 2.5
+                            distance > coincidence_tolerance
                             or not any(lo - parameter_epsilon <= other_parameter <= hi + parameter_epsilon for lo, hi in other_active)
                             or first_tangent is None
                             or second_tangent is None
-                            or abs(first_tangent[0] * second_tangent[0]
-                                   + first_tangent[1] * second_tangent[1]) < 0.90
+                            or abs(first_tangent[0] * second_tangent[0] + first_tangent[1] * second_tangent[1]) < 0.999
                         ):
-                            close_and_parallel = False
+                            coincident = False
                             break
-                        corresponding_parameters.append(other_parameter)
-                    if not close_and_parallel or len(corresponding_parameters) != 5:
+                        mapped_parameters.append(other_parameter)
+                    if not coincident or len(mapped_parameters) != 5:
                         continue
-                    increasing = all(
-                        corresponding_parameters[index] <= corresponding_parameters[index + 1] + 0.03
-                        for index in range(4)
+                    increasing = all(mapped_parameters[i] <= mapped_parameters[i + 1] + 0.01 for i in range(4))
+                    decreasing = all(mapped_parameters[i] >= mapped_parameters[i + 1] - 0.01 for i in range(4))
+                    if not (increasing or decreasing):
+                        continue
+                    if abs(mapped_parameters[-1] - mapped_parameters[0]) <= 0.1:
+                        continue
+                    target_entity_ids.add(other_id)
+                    target_intervals[other_id] = (
+                        min(mapped_parameters[0], mapped_parameters[-1]),
+                        max(mapped_parameters[0], mapped_parameters[-1]),
                     )
-                    decreasing = all(
-                        corresponding_parameters[index] >= corresponding_parameters[index + 1] - 0.03
-                        for index in range(4)
-                    )
-                    if (increasing or decreasing) and abs(
-                        corresponding_parameters[-1] - corresponding_parameters[0]
-                    ) > 0.1:
-                        target_entity_ids.add(other_id)
-                        target_intervals[other_id] = (
-                            min(corresponding_parameters[0], corresponding_parameters[-1]),
-                            max(corresponding_parameters[0], corresponding_parameters[-1]),
-                        )
 
         def unique_parameters(values):
             result = []
@@ -5505,26 +5706,33 @@ class SolveWorkspace(Div):
                     for index in range(steps + 1)
                 ]
             else:
-                # The original control points no longer describe this clipped spline.
-                fragment["type"] = "spline"
-                fragment["points"] = copy.deepcopy(fragment_samples)
+                # Keep the authored spline evaluator and clip only its parameter interval.
+                fragment["_parameter_source_entity"] = copy.deepcopy(entity)
+                fragment["_parameter_source_interval"] = [float(start_t), float(end_t)]
                 fragment["sampled_points"] = copy.deepcopy(fragment_samples)
-                fragment.pop("center", None)
-                fragment.pop("radius", None)
-                fragment.pop("clockwise", None)
-                fragment.pop("control_point", None)
+                points = entity.get("points", [])
+                fragment["points"] = [
+                    copy.deepcopy(fragment_samples[0]),
+                    *copy.deepcopy(points[1:-1]),
+                    copy.deepcopy(fragment_samples[-1]),
+                ]
+            fragment["_trim_parent_entity_id"] = entity.get("id")
+            fragment["_trim_parent_t0"] = float(start_t)
+            fragment["_trim_parent_t1"] = float(end_t)
             return fragment
 
         replacement_entities = []
+        forced_group_hits = {}
         removed_sections = 0
         changed_curves = 0
         touched_curves = 0
         changed_entity_ids = set()
         for entity in entities:
-            if target_entity_ids and entity.get("id") not in target_entity_ids:
+            target_is_explicit = bool(requested_target_entity_ids) or bool(target_edge_id) or is_point_trim
+            if target_is_explicit and entity.get("id") not in target_entity_ids:
                 replacement_entities.append(entity)
                 continue
-            target_interval = target_intervals.get(entity.get("id"))
+            target_interval = target_intervals.get(entity.get("id")) if target_is_explicit else None
             if isinstance(target_interval, (list, tuple)) and len(target_interval) == 2:
                 try:
                     interval_start, interval_end = sorted(float(value) for value in target_interval)
@@ -5586,6 +5794,7 @@ class SolveWorkspace(Div):
                             nearest = candidate
             if not hit_parameters and nearest is not None and nearest[0] <= nearest_hit_tolerance_px:
                 hit_parameters.append(nearest[1])
+            hit_parameters.extend(forced_group_hits.get(entity.get("id"), ()))
             hit_parameters = unique_parameters(hit_parameters)
             if not hit_parameters:
                 replacement_entities.append(entity)
@@ -5598,23 +5807,28 @@ class SolveWorkspace(Div):
                     continue
                 other_samples = curve_samples(other)
                 if len(other_samples) >= 2:
-                    other_samples_screen = [project(point) for point in other_samples]
                     candidate_intersections = curve_intersections(
-                        entity, other, samples_screen, other_samples_screen
+                        entity, other, samples_world, other_samples
                     )
                     other_active = active_intervals_by_id.get(other.get("id"), [(0.0, 1.0)])
-                    for parameter in candidate_intersections:
+                    for parameter, other_parameter in candidate_intersections:
                         if not any(lo - parameter_epsilon <= parameter <= hi + parameter_epsilon for lo, hi in active_ranges):
                             continue
-                        if is_overlapping_curve_intersection(parameter, samples_screen, other_samples_screen):
+                        if not any(lo - parameter_epsilon <= other_parameter <= hi + parameter_epsilon for lo, hi in other_active):
                             continue
-                        point = sample_at(samples_screen, parameter)
-                        distance, other_parameter = nearest_parameter(point, other_samples_screen)
-                        if distance <= 2.5 and any(
-                            lo - parameter_epsilon <= other_parameter <= hi + parameter_epsilon
-                            for lo, hi in other_active
+                        if is_overlapping_curve_intersection(
+                            parameter, other_parameter, entity, other, samples_world, other_samples
                         ):
-                            intersections.append(parameter)
+                            continue
+                        first_point = evaluate_sketch_entity(entity, parameter)
+                        second_point = evaluate_sketch_entity(other, other_parameter)
+                        if first_point is not None and second_point is not None:
+                            scale = min(
+                                sum(math.dist(a, b) for a, b in zip(samples_world, samples_world[1:])),
+                                sum(math.dist(a, b) for a, b in zip(other_samples, other_samples[1:])),
+                            )
+                            if math.dist(first_point, second_point) <= max(1e-12, scale * 1e-8):
+                                intersections.append(parameter)
             intersections = unique_parameters(intersections)
             if target_interval is not None:
                 intersections = [
@@ -5685,6 +5899,33 @@ class SolveWorkspace(Div):
                 replacement_entities.append(entity)
                 continue
 
+            group_id = entity.get("curve_group_id")
+            if group_id and entity.get("curve_group_size"):
+                try:
+                    group_index = int(entity.get("curve_group_index"))
+                    group_size = int(entity.get("curve_group_size"))
+                except (TypeError, ValueError, OverflowError):
+                    group_size = 0
+                    group_index = -1
+                if group_size > 1 and group_index >= 0:
+                    true_intersection_tolerance = 5e-7
+                    for removed_index in removed:
+                        removed_start, removed_end = sections[removed_index]
+                        starts_at_authored_seam = removed_start <= parameter_epsilon and not any(
+                            abs(value) <= true_intersection_tolerance for value in intersections
+                        )
+                        ends_at_authored_seam = removed_end >= 1.0 - parameter_epsilon and not any(
+                            abs(value - 1.0) <= true_intersection_tolerance for value in intersections
+                        )
+                        if starts_at_authored_seam:
+                            neighbor = group_members_by_index.get((group_index - 1) % group_size)
+                            if neighbor is not None:
+                                forced_group_hits.setdefault(neighbor.get("id"), []).append(1.0)
+                        if ends_at_authored_seam:
+                            neighbor = group_members_by_index.get((group_index + 1) % group_size)
+                            if neighbor is not None:
+                                forced_group_hits.setdefault(neighbor.get("id"), []).append(0.0)
+
             removed_sections += len(removed)
             changed_curves += 1
             if entity.get("id"):
@@ -5715,6 +5956,7 @@ class SolveWorkspace(Div):
             return False
 
         geometry = self.model["geometry"]
+        edge_metadata_sources = copy.deepcopy(geometry.get("edges", []))
         geometry["sketch_entities"] = replacement_entities
         retained_entity_ids = {item.get("id") for item in replacement_entities}
         geometry["edges"] = [
@@ -5737,6 +5979,7 @@ class SolveWorkspace(Div):
             source_templates=source_templates or None,
             entity_ids=refresh_entity_ids,
             active_intervals_by_id=partial_intervals,
+            edge_metadata_sources=edge_metadata_sources,
         )
         self.selected_edge_ids = []
         self.selected_edge_id = None
@@ -5761,7 +6004,10 @@ class SolveWorkspace(Div):
             intervals.append((entity_id, round(min(start, end), 9), round(max(start, end), 9)))
         return tuple(sorted(intervals)) if intervals else tuple(sorted(set(entity_ids)))
 
-    def _refresh_sketch_generated_regions(self, *, source_templates=None, entity_ids=None, active_intervals_by_id=None):
+    def _refresh_sketch_generated_regions(
+        self, *, source_templates=None, entity_ids=None, active_intervals_by_id=None,
+        edge_metadata_sources=None,
+    ):
         geometry = self.model["geometry"]
         old_generated = [
             region for region in geometry.get("regions", [])
@@ -5796,8 +6042,11 @@ class SolveWorkspace(Div):
         interval_view_sources = {}
         for entity in sketch_entities:
             entity_id = entity.get("id")
-            ranges = (active_intervals_by_id or {}).get(entity_id)
-            if not ranges:
+            has_explicit_ranges = active_intervals_by_id is not None and entity_id in active_intervals_by_id
+            ranges = active_intervals_by_id.get(entity_id) if has_explicit_ranges else None
+            if has_explicit_ranges and not ranges:
+                continue
+            if not has_explicit_ranges:
                 interval_views.append(entity)
                 continue
             if len(ranges) == 1 and abs(ranges[0][0]) <= 1e-12 and abs(ranges[0][1] - 1.0) <= 1e-12:
@@ -5925,7 +6174,7 @@ class SolveWorkspace(Div):
             region.setdefault("edge_ids", [])
             geometry["regions"].append(region)
         self._recompute_parent_links()
-        self._rebuild_edges()
+        self._rebuild_edges(metadata_edges=edge_metadata_sources)
         self._prune_region_groups()
 
     @staticmethod
@@ -7352,6 +7601,9 @@ class SolveWorkspace(Div):
                     old["name"] = f"{region.get('name', 'Circle')} edge {quadrant + 1}"
                 add_entity("arc", start, end, sampled, center=center, radius=radius,
                            through=through, source=old)
+                entities[-1]["curve_group_id"] = f"circle:{region.get('id', 'primitive')}"
+                entities[-1]["curve_group_index"] = quadrant
+                entities[-1]["curve_group_size"] = 4
         return made
 
     @_history_tracked
@@ -7561,9 +7813,10 @@ class SolveWorkspace(Div):
         for region in regions:
             region["parent_id"] = parents[region["id"]]
 
-    def _rebuild_edges(self):
+    def _rebuild_edges(self, *, metadata_edges=None):
         geometry = self.model["geometry"]
         old_edges = geometry.get("edges", [])
+        source_edges = metadata_edges if isinstance(metadata_edges, list) else old_edges
         old_points_by_coordinate = {
             tuple(round(float(value), 12) for value in point.get("coordinates", [])): point.get("id")
             for point in geometry.get("points", [])
@@ -7620,7 +7873,7 @@ class SolveWorkspace(Div):
 
         def source_edges_for(start, end, key):
             matches = []
-            for old in old_edges:
+            for old in source_edges:
                 old_curve = old.get("curve", {})
                 if isinstance(old_curve, dict) and old_curve.get("type", "line") != "line":
                     continue
@@ -7682,7 +7935,7 @@ class SolveWorkspace(Div):
             shape = region.get("shape", {})
             if isinstance(shape, dict) and shape.get("type") == "sketch":
                 old_edges_by_entity = {}
-                for old in old_edges:
+                for old in source_edges:
                     if isinstance(old, dict) and old.get("sketch_entity_id"):
                         old_edges_by_entity.setdefault(old["sketch_entity_id"], []).append(old)
                 entities_by_id = {
@@ -7698,9 +7951,15 @@ class SolveWorkspace(Div):
                     samples = entity.get("sampled_points") or entity.get("points") or []
                     start_t = float(reference.get("start_t", 0.0))
                     end_t = float(reference.get("end_t", 1.0))
-                    low_t, high_t = sorted((start_t, end_t))
+                    local_low_t, local_high_t = sorted((start_t, end_t))
+                    parent_id = entity.get("_trim_parent_entity_id", entity_id)
+                    parent_t0 = float(entity.get("_trim_parent_t0", 0.0))
+                    parent_t1 = float(entity.get("_trim_parent_t1", 1.0))
+                    mapped_start = parent_t0 + start_t * (parent_t1 - parent_t0)
+                    mapped_end = parent_t0 + end_t * (parent_t1 - parent_t0)
+                    low_t, high_t = sorted((mapped_start, mapped_end))
                     source_candidates = [
-                        old for old in old_edges_by_entity.get(entity_id, [])
+                        old for old in old_edges_by_entity.get(parent_id, [])
                         if max(
                             min(float(old.get("sketch_t0", 0.0)), float(old.get("sketch_t1", 1.0))),
                             low_t,
@@ -7756,6 +8015,8 @@ class SolveWorkspace(Div):
                         forward = tuple(round(float(value), 12) for value in edge["vertices"][0]) == tuple(round(float(value), 12) for value in (edge_start if forward else edge_end))
                     else:
                         edge = copy.deepcopy(source_edge) if source_edge else {}
+                        if source_edge is not None and source_edge.get("id"):
+                            edge["_trim_metadata_source_id"] = source_edge["id"]
                         old_id = source_edge.get("id") if source_edge else None
                         if old_id and old_id not in used_old_ids:
                             edge["id"] = old_id
@@ -7777,8 +8038,8 @@ class SolveWorkspace(Div):
                                     curve[curve_key] = copy.deepcopy(source_curve[curve_key])
                         curve["sampled_points"] = copy.deepcopy(interval_samples)
                         edge["curve"] = curve
-                        edge["sketch_t0"] = low_t
-                        edge["sketch_t1"] = high_t
+                        edge["sketch_t0"] = local_low_t
+                        edge["sketch_t1"] = local_high_t
                         edges_by_key[key] = edge
                         edges.append(edge)
                     region_edge_ids.append(edge["id"])
@@ -7805,12 +8066,12 @@ class SolveWorkspace(Div):
                 )
                 source_ids = set(region.get("edge_ids", []))
                 candidates = [
-                    old for old in old_edges
+                    old for old in source_edges
                     if isinstance(old, dict) and old.get("id") in source_ids
                 ]
                 if not candidates:
                     candidates = [
-                        old for old in old_edges
+                        old for old in source_edges
                         if isinstance(old, dict)
                         and isinstance(old.get("curve"), dict)
                         and old["curve"].get("type") in {"arc", "circle"}
@@ -8281,14 +8542,22 @@ class SolveWorkspace(Div):
                     key = sketch_edge_key(curve_type, path)
                     if key in edges_by_key:
                         continue
+                    parent_id = entity.get("_trim_parent_entity_id", entity_id)
+                    parent_t0 = float(entity.get("_trim_parent_t0", 0.0))
+                    parent_t1 = float(entity.get("_trim_parent_t1", 1.0))
+                    mapped_start = parent_t0 + start_t * (parent_t1 - parent_t0)
+                    mapped_end = parent_t0 + end_t * (parent_t1 - parent_t0)
+                    mapped_low, mapped_high = sorted((mapped_start, mapped_end))
                     source_edge = next((
-                        old for old in old_edges
-                        if old.get("sketch_entity_id") == entity_id
+                        old for old in source_edges
+                        if old.get("sketch_entity_id") == parent_id
                         and len(old.get("vertices", [])) == 2
-                        and max(min(float(old.get("sketch_t0", 0.0)), float(old.get("sketch_t1", 1.0))), start_t)
-                            < min(max(float(old.get("sketch_t0", 0.0)), float(old.get("sketch_t1", 1.0))), end_t) + 1e-10
+                        and max(min(float(old.get("sketch_t0", 0.0)), float(old.get("sketch_t1", 1.0))), mapped_low)
+                            < min(max(float(old.get("sketch_t0", 0.0)), float(old.get("sketch_t1", 1.0))), mapped_high) + 1e-10
                     ), None)
                     edge = copy.deepcopy(source_edge) if source_edge else {}
+                    if source_edge is not None and source_edge.get("id"):
+                        edge["_trim_metadata_source_id"] = source_edge["id"]
                     old_id = source_edge.get("id") if source_edge else None
                     if old_id and old_id not in used_old_ids:
                         edge_id = old_id
@@ -8365,6 +8634,16 @@ class SolveWorkspace(Div):
                 )
         geometry["points"] = list(topology_points_by_id.values())
         geometry["topology_version"] = 1
+        mesh = self.model.setdefault("mesh", {})
+        hp_edge_ids = list(dict.fromkeys(mesh.get("hp_edge_ids", [])))
+        hp_edge_id_set = set(hp_edge_ids)
+        for edge in edges:
+            source_id = edge.pop("_trim_metadata_source_id", None)
+            edge_id = edge.get("id")
+            if source_id in hp_edge_id_set and edge_id not in hp_edge_id_set:
+                hp_edge_ids.append(edge_id)
+                hp_edge_id_set.add(edge_id)
+        mesh["hp_edge_ids"] = hp_edge_ids
         geometry["edges"] = edges
 
         # Keep a selected old edge selected across each of its split segments.
