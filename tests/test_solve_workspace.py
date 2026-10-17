@@ -1525,6 +1525,54 @@ def test_click_line_chain_waits_until_finish_and_then_commits_all_segments(stand
     assert len(workspace.model["geometry"]["edges"]) == 2
 
 
+@pytest.mark.parametrize("tool", ["rectangle", "circle", "line", "arc", "spline", "trim"])
+def test_escape_from_any_sketch_tool_returns_to_select(standalone_components, tool):
+    from types import SimpleNamespace
+
+    workspace = SolveWorkspace()
+    workspace.set_sketch_tool(tool, announce=False)
+    workspace._canvas_drag = {"operation": "draw"}
+    workspace._pending_circle_points = [(0.002, 0.001)]
+    if tool == "arc":
+        workspace._pending_arc_points = [(0.002, 0.001), (0.004, 0.001)]
+    workspace._on_canvas_keydown(SimpleNamespace(value={"key": "Escape"}))
+
+    assert workspace.sketch_tool == "select"
+    assert workspace._canvas_drag is None
+    assert workspace._pending_circle_points == []
+    assert workspace._pending_arc_points == []
+
+
+def test_global_escape_returns_to_select_in_solve_workspace(standalone_components):
+    from types import SimpleNamespace
+
+    app = NGSolveGui.__new__(NGSolveGui)
+    workspace = SolveWorkspace()
+    workspace.set_sketch_tool("rectangle", announce=False)
+    app.kb = SimpleNamespace(_mode=None, _help_visible=False, on_escape=lambda: None)
+    app._workspace_mode = "solve"
+    app.solve_workspace = workspace
+
+    app._handle_escape_shortcut()
+
+    assert workspace.sketch_tool == "select"
+
+
+def test_global_escape_closes_keyboard_overlay_before_changing_tool(standalone_components):
+    from types import SimpleNamespace
+
+    app = NGSolveGui.__new__(NGSolveGui)
+    workspace = SolveWorkspace()
+    workspace.set_sketch_tool("rectangle", announce=False)
+    app.kb = SimpleNamespace(_mode="help", _help_visible=False, on_escape=lambda: None)
+    app._workspace_mode = "solve"
+    app.solve_workspace = workspace
+
+    app._handle_escape_shortcut()
+
+    assert workspace.sketch_tool == "rectangle"
+
+
 def test_enter_finishes_line_chain_and_escape_returns_to_select(standalone_components):
     from types import SimpleNamespace
 
@@ -1919,6 +1967,192 @@ def test_trimming_circle_outside_rectangle_does_not_restore_duplicate_edges(stan
         intervals.sort()
         for previous, current in zip(intervals, intervals[1:]):
             assert previous[1] <= current[0] + 1e-10
+
+    circle_entities = [
+        entity for entity in geometry["sketch_entities"]
+        if str(entity.get("curve_group_id", "")).startswith("circle:")
+    ]
+    rectangle_right = 0.00432 + 0.02195
+    outside_circle_points = [
+        point
+        for entity in circle_entities
+        for point in entity.get("sampled_points", [])
+        if point[0] > rectangle_right + 1e-8
+    ]
+    assert circle_entities
+    assert not outside_circle_points, (
+        "Power Trim should remove the whole circle arc outside the rectangle; "
+        f"remaining outside points: {outside_circle_points[:5]}"
+    )
+
+
+def test_trimming_circle_cap_when_drag_starts_on_edge_removes_whole_cap(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.00432,
+        ("rectangle", "z_min"): -0.01092,
+        ("rectangle", "width"): 0.02195,
+        ("rectangle", "height"): 0.02175,
+    })
+    workspace._add_primitive("rectangle")
+    workspace._primitive_values.update({
+        ("circle", "r_center"): 0.02537,
+        ("circle", "z_center"): 0.0,
+        ("circle", "radius"): 0.00836,
+    })
+    workspace._add_primitive("circle")
+    geometry = workspace.model["geometry"]
+    circle_right = 0.02537 + 0.00836
+    rightmost = (circle_right, 0.0)
+    edge_distance = lambda edge: min(
+        math.dist(tuple(point[:2]), rightmost)
+        for point in (
+            (edge.get("curve") or {}).get("sampled_points")
+            or edge.get("vertices", [])
+        )
+    )
+    target_edge = min(geometry["edges"], key=edge_distance)
+    assert edge_distance(target_edge) < 1e-4
+
+    rectangle_right = 0.00432 + 0.02195
+    assert workspace._trim_sketch_entities_along_stroke(
+        [(0.033, -0.005), (0.033, 0.005)],
+        target_edge_id=target_edge["id"],
+    )
+
+    remaining_circle = [
+        entity for entity in geometry["sketch_entities"]
+        if str(entity.get("curve_group_id", "")).startswith("circle:")
+    ]
+    assert remaining_circle
+    assert all(
+        point[0] <= rectangle_right + 1e-8
+        for entity in remaining_circle
+        for point in entity.get("sampled_points", [])
+    )
+
+
+@pytest.mark.parametrize("use_click", [False, True])
+@pytest.mark.parametrize("entity_type", ["arc", "spline3"])
+def test_trimming_curve_cap_outside_rectangle_removes_full_arc_interval(
+    standalone_components, entity_type, use_click
+):
+    workspace = SolveWorkspace()
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.005,
+        ("rectangle", "z_min"): -0.015,
+        ("rectangle", "width"): 0.021,
+        ("rectangle", "height"): 0.030,
+    })
+    workspace._add_primitive("rectangle")
+    rectangle_region = workspace.model["geometry"]["regions"][0]
+    workspace._materialize_primitive_as_sketch(rectangle_region)
+    workspace._refresh_sketch_generated_regions()
+    start = (0.018, -0.010)
+    end = (0.018, 0.010)
+    if entity_type == "arc":
+        workspace.set_sketch_tool("arc", announce=False, variant="three-point")
+        assert workspace._accept_arc_sketch_point(start, variant="three-point")
+        assert workspace._accept_arc_sketch_point(end, variant="three-point")
+        assert workspace._accept_arc_sketch_point((0.028, 0.0), variant="three-point")
+    else:
+        assert workspace._add_sketch_entity("spline3", [start, (0.25, 0.0), end])
+    rectangle_right = 0.026
+    assert max(
+        point[0]
+        for entity in workspace.model["geometry"]["sketch_entities"]
+        if entity.get("type") == entity_type
+        for point in entity.get("sampled_points", [])
+    ) > rectangle_right
+
+    if use_click:
+        curve_entity = next(
+            entity for entity in workspace.model["geometry"]["sketch_entities"]
+            if entity.get("type") == entity_type
+        )
+        candidate_edges = [
+            edge for edge in workspace.model["geometry"]["edges"]
+            if edge.get("sketch_entity_id") == curve_entity["id"]
+        ]
+        target_edge = max(
+            candidate_edges,
+            key=lambda edge: max(
+                point[0]
+                for point in (
+                    (edge.get("curve") or {}).get("sampled_points")
+                    or edge.get("vertices", [])
+                )
+            ),
+        )
+        samples = (
+            (target_edge.get("curve") or {}).get("sampled_points")
+            or target_edge.get("vertices", [])
+        )
+        trim_point = max(samples, key=lambda point: point[0])
+        assert trim_point[0] > rectangle_right
+        project, _ = workspace._canvas_projection()
+        assert workspace._trim_sketch_edge_at_canvas_point(
+            target_edge["id"], project(trim_point)
+        )
+    else:
+        assert workspace._trim_sketch_entities_along_stroke(
+            [(0.027, -0.009), (0.027, 0.009)]
+        )
+    remaining = [
+        entity for entity in workspace.model["geometry"]["sketch_entities"]
+        if entity.get("type") == entity_type
+    ]
+    assert remaining
+    assert all(
+        point[0] <= rectangle_right + 1e-8
+        for entity in remaining
+        for point in entity.get("sampled_points", [])
+    )
+
+
+def test_click_trim_circle_cap_removes_whole_outside_arc(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.00432,
+        ("rectangle", "z_min"): -0.01092,
+        ("rectangle", "width"): 0.02195,
+        ("rectangle", "height"): 0.02175,
+    })
+    workspace._add_primitive("rectangle")
+    workspace._primitive_values.update({
+        ("circle", "r_center"): 0.02537,
+        ("circle", "z_center"): 0.0,
+        ("circle", "radius"): 0.00836,
+    })
+    workspace._add_primitive("circle")
+    geometry = workspace.model["geometry"]
+    circle_right = 0.02537 + 0.00836
+    rightmost = (circle_right, 0.0)
+    edge_distance = lambda edge: min(
+        math.dist(tuple(point[:2]), rightmost)
+        for point in (
+            (edge.get("curve") or {}).get("sampled_points")
+            or edge.get("vertices", [])
+        )
+    )
+    target_edge = min(geometry["edges"], key=edge_distance)
+    assert edge_distance(target_edge) < 1e-4
+
+    project, _ = workspace._canvas_projection()
+    assert workspace._trim_sketch_edge_at_canvas_point(
+        target_edge["id"], project(rightmost)
+    )
+    rectangle_right = 0.00432 + 0.02195
+    remaining_circle = [
+        entity for entity in geometry["sketch_entities"]
+        if str(entity.get("curve_group_id", "")).startswith("circle:")
+    ]
+    assert remaining_circle
+    assert all(
+        point[0] <= rectangle_right + 1e-8
+        for entity in remaining_circle
+        for point in entity.get("sampled_points", [])
+    )
 
 
 def test_trimming_a_short_closing_edge_does_not_refill_an_open_spline_contour(standalone_components):
@@ -5456,3 +5690,91 @@ def test_trim_ignores_near_coincident_curve_tessellation_crossings(standalone_co
         xs = [point[0] for point in entity["sampled_points"]]
         assert min(xs) == pytest.approx(start_x)
         assert max(xs) == pytest.approx(divider_x, abs=1e-10)
+@pytest.mark.parametrize("use_click", [False, True])
+@pytest.mark.parametrize("arc_variant", ["centerpoint", "tangent"])
+def test_trimming_centerpoint_and_tangent_arc_caps(
+    standalone_components, arc_variant, use_click
+):
+    workspace = SolveWorkspace()
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.005,
+        ("rectangle", "z_min"): -0.015,
+        ("rectangle", "width"): 0.021,
+        ("rectangle", "height"): 0.030,
+    })
+    workspace._add_primitive("rectangle")
+    rectangle_region = workspace.model["geometry"]["regions"][0]
+    workspace._materialize_primitive_as_sketch(rectangle_region)
+    workspace._refresh_sketch_generated_regions()
+
+    rectangle_right = 0.026
+    if arc_variant == "centerpoint":
+        center, start, end = (0.018, 0.0), (0.018, -0.010), (0.018, 0.010)
+        assert workspace._accept_arc_sketch_point(center, variant="centerpoint")
+        assert workspace._accept_arc_sketch_point(start, variant="centerpoint")
+        assert workspace._accept_arc_sketch_point(end, variant="centerpoint")
+    else:
+        tangent_start, tangent_end = (0.018, -0.010), (0.018, 0.010)
+        assert workspace._add_sketch_entity("line", [tangent_start, tangent_end])
+        assert workspace._accept_arc_sketch_point(tangent_end, variant="tangent")
+        assert workspace._accept_arc_sketch_point((0.028, 0.006), variant="tangent")
+
+    arc_entity = next(
+        entity for entity in workspace.model["geometry"]["sketch_entities"]
+        if entity.get("type") == "arc"
+    )
+    assert max(point[0] for point in arc_entity["sampled_points"]) > rectangle_right
+
+    if use_click:
+        candidate_edges = [
+            edge for edge in workspace.model["geometry"]["edges"]
+            if edge.get("sketch_entity_id") == arc_entity["id"]
+        ]
+        assert candidate_edges
+        target_edge = max(
+            candidate_edges,
+            key=lambda edge: max(
+                point[0]
+                for point in (
+                    (edge.get("curve") or {}).get("sampled_points")
+                    or edge.get("vertices", [])
+                )
+            ),
+        )
+        samples = (
+            (target_edge.get("curve") or {}).get("sampled_points")
+            or target_edge.get("vertices", [])
+        )
+        trim_point = max(samples, key=lambda point: point[0])
+        project, _ = workspace._canvas_projection()
+        assert workspace._trim_sketch_edge_at_canvas_point(
+            target_edge["id"], project(trim_point)
+        )
+    else:
+        samples = arc_entity["sampled_points"]
+        outside_index = max(
+            range(1, len(samples) - 1),
+            key=lambda index: samples[index][0],
+        )
+        point = samples[outside_index]
+        before, after = samples[outside_index - 1], samples[outside_index + 1]
+        tangent = (after[0] - before[0], after[1] - before[1])
+        tangent_length = math.hypot(*tangent)
+        normal = (-tangent[1] / tangent_length, tangent[0] / tangent_length)
+        reach = 0.001
+        stroke = [
+            (point[0] - reach * normal[0], point[1] - reach * normal[1]),
+            (point[0] + reach * normal[0], point[1] + reach * normal[1]),
+        ]
+        assert workspace._trim_sketch_entities_along_stroke(stroke)
+
+    remaining_arcs = [
+        entity for entity in workspace.model["geometry"]["sketch_entities"]
+        if entity.get("type") == "arc"
+    ]
+    assert remaining_arcs
+    assert all(
+        point[0] <= rectangle_right + 1e-8
+        for entity in remaining_arcs
+        for point in entity.get("sampled_points", [])
+    )

@@ -830,7 +830,7 @@ class NGSolveGui(App):
                 f"Select item {i}",
                 "Navigation",
             )
-        self.add_keybinding("escape", lambda e: self.kb.on_escape())
+        self.add_keybinding("escape", self._handle_escape_shortcut)
         self.on_before_save(self.__on_before_save)
         if isinstance(filename, str):
             self._load_with_status(filename)
@@ -970,6 +970,24 @@ class NGSolveGui(App):
         if self._global_shortcut_context_active():
             return callback()
         return False
+
+    def _handle_escape_shortcut(self, event=None):
+        """Close active overlays first; otherwise return Solve sketching to Select."""
+        kb = getattr(self, "kb", None)
+        overlay_was_open = bool(
+            kb
+            and (
+                getattr(kb, "_mode", None)
+                or getattr(kb, "_help_visible", False)
+            )
+        )
+        if kb is not None:
+            kb.on_escape()
+        if overlay_was_open or getattr(self, "_workspace_mode", None) != "solve":
+            return
+        workspace = getattr(self, "solve_workspace", None)
+        if workspace is not None:
+            workspace._handle_sketch_escape()
 
     def _open_solve_section(self, section):
         if self._workspace_mode != "solve":

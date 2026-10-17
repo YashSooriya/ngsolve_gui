@@ -3822,6 +3822,20 @@ class SolveWorkspace(Div):
             self._message("No line segment was created; choose two distinct points.", error=True)
         return added > 0
 
+    def _handle_sketch_escape(self):
+        """Return sketching to Select, preserving completed line-chain segments."""
+        if self.sketch_tool == "select":
+            return
+        if self.sketch_tool == "line" and self._pending_line_points:
+            # Escape completes the already placed line-chain points, then returns
+            # to Select. This keeps the established line-tool interaction intact.
+            self._finish_line_sketch_chain(select_tool=True)
+            return
+        cancel_arc = self.sketch_tool == "arc" and bool(self._pending_arc_points)
+        self.set_sketch_tool("select", announce=False)
+        if cancel_arc:
+            self._message("Arc cancelled.")
+
     def _on_canvas_keydown(self, event):
         payload = getattr(event, "value", None)
         key = payload.get("key") if isinstance(payload, dict) else getattr(payload, "key", None)
@@ -3830,15 +3844,15 @@ class SolveWorkspace(Div):
         if not key and isinstance(payload, str):
             key = payload
         key = str(key or "").lower()
-        if self.sketch_tool == "arc" and key == "escape":
-            self._pending_arc_points = []
-            self.set_sketch_tool("select", announce=False)
-            self._message("Arc cancelled.")
+        if key == "escape":
+            self._handle_sketch_escape()
             return
-        if self.sketch_tool != "line" or not self._pending_line_points:
-            return
-        if key in {"enter", "numpadenter", "escape"}:
-            self._finish_line_sketch_chain(select_tool=(key == "escape"))
+        if (
+            self.sketch_tool == "line"
+            and self._pending_line_points
+            and key in {"enter", "numpadenter"}
+        ):
+            self._finish_line_sketch_chain(select_tool=False)
 
     def _on_canvas_pointer_cancel(self, event=None):
         """Discard an incomplete sketch gesture after a cancelled pointer."""
@@ -6359,6 +6373,20 @@ class SolveWorkspace(Div):
         _, unproject = self._canvas_projection()
         click = unproject(canvas_point)
         if entity_id:
+            entity = next(
+                (
+                    item for item in self.model["geometry"].get("sketch_entities", [])
+                    if isinstance(item, dict) and item.get("id") == entity_id
+                ),
+                None,
+            )
+            if entity and entity.get("curve_group_id"):
+                # A face edge can reference one quadrant of a primitive circle.
+                # Resolve grouped curves through the edge so Power Trim includes
+                # neighboring quadrants and removes the whole intersection-bounded arc.
+                return self._trim_sketch_entities_along_stroke(
+                    [click, click], target_edge_id=edge_id
+                )
             interval = None
             try:
                 first = float(edge.get("sketch_t0", 0.0))
