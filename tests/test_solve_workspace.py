@@ -224,6 +224,43 @@ def test_regional_and_hp_settings_invalidate_mesh_preview(standalone_components)
     assert workspace.mesh_preview_edges == []
 
 
+def test_canvas_visibility_toggles_preserve_independent_mesh_preview(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    workspace.set_mesh_preview([((0.0, 0.0), (1.0, 0.0))])
+    region_node = workspace._canvas_region_nodes[region["id"]]
+    edge_nodes = workspace._canvas_edge_nodes[region["edge_ids"][0]]
+
+    assert workspace._canvas_background_button.ui_label == "Hide background"
+    assert workspace._canvas_geometry_button.ui_label == "Hide geometry"
+    assert workspace._canvas_grid_layer._props["display"] == "inline"
+    assert region_node._props["display"] == "inline"
+
+    workspace.toggle_canvas_background()
+    assert not workspace._canvas_background_visible
+    assert workspace._canvas_background_button.ui_label == "Show background"
+    assert workspace._canvas_grid_layer._props["display"] == "none"
+    assert region_node._props["display"] == "inline"
+    assert workspace._canvas_mesh_path._props["display"] == "inline"
+
+    workspace.toggle_canvas_geometry()
+    assert not workspace._canvas_geometry_visible
+    assert workspace._canvas_geometry_button.ui_label == "Show geometry"
+    assert region_node._props["display"] == "none"
+    assert edge_nodes[0]._props["display"] == "none"
+    assert edge_nodes[1]._props["display"] == "none"
+    assert workspace._canvas_dimensions._props["display"] == "none"
+    assert workspace._canvas_mesh_path._props["display"] == "inline"
+
+    workspace.toggle_canvas_background()
+    workspace.toggle_canvas_geometry()
+    assert workspace._canvas_grid_layer._props["display"] == "inline"
+    assert region_node._props["display"] == "inline"
+    assert edge_nodes[0]._props["display"] == "inline"
+    assert edge_nodes[1]._props["display"] == "inline"
+
+
 def test_generated_mesh_preview_is_invalidated_only_by_mesh_relevant_edits(standalone_components):
     workspace = SolveWorkspace()
     workspace.set_mesh_preview([
@@ -2940,11 +2977,14 @@ def test_canvas_render_keeps_background_and_layer_components_mounted(standalone_
     assert tuple(workspace._canvas.ui_children) == root_layers
     assert root_layers == (
         workspace._canvas_background,
-        workspace._canvas_grid,
-        workspace._canvas_live_grid,
+        workspace._canvas_grid_layer,
         workspace._canvas_scene,
         workspace._canvas_dimensions,
         workspace._canvas_preview,
+    )
+    assert tuple(workspace._canvas_grid_layer.ui_children) == (
+        workspace._canvas_grid,
+        workspace._canvas_live_grid,
     )
 
 

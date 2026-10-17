@@ -404,6 +404,8 @@ class SolveWorkspace(Div):
         self.mesh_preview_edges = []
         self.mesh_preview_visible = False
         self._mesh_preview_signature = None
+        self._canvas_background_visible = True
+        self._canvas_geometry_visible = True
         self.selected_material_id = None
         self.selected_boundary_id = None
         self.selected_source_id = None
@@ -455,6 +457,8 @@ class SolveWorkspace(Div):
         )
         self._canvas_grid = Component("g")
         self._canvas_live_grid = Component("g")
+        self._canvas_grid_layer = Component("g")
+        self._canvas_grid_layer.ui_children = [self._canvas_grid, self._canvas_live_grid]
         self._canvas_scene = Component("g")
         self._canvas_mesh_path = _svg(
             "path",
@@ -571,8 +575,7 @@ class SolveWorkspace(Div):
         self._canvas = Component(
             "svg",
             self._canvas_background,
-            self._canvas_grid,
-            self._canvas_live_grid,
+            self._canvas_grid_layer,
             self._canvas_scene,
             self._canvas_dimensions,
             self._canvas_preview,
@@ -759,6 +762,16 @@ class SolveWorkspace(Div):
         )
         zoom_out_button = _button("Zoom out", "mdi-minus", lambda *a: self.zoom_canvas(1.2), tooltip="Zoom out one step", style="flex:0 0 auto;")
         zoom_in_button = _button("Zoom in", "mdi-plus", lambda *a: self.zoom_canvas(1 / 1.2), tooltip="Zoom in one step", style="flex:0 0 auto;")
+        self._canvas_background_button = _button(
+            "Hide background", "mdi-grid", self.toggle_canvas_background,
+            tooltip="Toggle grid lines, axes, and coordinate labels.",
+            style="flex:0 0 auto; white-space:nowrap;",
+        )
+        self._canvas_geometry_button = _button(
+            "Hide geometry", "mdi-eye", self.toggle_canvas_geometry,
+            tooltip="Toggle region fills, sketch edges, and dimensions. Mesh preview stays independent.",
+            style="flex:0 0 auto; white-space:nowrap;",
+        )
         self._mesh_preview_button = _button(
             "Mesh preview", "mdi-vector-polygon", self.toggle_mesh_preview,
             disable=True,
@@ -783,11 +796,14 @@ class SolveWorkspace(Div):
             fit_view_button,
             zoom_out_button,
             zoom_in_button,
+            self._canvas_background_button,
+            self._canvas_geometry_button,
             self._mesh_preview_button,
             self._preview_3d_button,
             ui_style="display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-start; gap:8px; flex:none; width:100%; min-width:0; min-height:46px; padding:5px 12px; border-bottom:1px solid var(--border); background:var(--surface);",
         )
         self._sketch_toolbar = toolbar
+        self._sync_canvas_visibility_buttons()
         self._tool_buttons = {
             "select": select_button,
             "rectangle": rectangle_button,
@@ -800,7 +816,8 @@ class SolveWorkspace(Div):
         self._sketch_view_controls = [
             select_button, snap_button, rectangle_group, circle_group, line_button, arc_group,
             trim_button, sketch_toolbar_separator, fit_view_button, zoom_out_button,
-            zoom_in_button, self._mesh_preview_button,
+            zoom_in_button, self._canvas_background_button, self._canvas_geometry_button,
+            self._mesh_preview_button,
         ]
 
         self._preview_3d_viewport = Div(
@@ -8005,6 +8022,10 @@ class SolveWorkspace(Div):
         """Update selected dimensions without replacing the full sketch scene."""
         region = self._selected_region()
         self._canvas_dimensions.ui_children = self._region_dimension_components(region)
+        _update_svg_props(
+            self._canvas_dimensions,
+            display="inline" if self._canvas_geometry_visible else "none",
+        )
         region_id = region.get("id") if region else None
         try:
             self.js.eval(
@@ -9593,6 +9614,10 @@ class SolveWorkspace(Div):
         width, height = self._canvas_width, self._canvas_height
         _update_svg_props(self._canvas, **{"viewBox": f"0 0 {width} {height}"})
         _update_svg_props(self._canvas_background, width=width, height=height)
+        _update_svg_props(
+            self._canvas_grid_layer,
+            display="inline" if self._canvas_background_visible else "none",
+        )
         plot = self._canvas_plot_bounds()
         xy, unproject = self._canvas_projection()
         regions = self.model["geometry"]["regions"]
@@ -9663,6 +9688,7 @@ class SolveWorkspace(Div):
                 "d": path_data,
                 "id": f"solve-sketch-region-{region_id}",
                 "fill": color,
+                "display": "inline" if self._canvas_geometry_visible else "none",
                 "fill_opacity": "0.33" if not selected else "0.48",
                 "stroke": "none",
                 "stroke_width": "0",
@@ -9732,6 +9758,7 @@ class SolveWorkspace(Div):
                 "fill": "none",
                 "stroke": edge_color,
                 "stroke_width": "3.4" if condition_highlight else ("2.2" if selected else "1.6"),
+                "display": "inline" if self._canvas_geometry_visible else "none",
                 "style": "pointer-events:none;" + (" animation:mmfem-condition-edge-pulse 2.8s ease-in-out infinite;" if condition_highlight else ""),
                 "data_sketch_edge_id": edge_id,
                 "data_sketch_edge_role": "visible",
@@ -9744,6 +9771,7 @@ class SolveWorkspace(Div):
                 "d": edge_path,
                 "fill": "none",
                 "stroke": "transparent", "stroke_width": "12",
+                "display": "inline" if self._canvas_geometry_visible else "none",
                 "data_sketch_edge_id": edge_id,
                 "data_sketch_edge_role": "hit",
                 "data_sketch_region_id": region_id,
@@ -10996,6 +11024,34 @@ class SolveWorkspace(Div):
         self._mesh_preview_button.ui_label = "Hide mesh" if self.mesh_preview_visible else "Show mesh"
         self._mesh_preview_button.ui_color = "primary" if self.mesh_preview_visible else None
         self._mesh_preview_button.ui_flat = not self.mesh_preview_visible
+        self.render_canvas()
+
+    def _sync_canvas_visibility_buttons(self):
+        background_button = getattr(self, "_canvas_background_button", None)
+        if background_button is not None:
+            background_button.ui_label = (
+                "Hide background" if self._canvas_background_visible else "Show background"
+            )
+            background_button.ui_color = "primary" if self._canvas_background_visible else None
+            background_button.ui_flat = not self._canvas_background_visible
+        geometry_button = getattr(self, "_canvas_geometry_button", None)
+        if geometry_button is not None:
+            geometry_button.ui_label = (
+                "Hide geometry" if self._canvas_geometry_visible else "Show geometry"
+            )
+            geometry_button.ui_color = "primary" if self._canvas_geometry_visible else None
+            geometry_button.ui_flat = not self._canvas_geometry_visible
+
+    def toggle_canvas_background(self, *args):
+        """Toggle the grid, coordinate axes, and their labels."""
+        self._canvas_background_visible = not self._canvas_background_visible
+        self._sync_canvas_visibility_buttons()
+        self.render_canvas()
+
+    def toggle_canvas_geometry(self, *args):
+        """Toggle model geometry while leaving the mesh preview independent."""
+        self._canvas_geometry_visible = not self._canvas_geometry_visible
+        self._sync_canvas_visibility_buttons()
         self.render_canvas()
 
     def _clear_mesh_preview(self):
