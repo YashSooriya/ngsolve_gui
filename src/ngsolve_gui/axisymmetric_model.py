@@ -1736,7 +1736,7 @@ def validate_model(model: dict, *, scope="solve") -> list[str]:
                     ):
                         errors.append(f"Edge '{edge.get('name', edge_id)}' must have distinct endpoints.")
                         continue
-                    key = _coordinate_edge_key(endpoint_values)
+                    key = _coordinate_edge_key(endpoint_values, curve)
                 if key in edge_keys:
                     errors.append(f"Geometry edge '{edge.get('name', edge_id)}' duplicates another edge.")
                 edge_keys[key] = edge_id
@@ -2193,9 +2193,74 @@ def _signed_area(points):
     )
 
 
-def _coordinate_edge_key(points):
-    coordinates = [tuple(round(float(value), 12) for value in point) for point in points]
-    return tuple(sorted(coordinates))
+def _coordinate_edge_key(points, curve=None):
+    coordinates = tuple(
+        tuple(round(float(value), 12) for value in point)
+        for point in points
+    )
+    endpoint_key = tuple(sorted(coordinates))
+    if not isinstance(curve, dict):
+        return endpoint_key
+
+    curve_type = str(curve.get("type") or "line").lower()
+    if curve_type == "line":
+        return endpoint_key
+
+    if curve_type == "arc":
+        try:
+            center = tuple(round(float(value), 12) for value in curve.get("center", []))
+            radius = round(float(curve.get("radius")), 12)
+            clockwise = curve.get("clockwise")
+            if len(center) == 2 and math.isfinite(radius) and radius > 0 and isinstance(clockwise, bool):
+                # The direction flag is relative to the stored endpoint order.
+                # Normalize it so an identical arc with reversed endpoints has
+                # the same key, while the other arc between those endpoints
+                # remains distinct.
+                reversed_endpoints = coordinates[0] != endpoint_key[0]
+                canonical_clockwise = clockwise != reversed_endpoints
+                return ("arc", endpoint_key, center, radius, canonical_clockwise)
+        except (TypeError, ValueError, OverflowError):
+            pass
+
+    def normalized_path(path):
+        if not isinstance(path, (list, tuple)) or len(path) < 2:
+            return None
+        try:
+            result = tuple(
+                tuple(round(float(value), 12) for value in point)
+                for point in path
+            )
+            if any(
+                len(point) != 2
+                or not all(math.isfinite(value) for value in point)
+                for point in result
+            ):
+                return None
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        return min(result, tuple(reversed(result)))
+
+    sampled_path = normalized_path(curve.get("sampled_points"))
+    if sampled_path is not None:
+        return ("curve", curve_type, sampled_path)
+
+    if curve_type == "spline":
+        control_path = normalized_path(curve.get("control_points"))
+        if control_path is not None:
+            return ("curve", curve_type, control_path)
+    elif curve_type == "spline3":
+        control_point = normalized_path([curve.get("control_point")])
+        if control_point is not None:
+            return ("curve", curve_type, endpoint_key, control_point[0])
+
+    # Preserve curve metadata for legacy or extension curve types that do not
+    # expose samples, so a chord cannot be mistaken for the same edge.
+    metadata = tuple(sorted(
+        (str(key), repr(value))
+        for key, value in curve.items()
+        if key not in {"sampled_points", "type"}
+    ))
+    return ("curve", curve_type, endpoint_key, metadata)
 
 
 def _point_in_polygon(point, polygon):

@@ -13,7 +13,7 @@ from ngapp.components import Div
 
 import ngsolve_gui.app as app_module
 from ngsolve_gui.app import NGSolveGui
-from ngsolve_gui.axisymmetric_model import builtin_materials
+from ngsolve_gui.axisymmetric_model import builtin_materials, validate_model
 from ngsolve_gui.solve_workspace import (
     SolveWorkspace,
     _load_saved_run_history,
@@ -1584,6 +1584,44 @@ def test_shared_endpoints_do_not_merge_a_chord_with_a_curve(
 
     assert line_edge["id"] != curve_edge["id"]
     assert len(curve_edge["curve"]["sampled_points"]) >= 3
+
+    errors = validate_model(workspace.model, scope="mesh")
+    assert not any("duplicates another edge" in error for error in errors), errors
+
+
+def test_centerpoint_arc_and_chord_are_distinct_mesh_edges(standalone_components):
+    workspace = SolveWorkspace()
+    start, end = (0.006, 0.003), (0.012, 0.003)
+    center = (0.009, 0.003)
+    assert workspace._add_sketch_entity("line", [start, end])
+    assert workspace._accept_arc_sketch_point(center, variant="centerpoint")
+    assert workspace._accept_arc_sketch_point(start, variant="centerpoint")
+    assert workspace._accept_arc_sketch_point(end, variant="centerpoint")
+
+    errors = validate_model(workspace.model, scope="mesh")
+    assert not any("duplicates another edge" in error for error in errors), errors
+    assert any(
+        edge.get("curve", {}).get("type") == "arc"
+        for edge in workspace.model["geometry"]["edges"]
+    )
+
+
+def test_validator_still_detects_identical_arc_edges(standalone_components):
+    workspace = SolveWorkspace()
+    start, through, end = (0.006, 0.003), (0.009, 0.006), (0.012, 0.003)
+    assert workspace._add_sketch_entity("line", [start, end])
+    assert workspace._add_sketch_entity("arc", [start, through, end])
+    arc_edge = next(
+        edge for edge in workspace.model["geometry"]["edges"]
+        if edge.get("curve", {}).get("type") == "arc"
+    )
+    duplicate = copy.deepcopy(arc_edge)
+    duplicate["id"] = "duplicate-arc-edge"
+    duplicate["name"] = "Duplicate arc edge"
+    workspace.model["geometry"]["edges"].append(duplicate)
+
+    errors = validate_model(workspace.model, scope="mesh")
+    assert any("Duplicate arc edge" in error and "duplicates another edge" in error for error in errors), errors
 
 
 def test_selected_arc_radius_is_editable_and_preserves_endpoints(standalone_components):
