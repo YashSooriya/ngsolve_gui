@@ -7760,7 +7760,7 @@ class SolveWorkspace(Div):
         for region in self.model["geometry"]["regions"]:
             polygon = region["vertices"]
             outer_area = abs(_polygon_area(polygon))
-            if outer_area > child_area + _area_tolerance(polygon, vertices) and _contains_or_touches(polygon, vertices):
+            if outer_area > child_area + _area_tolerance(polygon, vertices) and _strictly_contains(polygon, vertices):
                 candidates.append((outer_area, region["id"]))
         return min(candidates)[1] if candidates else None
 
@@ -7807,7 +7807,7 @@ class SolveWorkspace(Div):
                 if outer["id"] != child["id"]
                 and abs(_polygon_area(outer["vertices"]))
                     > child_area + _area_tolerance(outer["vertices"], child["vertices"])
-                and _contains_or_touches(outer["vertices"], child["vertices"])
+                and _strictly_contains(outer["vertices"], child["vertices"])
             ]
             parents[child["id"]] = min(containers)[1] if containers else None
         for region in regions:
@@ -8424,6 +8424,24 @@ class SolveWorkspace(Div):
             except (TypeError, ValueError, IndexError, OverflowError):
                 continue
             dx, dy = second[0] - first[0], second[1] - first[1]
+            length_squared = dx * dx + dy * dy
+            # Region loops are the authoritative planar arrangement. Their
+            # endpoints include exact curve/line intersections even when a
+            # later analytic curve pass cannot reproduce the same parameter.
+            # Split open line remnants at those nodes before adding them, or a
+            # long cached line can overlap several already rebuilt fragments.
+            for boundary_edge in edges:
+                for point in boundary_edge.get("vertices", []):
+                    if not _point_on_segment(point, first, second, 1e-10):
+                        continue
+                    parameter = (
+                        (float(point[0]) - first[0]) * dx
+                        + (float(point[1]) - first[1]) * dy
+                    ) / length_squared
+                    if -1e-10 <= parameter <= 1.0 + 1e-10:
+                        split_parameters[entity_id].add(
+                            round(min(1.0, max(0.0, parameter)), 12)
+                        )
             parameters = sorted(split_parameters[entity_id])
             for start_t, end_t in zip(parameters, parameters[1:]):
                 if end_t - start_t <= 1e-12:
@@ -8580,6 +8598,11 @@ class SolveWorkspace(Div):
             entity.get("id") for entity in geometry.get("sketch_entities", [])
             if isinstance(entity, dict) and isinstance(entity.get("id"), str)
         }
+        sketch_entities_by_id = {
+            entity.get("id"): entity
+            for entity in geometry.get("sketch_entities", [])
+            if isinstance(entity, dict) and isinstance(entity.get("id"), str)
+        }
         for old in old_edges:
             if (
                 not isinstance(old, dict)
@@ -8601,6 +8624,20 @@ class SolveWorkspace(Div):
             )
             if key in edges_by_key:
                 continue
+            entity = sketch_entities_by_id.get(old.get("sketch_entity_id"))
+            if isinstance(entity, dict):
+                entity_samples = entity.get("sampled_points") or entity.get("points") or []
+                entity_type = str(entity.get("type", ""))
+                regenerated = (
+                    entity_type == "line" and len(entity_samples) == 2
+                ) or (
+                    entity_type != "line" and len(entity_samples) >= 2
+                )
+                if regenerated:
+                    # The sketch entity is rebuilt above, including its split
+                    # intervals. Never restore an older whole edge over those
+                    # regenerated segments.
+                    continue
             edge = copy.deepcopy(old)
             edges_by_key[key] = edge
             edges.append(edge)

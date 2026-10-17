@@ -1839,7 +1839,7 @@ def validate_model(model: dict, *, scope="solve") -> list[str]:
             if outer.get("id") != region.get("id")
             and abs(_signed_area(outer_points))
                 > child_area + _area_tolerance(outer_points, points)
-            and _contains_or_touches(outer_points, points)
+            and _strictly_contains(outer_points, points)
         ]
         expected_parent = min(containers)[1] if containers else None
         if region.get("parent_id") != expected_parent:

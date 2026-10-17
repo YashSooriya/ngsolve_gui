@@ -1866,6 +1866,61 @@ def test_power_trim_can_cut_a_primitive_rectangle_edge(standalone_components):
     assert len(workspace.model["geometry"]["sketch_entities"]) == 3
 
 
+def test_trimming_circle_outside_rectangle_does_not_restore_duplicate_edges(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.00432,
+        ("rectangle", "z_min"): -0.01092,
+        ("rectangle", "width"): 0.02195,
+        ("rectangle", "height"): 0.02175,
+    })
+    workspace._add_primitive("rectangle")
+    workspace._primitive_values.update({
+        ("circle", "r_center"): 0.02537,
+        ("circle", "z_center"): 0.0,
+        ("circle", "radius"): 0.00836,
+    })
+    workspace._add_primitive("circle")
+    geometry = workspace.model["geometry"]
+    assert len(geometry["regions"]) == 3
+
+    # Power-trim the outer circular cap beyond the rectangle's right edge.
+    assert workspace._trim_sketch_entities_along_stroke(
+        [(0.033, -0.005), (0.033, 0.005)]
+    )
+
+    geometry = workspace.model["geometry"]
+    assert len(geometry["regions"]) == 2
+    assert all(region.get("parent_id") is None for region in geometry["regions"])
+    assert all(
+        loop.get("role") == "outer"
+        for region in geometry["regions"]
+        for loop in region.get("boundary_loops", [])
+    )
+    edge_ids = {edge["id"] for edge in geometry["edges"]}
+    referenced_edge_ids = {
+        edge_id
+        for region in geometry["regions"]
+        for edge_id in region.get("edge_ids", [])
+    }
+    errors = validate_model(workspace.model, scope="mesh")
+    assert not any("Unattached edge" in error for error in errors)
+    assert edge_ids == referenced_edge_ids
+
+    intervals_by_entity = {}
+    for edge in geometry["edges"]:
+        entity_id = edge.get("sketch_entity_id")
+        if not entity_id:
+            continue
+        start = min(float(edge.get("sketch_t0", 0.0)), float(edge.get("sketch_t1", 1.0)))
+        end = max(float(edge.get("sketch_t0", 0.0)), float(edge.get("sketch_t1", 1.0)))
+        intervals_by_entity.setdefault(entity_id, []).append((start, end))
+    for intervals in intervals_by_entity.values():
+        intervals.sort()
+        for previous, current in zip(intervals, intervals[1:]):
+            assert previous[1] <= current[0] + 1e-10
+
+
 def test_trimming_a_short_closing_edge_does_not_refill_an_open_spline_contour(standalone_components):
     workspace = SolveWorkspace()
     assert workspace._add_sketch_entity("line", [(0.003, 0.0), (0.010, 0.0)])
@@ -4480,15 +4535,17 @@ def test_circle_crossing_square_creates_clean_curved_regions(standalone_componen
                 for first, second in zip(samples, samples[1:])
             )
 
-    # The overlap face must be filled from its sampled arc boundary, not just
-    # the two intersection endpoints joined by a straight chord.
-    parent_id = next(region["id"] for region in regions if region["shape"]["type"] == "sketch"
-                     and region.get("parent_id") is None)
-    overlap = next(region for region in regions if region.get("parent_id") == parent_id)
-    contour = workspace._canvas_region_path_data(
-        overlap, project=lambda point: (point[0] * 1e6, point[1] * 1e6)
-    )
-    assert contour.count("L") >= 40
+    # Intersecting faces touch at their shared boundaries, so none should be
+    # misclassified as a nested child. Curved faces still render their sampled
+    # arc contour rather than a chord between intersection points.
+    assert all(region.get("parent_id") is None for region in regions)
+    contours = [
+        workspace._canvas_region_path_data(
+            region, project=lambda point: (point[0] * 1e6, point[1] * 1e6)
+        )
+        for region in regions
+    ]
+    assert max(contour.count("L") for contour in contours) >= 40
 
 
 @pytest.mark.parametrize("curve_kind", ["three-point-arc", "tangent-arc", "spline3", "spline"])
