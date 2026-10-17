@@ -4758,6 +4758,104 @@ class SolveWorkspace(Div):
         self._add_primitive("circle")
         self.set_sketch_tool("select", announce=False)
 
+    @staticmethod
+    def _merge_sketch_parameter_intervals(intervals, *, tolerance=1e-8):
+        cleaned = []
+        for interval in intervals or []:
+            if not isinstance(interval, (list, tuple)) or len(interval) != 2:
+                continue
+            try:
+                first, second = (float(value) for value in interval)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(first) or not math.isfinite(second):
+                continue
+            low = max(0.0, min(1.0, min(first, second)))
+            high = max(0.0, min(1.0, max(first, second)))
+            if high - low > tolerance:
+                cleaned.append((low, high))
+        merged = []
+        for low, high in sorted(cleaned):
+            if merged and low <= merged[-1][1] + tolerance:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], high))
+            else:
+                merged.append((low, high))
+        return merged
+
+    def _sketch_entity_active_intervals(self, entity, geometry=None):
+        """Return the ranges of a source curve that are present in the sketch."""
+        if not isinstance(entity, dict):
+            return []
+        if isinstance(entity.get("active_intervals"), (list, tuple)):
+            return self._merge_sketch_parameter_intervals(entity["active_intervals"])
+        geometry = geometry or self.model.get("geometry", {})
+        entity_id = entity.get("id")
+        raw_source = entity.get("sampled_points") or entity.get("points") or []
+        try:
+            source = [(float(point[0]), float(point[1])) for point in raw_source if len(point) >= 2]
+        except (TypeError, ValueError, IndexError, OverflowError):
+            source = []
+        if len(source) < 2:
+            return []
+        edge_points = [
+            (float(point[0]), float(point[1]))
+            for edge in geometry.get("edges", []) if isinstance(edge, dict)
+            for point in edge.get("vertices", [])
+            if isinstance(point, (list, tuple)) and len(point) >= 2
+        ]
+        span = max(
+            max((point[0] for point in edge_points), default=0.0) - min((point[0] for point in edge_points), default=0.0),
+            max((point[1] for point in edge_points), default=0.0) - min((point[1] for point in edge_points), default=0.0),
+            1e-12,
+        )
+        match_tolerance = max(1e-12, min(1e-7, span * 2.5e-5))
+
+        def nearest_parameter(point):
+            best_distance, best_parameter = float("inf"), 0.0
+            count = len(source) - 1
+            for index, (first, second) in enumerate(zip(source, source[1:])):
+                dx, dy = second[0] - first[0], second[1] - first[1]
+                length2 = dx * dx + dy * dy
+                fraction = 0.0 if length2 <= 1e-24 else min(
+                    1.0, max(0.0, ((point[0] - first[0]) * dx + (point[1] - first[1]) * dy) / length2)
+                )
+                nearest = (first[0] + fraction * dx, first[1] + fraction * dy)
+                distance = math.dist(point, nearest)
+                if distance < best_distance:
+                    best_distance = distance
+                    best_parameter = (index + fraction) / count
+            return best_distance, best_parameter
+
+        edge_ranges = []
+        for edge in geometry.get("edges", []):
+            if not isinstance(edge, dict) or edge.get("sketch_entity_id") != entity_id:
+                continue
+            curve = edge.get("curve", {})
+            raw_edge = curve.get("sampled_points") if isinstance(curve, dict) else None
+            raw_edge = raw_edge or edge.get("vertices", [])
+            try:
+                points = [(float(point[0]), float(point[1])) for point in raw_edge if len(point) >= 2]
+            except (TypeError, ValueError, IndexError, OverflowError):
+                continue
+            if len(points) < 2:
+                continue
+            matches = [nearest_parameter(point) for point in points]
+            if max(distance for distance, _ in matches) <= match_tolerance:
+                values = [parameter for _, parameter in matches]
+                edge_ranges.append((min(values), max(values)))
+        # Face references are authoritative only when there is a corresponding
+        # cached visible edge. Without an edge record this may be a freshly
+        # created open overhang, which must remain editable.
+        ranges = list(edge_ranges) if edge_ranges else []
+        for region in geometry.get("regions", []) if edge_ranges else []:
+            shape = region.get("shape", {})
+            if not isinstance(shape, dict) or shape.get("type") != "sketch":
+                continue
+            for boundary in shape.get("boundary", []):
+                if isinstance(boundary, dict) and boundary.get("entity_id") == entity_id:
+                    ranges.append((boundary.get("start_t", 0.0), boundary.get("end_t", 1.0)))
+        return self._merge_sketch_parameter_intervals(ranges) or [(0.0, 1.0)]
+
     @_history_tracked
     def _trim_sketch_entities_along_stroke(
         self, world_stroke, *, target_entity_ids=None, target_edge_id=None,
@@ -5235,6 +5333,11 @@ class SolveWorkspace(Div):
             self._message("That edge cannot be trimmed as an editable sketch curve.", error=True)
             return False
 
+        active_intervals_by_id = {
+            entity.get("id"): self._sketch_entity_active_intervals(entity, geometry)
+            for entity in entities if isinstance(entity, dict) and isinstance(entity.get("id"), str)
+        }
+
         # Imported and previously edited geometry can contain multiple sketch
         # entities tracing the same visible edge. Treat those as one trim target
         # so clipping one source does not leave a duplicate curve on screen.
@@ -5272,8 +5375,10 @@ class SolveWorkspace(Div):
                         distance, other_parameter = nearest_parameter(point, other_samples)
                         first_tangent = sample_tangent(selected_samples, selected_parameter)
                         second_tangent = sample_tangent(other_samples, other_parameter)
+                        other_active = active_intervals_by_id.get(other_id, [(0.0, 1.0)])
                         if (
                             distance > 2.5
+                            or not any(lo - parameter_epsilon <= other_parameter <= hi + parameter_epsilon for lo, hi in other_active)
                             or first_tangent is None
                             or second_tangent is None
                             or abs(first_tangent[0] * second_tangent[0]
@@ -5410,6 +5515,7 @@ class SolveWorkspace(Div):
                 replacement_entities.append(entity)
                 continue
             samples_screen = [project(point) for point in samples_world]
+            active_ranges = active_intervals_by_id.get(entity.get("id"), [(0.0, 1.0)])
             hit_parameters = []
             nearest = None
             for stroke_a, stroke_b in zip(stroke, stroke[1:]):
@@ -5417,20 +5523,26 @@ class SolveWorkspace(Div):
                     local = segment_hit_parameter(stroke_a, stroke_b, curve_a, curve_b)
                     if local is not None:
                         parameter = (index + local) / (len(samples_screen) - 1)
-                        if hit_is_in_target_interval(parameter):
+                        if hit_is_in_target_interval(parameter) and any(
+                            lo - parameter_epsilon <= parameter <= hi + parameter_epsilon for lo, hi in active_ranges
+                        ):
                             hit_parameters.append(parameter)
                         continue
                     for point in (stroke_a, stroke_b):
                         distance, local = point_segment_distance(point, curve_a, curve_b)
                         parameter = (index + local) / (len(samples_screen) - 1)
-                        if not hit_is_in_target_interval(parameter):
+                        if not hit_is_in_target_interval(parameter) or not any(
+                            lo - parameter_epsilon <= parameter <= hi + parameter_epsilon for lo, hi in active_ranges
+                        ):
                             continue
                         candidate = (distance, parameter)
                         if nearest is None or candidate[0] < nearest[0]:
                             nearest = candidate
                     for point, parameter in ((curve_a, index / (len(samples_screen) - 1)),
                                              (curve_b, (index + 1) / (len(samples_screen) - 1))):
-                        if not hit_is_in_target_interval(parameter):
+                        if not hit_is_in_target_interval(parameter) or not any(
+                            lo - parameter_epsilon <= parameter <= hi + parameter_epsilon for lo, hi in active_ranges
+                        ):
                             continue
                         distance, _ = point_segment_distance(point, stroke_a, stroke_b)
                         candidate = (distance, parameter)
@@ -5454,12 +5566,19 @@ class SolveWorkspace(Div):
                     candidate_intersections = curve_intersections(
                         entity, other, samples_screen, other_samples_screen
                     )
-                    intersections.extend(
-                        parameter for parameter in candidate_intersections
-                        if not is_overlapping_curve_intersection(
-                            parameter, samples_screen, other_samples_screen
-                        )
-                    )
+                    other_active = active_intervals_by_id.get(other.get("id"), [(0.0, 1.0)])
+                    for parameter in candidate_intersections:
+                        if not any(lo - parameter_epsilon <= parameter <= hi + parameter_epsilon for lo, hi in active_ranges):
+                            continue
+                        if is_overlapping_curve_intersection(parameter, samples_screen, other_samples_screen):
+                            continue
+                        point = sample_at(samples_screen, parameter)
+                        distance, other_parameter = nearest_parameter(point, other_samples_screen)
+                        if distance <= 2.5 and any(
+                            lo - parameter_epsilon <= other_parameter <= hi + parameter_epsilon
+                            for lo, hi in other_active
+                        ):
+                            intersections.append(parameter)
             intersections = unique_parameters(intersections)
             if target_interval is not None:
                 intersections = [
@@ -5501,15 +5620,22 @@ class SolveWorkspace(Div):
                 replacement_entities.append(entity)
                 continue
 
-            cuts = unique_parameters([0.0, 1.0, *intersections, *topology_parameters])
-            sections = list(zip(cuts, cuts[1:]))
+            sections = []
+            for active_start, active_end in active_ranges:
+                local_cuts = [active_start, active_end]
+                local_cuts.extend(value for value in intersections if active_start + parameter_epsilon < value < active_end - parameter_epsilon)
+                local_cuts.extend(value for value in topology_parameters if active_start + parameter_epsilon < value < active_end - parameter_epsilon)
+                cuts = unique_parameters(local_cuts)
+                sections.extend((lo, hi) for lo, hi in zip(cuts, cuts[1:]) if hi - lo > parameter_epsilon)
             removed = set()
             for hit in hit_parameters:
                 # A hit exactly on an interior intersection does not identify
                 # which adjacent segment the user intended to remove.
-                if any(parameter_epsilon < boundary < 1.0 - parameter_epsilon
-                       and abs(hit - boundary) <= parameter_epsilon
-                       for boundary in intersections):
+                if any(
+                    active_start + parameter_epsilon < boundary < active_end - parameter_epsilon
+                    and abs(hit - boundary) <= parameter_epsilon
+                    for active_start, active_end in active_ranges for boundary in intersections
+                ):
                     continue
                 for index, (lo, hi) in enumerate(sections):
                     if lo - parameter_epsilon <= hit <= hi + parameter_epsilon:
@@ -5565,9 +5691,16 @@ class SolveWorkspace(Div):
                 )
             )
         ]
+        partial_intervals = {
+            entity_id: ranges
+            for entity_id, ranges in active_intervals_by_id.items()
+            if entity_id not in changed_entity_ids
+            and not (len(ranges) == 1 and abs(ranges[0][0]) <= 1e-12 and abs(ranges[0][1] - 1.0) <= 1e-12)
+        }
         self._refresh_sketch_generated_regions(
             source_templates=source_templates or None,
             entity_ids=refresh_entity_ids,
+            active_intervals_by_id=partial_intervals,
         )
         self.selected_edge_ids = []
         self.selected_edge_id = None
@@ -5592,7 +5725,7 @@ class SolveWorkspace(Div):
             intervals.append((entity_id, round(min(start, end), 9), round(max(start, end), 9)))
         return tuple(sorted(intervals)) if intervals else tuple(sorted(set(entity_ids)))
 
-    def _refresh_sketch_generated_regions(self, *, source_templates=None, entity_ids=None):
+    def _refresh_sketch_generated_regions(self, *, source_templates=None, entity_ids=None, active_intervals_by_id=None):
         geometry = self.model["geometry"]
         old_generated = [
             region for region in geometry.get("regions", [])
@@ -5623,7 +5756,63 @@ class SolveWorkspace(Div):
         if entity_ids is not None:
             allowed_entity_ids = set(entity_ids)
             sketch_entities = [item for item in sketch_entities if item.get("id") in allowed_entity_ids]
-        for loop in find_closed_sketch_loops(sketch_entities):
+        interval_views = []
+        interval_view_sources = {}
+        for entity in sketch_entities:
+            entity_id = entity.get("id")
+            ranges = (active_intervals_by_id or {}).get(entity_id)
+            if not ranges:
+                interval_views.append(entity)
+                continue
+            if len(ranges) == 1 and abs(ranges[0][0]) <= 1e-12 and abs(ranges[0][1] - 1.0) <= 1e-12:
+                interval_views.append(entity)
+                continue
+            source_samples = entity.get("sampled_points") or entity.get("points") or []
+            for interval_index, (start_t, end_t) in enumerate(ranges):
+                if end_t - start_t <= 1e-9:
+                    continue
+                view = copy.deepcopy(entity)
+                view_id = f"__active_interval__{entity_id}__{interval_index}"
+                view["id"] = view_id
+                view["_parameter_source_entity"] = entity
+                view["_parameter_source_interval"] = [start_t, end_t]
+                sample_count = max(2, int(math.ceil(max(1, len(source_samples) - 1) * (end_t - start_t))) + 1)
+                view_samples = []
+                for sample_index in range(sample_count):
+                    parameter = start_t + (end_t - start_t) * sample_index / (sample_count - 1)
+                    point = evaluate_sketch_entity(entity, parameter)
+                    if point is not None:
+                        view_samples.append([float(point[0]), float(point[1])])
+                if len(view_samples) < 2:
+                    continue
+                view["sampled_points"] = view_samples
+                interval_views.append(view)
+                interval_view_sources[view_id] = (entity_id, start_t, end_t)
+        loops = find_closed_sketch_loops(interval_views)
+        for loop in loops:
+            mapped_entity_ids = []
+            mapped_boundary = []
+            for view_id in loop.get("entity_ids", []):
+                source = interval_view_sources.get(view_id)
+                entity_id = source[0] if source else view_id
+                if entity_id not in mapped_entity_ids:
+                    mapped_entity_ids.append(entity_id)
+            for reference in loop.get("boundary", []):
+                source = interval_view_sources.get(reference.get("entity_id"))
+                if source is None:
+                    mapped_boundary.append(reference)
+                    continue
+                entity_id, start_t, end_t = source
+                mapped = copy.deepcopy(reference)
+                mapped["entity_id"] = entity_id
+                mapped["start_t"] = start_t + float(reference.get("start_t", 0.0)) * (end_t - start_t)
+                mapped["end_t"] = start_t + float(reference.get("end_t", 1.0)) * (end_t - start_t)
+                mapped_boundary.append(mapped)
+            if interval_view_sources:
+                if len(mapped_boundary) < 3:
+                    continue
+                loop["entity_ids"] = mapped_entity_ids
+                loop["boundary"] = mapped_boundary
             vertices = loop["vertices"]
             parent_id = self._find_containing_region(vertices)
             if self._has_unsupported_overlap(vertices, parent_id, regions=source_regions):
@@ -7801,6 +7990,111 @@ class SolveWorkspace(Div):
                 edges_by_key[key] = edge
                 edges.append(edge)
                 current_edge_ids.add(edge_id)
+
+        # Edges on generated faces cover only the curve intervals that bound
+        # those faces. Preserve the remaining authored arc/spline intervals as
+        # open sketch edges, so they remain visible and trim-able. When a loaded
+        # project already has edge records, those records define its visible
+        # source ranges and prevent hidden portions from being resurrected.
+        boundary_intervals_by_entity = {}
+        for region in geometry.get("regions", []):
+            shape = region.get("shape", {})
+            if not isinstance(shape, dict) or shape.get("type") != "sketch":
+                continue
+            for reference in shape.get("boundary", []):
+                if isinstance(reference, dict) and isinstance(reference.get("entity_id"), str):
+                    boundary_intervals_by_entity.setdefault(reference["entity_id"], []).append((
+                        reference.get("start_t", 0.0), reference.get("end_t", 1.0)
+                    ))
+
+        for entity in geometry.get("sketch_entities", []):
+            if not isinstance(entity, dict) or entity.get("type") == "line":
+                continue
+            entity_id = entity.get("id")
+            source_samples = entity.get("sampled_points") or entity.get("points") or []
+            if not isinstance(entity_id, str) or len(source_samples) < 2:
+                continue
+            active_ranges = self._sketch_entity_active_intervals(entity, geometry)
+            covered_ranges = self._merge_sketch_parameter_intervals(
+                boundary_intervals_by_entity.get(entity_id, [])
+            )
+            for active_start, active_end in active_ranges:
+                cuts = {active_start, active_end}
+                for cover_start, cover_end in covered_ranges:
+                    if active_start < cover_start < active_end:
+                        cuts.add(cover_start)
+                    if active_start < cover_end < active_end:
+                        cuts.add(cover_end)
+                ordered = sorted(cuts)
+                for start_t, end_t in zip(ordered, ordered[1:]):
+                    if end_t - start_t <= 1e-10:
+                        continue
+                    midpoint = 0.5 * (start_t + end_t)
+                    if any(lo - 1e-10 <= midpoint <= hi + 1e-10 for lo, hi in covered_ranges):
+                        continue
+                    parameters = [start_t]
+                    parameters.extend(
+                        index / (len(source_samples) - 1)
+                        for index in range(1, len(source_samples) - 1)
+                        if start_t < index / (len(source_samples) - 1) < end_t
+                    )
+                    parameters.append(end_t)
+                    path = []
+                    for parameter in parameters:
+                        point = evaluate_sketch_entity(entity, parameter)
+                        if point is None:
+                            scaled = parameter * (len(source_samples) - 1)
+                            index = min(len(source_samples) - 2, max(0, int(math.floor(scaled))))
+                            fraction = scaled - index
+                            first, second = source_samples[index], source_samples[index + 1]
+                            point = tuple(
+                                float(first[axis]) + fraction * (float(second[axis]) - float(first[axis]))
+                                for axis in range(2)
+                            )
+                        path.append([float(point[0]), float(point[1])])
+                    if len(path) < 2 or math.dist(path[0], path[-1]) <= 1e-12:
+                        continue
+                    authored_points = entity.get("points") or []
+                    if start_t <= 1e-12 and len(authored_points) >= 2:
+                        path[0] = [float(value) for value in authored_points[0][:2]]
+                    if end_t >= 1.0 - 1e-12 and len(authored_points) >= 2:
+                        path[-1] = [float(value) for value in authored_points[-1][:2]]
+                    if any(
+                        edge.get("sketch_entity_id") == entity_id
+                        and min(float(edge.get("sketch_t0", 0.0)), float(edge.get("sketch_t1", 1.0))) <= start_t + 1e-9
+                        and max(float(edge.get("sketch_t0", 0.0)), float(edge.get("sketch_t1", 1.0))) >= end_t - 1e-9
+                        for edge in edges
+                    ):
+                        continue
+                    curve_type = str(entity.get("type", "spline"))
+                    key = sketch_edge_key(curve_type, path)
+                    if key in edges_by_key:
+                        continue
+                    source_edge = next((
+                        old for old in old_edges
+                        if old.get("sketch_entity_id") == entity_id
+                        and len(old.get("vertices", [])) == 2
+                        and max(min(float(old.get("sketch_t0", 0.0)), float(old.get("sketch_t1", 1.0))), start_t)
+                            < min(max(float(old.get("sketch_t0", 0.0)), float(old.get("sketch_t1", 1.0))), end_t) + 1e-10
+                    ), None)
+                    edge = copy.deepcopy(source_edge) if source_edge else {}
+                    old_id = source_edge.get("id") if source_edge else None
+                    if old_id and old_id not in used_old_ids:
+                        edge_id = old_id
+                        used_old_ids.add(old_id)
+                    else:
+                        edge_id = new_id("edge")
+                    edge["id"] = edge_id
+                    edge.setdefault("name", entity.get("name", f"Edge {len(edges) + 1}"))
+                    edge.setdefault("boundary_condition_ids", _edge_condition_ids(source_edge) if source_edge else [])
+                    edge["vertices"] = [path[0], path[-1]]
+                    edge["sketch_entity_id"] = entity_id
+                    edge["sketch_t0"], edge["sketch_t1"] = start_t, end_t
+                    edge["curve"] = copy.deepcopy(entity)
+                    edge["curve"]["sampled_points"] = copy.deepcopy(path)
+                    edges_by_key[key] = edge
+                    edges.append(edge)
+                    current_edge_ids.add(edge_id)
 
         live_sketch_entity_ids = {
             entity.get("id") for entity in geometry.get("sketch_entities", [])

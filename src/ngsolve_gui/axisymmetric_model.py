@@ -65,6 +65,12 @@ def evaluate_sketch_entity(entity, parameter):
     if not isinstance(entity, dict):
         return None
     try:
+        source_entity = entity.get("_parameter_source_entity")
+        source_interval = entity.get("_parameter_source_interval")
+        if isinstance(source_entity, dict) and isinstance(source_interval, (list, tuple)) and len(source_interval) == 2:
+            source_start, source_end = (float(value) for value in source_interval)
+            local_parameter = min(1.0, max(0.0, float(parameter)))
+            return evaluate_sketch_entity(source_entity, source_start + local_parameter * (source_end - source_start))
         t = min(1.0, max(0.0, float(parameter)))
         if not math.isfinite(t):
             return None
