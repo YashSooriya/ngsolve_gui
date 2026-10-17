@@ -516,6 +516,7 @@ def find_closed_sketch_loops(entities, *, tolerance=1e-12):
             current = initial
             cycle_nodes = []
             cycle_refs = []
+            cycle_edge_indices = []
             closed = False
             for _ in range(2 * len(segments) + 1):
                 start, current_edge = current
@@ -524,6 +525,7 @@ def find_closed_sketch_loops(entities, *, tolerance=1e-12):
                     break
                 visited.add(current)
                 cycle_nodes.append(start)
+                cycle_edge_indices.append(current_edge)
                 edge_start, edge_end, entity_id, path_t0, path_t1 = segments[current_edge]
                 forward = start == edge_start
                 from_t, to_t = (path_t0, path_t1) if forward else (path_t1, path_t0)
@@ -548,6 +550,33 @@ def find_closed_sketch_loops(entities, *, tolerance=1e-12):
                     break
             if not closed or len(cycle_nodes) < 3:
                 continue
+            # A face walk can include a dangling branch attached to a valid
+            # contour: it travels down the branch and returns over the same
+            # edges before continuing around the face. Remove those closed
+            # excursions so the valid face survives, while an open contour
+            # made only from a doubled-back branch reduces below three nodes.
+            while len(cycle_nodes) >= 3:
+                seen_nodes = {}
+                repeated_pair = None
+                for index, node in enumerate(cycle_nodes):
+                    if node in seen_nodes:
+                        repeated_pair = (seen_nodes[node], index)
+                        break
+                    seen_nodes[node] = index
+                if repeated_pair is None:
+                    break
+                first, repeated = repeated_pair
+                cycle_nodes = cycle_nodes[:first + 1] + cycle_nodes[repeated + 1:]
+                cycle_refs = cycle_refs[:first] + cycle_refs[repeated:]
+                cycle_edge_indices = (
+                    cycle_edge_indices[:first] + cycle_edge_indices[repeated:]
+                )
+            if (
+                len(cycle_nodes) < 3
+                or len(set(cycle_edge_indices)) != len(cycle_edge_indices)
+                or len(set(cycle_nodes)) != len(cycle_nodes)
+            ):
+                continue
             canonical_start = min(range(len(cycle_nodes)), key=lambda index: cycle_nodes[index])
             cycle_nodes = cycle_nodes[canonical_start:] + cycle_nodes[:canonical_start]
             cycle_refs = cycle_refs[canonical_start:] + cycle_refs[:canonical_start]
@@ -557,7 +586,19 @@ def find_closed_sketch_loops(entities, *, tolerance=1e-12):
                 - polygon[(i + 1) % len(polygon)][0] * polygon[i][1]
                 for i in range(len(polygon))
             )
-            if area <= tolerance * tolerance:
+            extent = max(
+                max(point[0] for point in polygon) - min(point[0] for point in polygon),
+                max(point[1] for point in polygon) - min(point[1] for point in polygon),
+                tolerance,
+            )
+            coordinate_scale = max(
+                extent,
+                max(abs(value) for point in polygon for value in point),
+                tolerance,
+            )
+            roundoff_area = math.ulp(max(coordinate_scale * coordinate_scale, 1e-300)) * len(polygon) * 8
+            area_tolerance = max(tolerance * extent, roundoff_area)
+            if area <= area_tolerance:
                 continue
             canonical = tuple(cycle_nodes)
             rotations = [canonical[i:] + canonical[:i] for i in range(len(canonical))]

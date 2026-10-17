@@ -1866,6 +1866,210 @@ def test_power_trim_can_cut_a_primitive_rectangle_edge(standalone_components):
     assert len(workspace.model["geometry"]["sketch_entities"]) == 3
 
 
+def test_trimming_a_short_closing_edge_does_not_refill_an_open_spline_contour(standalone_components):
+    workspace = SolveWorkspace()
+    assert workspace._add_sketch_entity("line", [(0.003, 0.0), (0.010, 0.0)])
+    assert workspace._add_sketch_entity("line", [(0.006, 0.0), (0.006, 0.002)])
+    assert workspace._add_sketch_entity("spline3", [(0.006, 0.002), (0.00826, 0.00152), (0.010, 0.0)])
+    assert len(workspace.model["geometry"]["regions"]) == 1
+
+    vertical = next(
+        edge for edge in workspace.model["geometry"]["edges"]
+        if abs(edge["vertices"][0][0] - 0.006) < 1e-10
+        and abs(edge["vertices"][1][0] - 0.006) < 1e-10
+        and abs(edge["vertices"][0][1] - edge["vertices"][1][1]) > 1e-10
+    )
+    project, _ = workspace._canvas_projection()
+    assert workspace._trim_sketch_edge_at_canvas_point(vertical["id"], project((0.006, 0.001)))
+
+    assert workspace.model["geometry"]["regions"] == []
+    assert {entity["type"] for entity in workspace.model["geometry"]["sketch_entities"]} == {"line", "spline3"}
+
+
+def test_trimming_a_spline_overhang_preserves_its_attached_region(standalone_components):
+    workspace = SolveWorkspace()
+    base = [(0.01838, -0.00175), (0.02052, -0.00175)]
+    spline = [(0.01625, -0.00175), (0.01773, -0.00047), (0.02052, -0.00175)]
+    vertical = [(0.01838, -0.0011792779896355491), (0.01838, -0.00175)]
+    geometry = workspace.model["geometry"]
+    geometry["sketch_entities"] = [
+        {"id": "base", "type": "line", "points": base, "sampled_points": base},
+        {
+            "id": "spline", "type": "spline3", "points": spline,
+            "control_point": spline[1], "sampled_points": workspace._sample_spline3(*spline),
+        },
+        {"id": "vertical", "type": "line", "points": vertical, "sampled_points": vertical},
+    ]
+    workspace._refresh_sketch_generated_regions()
+    assert len(geometry["regions"]) == 1
+
+    assert workspace._trim_sketch_entities_along_stroke(
+        [(0.017, -0.0005), (0.017, -0.0025)]
+    )
+    assert len(geometry["regions"]) == 1
+    remaining_spline = next(entity for entity in geometry["sketch_entities"] if entity["type"] in {"spline", "spline3"})
+    assert min(point[0] for point in remaining_spline["sampled_points"]) >= 0.01838 - 1e-8
+
+
+def test_trimming_a_spline_region_boundary_removes_its_curve_edge(standalone_components):
+    workspace = SolveWorkspace()
+    base = [(0.01838, -0.00175), (0.02052, -0.00175)]
+    spline = [(0.01625, -0.00175), (0.01773, -0.00047), (0.02052, -0.00175)]
+    vertical = [(0.01838, -0.0011792779896355491), (0.01838, -0.00175)]
+    geometry = workspace.model["geometry"]
+    geometry["sketch_entities"] = [
+        {"id": "base", "type": "line", "points": base, "sampled_points": base},
+        {
+            "id": "spline", "type": "spline3", "points": spline,
+            "control_point": spline[1], "sampled_points": workspace._sample_spline3(*spline),
+        },
+        {"id": "vertical", "type": "line", "points": vertical, "sampled_points": vertical},
+    ]
+    workspace._refresh_sketch_generated_regions()
+    assert len(geometry["regions"]) == 1
+
+    assert workspace._trim_sketch_entities_along_stroke(
+        [(0.0193, -0.0005), (0.0193, -0.0015)]
+    )
+    assert geometry["regions"] == []
+    remaining_spline = next(
+        entity for entity in geometry["sketch_entities"]
+        if entity["type"] in {"spline", "spline3"}
+    )
+    assert max(point[0] for point in remaining_spline["sampled_points"]) <= 0.01838 + 1e-8
+    assert not any(
+        edge.get("sketch_entity_id") == remaining_spline["id"]
+        and max(point[0] for point in edge.get("vertices", [])) > 0.01838 + 1e-8
+        for edge in geometry["edges"]
+    )
+
+
+def test_trimming_the_overhang_preserves_the_curved_region(standalone_components):
+    workspace = SolveWorkspace()
+    assert workspace._add_sketch_entity("line", [(0.003, 0.0), (0.010, 0.0)])
+    assert workspace._add_sketch_entity("line", [(0.006, 0.0), (0.006, 0.002)])
+    assert workspace._add_sketch_entity("arc", [(0.006, 0.002), (0.00826, 0.00152), (0.010, 0.0)])
+    assert len(workspace.model["geometry"]["regions"]) == 1
+
+    overhang = next(
+        edge for edge in workspace.model["geometry"]["edges"]
+        if all(abs(point[1]) < 1e-10 for point in edge["vertices"])
+        and max(point[0] for point in edge["vertices"]) <= 0.006 + 1e-10
+        and min(point[0] for point in edge["vertices"]) < 0.006 - 1e-10
+    )
+    project, _ = workspace._canvas_projection()
+    assert workspace._trim_sketch_edge_at_canvas_point(overhang["id"], project((0.004, 0.0)))
+
+    assert len(workspace.model["geometry"]["regions"]) == 1
+    assert any(entity["type"] == "arc" for entity in workspace.model["geometry"]["sketch_entities"])
+    assert any(
+        entity["type"] == "line"
+        and all(abs(point[1]) < 1e-10 for point in entity["points"])
+        and min(point[0] for point in entity["points"]) >= 0.006 - 1e-10
+        for entity in workspace.model["geometry"]["sketch_entities"]
+    )
+
+
+def test_trimming_a_short_closing_edge_does_not_refill_an_open_arc_contour(standalone_components):
+    workspace = SolveWorkspace()
+    assert workspace._add_sketch_entity("line", [(0.003, 0.0), (0.010, 0.0)])
+    assert workspace._add_sketch_entity("line", [(0.006, 0.0), (0.006, 0.002)])
+    assert workspace._add_sketch_entity("arc", [(0.006, 0.002), (0.00826, 0.00152), (0.010, 0.0)])
+    assert len(workspace.model["geometry"]["regions"]) == 1
+
+    vertical = next(
+        edge for edge in workspace.model["geometry"]["edges"]
+        if abs(edge["vertices"][0][0] - 0.006) < 1e-10
+        and abs(edge["vertices"][1][0] - 0.006) < 1e-10
+        and abs(edge["vertices"][0][1] - edge["vertices"][1][1]) > 1e-10
+    )
+    project, _ = workspace._canvas_projection()
+    assert workspace._trim_sketch_edge_at_canvas_point(vertical["id"], project((0.006, 0.001)))
+
+    assert workspace.model["geometry"]["regions"] == []
+    assert {entity["type"] for entity in workspace.model["geometry"]["sketch_entities"]} == {"line", "arc"}
+
+
+def test_trimming_a_curved_boundary_removes_its_edge_with_the_open_face(standalone_components):
+    workspace = SolveWorkspace()
+    assert workspace._add_sketch_entity("line", [(0.003, 0.0), (0.010, 0.0)])
+    assert workspace._add_sketch_entity("line", [(0.006, 0.0), (0.006, 0.002)])
+    assert workspace._add_sketch_entity("arc", [(0.006, 0.002), (0.00826, 0.00152), (0.010, 0.0)])
+    arc = next(entity for entity in workspace.model["geometry"]["sketch_entities"] if entity["type"] == "arc")
+    arc_edge = next(edge for edge in workspace.model["geometry"]["edges"] if edge.get("sketch_entity_id") == arc["id"])
+    project, _ = workspace._canvas_projection()
+
+    assert workspace._trim_sketch_edge_at_canvas_point(arc_edge["id"], project((0.00826, 0.00152)))
+
+    assert workspace.model["geometry"]["regions"] == []
+    assert not any(entity["type"] == "arc" for entity in workspace.model["geometry"]["sketch_entities"])
+    assert not any(edge.get("curve", {}).get("type") == "arc" for edge in workspace.model["geometry"]["edges"])
+
+
+def test_trimming_the_region_base_keeps_the_curved_boundary_and_open_edges(standalone_components):
+    workspace = SolveWorkspace()
+    assert workspace._add_sketch_entity("line", [(0.003, 0.0), (0.010, 0.0)])
+    assert workspace._add_sketch_entity("line", [(0.006, 0.0), (0.006, 0.002)])
+    assert workspace._add_sketch_entity("arc", [(0.006, 0.002), (0.00826, 0.00152), (0.010, 0.0)])
+    base = next(
+        edge for edge in workspace.model["geometry"]["edges"]
+        if all(abs(point[1]) < 1e-10 for point in edge["vertices"])
+        and {round(point[0], 6) for point in edge["vertices"]} == {0.006, 0.01}
+    )
+    project, _ = workspace._canvas_projection()
+
+    assert workspace._trim_sketch_edge_at_canvas_point(base["id"], project((0.008, 0.0)))
+
+    assert workspace.model["geometry"]["regions"] == []
+    assert any(entity["type"] == "arc" for entity in workspace.model["geometry"]["sketch_entities"])
+    assert any(
+        entity["type"] == "line"
+        and all(abs(point[0] - 0.006) < 1e-10 for point in entity["points"])
+        for entity in workspace.model["geometry"]["sketch_entities"]
+    )
+
+
+def test_trim_stroke_does_not_remove_a_nearby_base_while_trimming_spline(standalone_components):
+    workspace = SolveWorkspace()
+    base = [(0.01838, -0.00175), (0.02052, -0.00175)]
+    spline = [(0.01625, -0.00175), (0.01773, -0.00047), (0.02052, -0.00175)]
+    vertical = [(0.01838, -0.0011792779896355491), (0.01838, -0.00175)]
+    geometry = workspace.model["geometry"]
+    geometry["sketch_entities"] = [
+        {"id": "base", "type": "line", "points": base, "sampled_points": base},
+        {
+            "id": "spline", "type": "spline3", "points": spline,
+            "control_point": spline[1], "sampled_points": workspace._sample_spline3(*spline),
+        },
+        {"id": "vertical", "type": "line", "points": vertical, "sampled_points": vertical},
+    ]
+    workspace._refresh_sketch_generated_regions()
+    assert len(geometry["regions"]) == 1
+
+    curve_samples = workspace._sample_spline3(*spline)
+    curve_point = curve_samples[round(0.8 * (len(curve_samples) - 1))]
+    project, unproject = workspace._canvas_projection()
+    curve_canvas = project(curve_point)
+    base_canvas = project((curve_point[0], base[0][1]))
+    assert base_canvas[1] - curve_canvas[1] > 6.0
+
+    # Cross the curved boundary but end only three screen pixels from the
+    # neighboring base. The base is close, but the trim stroke does not touch it.
+    stroke_canvas = [
+        (curve_canvas[0], curve_canvas[1] - 3.0),
+        (curve_canvas[0], base_canvas[1] - 3.0),
+    ]
+    assert workspace._trim_sketch_entities_along_stroke(
+        [unproject(point) for point in stroke_canvas]
+    )
+
+    retained_base = next(
+        entity for entity in geometry["sketch_entities"] if entity.get("id") == "base"
+    )
+    assert retained_base["points"] == base
+    assert geometry["regions"] == []
+
+
 def test_trim_stroke_removes_only_the_intersection_bounded_section(standalone_components):
     workspace = SolveWorkspace()
     assert workspace._add_sketch_entity("line", [(0.001, 0.0), (0.009, 0.0)])

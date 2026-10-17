@@ -4753,7 +4753,8 @@ class SolveWorkspace(Div):
 
     @_history_tracked
     def _trim_sketch_entities_along_stroke(
-        self, world_stroke, *, target_entity_ids=None, target_edge_id=None
+        self, world_stroke, *, target_entity_ids=None, target_edge_id=None,
+        target_intervals=None,
     ):
         """Power-trim curve sections crossed by the trim trace, up to intersections."""
         if not isinstance(world_stroke, (list, tuple)) or len(world_stroke) < 2:
@@ -4764,9 +4765,18 @@ class SolveWorkspace(Div):
         stroke = [project(point) for point in world_stroke]
         geometry = self.model["geometry"]
         target_entity_ids = set(target_entity_ids or ())
+        target_intervals = target_intervals or {}
         primitive_snapshot = None
         source_templates = []
-        tolerance_px = 6.0
+        # A trim stroke must actually cross an edge. Keep only a small
+        # pixel allowance for sampling/rendering error; the larger pick radius
+        # is reserved for a deliberate zero-length edge click.
+        tolerance_px = 2.5
+        is_point_trim = all(
+            math.dist(stroke[index], stroke[index + 1]) <= 1e-9
+            for index in range(len(stroke) - 1)
+        )
+        nearest_hit_tolerance_px = 6.0 if is_point_trim else tolerance_px
         parameter_epsilon = 1e-7
 
         def cross(a, b):
@@ -5039,7 +5049,7 @@ class SolveWorkspace(Div):
                     result.append(value)
             return result
 
-        def sample_interval(samples, start_t, end_t):
+        def sample_interval(entity, samples, start_t, end_t):
             count = len(samples) - 1
             if count <= 0:
                 return [list(samples[0])] if samples else []
@@ -5047,6 +5057,9 @@ class SolveWorkspace(Div):
             end_t = max(0.0, min(1.0, end_t))
 
             def at(fraction):
+                exact = evaluate_sketch_entity(entity, fraction)
+                if exact is not None:
+                    return [float(exact[0]), float(exact[1])]
                 position = fraction * count
                 index = min(count - 1, max(0, int(math.floor(position))))
                 local = position - index
@@ -5062,7 +5075,7 @@ class SolveWorkspace(Div):
             return result
 
         def entity_fragment(entity, samples, start_t, end_t, fragment_id):
-            fragment_samples = sample_interval(samples, start_t, end_t)
+            fragment_samples = sample_interval(entity, samples, start_t, end_t)
             if len(fragment_samples) < 2 or math.dist(fragment_samples[0], fragment_samples[-1]) <= 1e-12:
                 return None
             fragment = copy.deepcopy(entity)
@@ -5106,10 +5119,33 @@ class SolveWorkspace(Div):
         removed_sections = 0
         changed_curves = 0
         touched_curves = 0
+        changed_entity_ids = set()
         for entity in entities:
             if target_entity_ids and entity.get("id") not in target_entity_ids:
                 replacement_entities.append(entity)
                 continue
+            target_interval = target_intervals.get(entity.get("id"))
+            if isinstance(target_interval, (list, tuple)) and len(target_interval) == 2:
+                try:
+                    interval_start, interval_end = sorted(float(value) for value in target_interval)
+                    if not all(math.isfinite(value) for value in (interval_start, interval_end)):
+                        target_interval = None
+                    else:
+                        target_interval = (
+                            max(0.0, min(1.0, interval_start)),
+                            max(0.0, min(1.0, interval_end)),
+                        )
+                except (TypeError, ValueError, OverflowError):
+                    target_interval = None
+            else:
+                target_interval = None
+
+            def hit_is_in_target_interval(parameter):
+                return (
+                    target_interval is None
+                    or target_interval[0] - parameter_epsilon <= parameter <= target_interval[1] + parameter_epsilon
+                )
+
             samples_world = curve_samples(entity)
             if len(samples_world) < 2:
                 replacement_entities.append(entity)
@@ -5121,20 +5157,27 @@ class SolveWorkspace(Div):
                 for index, (curve_a, curve_b) in enumerate(zip(samples_screen, samples_screen[1:])):
                     local = segment_hit_parameter(stroke_a, stroke_b, curve_a, curve_b)
                     if local is not None:
-                        hit_parameters.append((index + local) / (len(samples_screen) - 1))
+                        parameter = (index + local) / (len(samples_screen) - 1)
+                        if hit_is_in_target_interval(parameter):
+                            hit_parameters.append(parameter)
                         continue
                     for point in (stroke_a, stroke_b):
                         distance, local = point_segment_distance(point, curve_a, curve_b)
-                        candidate = (distance, (index + local) / (len(samples_screen) - 1))
+                        parameter = (index + local) / (len(samples_screen) - 1)
+                        if not hit_is_in_target_interval(parameter):
+                            continue
+                        candidate = (distance, parameter)
                         if nearest is None or candidate[0] < nearest[0]:
                             nearest = candidate
                     for point, parameter in ((curve_a, index / (len(samples_screen) - 1)),
                                              (curve_b, (index + 1) / (len(samples_screen) - 1))):
+                        if not hit_is_in_target_interval(parameter):
+                            continue
                         distance, _ = point_segment_distance(point, stroke_a, stroke_b)
                         candidate = (distance, parameter)
                         if nearest is None or candidate[0] < nearest[0]:
                             nearest = candidate
-            if not hit_parameters and nearest is not None and nearest[0] <= tolerance_px:
+            if not hit_parameters and nearest is not None and nearest[0] <= nearest_hit_tolerance_px:
                 hit_parameters.append(nearest[1])
             hit_parameters = unique_parameters(hit_parameters)
             if not hit_parameters:
@@ -5183,6 +5226,8 @@ class SolveWorkspace(Div):
 
             removed_sections += len(removed)
             changed_curves += 1
+            if entity.get("id"):
+                changed_entity_ids.add(entity.get("id"))
             retained = [(lo, hi) for index, (lo, hi) in enumerate(sections)
                         if index not in removed and hi - lo > parameter_epsilon]
             for fragment_index, (lo, hi) in enumerate(retained):
@@ -5210,7 +5255,13 @@ class SolveWorkspace(Div):
         retained_entity_ids = {item.get("id") for item in replacement_entities}
         geometry["edges"] = [
             item for item in geometry.get("edges", [])
-            if not item.get("sketch_entity_id") or item.get("sketch_entity_id") in retained_entity_ids
+            if (
+                not item.get("sketch_entity_id")
+                or (
+                    item.get("sketch_entity_id") in retained_entity_ids
+                    and item.get("sketch_entity_id") not in changed_entity_ids
+                )
+            )
         ]
         self._refresh_sketch_generated_regions(source_templates=source_templates or None)
         self.selected_edge_ids = []
@@ -5525,8 +5576,18 @@ class SolveWorkspace(Div):
         _, unproject = self._canvas_projection()
         click = unproject(canvas_point)
         if entity_id:
+            interval = None
+            try:
+                first = float(edge.get("sketch_t0", 0.0))
+                second = float(edge.get("sketch_t1", 1.0))
+                if math.isfinite(first) and math.isfinite(second):
+                    interval = (first, second)
+            except (TypeError, ValueError, OverflowError):
+                pass
             return self._trim_sketch_entities_along_stroke(
-                [click, click], target_entity_ids={entity_id}
+                [click, click],
+                target_entity_ids={entity_id},
+                target_intervals={entity_id: interval} if interval is not None else None,
             )
         return self._trim_sketch_entities_along_stroke(
             [click, click], target_edge_id=edge_id
