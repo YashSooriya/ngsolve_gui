@@ -304,8 +304,8 @@ def test_mesh_preview_invalidates_when_a_mesh_parameter_changes(standalone_compo
     assert workspace._mesh_preview_button.ui_disable
 
 
-def test_ngsolve_mesh_edges_are_deduplicated_for_preview():
-    from netgen.geom2d import unit_square
+def test_ngsolve_mesh_edges_are_deduplicated_and_curved_for_preview():
+    from netgen.geom2d import MakeCircle, SplineGeometry, unit_square
     from ngsolve import Mesh, VOL
     from ngsolve_gui.app import _axisymmetric_mesh_edges
 
@@ -315,7 +315,22 @@ def test_ngsolve_mesh_edges_are_deduplicated_for_preview():
 
     assert preview_edges
     assert len(preview_edges) < element_edge_count
-    assert all(len(start) == len(end) == 2 for start, end in preview_edges)
+    assert all(len(point) == 2 for edge in preview_edges for point in edge)
+
+    circle = SplineGeometry()
+    MakeCircle(circle, (0.0, 0.0), 1.0)
+    curved_mesh = Mesh(circle.GenerateMesh(maxh=0.8))
+    curved_mesh.Curve(4)
+    curved_edges = _axisymmetric_mesh_edges(curved_mesh)
+    assert any(len(edge) > 2 for edge in curved_edges)
+
+
+def test_mesh_preview_keeps_curved_edge_polyline_points(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.set_mesh_preview([[
+        [0.0, 0.0], [0.5, 0.25], [1.0, 0.0],
+    ]])
+    assert workspace.mesh_preview_edges == [((0.0, 0.0), (0.5, 0.25), (1.0, 0.0))]
 
 
 def test_model_edits_support_undo_redo_and_clear_redo_after_new_edit(standalone_components):

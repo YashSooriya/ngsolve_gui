@@ -384,6 +384,7 @@ def legacy_problem_to_model(problem, *, name="Imported legacy problem", element_
     mesh = model["mesh"]
     mesh["element_size"] = _expression(_number(element_size, "Target element size"))
     mesh["polynomial_order"] = int(polynomial_order)
+    mesh["curve_order"] = int(polynomial_order)
     mesh["hp_layers"] = int(problem.get("HpLayers", 0) or 0)
     mesh["hp_grading_factor"] = _number(problem.get("sigmaG", 0.3), "HP grading factor")
     mesh["region_element_sizes"] = {}

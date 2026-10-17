@@ -26,6 +26,7 @@ from .cerbsim_style import theme, kb_theme, flex_fill, panel_full
 from .system_monitor import SystemMonitor, available as system_monitor_available
 from .footer import StatusFooter
 from .solve_workspace import SolveWorkspace, default_run_history_root
+from .mesh_geometry import axisymmetric_mesh_edge_polylines
 from .axisymmetric_model import new_model, new_studies, unpack_model, package_model, serialize_model_json
 from .result_files import (
     MESH_SUFFIX,
@@ -199,26 +200,8 @@ class _WorkspaceLogBuffer(io.StringIO):
 
 
 def _axisymmetric_mesh_edges(mesh):
-    """Convert a 2D NGSolve mesh into unique world-coordinate edge segments."""
-    from ngsolve import VOL
-
-    edges = {}
-    for element in mesh.Elements(VOL):
-        vertices = tuple(element.vertices)
-        if len(vertices) < 3:
-            continue
-        for index, start in enumerate(vertices):
-            end = vertices[(index + 1) % len(vertices)]
-            key = tuple(sorted((start.nr, end.nr)))
-            if key in edges:
-                continue
-            start_point = mesh[start].point
-            end_point = mesh[end].point
-            edges[key] = (
-                (float(start_point[0]), float(start_point[1])),
-                (float(end_point[0]), float(end_point[1])),
-            )
-    return list(edges.values())
+    """Return unique mesh edges, sampling curved boundaries for display."""
+    return axisymmetric_mesh_edge_polylines(mesh)
 
 
 class StackHost(Div):

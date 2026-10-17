@@ -178,6 +178,8 @@ def test_legacy_file_import_uses_solver_default_mesh_controls():
     assert defaults["element_size"] == 1.0
     assert defaults["legacy_h_local"] == 0.1
     assert defaults["polynomial_order"] == 3
+    model, _studies, _layout = legacy_problem_to_model(_legacy_test_problem())
+    assert model["mesh"]["curve_order"] == 3
 
 
 def test_legacy_domain_mesh_overrides_are_preserved_per_region(standalone_components):

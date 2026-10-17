@@ -267,6 +267,7 @@ def _mesh_signature(model):
         "regions": regions,
         "element_size": element_size,
         "polynomial_order": mesh.get("polynomial_order", 3),
+        "curve_order": mesh.get("curve_order", mesh.get("polynomial_order", 3)),
         "region_element_sizes": region_element_sizes,
         "hp_layers": mesh.get("hp_layers", 0),
         "hp_grading_factor": mesh.get("hp_grading_factor", 0.3),
@@ -9333,10 +9334,25 @@ class SolveWorkspace(Div):
         mesh = self.model["mesh"]
         order = QSelect(ui_label="Polynomial order", ui_options=[1, 2, 3, 4, 5, 6], ui_model_value=mesh["polynomial_order"], ui_dense=True, ui_filled=True)
         order.on_update_model_value(lambda event: self._set_mesh("polynomial_order", int(event.value)))
+        curve_order = QSelect(
+            ui_label="Curved edge order",
+            ui_options=[1, 2, 3, 4, 5, 6],
+            ui_model_value=mesh.get("curve_order", mesh["polynomial_order"]),
+            ui_dense=True,
+            ui_filled=True,
+        )
+        curve_order.on_update_model_value(
+            lambda event: self._set_mesh("curve_order", int(event.value))
+        )
         children = [
             _section_title("Mesh", "Control global density, local overrides, and geometric hp layers."),
             _input("Target element size", mesh["element_size"], lambda event: self._set_mesh("element_size", event.value), suffix="m"),
             order,
+            curve_order,
+            Div(
+                "1 keeps mesh edges straight. Higher orders follow the sketch curves more closely; this is separate from polynomial order.",
+                ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);",
+            ),
             Div("REGION-WISE ELEMENT SIZING", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:7px;"),
             Div("Only regions with a local override are listed. Other regions use the global target.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
             _button("Add region-wise element sizing", "mdi-plus", lambda *args: self._open_region_mesh_size_editor(), color="primary"),
@@ -9714,12 +9730,17 @@ class SolveWorkspace(Div):
         ]
 
         if self.mesh_preview_visible and self.mesh_preview_edges:
-            mesh_path = " ".join(
-                f"M{x1:.2f},{y1:.2f} L{x2:.2f},{y2:.2f}"
-                for start, end in self.mesh_preview_edges
-                for x1, y1 in (xy(start),)
-                for x2, y2 in (xy(end),)
-            )
+            mesh_paths = []
+            for edge_points in self.mesh_preview_edges:
+                projected = [xy(point) for point in edge_points]
+                if len(projected) < 2:
+                    continue
+                path = f"M{projected[0][0]:.2f},{projected[0][1]:.2f}"
+                path += "".join(
+                    f" L{x:.2f},{y:.2f}" for x, y in projected[1:]
+                )
+                mesh_paths.append(path)
+            mesh_path = " ".join(mesh_paths)
             _update_svg_props(
                 self._canvas_mesh_path,
                 d=mesh_path,
@@ -11069,12 +11090,22 @@ class SolveWorkspace(Div):
             self.render_canvas()
 
     def set_mesh_preview(self, edges):
-        """Show mesh segments returned by a completed solver mesh build."""
-        self.mesh_preview_edges = [
-            ((float(start[0]), float(start[1])), (float(end[0]), float(end[1])))
-            for start, end in edges
-            if len(start) >= 2 and len(end) >= 2
-        ]
+        """Show mesh edge polylines returned by a completed solver mesh build."""
+        polylines = []
+        for edge in edges:
+            if not isinstance(edge, (list, tuple)) or len(edge) < 2:
+                continue
+            try:
+                points = tuple(
+                    (float(point[0]), float(point[1]))
+                    for point in edge
+                    if len(point) >= 2
+                )
+            except (TypeError, ValueError, IndexError, OverflowError):
+                continue
+            if len(points) >= 2:
+                polylines.append(points)
+        self.mesh_preview_edges = polylines
         self.mesh_preview_visible = bool(self.mesh_preview_edges)
         self._mesh_preview_signature = _mesh_signature(self.model) if self.mesh_preview_edges else None
         self._mesh_preview_button.ui_disable = not self.mesh_preview_edges

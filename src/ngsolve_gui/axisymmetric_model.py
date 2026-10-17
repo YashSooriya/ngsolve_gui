@@ -1141,6 +1141,7 @@ def new_model(name: str = "Untitled axisymmetric model") -> dict:
         "mesh": {
             "element_size": "0.01",
             "polynomial_order": 3,
+            "curve_order": 3,
             "region_element_sizes": {},
             "hp_layers": 0,
             "hp_grading_factor": 0.3,
@@ -2028,6 +2029,16 @@ def validate_model(model: dict, *, scope="solve") -> list[str]:
             raise ValueError("polynomial order must be an integer between 1 and 6")
         if int(order_value) not in range(1, 7):
             raise ValueError("polynomial order must be between 1 and 6")
+        raw_curve_order = mesh.get("curve_order", raw_order)
+        curve_order_value = float(raw_curve_order)
+        if (
+            isinstance(raw_curve_order, bool)
+            or not math.isfinite(curve_order_value)
+            or not curve_order_value.is_integer()
+        ):
+            raise ValueError("curved edge order must be an integer between 1 and 6")
+        if int(curve_order_value) not in range(1, 7):
+            raise ValueError("curved edge order must be between 1 and 6")
         element_size = float(evaluate_expression(mesh.get("element_size", "0.01"), parameter_map))
         if not math.isfinite(element_size) or element_size <= 0:
             raise ValueError("target element size must be finite and positive")
