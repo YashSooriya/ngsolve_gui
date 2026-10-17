@@ -550,12 +550,29 @@ class SolveWorkspace(Div):
                 style="pointer-events:none;",
             ),
         )
+        self._canvas_inference = Component(
+            "g",
+            _svg(
+                "path", id="solve-sketch-inference-halo", d="", display="none",
+                fill="none", stroke="#ffffff", stroke_width="6",
+                stroke_linecap="round", stroke_linejoin="round",
+                style="pointer-events:none;",
+            ),
+            _svg(
+                "path", id="solve-sketch-inference-marker", d="", display="none",
+                fill="none", stroke="#16814a", stroke_width="2.4",
+                stroke_linecap="round", stroke_linejoin="round",
+                style="pointer-events:none;",
+            ),
+            ui_style="pointer-events:none;",
+        )
         for component, element_id in (
             (self._canvas_grid, "solve-sketch-grid"),
             (self._canvas_live_grid, "solve-sketch-live-grid"),
             (self._canvas_scene, "solve-sketch-scene"),
             (self._canvas_dimensions, "solve-sketch-dimensions"),
             (self._canvas_preview, "solve-sketch-preview"),
+            (self._canvas_inference, "solve-sketch-inference"),
         ):
             component._props["id"] = element_id
         self._canvas_live_grid._props.update({
@@ -580,6 +597,7 @@ class SolveWorkspace(Div):
             self._canvas_scene,
             self._canvas_dimensions,
             self._canvas_preview,
+            self._canvas_inference,
             ui_class="solve-sketch-canvas",
             ui_style="display:block; width:100%; height:100%; min-height:0; background:var(--canvas-bg, #f4f6f8); cursor:default; user-select:none; -webkit-user-select:none; touch-action:none; overscroll-behavior:contain;",
         )
@@ -1440,7 +1458,8 @@ class SolveWorkspace(Div):
             self.js.eval(
                 "if (window.__ngsolveCancelSketchGesture) window.__ngsolveCancelSketchGesture(); "
                 f"window.__ngsolveSketchTool = '{tool}'; "
-                f"window.__ngsolveSketchToolVariant = '{self._sketch_tool_variant.get(tool, '')}'"
+                f"window.__ngsolveSketchToolVariant = '{self._sketch_tool_variant.get(tool, '')}'; "
+                "if (window.__ngsolveClearSketchInferenceMarker) window.__ngsolveClearSketchInferenceMarker();"
             )
         except Exception:
             # Standalone tests and non-browser frontends have no JS runtime.
@@ -1827,8 +1846,8 @@ class SolveWorkspace(Div):
         script = r"""
 (() => {
   window.__ngsolveSketchTool = '__SKETCH_TOOL__';
-  if (window.__ngsolveSketchPointerCaptureVersion === 14) return;
-  window.__ngsolveSketchPointerCaptureVersion = 14;
+  if (window.__ngsolveSketchPointerCaptureVersion === 16) return;
+  window.__ngsolveSketchPointerCaptureVersion = 16;
   let active = false;
   let activePointerId = null;
   let dragStart = null;
@@ -2085,6 +2104,7 @@ class SolveWorkspace(Div):
   };
   const applyCanvasTransform = (scale, tx, ty, svg = currentSvg()) => {
     if (!svg) return;
+    clearInferenceMarker(svg);
     visualScale = scale;
     visualTranslateX = tx;
     visualTranslateY = ty;
@@ -2099,6 +2119,7 @@ class SolveWorkspace(Div):
   };
   const resetCanvasTransform = (svg = currentSvg()) => {
     if (!svg) return;
+    clearInferenceMarker(svg);
     visualScale = 1;
     visualTranslateX = 0;
     visualTranslateY = 0;
@@ -2301,8 +2322,6 @@ class SolveWorkspace(Div):
     const snappedY = grid.originY + Math.round((point[1] - grid.originY) / grid.stepPx) * grid.stepPx;
     return [Math.max(grid.originX, snappedX), snappedY];
   };
-  const sketchPoint = (point) =>
-    (window.__ngsolveSketchTool || 'select') === 'select' ? point : snapPoint(point);
   const toScenePoint = (point) => [
     (point[0] - visualTranslateX) / visualScale,
     (point[1] - visualTranslateY) / visualScale,
@@ -2311,6 +2330,187 @@ class SolveWorkspace(Div):
     visualScale * point[0] + visualTranslateX,
     visualScale * point[1] + visualTranslateY,
   ];
+  let inferenceSnapCache = null;
+  const clearInferenceMarker = (svg = currentSvg()) => {
+    if (!svg) return;
+    const halo = svg.querySelector("#solve-sketch-inference-halo");
+    const marker = svg.querySelector("#solve-sketch-inference-marker");
+    if (halo) halo.setAttribute("display", "none");
+    if (marker) marker.setAttribute("display", "none");
+  };
+  window.__ngsolveClearSketchInferenceMarker = () => clearInferenceMarker(currentSvg());
+  const inferenceMarkerPath = (point, kind) => {
+    const x = point[0], y = point[1];
+    const r = kind === "endpoint" ? 5.5 : 5;
+    if (kind === "endpoint") {
+      return "M" + (x-r) + "," + (y-r) + " H" + (x+r) + " V" + (y+r) + " H" + (x-r) + " Z"
+        + " M" + (x-2) + "," + y + " H" + (x+2) + " M" + x + "," + (y-2) + " V" + (y+2);
+    }
+    if (kind === "midpoint") {
+      return "M" + x + "," + (y-r) + " L" + (x+r) + "," + y + " L" + x + "," + (y+r) + " L" + (x-r) + "," + y + " Z"
+        + " M" + (x-2) + "," + y + " H" + (x+2);
+    }
+    if (kind === "center") {
+      return "M" + (x-r) + "," + y + " A" + r + "," + r + " 0 1 0 " + (x+r) + "," + y
+        + " A" + r + "," + r + " 0 1 0 " + (x-r) + "," + y
+        + " M" + (x-8) + "," + y + " H" + (x+8) + " M" + x + "," + (y-8) + " V" + (y+8);
+    }
+    return "M" + (x-r) + "," + y + " A" + r + "," + r + " 0 1 0 " + (x+r) + "," + y
+      + " A" + r + "," + r + " 0 1 0 " + (x-r) + "," + y
+      + " M" + (x-2) + "," + y + " H" + (x+2) + " M" + x + "," + (y-2) + " V" + (y+2);
+  };
+  const showInferenceMarker = (svg, candidate) => {
+    if (!svg || !candidate) return clearInferenceMarker(svg);
+    const halo = svg.querySelector("#solve-sketch-inference-halo");
+    const marker = svg.querySelector("#solve-sketch-inference-marker");
+    if (!halo || !marker) return;
+    const d = inferenceMarkerPath(candidate.point, candidate.kind);
+    halo.setAttribute("d", d);
+    halo.setAttribute("display", "inline");
+    marker.setAttribute("d", d);
+    marker.setAttribute("stroke", ({endpoint:"#16814a", midpoint:"#d18a0a", center:"#7a43b6", edge:"#1176b8"})[candidate.kind] || "#1176b8");
+    marker.setAttribute("display", "inline");
+  };
+  const pathPointInCanvas = (svg, path, distance) => {
+    try {
+      const matrix = path.getCTM();
+      if (!matrix) return null;
+      const local = path.getPointAtLength(distance);
+      const point = svg.createSVGPoint();
+      point.x = local.x;
+      point.y = local.y;
+      const canvasPoint = point.matrixTransform(matrix);
+      return [canvasPoint.x, canvasPoint.y];
+    } catch (_) {
+      return null;
+    }
+  };
+  const inferenceTargetsFor = (svg) => {
+    const key = String(svg.getAttribute("data-sketch-render-version") || "0") + ":" + viewVersion;
+    if (inferenceSnapCache && inferenceSnapCache.svg === svg && inferenceSnapCache.key === key) return inferenceSnapCache;
+    const points = [];
+    const buckets = new Map();
+    const cellSize = 32;
+    const addPoint = (kind, point, keyValue) => {
+      if (!point || !point.every(Number.isFinite)) return;
+      if (points.some(item => item.kind === kind && Math.hypot(item.point[0]-point[0], item.point[1]-point[1]) < 0.75)) return;
+      points.push({kind, point, key:keyValue, priority:kind === "endpoint" ? 0 : (kind === "center" ? 1 : 2)});
+    };
+    let segmentId = 0;
+    const addSegment = (a, b) => {
+      if (!a || !b || Math.hypot(a[0]-b[0], a[1]-b[1]) < 1e-6) return;
+      const segment = {id:segmentId++, a, b};
+      const minX = Math.floor(Math.min(a[0],b[0]) / cellSize);
+      const maxX = Math.floor(Math.max(a[0],b[0]) / cellSize);
+      const minY = Math.floor(Math.min(a[1],b[1]) / cellSize);
+      const maxY = Math.floor(Math.max(a[1],b[1]) / cellSize);
+      for (let bx=minX; bx<=maxX; bx += 1) for (let by=minY; by<=maxY; by += 1) {
+        const bucketKey = bx + "," + by;
+        if (!buckets.has(bucketKey)) buckets.set(bucketKey, []);
+        buckets.get(bucketKey).push(segment);
+      }
+    };
+    const paths = svg.querySelectorAll('[data-sketch-edge-role="visible"]');
+    for (const path of paths) {
+      if (path.getAttribute("display") === "none" || getComputedStyle(path).display === "none") continue;
+      let length;
+      try { length = path.getTotalLength(); } catch (_) { continue; }
+      if (!Number.isFinite(length) || length <= 0.5) continue;
+      const type = (path.getAttribute("data-sketch-curve-type") || "line").toLowerCase();
+      const edgeId = path.getAttribute("data-sketch-edge-id") || String(segmentId);
+      const first = pathPointInCanvas(svg, path, 0);
+      const last = pathPointInCanvas(svg, path, length);
+      if (type !== "circle") {
+        addPoint("endpoint", first, edgeId + ":start");
+        addPoint("endpoint", last, edgeId + ":end");
+      }
+      if (type === "line" || type === "arc") {
+        addPoint("midpoint", pathPointInCanvas(svg, path, length * 0.5), edgeId + ":mid");
+      }
+      if (type === "arc" || type === "circle") {
+        const cxValue = path.getAttribute("data-sketch-curve-center-x");
+        const cyValue = path.getAttribute("data-sketch-curve-center-y");
+        const cx = Number(cxValue), cy = Number(cyValue);
+        const matrix = path.getCTM();
+        if (cxValue !== null && cxValue !== "" && cyValue !== null && cyValue !== ""
+          && Number.isFinite(cx) && Number.isFinite(cy) && matrix) {
+          const local = svg.createSVGPoint();
+          local.x = cx;
+          local.y = cy;
+          const center = local.matrixTransform(matrix);
+          addPoint("center", [center.x, center.y], edgeId + ":center");
+        }
+      }
+      const sampleCount = Math.min(512, Math.max(2, Math.ceil(length / 6)));
+      let previous = pathPointInCanvas(svg, path, 0);
+      for (let index=1; index<=sampleCount; index += 1) {
+        const current = pathPointInCanvas(svg, path, length * index / sampleCount);
+        addSegment(previous, current);
+        previous = current;
+      }
+    }
+    inferenceSnapCache = {svg, key, points, buckets, cellSize};
+    return inferenceSnapCache;
+  };
+  const closestEdgeCandidate = (cache, point, limit) => {
+    const cell = cache.cellSize;
+    const bx = Math.floor(point[0] / cell), by = Math.floor(point[1] / cell);
+    let best = null;
+    const visited = new Set();
+    for (let ox=-1; ox<=1; ox += 1) for (let oy=-1; oy<=1; oy += 1) {
+      const segments = cache.buckets.get((bx+ox) + "," + (by+oy)) || [];
+      for (const segment of segments) {
+        if (visited.has(segment.id)) continue;
+        visited.add(segment.id);
+        const dx = segment.b[0]-segment.a[0], dy = segment.b[1]-segment.a[1];
+        const lengthSquared = dx*dx + dy*dy;
+        const fraction = lengthSquared <= 1e-12 ? 0 : Math.max(0, Math.min(1,
+          ((point[0]-segment.a[0])*dx + (point[1]-segment.a[1])*dy) / lengthSquared));
+        const nearest = [segment.a[0] + fraction*dx, segment.a[1] + fraction*dy];
+        const distance = Math.hypot(point[0]-nearest[0], point[1]-nearest[1]);
+        if (distance <= limit && (!best || distance < best.distance)) best = {kind:"edge", point:nearest, distance};
+      }
+    }
+    return best;
+  };
+  const findInferenceSnap = (scenePoint, svg) => {
+    const tool = window.__ngsolveSketchTool || "select";
+    if (!svg || !["line", "arc"].includes(tool)) {
+      clearInferenceMarker(svg);
+      return null;
+    }
+    const pointer = toViewPoint(scenePoint);
+    const cache = inferenceTargetsFor(svg);
+    const pointCandidates = cache.points.map(item => ({
+      kind:item.kind, point:item.point, key:item.key, priority:item.priority,
+      distance:Math.hypot(pointer[0]-item.point[0], pointer[1]-item.point[1]),
+    })).filter(item => item.distance <= 10);
+    pointCandidates.sort((a,b) => a.distance-b.distance || a.priority-b.priority);
+    const candidate = pointCandidates[0] || closestEdgeCandidate(cache, pointer, 10);
+    if (!candidate) {
+      clearInferenceMarker(svg);
+      return null;
+    }
+    showInferenceMarker(svg, candidate);
+    return toScenePoint(candidate.point);
+  };
+  const sketchPoint = (point, svg = currentSvg()) => {
+    const tool = window.__ngsolveSketchTool || "select";
+    if (tool === "select") {
+      clearInferenceMarker(svg);
+      return point;
+    }
+    const inferred = findInferenceSnap(point, svg);
+    if (inferred) return inferred;
+    const grid = window.__ngsolveSketchSnap;
+    if ((tool === "line" || tool === "arc") && grid && grid.enabled) {
+      const gridPoint = snapPoint(point);
+      const gridInference = findInferenceSnap(gridPoint, svg);
+      if (gridInference) return gridInference;
+      return gridPoint;
+    }
+    return snapPoint(point);
+  };
   const setPreviewPath = (svg, id, d, visible = true) => {
     const node = svg && svg.querySelector("#" + id);
     if (!node) return;
@@ -2961,17 +3161,22 @@ class SolveWorkspace(Div):
       updateHover(event, svg);
       moveGesture(event, svg);
       if (!active && svg) {
-        const state = window.__ngsolveSketchConstruction || {};
-        const tool = window.__ngsolveSketchTool || 'select';
-        const hasPending = tool === 'line'
-          ? (Array.isArray(state.linePoints) && state.linePoints.length > 0)
-          : (tool === 'arc'
-            ? (Array.isArray(state.arcPoints) && state.arcPoints.length > 0)
-            : (tool === 'circle' && state.circleVariant === 'three-point'
-              && Array.isArray(state.circlePoints) && state.circlePoints.length > 0));
-        if (hasPending) {
-          const screen = svgPoint(svg, event);
-          if (screen) updateConstructionPreview(svg, sketchPoint(toScenePoint(screen)));
+        if (!targetIsSvg(event, svg)) {
+          clearInferenceMarker(svg);
+          return;
+        }
+        const screen = svgPoint(svg, event);
+        if (screen) {
+          const point = sketchPoint(toScenePoint(screen), svg);
+          const state = window.__ngsolveSketchConstruction || {};
+          const tool = window.__ngsolveSketchTool || 'select';
+          const hasPending = tool === 'line'
+            ? (Array.isArray(state.linePoints) && state.linePoints.length > 0)
+            : (tool === 'arc'
+              ? (Array.isArray(state.arcPoints) && state.arcPoints.length > 0)
+              : (tool === 'circle' && state.circleVariant === 'three-point'
+                && Array.isArray(state.circlePoints) && state.circlePoints.length > 0));
+          if (hasPending) updateConstructionPreview(svg, point);
         }
       }
     }, true);
@@ -3749,21 +3954,65 @@ class SolveWorkspace(Div):
         _, unproject = self._canvas_projection()
         result = []
         for raw in points:
-            point = (float(raw[0]), float(raw[1]))
+            screen_point = (float(raw[0]), float(raw[1]))
+            world = tuple(float(value) for value in unproject(screen_point))
             if snap:
-                point = self._snap_canvas_point(point)
-            world = unproject(point)
+                inferred, matched = self._snap_sketch_endpoint(world, return_match=True)
+                if matched:
+                    world = inferred
+                else:
+                    grid_screen_point = self._snap_canvas_point(screen_point)
+                    grid_world = tuple(float(value) for value in unproject(grid_screen_point))
+                    inferred, matched = self._snap_sketch_endpoint(grid_world, return_match=True)
+                    world = inferred if matched else grid_world
             result.append((_round_sketch_m(float(world[0])), _round_sketch_m(float(world[1]))))
         return result
 
-    def _snap_sketch_endpoint(self, point):
-        """Snap endpoints to nearby sketch vertices and existing curve segments."""
+    def _snap_sketch_endpoint(self, point, *, return_match=False):
+        """Return the nearest CAD inference target within ten screen pixels.
+
+        Endpoint snaps take priority, followed by curve centers, line/arc
+        midpoints, and then the nearest point on any visible sketch edge.
+        Splines expose endpoint and edge snaps only.
+        """
         project, _ = self._canvas_projection()
         target = project(point)
-        candidates = []
+        tolerance = 10.0
+        endpoint_candidates = []
+        center_candidates = []
+        midpoint_candidates = []
+        edge_candidates = []
         sources = []
         sketch_endpoint_sources = []
         analytic_curves = []
+
+        def add_candidate(collection, candidate):
+            try:
+                world = (float(candidate[0]), float(candidate[1]))
+                screen = project(world)
+                distance = math.hypot(target[0] - screen[0], target[1] - screen[1])
+            except (TypeError, ValueError, IndexError, OverflowError):
+                return
+            if math.isfinite(distance) and distance <= tolerance:
+                collection.append((distance, world))
+
+        def sample_midpoint(samples):
+            if len(samples) < 2:
+                return None
+            lengths = [math.dist(first, second) for first, second in zip(samples, samples[1:])]
+            total = sum(lengths)
+            if not math.isfinite(total) or total <= 1e-15:
+                return None
+            remaining = total / 2.0
+            for index, (first, second, length) in enumerate(zip(samples, samples[1:], lengths)):
+                if remaining <= length or index == len(lengths) - 1:
+                    fraction = 0.0 if length <= 1e-15 else min(1.0, max(0.0, remaining / length))
+                    return (
+                        float(first[0]) + fraction * (float(second[0]) - float(first[0])),
+                        float(first[1]) + fraction * (float(second[1]) - float(first[1])),
+                    )
+                remaining -= length
+            return tuple(float(value) for value in samples[-1])
 
         def add_analytic_curve(kind, curve, endpoints):
             if kind not in {"arc", "circle"} or not isinstance(curve, dict):
@@ -3779,22 +4028,31 @@ class SolveWorkspace(Div):
                 return
             if not math.isfinite(radius) or radius <= 0:
                 return
+            add_candidate(center_candidates, center)
             endpoints = endpoints if isinstance(endpoints, (list, tuple)) else []
-            start = endpoints[0] if endpoints else center
-            end = endpoints[-1] if endpoints else center
+            start_point = endpoints[0] if endpoints else center
+            end_point = endpoints[-1] if endpoints else center
             through = endpoints[1] if kind == "arc" and len(endpoints) > 2 else None
             analytic_curves.append((
-                kind, center, radius, tuple(start),
+                kind, center, radius, tuple(start_point),
                 tuple(through) if through is not None else None,
-                tuple(end), bool(curve.get("clockwise", False)),
+                tuple(end_point), bool(curve.get("clockwise", False)),
             ))
 
         for entity in self.model["geometry"].get("sketch_entities", []):
             samples = entity.get("sampled_points") or entity.get("points") or []
+            curve_type = str(entity.get("type", "line")).lower()
             if len(samples) >= 2:
+                samples = [tuple(float(value) for value in sample[:2]) for sample in samples]
                 sources.append(samples)
-                sketch_endpoint_sources.append(samples)
-                add_analytic_curve(entity.get("type"), entity, entity.get("points"))
+                if curve_type != "circle":
+                    sketch_endpoint_sources.append((samples, curve_type))
+                if curve_type in {"line", "arc"}:
+                    midpoint = sample_midpoint(samples)
+                    if midpoint is not None:
+                        add_candidate(midpoint_candidates, midpoint)
+                add_analytic_curve(curve_type, entity, entity.get("points"))
+
         represented = {
             edge.get("sketch_entity_id")
             for edge in self.model["geometry"].get("edges", [])
@@ -3804,39 +4062,35 @@ class SolveWorkspace(Div):
             if edge.get("sketch_entity_id") in represented:
                 continue
             curve = edge.get("curve", {})
-            samples = curve.get("sampled_points") if isinstance(curve, dict) else None
+            curve = curve if isinstance(curve, dict) else {}
+            curve_type = str(curve.get("type", "line")).lower()
+            samples = curve.get("sampled_points")
             samples = samples if isinstance(samples, list) and len(samples) >= 2 else edge.get("vertices", [])
             if len(samples) >= 2:
+                samples = [tuple(float(value) for value in sample[:2]) for sample in samples]
                 sources.append(samples)
-                add_analytic_curve(
-                    curve.get("type") if isinstance(curve, dict) else None,
-                    curve,
-                    edge.get("vertices", []),
-                )
-        endpoint_candidates = []
-        for samples in sketch_endpoint_sources:
-            projected = [project(candidate) for candidate in samples]
-            # Prefer endpoints of authored sketch entities when the pointer is
-            # close. Sampled points on primitive circles/curves are not topology
-            # vertices: treating them as endpoints can move a true curve
-            # intersection and prevent the curve from splitting correctly.
-            for endpoint_index in (0, -1):
-                endpoint = samples[endpoint_index]
-                screen_endpoint = projected[endpoint_index]
-                distance = math.hypot(
-                    target[0] - screen_endpoint[0],
-                    target[1] - screen_endpoint[1],
-                )
-                if distance <= 8.0:
-                    endpoint_candidates.append((distance, tuple(endpoint)))
-        for kind, center, radius, start, through, end, clockwise in analytic_curves:
+                if curve_type != "circle":
+                    sketch_endpoint_sources.append((samples, curve_type))
+                if curve_type in {"line", "arc"}:
+                    midpoint = sample_midpoint(samples)
+                    if midpoint is not None:
+                        add_candidate(midpoint_candidates, midpoint)
+                add_analytic_curve(curve_type, curve, edge.get("vertices", []))
+
+        for samples, curve_type in sketch_endpoint_sources:
+            if curve_type == "circle":
+                continue
+            for endpoint in (samples[0], samples[-1]):
+                add_candidate(endpoint_candidates, endpoint)
+
+        for kind, center, radius, start_point, through, end_point, clockwise in analytic_curves:
             dx, dy = float(point[0]) - center[0], float(point[1]) - center[1]
             if dx * dx + dy * dy <= 1e-24:
                 continue
             angle = math.atan2(dy, dx)
             if kind == "arc":
-                start_angle = math.atan2(start[1] - center[1], start[0] - center[0])
-                end_angle = math.atan2(end[1] - center[1], end[0] - center[0])
+                start_angle = math.atan2(start_point[1] - center[1], start_point[0] - center[0])
+                end_angle = math.atan2(end_point[1] - center[1], end_point[0] - center[0])
                 tau = 2.0 * math.pi
                 if clockwise:
                     total = (start_angle - end_angle) % tau
@@ -3845,9 +4099,7 @@ class SolveWorkspace(Div):
                     total = (end_angle - start_angle) % tau
                     offset = (angle - start_angle) % tau
                 if through is not None:
-                    through_angle = math.atan2(
-                        through[1] - center[1], through[0] - center[0]
-                    )
+                    through_angle = math.atan2(through[1] - center[1], through[0] - center[0])
                     through_offset = (
                         (start_angle - through_angle) % tau
                         if clockwise else (through_angle - start_angle) % tau
@@ -3868,13 +4120,8 @@ class SolveWorkspace(Div):
                 center[0] + radius * math.cos(angle),
                 center[1] + radius * math.sin(angle),
             )
-            screen_nearest = project(world_nearest)
-            distance = math.hypot(
-                target[0] - screen_nearest[0],
-                target[1] - screen_nearest[1],
-            )
-            if distance <= 8.0:
-                candidates.append((distance, tuple(world_nearest)))
+            add_candidate(edge_candidates, world_nearest)
+
         for samples in sources:
             projected = [project(candidate) for candidate in samples]
             for first, second, screen_first, screen_second in zip(samples, samples[1:], projected, projected[1:]):
@@ -3886,17 +4133,28 @@ class SolveWorkspace(Div):
                 )
                 screen_nearest = (screen_first[0] + fraction * dx, screen_first[1] + fraction * dy)
                 distance = math.hypot(target[0] - screen_nearest[0], target[1] - screen_nearest[1])
-                if distance <= 8.0:
+                if distance <= tolerance:
                     world_nearest = (
                         first[0] + fraction * (second[0] - first[0]),
                         first[1] + fraction * (second[1] - first[1]),
                     )
-                    candidates.append((distance, tuple(world_nearest)))
-        if endpoint_candidates:
-            return min(endpoint_candidates, key=lambda item: item[0])[1]
-        if candidates:
-            return min(candidates)[1]
-        return tuple(point)
+                    edge_candidates.append((distance, tuple(world_nearest)))
+
+        point_candidates = [
+            (distance, priority, world)
+            for priority, collection in enumerate(
+                (endpoint_candidates, center_candidates, midpoint_candidates)
+            )
+            for distance, world in collection
+        ]
+        if point_candidates:
+            result = min(point_candidates, key=lambda item: (item[0], item[1]))[2]
+            return (result, True) if return_match else result
+        if edge_candidates:
+            result = min(edge_candidates, key=lambda item: item[0])[1]
+            return (result, True) if return_match else result
+        result = tuple(point)
+        return (result, False) if return_match else result
 
     @staticmethod
     def _arc_from_three_points(start, through, end):
@@ -10005,6 +10263,10 @@ class SolveWorkspace(Div):
             selected = edge_id in self.selected_edge_ids or region_id in set(self._selected_region_ids_live())
             condition_highlight = edge_id in highlighted_edges
             edge_color = "#ff8738" if condition_highlight else ("#0877b9" if selected else "#263746")
+            curve_type = str(curve.get("type", "line")) if isinstance(curve, dict) else "line"
+            curve_center = curve.get("center") if isinstance(curve, dict) else None
+            curve_center_x = curve_center[0] if isinstance(curve_center, (list, tuple)) and len(curve_center) >= 2 else None
+            curve_center_y = curve_center[1] if isinstance(curve_center, (list, tuple)) and len(curve_center) >= 2 else None
             visible_props = {
                 "d": edge_path,
                 "fill": "none",
@@ -10014,6 +10276,9 @@ class SolveWorkspace(Div):
                 "style": "pointer-events:none;" + (" animation:mmfem-condition-edge-pulse 2.8s ease-in-out infinite;" if condition_highlight else ""),
                 "data_sketch_edge_id": edge_id,
                 "data_sketch_edge_role": "visible",
+                "data_sketch_curve_type": curve_type,
+                "data_sketch_curve_center_x": curve_center_x,
+                "data_sketch_curve_center_y": curve_center_y,
                 "data_sketch_selected": str(selected).lower(),
                 "data_sketch_condition_highlight": str(edge_id in highlighted_edges).lower(),
                 "data_sketch_region_id": region_id,

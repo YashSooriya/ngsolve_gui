@@ -1434,6 +1434,57 @@ def test_nearby_arc_endpoint_snaps_exactly_and_closes_sketch_region(standalone_c
     assert len(regions) == 1
 
 
+def test_sketch_inference_snaps_to_line_midpoint_and_arc_center(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    scale = 100_000.0
+    project = lambda point: (point[0] * scale, point[1] * scale)
+    unproject = lambda point: (point[0] / scale, point[1] / scale)
+    monkeypatch.setattr(workspace, "_canvas_projection", lambda: (project, unproject))
+
+    assert workspace._add_sketch_entity("line", [(0.005, 0.0), (0.015, 0.0)])
+    line_midpoint = (0.010, 0.0)
+    snapped, matched = workspace._snap_sketch_endpoint((0.01002, 0.00003), return_match=True)
+    assert matched
+    assert snapped == pytest.approx(line_midpoint, abs=1e-12)
+
+    assert workspace._add_sketch_entity("arc", [(0.020, 0.0), (0.025, 0.006), (0.030, 0.0)])
+    arc = next(item for item in workspace.model["geometry"]["sketch_entities"] if item["type"] == "arc")
+    center = tuple(arc["center"])
+    snapped, matched = workspace._snap_sketch_endpoint(
+        (center[0] + 0.00002, center[1] - 0.00003),
+        return_match=True,
+    )
+    assert matched
+    assert snapped == pytest.approx(center, abs=1e-12)
+
+
+def test_spline_has_no_center_or_midpoint_inference_target(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    scale = 100_000.0
+    project = lambda point: (point[0] * scale, point[1] * scale)
+    unproject = lambda point: (point[0] / scale, point[1] / scale)
+    monkeypatch.setattr(workspace, "_canvas_projection", lambda: (project, unproject))
+    spline = {
+        "id": "spline-test",
+        "type": "spline3",
+        "points": [[0.005, 0.0], [0.010, 0.010], [0.015, 0.0]],
+        "control_point": [0.010, 0.010],
+        "sampled_points": [[0.005, 0.0], [0.0075, 0.003], [0.010, 0.004], [0.0125, 0.003], [0.015, 0.0]],
+    }
+    workspace.model["geometry"]["sketch_entities"] = [spline]
+    workspace.model["geometry"]["edges"] = [{
+        "id": "spline-edge",
+        "vertices": [spline["sampled_points"][0], spline["sampled_points"][-1]],
+        "curve": {"type": "spline3", "sampled_points": spline["sampled_points"]},
+        "sketch_entity_id": "spline-test",
+    }]
+
+    target = (0.010, 0.0)
+    snapped, matched = workspace._snap_sketch_endpoint(target, return_match=True)
+    assert not matched
+    assert snapped == pytest.approx(target, abs=1e-12)
+
+
 def test_line_and_trim_preview_paths_are_separate_from_marquee(standalone_components, monkeypatch):
     workspace = SolveWorkspace()
     scripts = []
@@ -3046,6 +3097,7 @@ def test_canvas_render_keeps_background_and_layer_components_mounted(standalone_
         workspace._canvas_scene,
         workspace._canvas_dimensions,
         workspace._canvas_preview,
+        workspace._canvas_inference,
     )
     assert tuple(workspace._canvas_grid_layer.ui_children) == (
         workspace._canvas_grid,
