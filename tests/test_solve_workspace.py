@@ -4189,6 +4189,90 @@ def test_sketch_diameter_splits_a_primitive_circle_into_two_regions(standalone_c
                for edge in workspace.model["geometry"]["edges"])
 
 
+def _add_rectangle_with_crossing_divider(workspace):
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): 0.002,
+        ("rectangle", "z_min"): 0.002,
+        ("rectangle", "width"): 0.006,
+        ("rectangle", "height"): 0.006,
+    })
+    workspace._add_primitive("rectangle")
+    assert workspace._add_sketch_entity("line", [(0.001, 0.005), (0.009, 0.005)])
+    divider = next(
+        entity for entity in workspace.model["geometry"]["sketch_entities"]
+        if entity.get("type") == "line"
+        and entity.get("points", [])[0][1] == pytest.approx(0.005)
+        and entity.get("points", [])[-1][1] == pytest.approx(0.005)
+        and min(point[0] for point in entity["points"]) == pytest.approx(0.001)
+    )
+    return divider
+
+
+def test_click_selects_and_deletes_the_complete_divider_without_deleting_its_faces(standalone_components):
+    workspace = SolveWorkspace()
+    divider = _add_rectangle_with_crossing_divider(workspace)
+    geometry = workspace.model["geometry"]
+    faces = [region for region in geometry["regions"] if region.get("shape", {}).get("type") == "sketch"]
+    assert len(faces) == 2
+    divider_edges = [edge for edge in geometry["edges"] if edge.get("sketch_entity_id") == divider["id"]]
+    assert len(divider_edges) >= 3
+
+    workspace.select_edge(divider_edges[0]["id"])
+    assert set(workspace.selected_edge_ids) == {edge["id"] for edge in divider_edges}
+    workspace.select_edge(divider_edges[1]["id"], additive=True)
+    assert workspace.selected_edge_ids == []
+    workspace.select_edge(divider_edges[1]["id"])
+    assert workspace.delete_selected_sketch_edges()
+
+    geometry = workspace.model["geometry"]
+    remaining_faces = [region for region in geometry["regions"] if region.get("shape", {}).get("type") == "sketch"]
+    assert len(remaining_faces) == 1
+    assert not any(entity.get("id") == divider["id"] for entity in geometry["sketch_entities"])
+    assert len(geometry["sketch_entities"]) == 4
+    vertices = remaining_faces[0]["vertices"]
+    area = abs(sum(
+        vertices[index][0] * vertices[(index + 1) % len(vertices)][1]
+        - vertices[(index + 1) % len(vertices)][0] * vertices[index][1]
+        for index in range(len(vertices))
+    ) / 2.0)
+    assert area == pytest.approx(0.006 * 0.006)
+
+
+def test_power_trim_removes_each_external_divider_tail_but_preserves_both_faces(standalone_components):
+    workspace = SolveWorkspace()
+    divider = _add_rectangle_with_crossing_divider(workspace)
+    assert len([region for region in workspace.model["geometry"]["regions"]
+                if region.get("shape", {}).get("type") == "sketch"]) == 2
+
+    assert workspace._trim_sketch_entities_along_stroke([(0.0015, 0.0045), (0.0015, 0.0055)])
+    faces = [region for region in workspace.model["geometry"]["regions"] if region.get("shape", {}).get("type") == "sketch"]
+    assert len(faces) == 2
+    horizontal = [
+        entity for entity in workspace.model["geometry"]["sketch_entities"]
+        if entity.get("type") == "line"
+        and len(entity.get("points", [])) == 2
+        and all(abs(point[1] - 0.005) < 1e-10 for point in entity["points"])
+    ]
+    spans = sorted(tuple(sorted(point[0] for point in entity["points"])) for entity in horizontal)
+    assert len(spans) == 2
+    assert spans[0] == pytest.approx((0.002, 0.008))
+    assert spans[1] == pytest.approx((0.008, 0.009))
+
+    right_tail = next(entity for entity in horizontal if entity["id"] != divider["id"])
+    midpoint = sum(point[0] for point in right_tail["points"]) / 2
+    assert workspace._trim_sketch_entities_along_stroke([(midpoint, 0.0045), (midpoint, 0.0055)])
+    faces = [region for region in workspace.model["geometry"]["regions"] if region.get("shape", {}).get("type") == "sketch"]
+    assert len(faces) == 2
+    horizontal = [
+        entity for entity in workspace.model["geometry"]["sketch_entities"]
+        if entity.get("type") == "line"
+        and len(entity.get("points", [])) == 2
+        and all(abs(point[1] - 0.005) < 1e-10 for point in entity["points"])
+    ]
+    assert len(horizontal) == 1
+    assert tuple(sorted(point[0] for point in horizontal[0]["points"])) == pytest.approx((0.002, 0.008))
+
+
 def test_deleting_a_simple_region_removes_its_outline(standalone_components):
     workspace = SolveWorkspace()
     workspace._add_primitive("rectangle")
@@ -4687,3 +4771,22 @@ def test_run_history_defaults_to_home_results_directory_without_vm_override(
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
     assert default_run_history_root() == tmp_path / "NGSolve_results"
+
+
+def test_centerpoint_arc_snaps_onto_existing_endpoint_without_open_gap(standalone_components):
+    workspace = SolveWorkspace()
+    start, end = (0.00942, -0.00175), (0.01241, -0.00175)
+    center = (0.01092, -0.00175)
+
+    assert workspace._add_sketch_entity("line", [start, end])
+    assert workspace._accept_arc_sketch_point(center, variant="centerpoint")
+    assert workspace._accept_arc_sketch_point(start, variant="centerpoint")
+    assert workspace._accept_arc_sketch_point(end, variant="centerpoint")
+
+    arc = next(
+        entity for entity in workspace.model["geometry"]["sketch_entities"]
+        if entity.get("type") == "arc"
+    )
+    assert arc["points"][-1] == list(end)
+    assert math.dist(arc["center"], start) == pytest.approx(math.dist(arc["center"], end))
+    assert len(workspace.model["geometry"]["regions"]) == 1

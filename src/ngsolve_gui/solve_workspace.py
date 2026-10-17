@@ -4287,16 +4287,69 @@ class SolveWorkspace(Div):
                 self._sync_pending_construction_preview()
                 self._message("Centerpoint arc: move clockwise or counter-clockwise from the start to preview the fixed-radius arc, then click its end.")
                 return True
-            center, start = pending[:2]
+            center, start = (tuple(pending[0]), tuple(pending[1]))
             radius = math.dist(center, start)
-            cursor = point
+
+            # If the end click snapped to an authored curve endpoint, keep that
+            # exact topological vertex. Projecting it back onto the originally
+            # clicked circle can move it by a few micrometres, leaving an arc
+            # that looks closed but does not share the chord endpoint.
+            snapped_end = None
+            for entity in self.model["geometry"].get("sketch_entities", []):
+                if entity.get("type") == "circle":
+                    continue
+                entity_points = entity.get("points") or entity.get("sampled_points") or []
+                if len(entity_points) < 2:
+                    continue
+                try:
+                    first_endpoint = tuple(float(value) for value in entity_points[0][:2])
+                    last_endpoint = tuple(float(value) for value in entity_points[-1][:2])
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    continue
+                if math.dist(first_endpoint, last_endpoint) <= 1e-12:
+                    continue
+                for endpoint in (first_endpoint, last_endpoint):
+                    if math.dist(point, endpoint) <= 1e-12:
+                        snapped_end = endpoint
+                        break
+                if snapped_end is not None:
+                    break
+
+            if snapped_end is not None:
+                end = snapped_end
+                chord = (end[0] - start[0], end[1] - start[1])
+                chord_length = math.hypot(*chord)
+                if chord_length <= 1e-12:
+                    self._message("The arc start and end must be different points.", error=True)
+                    return False
+                midpoint = ((start[0] + end[0]) * 0.5, (start[1] + end[1]) * 0.5)
+                normal = (-chord[1] / chord_length, chord[0] / chord_length)
+                center_offset = (center[0] - midpoint[0]) * normal[0] + (center[1] - midpoint[1]) * normal[1]
+                adjusted_center = (
+                    midpoint[0] + center_offset * normal[0],
+                    midpoint[1] + center_offset * normal[1],
+                )
+                project, _ = self._canvas_projection()
+                if math.dist(project(center), project(adjusted_center)) > 16.0:
+                    self._message(
+                        "The selected arc center is too far from the circle through the snapped endpoints. "
+                        "Choose a center closer to their perpendicular bisector.",
+                        error=True,
+                    )
+                    return False
+                center = adjusted_center
+                radius = math.dist(center, start)
+                cursor = end
+            else:
+                cursor = point
             cursor_radius = math.dist(center, cursor)
             if radius <= 0 or cursor_radius <= 1e-12:
                 self._message("The arc radius must be positive and the endpoint must differ from its center.", error=True)
                 return False
             end_angle = math.atan2(cursor[1] - center[1], cursor[0] - center[0])
             start_angle = math.atan2(start[1] - center[1], start[0] - center[0])
-            end = (center[0] + radius * math.cos(end_angle), center[1] + radius * math.sin(end_angle))
+            if snapped_end is None:
+                end = (center[0] + radius * math.cos(end_angle), center[1] + radius * math.sin(end_angle))
             if math.dist(start, end) <= 1e-12:
                 self._message("The arc start and end must define a nonzero angular span.", error=True)
                 return False
@@ -4962,6 +5015,18 @@ class SolveWorkspace(Div):
             for region in geometry.get("regions", [])
             if set(region.get("edge_ids", [])).intersection(delete_ids)
         }
+        # Sketch regions are derived faces of the editable curve network. Let
+        # the topology rebuild remove/recreate those faces after a curve is
+        # deleted; deleting the cached faces directly also removes their
+        # surviving outline curves and destroys the original region.
+        generated_sketch_regions = {
+            region.get("id")
+            for region in geometry.get("regions", [])
+            if region.get("id") in affected_regions
+            and isinstance(region.get("shape"), dict)
+            and region["shape"].get("type") == "sketch"
+        }
+        regions_to_delete = affected_regions - generated_sketch_regions
         affected_voids = [
             void for void in geometry.get("voids", [])
             if set(void.get("edge_ids", [])).intersection(delete_ids)
@@ -4989,7 +5054,7 @@ class SolveWorkspace(Div):
             edge["sketch_entity_id"] = entity_id
 
         for region in geometry.get("regions", []):
-            if region.get("id") not in affected_regions:
+            if region.get("id") not in regions_to_delete:
                 continue
             for edge_id in region.get("edge_ids", []):
                 if edge_id in delete_ids:
@@ -4998,7 +5063,7 @@ class SolveWorkspace(Div):
                 if edge is None:
                     continue
                 used_elsewhere = any(
-                    other.get("id") not in affected_regions
+                    other.get("id") not in regions_to_delete
                     and edge_id in other.get("edge_ids", [])
                     for other in geometry.get("regions", [])
                 )
@@ -5023,9 +5088,9 @@ class SolveWorkspace(Div):
             if not set(void.get("edge_ids", [])).intersection(delete_ids)
         ]
 
-        if affected_regions:
+        if regions_to_delete:
             self._delete_regions(
-                affected_regions,
+                regions_to_delete,
                 create_holes=False,
                 notify=False,
             )
@@ -7801,16 +7866,29 @@ class SolveWorkspace(Div):
         additive = isinstance(value, dict) and bool(value.get("shiftKey") or value.get("ctrlKey"))
         self.select_edge(edge_id, additive=additive)
 
+    def _edge_ids_for_sketch_entity(self, edge_id):
+        """Return every rendered segment that belongs to one sketch curve."""
+        edges = self.model.get("geometry", {}).get("edges", [])
+        edge = next((item for item in edges if item.get("id") == edge_id), None)
+        if edge is None or not edge.get("sketch_entity_id"):
+            return [edge_id]
+        entity_id = edge["sketch_entity_id"]
+        return [
+            item["id"] for item in edges
+            if item.get("sketch_entity_id") == entity_id and item.get("id")
+        ]
+
     def select_edge(self, edge_id, additive=False):
+        entity_edge_ids = self._edge_ids_for_sketch_entity(edge_id)
         if additive:
             selected = list(self.selected_edge_ids)
-            if edge_id in selected:
-                selected.remove(edge_id)
+            if set(selected).intersection(entity_edge_ids):
+                selected = [item for item in selected if item not in entity_edge_ids]
             else:
-                selected.append(edge_id)
+                selected.extend(item for item in entity_edge_ids if item not in selected)
             self.selected_edge_ids = selected
         else:
-            self.selected_edge_ids = [edge_id]
+            self.selected_edge_ids = entity_edge_ids
         self.selected_edge_id = self.selected_edge_ids[-1] if self.selected_edge_ids else None
         self.selected_region_id = None
         self.selected_region_ids = []
