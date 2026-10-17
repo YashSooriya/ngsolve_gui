@@ -2090,6 +2090,116 @@ def test_trim_stroke_removes_only_the_intersection_bounded_section(standalone_co
 
 
 
+
+def _make_trim_test_spline_divider(workspace):
+    left = (0.004, 0.0018)
+    divider_x = 0.0125
+    right = (0.021, 0.0018)
+    control = (divider_x, 0.007)
+    curve_points = [left, control, right]
+    curve_samples = workspace._sample_spline3(*curve_points)
+    top = min(curve_samples, key=lambda point: abs(point[0] - divider_x))
+    base = {"id": "trim-base", "type": "line", "points": [left, (divider_x, 0.0018)],
+            "sampled_points": [left, (divider_x, 0.0018)]}
+    curve = {"id": "trim-curve", "type": "spline3", "points": curve_points,
+             "control_point": control, "sampled_points": curve_samples}
+    divider = {"id": "trim-divider", "type": "line", "points": [top, (divider_x, 0.0018)],
+               "sampled_points": [top, (divider_x, 0.0018)]}
+    workspace.model["geometry"]["sketch_entities"] = [base, curve, divider]
+    workspace._refresh_sketch_generated_regions()
+    assert len(workspace.model["geometry"]["regions"]) == 1
+    return base, curve, divider, top
+
+
+def test_drag_trim_of_curved_region_edge_removes_to_the_divider(standalone_components):
+    workspace = SolveWorkspace()
+    base, curve, divider, _ = _make_trim_test_spline_divider(workspace)
+    edge = next(
+        item for item in workspace.model["geometry"]["edges"]
+        if item.get("sketch_entity_id") == curve["id"]
+        and min(item.get("sketch_t0", 0.0), item.get("sketch_t1", 1.0)) <= 0.25
+        <= max(item.get("sketch_t0", 0.0), item.get("sketch_t1", 1.0))
+    )
+    point = curve["sampled_points"][len(curve["sampled_points"]) // 4]
+    stroke = [(point[0], point[1] + 0.0002), (point[0], point[1] - 0.0002)]
+
+    assert workspace._trim_sketch_entities_along_stroke(stroke, target_edge_id=edge["id"])
+
+    remaining_curve = next(
+        item for item in workspace.model["geometry"]["sketch_entities"]
+        if item.get("type") in {"spline", "spline3"}
+    )
+    assert min(point[0] for point in remaining_curve["sampled_points"]) >= divider["points"][0][0] - 1e-8
+    assert next(item for item in workspace.model["geometry"]["sketch_entities"]
+                if item["id"] == base["id"])["points"] == base["points"]
+    assert next(item for item in workspace.model["geometry"]["sketch_entities"]
+                if item["id"] == divider["id"])["points"] == divider["points"]
+
+
+def test_drag_trim_started_on_divider_does_not_trim_other_edges(standalone_components):
+    workspace = SolveWorkspace()
+    base, curve, divider, top = _make_trim_test_spline_divider(workspace)
+    edge = next(
+        item for item in workspace.model["geometry"]["edges"]
+        if item.get("sketch_entity_id") == divider["id"]
+    )
+    before_curve = copy.deepcopy(curve)
+    before_base = copy.deepcopy(base)
+    y = (top[1] + base["points"][1][1]) / 2
+    stroke = [(0.003, y), (0.022, y)]
+
+    assert workspace._trim_sketch_entities_along_stroke(stroke, target_edge_id=edge["id"])
+
+    remaining = {item["id"]: item for item in workspace.model["geometry"]["sketch_entities"]}
+    assert remaining[base["id"]]["points"] == before_base["points"]
+    remaining_curve = next(item for item in remaining.values() if item["type"] == "spline3")
+    assert remaining_curve["points"] == before_curve["points"]
+    assert divider["id"] not in remaining
+
+
+
+def test_drag_trim_forwards_the_edge_under_pointer_as_its_target(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    workspace._canvas_drag = {"operation": "trim"}
+    workspace._commit_browser_canvas_view = lambda *args, **kwargs: False
+    workspace._sketch_screen_points_to_world = lambda points, snap=False: [(0.0, 0.0), (1.0, 1.0)]
+    captured = {}
+    workspace._trim_sketch_entities_along_stroke = lambda stroke, **kwargs: captured.update(
+        stroke=stroke, **kwargs
+    ) or True
+    completed = [
+        "trim", "trim", 10, 10, 30, 10, "", False, True, 1, 0, 0, 1,
+        "edge-under-pointer", [[10, 10], [30, 10]],
+    ]
+    fake_js = SimpleNamespace(eval=lambda _script: completed)
+    monkeypatch.setattr(SolveWorkspace, "js", property(lambda self: fake_js), raising=False)
+
+    workspace._on_canvas_mouse_up(SimpleNamespace(value={}))
+
+    assert captured["target_edge_id"] == "edge-under-pointer"
+    assert captured["stroke"] == [(0.0, 0.0), (1.0, 1.0)]
+
+
+def test_trim_uses_region_boundary_parameters_for_approximate_junctions(standalone_components):
+    workspace = SolveWorkspace()
+    base, curve, divider, top = _make_trim_test_spline_divider(workspace)
+    # Keep the generated face's topology but perturb the divider endpoint by
+    # less than a screen pixel. The region boundary parameter remains the
+    # authoritative endpoint for the curved edge.
+    divider["points"][0] = (top[0], top[1] - 1e-6)
+    divider["sampled_points"] = list(divider["points"])
+    point = curve["sampled_points"][len(curve["sampled_points"]) // 4]
+    stroke = [(point[0], point[1] + 0.0002), (point[0], point[1] - 0.0002)]
+
+    assert workspace._trim_sketch_entities_along_stroke(stroke)
+
+    remaining_curve = next(
+        item for item in workspace.model["geometry"]["sketch_entities"]
+        if item.get("type") in {"spline", "spline3"}
+    )
+    assert min(point[0] for point in remaining_curve["sampled_points"]) >= top[0] - 1e-8
+
+
 def test_trim_preserves_visible_line_fragment_with_stale_entity_reference(standalone_components):
     workspace = SolveWorkspace()
     geometry = workspace.model["geometry"]
@@ -5131,3 +5241,161 @@ def test_power_trim_preserves_both_faces_at_a_spline_divider_intersection(standa
     assert len(workspace.model["geometry"]["regions"]) == 2
     assert workspace._trim_sketch_entities_along_stroke([(divider_x - 0.0005, 0.0048), (divider_x + 0.0005, 0.0048)])
     assert len(workspace.model["geometry"]["regions"]) == 2
+
+
+def _make_trim_test_split_rectangle(workspace):
+    lower_left = (0.004, 0.002)
+    divider_bottom = (0.012, 0.002)
+    lower_right = (0.020, 0.002)
+    upper_right = (0.020, 0.007)
+    divider_top = (0.012, 0.007)
+    upper_left = (0.004, 0.007)
+    definitions = [
+        ("trim-bottom", lower_left, lower_right),
+        ("trim-right", lower_right, upper_right),
+        ("trim-top", upper_right, upper_left),
+        ("trim-left", upper_left, lower_left),
+        ("trim-divider", divider_bottom, divider_top),
+    ]
+    entities = [
+        {"id": entity_id, "type": "line", "points": [list(start), list(end)],
+         "sampled_points": [list(start), list(end)]}
+        for entity_id, start, end in definitions
+    ]
+    workspace.model["geometry"]["regions"] = []
+    workspace.model["geometry"]["edges"] = []
+    workspace.model["geometry"]["sketch_entities"] = entities
+    workspace._refresh_sketch_generated_regions()
+    assert len(workspace.model["geometry"]["regions"]) == 2
+    return {entity["id"]: entity for entity in entities}
+
+
+def test_trim_right_side_of_split_base_stops_at_the_divider(standalone_components):
+    workspace = SolveWorkspace()
+    entities = _make_trim_test_split_rectangle(workspace)
+    right_base_edge = next(
+        edge for edge in workspace.model["geometry"]["edges"]
+        if edge.get("sketch_entity_id") == "trim-bottom"
+        and sum(point[0] for point in edge.get("vertices", [])) / 2 > 0.012
+    )
+
+    assert workspace._trim_sketch_entities_along_stroke(
+        [(0.016, 0.0015), (0.016, 0.0025)], target_edge_id=right_base_edge["id"]
+    )
+
+    remaining = {entity["id"]: entity for entity in workspace.model["geometry"]["sketch_entities"]}
+    assert remaining["trim-bottom"]["points"] == [[0.004, 0.002], [0.012, 0.002]]
+    assert "trim-divider" in remaining
+    assert len(workspace.model["geometry"]["regions"]) == 1
+    remaining_edges = {edge.get("sketch_entity_id") for edge in workspace.model["geometry"]["edges"]}
+    assert {"trim-right", "trim-top", "trim-left", "trim-divider"} <= remaining_edges
+
+
+def test_trim_internal_vertical_divider_preserves_the_outer_geometry(standalone_components):
+    workspace = SolveWorkspace()
+    entities = _make_trim_test_split_rectangle(workspace)
+    divider_edge = next(
+        edge for edge in workspace.model["geometry"]["edges"]
+        if edge.get("sketch_entity_id") == "trim-divider"
+    )
+
+    assert workspace._trim_sketch_entities_along_stroke(
+        [(0.011, 0.0045), (0.013, 0.0045)], target_edge_id=divider_edge["id"]
+    )
+
+    remaining_ids = {entity["id"] for entity in workspace.model["geometry"]["sketch_entities"]}
+    assert "trim-divider" not in remaining_ids
+    assert {"trim-bottom", "trim-right", "trim-top", "trim-left"} <= remaining_ids
+    assert len(workspace.model["geometry"]["regions"]) == 1
+    region_entity_ids = set(workspace.model["geometry"]["regions"][0]["shape"]["entity_ids"])
+    assert region_entity_ids == {"trim-bottom", "trim-right", "trim-top", "trim-left"}
+
+
+
+def test_scoped_sketch_refresh_ignores_unrelated_closed_curves(standalone_components):
+    workspace = SolveWorkspace()
+    entities = _make_trim_test_split_rectangle(workspace)
+    outer_ids = {"trim-bottom", "trim-right", "trim-top", "trim-left"}
+    triangle = [
+        {"id": "loose-a", "type": "line", "points": [[0.030, 0.002], [0.032, 0.002]],
+         "sampled_points": [[0.030, 0.002], [0.032, 0.002]]},
+        {"id": "loose-b", "type": "line", "points": [[0.032, 0.002], [0.031, 0.004]],
+         "sampled_points": [[0.032, 0.002], [0.031, 0.004]]},
+        {"id": "loose-c", "type": "line", "points": [[0.031, 0.004], [0.030, 0.002]],
+         "sampled_points": [[0.031, 0.004], [0.030, 0.002]]},
+    ]
+    workspace.model["geometry"]["sketch_entities"].extend(triangle)
+    workspace.model["geometry"]["regions"] = [
+        region for region in workspace.model["geometry"]["regions"]
+        if set(region.get("shape", {}).get("entity_ids", [])) <= outer_ids
+    ]
+
+    workspace._refresh_sketch_generated_regions(entity_ids=outer_ids)
+
+    assert len(workspace.model["geometry"]["regions"]) == 1
+    assert set(workspace.model["geometry"]["regions"][0]["shape"]["entity_ids"]) == outer_ids
+    assert {item["id"] for item in workspace.model["geometry"]["sketch_entities"]} >= outer_ids | {
+        "loose-a", "loose-b", "loose-c"
+    }
+
+
+def test_trim_ignores_near_coincident_curve_tessellation_crossings(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    count = 65
+    start_x, divider_x, end_x = 0.004, 0.012, 0.020
+    base_y = 0.003
+    target_points = [
+        [start_x + (end_x - start_x) * index / (count - 1), base_y]
+        for index in range(count)
+    ]
+    duplicate_points = [
+        [point[0], point[1] + 2e-5 * math.sin(8.0 * math.pi * index / (count - 1))]
+        for index, point in enumerate(target_points)
+    ]
+    entities = [
+        {"id": "near-target", "type": "spline", "points": target_points,
+         "sampled_points": target_points},
+        {"id": "near-copy", "type": "spline", "points": duplicate_points,
+         "sampled_points": duplicate_points},
+        {"id": "trim-left-stop", "type": "line", "points": [[start_x, 0.001], [start_x, 0.005]],
+         "sampled_points": [[start_x, 0.001], [start_x, 0.005]]},
+        {"id": "trim-divider-stop", "type": "line", "points": [[divider_x, 0.001], [divider_x, 0.005]],
+         "sampled_points": [[divider_x, 0.001], [divider_x, 0.005]]},
+        {"id": "trim-right-stop", "type": "line", "points": [[end_x, 0.001], [end_x, 0.005]],
+         "sampled_points": [[end_x, 0.001], [end_x, 0.005]]},
+    ]
+    workspace.model["geometry"]["sketch_entities"] = entities
+    workspace.model["geometry"]["edges"] = [{
+        "id": "near-target-edge", "sketch_entity_id": "near-target",
+        "sketch_t0": 0.5, "sketch_t1": 1.0,
+        "vertices": [target_points[count // 2], target_points[-1]],
+        "curve": {"type": "spline", "sampled_points": target_points[count // 2:]},
+    }]
+    workspace.model["geometry"]["regions"] = [{
+        "id": "near-region", "name": "Near-overlap test",
+        "vertices": [[start_x, 0.001], [end_x, 0.001], [end_x, 0.005], [start_x, 0.005]],
+        "shape": {"type": "sketch", "entity_ids": [
+            "near-target", "trim-left-stop", "trim-divider-stop", "trim-right-stop"
+        ], "boundary": [
+            {"entity_id": "near-target", "start_t": 0.0, "end_t": 1.0},
+            {"entity_id": "trim-left-stop", "start_t": 0.0, "end_t": 1.0},
+            {"entity_id": "trim-divider-stop", "start_t": 0.0, "end_t": 1.0},
+            {"entity_id": "trim-right-stop", "start_t": 0.0, "end_t": 1.0},
+        ]},
+    }]
+    monkeypatch.setattr(workspace, "_refresh_sketch_generated_regions", lambda **_kwargs: None)
+
+    assert workspace._trim_sketch_entities_along_stroke(
+        [(0.016, 0.002), (0.016, 0.004)],
+        target_edge_id="near-target-edge",
+    )
+
+    remaining = {
+        entity["id"]: entity for entity in workspace.model["geometry"]["sketch_entities"]
+        if entity.get("id") in {"near-target", "near-copy"}
+    }
+    assert set(remaining) == {"near-target", "near-copy"}
+    for entity in remaining.values():
+        xs = [point[0] for point in entity["sampled_points"]]
+        assert min(xs) == pytest.approx(start_x)
+        assert max(xs) == pytest.approx(divider_x, abs=1e-10)
