@@ -3001,23 +3001,58 @@ class SolveWorkspace(Div):
     }
   };
   window.__ngsolveCancelSketchGesture = () => cancelGesture(true);
-  window.__ngsolveCommitSketchRegionMove = (regionId, dx, dy, fillUpdates = []) => {
-    if (!regionId || !Number.isFinite(dx) || !Number.isFinite(dy)) return;
-    const previous = committedRegionOffsets.get(regionId) || [0, 0];
-    const offset = [previous[0] + dx, previous[1] + dy];
-    committedRegionOffsets.set(regionId, offset);
+  window.__ngsolveCommitSketchRegionMove = (regionId, fillUpdates = [], edgeUpdates = []) => {
+    if (!regionId) return false;
     const svg = currentSvg();
-    if (svg) {
-      for (const update of fillUpdates || []) {
-        if (!update || !update.id || typeof update.d !== 'string') continue;
-        const shape = Array.from(svg.querySelectorAll('[data-sketch-region-role="shape"]'))
-          .find((node) => node.getAttribute('data-sketch-region-id') === String(update.id));
-        if (shape) shape.setAttribute('d', update.d);
+    if (!svg) return false;
+
+    const shapesById = new Map(
+      Array.from(svg.querySelectorAll('[data-sketch-region-role="shape"]'))
+        .map((node) => [node.getAttribute('data-sketch-region-id'), node])
+    );
+    const edgesById = new Map();
+    for (const node of svg.querySelectorAll('[data-sketch-edge-id]')) {
+      const id = node.getAttribute('data-sketch-edge-id');
+      if (!edgesById.has(id)) edgesById.set(id, []);
+      edgesById.get(id).push(node);
+    }
+    const validFills = (fillUpdates || []).filter(
+      (update) => update && update.id && typeof update.d === 'string'
+    );
+    const validEdges = (edgeUpdates || []).filter(
+      (update) => update && update.id && typeof update.d === 'string'
+    );
+
+    // Check all targets before mutating the live canvas. A partial commit
+    // could leave visible and clickable geometry at different coordinates.
+    if (validFills.some((update) => !shapesById.has(String(update.id)))
+        || validEdges.some((update) => !edgesById.has(String(update.id)))) {
+      return false;
+    }
+    for (const update of validFills) {
+      const shape = shapesById.get(String(update.id));
+      shape.setAttribute('d', update.d);
+      shape.removeAttribute('transform');
+    }
+    for (const update of validEdges) {
+      for (const node of edgesById.get(String(update.id))) {
+        node.setAttribute('d', update.d);
+        node.removeAttribute('transform');
       }
     }
-    setRegionOffset(svg, regionId, offset);
-    const dimensions = svg && svg.querySelector('#solve-sketch-dimensions');
+
+    // Every edge path now contains its model coordinates. Clear any accumulated
+    // drag transforms only after both visible and hit-test paths are committed.
+    for (const node of svg.querySelectorAll('[data-sketch-edge-id]')) {
+      node.removeAttribute('transform');
+    }
+    for (const node of svg.querySelectorAll('[data-sketch-region-role="shape"]')) {
+      node.removeAttribute('transform');
+    }
+    committedRegionOffsets.clear();
+    const dimensions = svg.querySelector('#solve-sketch-dimensions');
     if (dimensions) dimensions.removeAttribute('transform');
+    return true;
   };
   window.__ngsolveSyncSketchDimensionOffset = (regionId) => {
     const svg = currentSvg();
@@ -6119,17 +6154,29 @@ class SolveWorkspace(Div):
             return False
 
         self._preserve_canvas_view()
-        old_geometry_points = copy.deepcopy(self.model["geometry"].get("points", []))
+        geometry = self.model["geometry"]
+        old_geometry_points = copy.deepcopy(geometry.get("points", []))
         old_boundary_loops = {
             item["id"]: copy.deepcopy(item.get("boundary_loops", []))
-            for item in self.model["geometry"].get("regions", [])
+            for item in geometry.get("regions", [])
         }
         old_shape = copy.deepcopy(region["shape"])
         old_vertices = copy.deepcopy(region["vertices"])
-        old_parents = {item["id"]: item.get("parent_id") for item in self.model["geometry"]["regions"]}
-        old_edges = copy.deepcopy(self.model["geometry"].get("edges", []))
+        old_parents = {item["id"]: item.get("parent_id") for item in geometry["regions"]}
+        old_region_edge_ids = {
+            item["id"]: copy.deepcopy(item.get("edge_ids"))
+            for item in geometry.get("regions", [])
+        }
+        old_edges = copy.deepcopy(geometry.get("edges", []))
+        had_sketch_entities = "sketch_entities" in geometry
+        old_sketch_entities = copy.deepcopy(geometry.get("sketch_entities", []))
+        had_voids = "voids" in geometry
+        old_voids = copy.deepcopy(geometry.get("voids", []))
+        had_boundary_conditions = "boundary_conditions" in self.model
+        old_boundary_conditions = copy.deepcopy(self.model.get("boundary_conditions", []))
         try:
             shape = region["shape"]
+            imported_edge_ids = set()
             if shape["type"] == "rectangle":
                 expressions = shape.setdefault("dimension_expressions", {})
                 shape["r_min"] += dr
@@ -6161,6 +6208,10 @@ class SolveWorkspace(Div):
                     if isinstance(entity.get("center"), list):
                         entity["center"] = [entity["center"][0] + dr, entity["center"][1] + dz]
             elif shape.get("type") == "imported_contour":
+                # _move_imported_contour translates these model edges itself.
+                # Remember their IDs so the shared edge pass below does not
+                # apply the same displacement a second time.
+                imported_edge_ids = set(region.get("edge_ids", []))
                 self._move_imported_contour(region, dr, dz)
                 self._sync_imported_contour_dimension_expressions(region)
             elif shape.get("type") == "circle":
@@ -6217,7 +6268,7 @@ class SolveWorkspace(Div):
             # Moving existing edges before rebuilding preserves their IDs,
             # names, and electromagnetic/mechanical boundary assignments.
             for edge in self.model["geometry"].get("edges", []):
-                if edge["id"] in edge_ids:
+                if edge["id"] in edge_ids and edge["id"] not in imported_edge_ids:
                     edge["vertices"] = [[point[0] + dr, point[1] + dz] for point in edge["vertices"]]
                     curve = edge.get("curve")
                     if isinstance(curve, dict) and isinstance(curve.get("sampled_points"), list):
@@ -6255,13 +6306,31 @@ class SolveWorkspace(Div):
             self._message(f"Moved {region['name']} by {dr:g} m radially and {dz:g} m axially.")
             return True
         except (KeyError, ValueError, TypeError, OverflowError) as error:
+            geometry = self.model["geometry"]
             region["shape"] = old_shape
             region["vertices"] = old_vertices
-            self.model["geometry"]["edges"] = old_edges
-            self.model["geometry"]["points"] = old_geometry_points
-            for item in self.model["geometry"]["regions"]:
+            geometry["edges"] = old_edges
+            geometry["points"] = old_geometry_points
+            if had_sketch_entities:
+                geometry["sketch_entities"] = old_sketch_entities
+            else:
+                geometry.pop("sketch_entities", None)
+            if had_voids:
+                geometry["voids"] = old_voids
+            else:
+                geometry.pop("voids", None)
+            for item in geometry["regions"]:
                 item["parent_id"] = old_parents[item["id"]]
                 item["boundary_loops"] = old_boundary_loops[item["id"]]
+                saved_edge_ids = old_region_edge_ids[item["id"]]
+                if saved_edge_ids is None:
+                    item.pop("edge_ids", None)
+                else:
+                    item["edge_ids"] = saved_edge_ids
+            if had_boundary_conditions:
+                self.model["boundary_conditions"] = old_boundary_conditions
+            else:
+                self.model.pop("boundary_conditions", None)
             self._message(str(error), error=True)
             if preserve_canvas:
                 self._rollback_canvas_region_move(region_id)
@@ -6663,11 +6732,7 @@ class SolveWorkspace(Div):
                 })
 
     def _commit_canvas_region_move(self, region_id, dr, dz, fill_region_ids=()):
-        """Keep the live SVG scene mounted and commit its region preview offset."""
-        project, _ = self._canvas_projection()
-        origin = project((0.0, 0.0))
-        moved = project((dr, dz))
-        dx, dy = moved[0] - origin[0], moved[1] - origin[1]
+        """Commit model coordinates to every live fill and edge before clearing drag transforms."""
         regions_by_id = {
             item.get("id"): item for item in self.model["geometry"].get("regions", [])
         }
@@ -6676,12 +6741,37 @@ class SolveWorkspace(Div):
             for affected_id in dict.fromkeys(fill_region_ids)
             if affected_id in regions_by_id
         ]
+        project, _ = self._canvas_projection()
+        edge_updates = []
+        for edge in self.model["geometry"].get("edges", []):
+            vertices = edge.get("vertices", [])
+            curve = edge.get("curve", {})
+            curve_points = curve.get("sampled_points") if isinstance(curve, dict) else None
+            display_points = (
+                curve_points
+                if isinstance(curve_points, list) and len(curve_points) >= 2
+                else vertices
+            )
+            projected = [project(point) for point in display_points]
+            if len(projected) < 2:
+                continue
+            path_data = f"M{projected[0][0]:.3f},{projected[0][1]:.3f}"
+            path_data += " ".join(
+                f"L{x:.3f},{y:.3f}" for x, y in projected[1:]
+            )
+            edge_updates.append({"id": edge.get("id"), "d": path_data})
+
         try:
-            self.js.eval(
+            committed = self.js.eval(
                 "(() => { const commit = window.__ngsolveCommitSketchRegionMove; "
-                f"if (commit) commit({json.dumps(region_id)}, {dx!r}, {dy!r}, {json.dumps(fill_updates)}); "
+                f"if (!commit) return false; return commit({json.dumps(region_id)}, "
+                f"{json.dumps(fill_updates)}, {json.dumps(edge_updates)}); "
                 "})()"
             )
+            if committed is False:
+                # If the live nodes no longer match the model, replace the
+                # canvas once so no old clickable paths remain behind.
+                self.render_canvas()
         except Exception:
             # Standalone tests and non-browser frontends have no JS runtime.
             pass
