@@ -30,6 +30,27 @@ from .helpers import (
 )
 
 
+def test_autoscale_preserves_small_nonzero_engineering_values() -> None:
+    from ngsolve_gui.function import _MMFEMColormap
+
+    colormap = _MMFEMColormap(minval=0.0, maxval=1.0)
+    colormap.autoscale = True
+    colormap.widen_range(0.0, 4.7e-13, timestamp=1)
+
+    assert colormap.minval == 0.0
+    assert abs(colormap.maxval - 4.7e-13) < 1e-25
+    assert colormap.autoscale
+
+    # Additional renderers in the same frame widen one shared range, while a
+    # new frame resets the range and its scale factor.
+    colormap.widen_range(-1e-13, 6e-13, timestamp=1)
+    assert abs(colormap.minval + 1e-13) < 1e-25
+    assert abs(colormap.maxval - 6e-13) < 1e-25
+    colormap.widen_range(0.0, 2e-13, timestamp=2)
+    assert colormap.minval == 0.0
+    assert abs(colormap.maxval - 2e-13) < 1e-25
+
+
 @app_test("ngsolve_gui.appconfig")
 def test_function_scalar_2d(page: Page, app) -> None:
     """2D scalar x*y: default (deformed) → no wireframe → deformation off."""

@@ -18,6 +18,37 @@ _originals: dict = {}
 
 _last_interaction = 0.0
 
+
+def _camera_view_center(matrix):
+    """Return the world-space point currently at the centre of the viewport.
+
+    The WebGPU camera transform maps world coordinates to camera coordinates;
+    its origin therefore identifies the target at the centre of the view.  The
+    camera's default pivot is the fitted domain centre, which becomes stale
+    after panning unless it is moved to this point.
+    """
+    import numpy as np
+
+    matrix = np.asarray(matrix, dtype=float).reshape(4, 4)
+    return np.linalg.solve(matrix[:3, :3], -matrix[:3, 3])
+
+
+def _sync_camera_view_center(scene):
+    """Update the Python and browser camera pivots to the viewport centre."""
+    transform = scene.options.camera.transform
+    center = _camera_view_center(transform._mat)
+    transform._center = center
+
+    # The browser engine owns interactive camera state.  Keep its pivot in
+    # sync without resetting its transform or forcing an extra render.
+    engine = getattr(scene, "_js_engine", None)
+    if engine is not None:
+        import webgpu.platform as platform
+
+        engine.camera.transform._center = platform.toJS(center.tolist())
+    return center
+
+
 def install(app):
     """Register the running app and monkey-patch GenerateMesh (idempotent)."""
     global _app, _patched
@@ -32,10 +63,11 @@ def install(app):
 def _patch_camera_interaction():
     """Record interaction time whenever the JS engine reports a camera move.
 
-    Rotation/zoom is handled entirely JS-side (Scene._apply_camera_from_js only
-    mirrors the matrix into Python, it does not re-render). We hook it to know
-    when the user is actively interacting so the preview can hold its updates and
-    not ship structural engine.update()s into the middle of a JS render frame —
+    Rotation/zoom is handled entirely JS-side. We mirror the camera state into
+    Python and update its pivot to the world point at the viewport centre, so a
+    later rotation or zoom follows the user's current view after panning. We
+    also record interaction time so the preview can hold its updates and avoid
+    shipping structural engine.update()s into the middle of a JS render frame —
     that race is what flickers between the geometry and the mesh while rotating.
 
     Patched at the class level at app startup, before any scene creates its
@@ -54,7 +86,12 @@ def _patch_camera_interaction():
         import time
 
         _last_interaction = time.monotonic()
-        return orig(self, payload)
+        result = orig(self, payload)
+        try:
+            _sync_camera_view_center(self)
+        except Exception as exc:
+            print(f"warning: camera view-centre sync failed: {exc}")
+        return result
 
     Scene._apply_camera_from_js = wrapped
     Scene._meshing_preview_cam_patched = True

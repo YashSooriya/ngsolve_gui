@@ -17,6 +17,9 @@ import sys
 # ``(label, "ext ext ...")`` groups, mirroring tkinter's filetypes argument.
 DEFAULT_FILTERS = [
     ("All Files", "*"),
+    ("MM-FEM Problem Files", "*.json *.ngsmodel"),
+    ("MM-FEM Mesh Bundles", "*.mmfem-mesh"),
+    ("MM-FEM Solution Bundles", "*.mmfem-solutions"),
     ("Mesh Files", "*.vol *.vol.gz"),
     ("Geometry Files", "*.step *.iges *.stp *.brep"),
     ("Python Files", "*.py"),
@@ -37,6 +40,92 @@ def open_file_dialog(title="Select a file", initialdir=None, filters=DEFAULT_FIL
     if path is None:
         path = _tkinter(title, initialdir, filters)
     return path or None
+
+
+def save_file_dialog(title="Save a file", initialdir=None, filename="", filters=DEFAULT_FILTERS):
+    'Open a native save dialog and return the selected filesystem path.'
+    initialdir = initialdir or os.path.expanduser("~")
+    if sys.platform == "win32":
+        return _windows_save_dialog(title, initialdir, filename, filters)
+
+    from tkinter import Tk, filedialog
+
+    root = Tk()
+    root.withdraw()
+    try:
+        return filedialog.asksaveasfilename(
+            title=title,
+            initialdir=initialdir,
+            initialfile=filename,
+            filetypes=[(label, patterns) for label, patterns in filters],
+            confirmoverwrite=True,
+        ) or None
+    finally:
+        root.destroy()
+
+
+def _windows_save_dialog(title, initialdir, filename, filters):
+    patterns = "|".join(
+        part
+        for label, group in filters
+        for part in (label, ";".join(group.split()) or "*.*")
+    ) or "All Files|*.*"
+    env = os.environ.copy()
+    env.update({
+        "MMFEM_DIALOG_TITLE": title,
+        "MMFEM_DIALOG_INITIALDIR": initialdir,
+        "MMFEM_DIALOG_FILENAME": filename,
+        "MMFEM_DIALOG_FILTER": patterns,
+    })
+    script = r'''
+Add-Type -AssemblyName System.Windows.Forms
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$dialog = New-Object System.Windows.Forms.SaveFileDialog
+$dialog.Title = $env:MMFEM_DIALOG_TITLE
+$dialog.FileName = $env:MMFEM_DIALOG_FILENAME
+$dialog.Filter = $env:MMFEM_DIALOG_FILTER
+$dialog.AddExtension = $true
+$dialog.OverwritePrompt = $true
+if (Test-Path -LiteralPath $env:MMFEM_DIALOG_INITIALDIR -PathType Container) {
+    $dialog.InitialDirectory = $env:MMFEM_DIALOG_INITIALDIR
+}
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class MMFEMWindowApi {
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+}
+'@
+$ownerHandle = [MMFEMWindowApi]::GetForegroundWindow()
+$owner = $null
+if ($ownerHandle -ne [IntPtr]::Zero) {
+    $owner = New-Object System.Windows.Forms.NativeWindow
+    $owner.AssignHandle($ownerHandle)
+    $dialogResult = $dialog.ShowDialog($owner)
+} else {
+    $dialogResult = $dialog.ShowDialog()
+}
+if ($dialogResult -eq [System.Windows.Forms.DialogResult]::OK) {
+    [Console]::Out.Write($dialog.FileName)
+}
+if ($owner) { $owner.ReleaseHandle() }
+$dialog.Dispose()
+'''
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoLogo", "-NoProfile", "-STA", "-Command", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+        )
+    except OSError as error:
+        raise RuntimeError(f"Could not open the Windows save dialog: {error}") from error
+    if result.returncode != 0:
+        message = result.stderr.strip() or "The Windows save dialog failed."
+        raise RuntimeError(message)
+    return result.stdout.strip() or None
 
 
 def _run(cmd):
