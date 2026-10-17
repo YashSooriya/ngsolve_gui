@@ -4540,7 +4540,82 @@ class SolveWorkspace(Div):
         def curve_samples(entity):
             return entity.get("sampled_points") or entity.get("points") or []
 
-        def curve_intersections(first_samples, second_samples):
+        def exact_arc_line_parameters(first_entity, second_entity):
+            """Return exact parameters where one authored line meets an arc."""
+            first_type = first_entity.get("type")
+            second_type = second_entity.get("type")
+            if first_type == "arc" and second_type == "line":
+                arc_entity, line_entity, parameter_on_first = first_entity, second_entity, False
+            elif first_type == "line" and second_type == "arc":
+                arc_entity, line_entity, parameter_on_first = second_entity, first_entity, True
+            else:
+                return None
+            line_points = line_entity.get("points", [])
+            try:
+                if len(line_points) != 2:
+                    return None
+                line_start = tuple(float(value) for value in line_points[0][:2])
+                line_end = tuple(float(value) for value in line_points[1][:2])
+                center = tuple(float(value) for value in arc_entity.get("center", []))
+                radius = float(arc_entity.get("radius"))
+                arc_points = arc_entity.get("points", [])
+                arc_start = tuple(float(value) for value in arc_points[0][:2])
+                arc_end = tuple(float(value) for value in arc_points[-1][:2])
+            except (TypeError, ValueError, IndexError, OverflowError):
+                return None
+            if len(center) != 2 or radius <= 0 or not math.isfinite(radius):
+                return None
+
+            dx, dy = line_end[0] - line_start[0], line_end[1] - line_start[1]
+            fx, fy = line_start[0] - center[0], line_start[1] - center[1]
+            quadratic_a = dx * dx + dy * dy
+            if quadratic_a <= 1e-24:
+                return []
+            quadratic_b = 2.0 * (fx * dx + fy * dy)
+            quadratic_c = fx * fx + fy * fy - radius * radius
+            discriminant = quadratic_b * quadratic_b - 4.0 * quadratic_a * quadratic_c
+            discriminant_tolerance = max(
+                1e-30,
+                1e-12 * (quadratic_b * quadratic_b + abs(4.0 * quadratic_a * quadratic_c)),
+            )
+            if discriminant < -discriminant_tolerance:
+                return []
+            root = math.sqrt(max(0.0, discriminant))
+            line_tolerance = max(1e-10, 1e-12 / math.sqrt(quadratic_a))
+            start_angle = math.atan2(arc_start[1] - center[1], arc_start[0] - center[0])
+            end_angle = math.atan2(arc_end[1] - center[1], arc_end[0] - center[0])
+            clockwise = bool(arc_entity.get("clockwise", False))
+            total_sweep = (
+                (start_angle - end_angle) % (2.0 * math.pi)
+                if clockwise else (end_angle - start_angle) % (2.0 * math.pi)
+            )
+            if total_sweep <= 1e-14:
+                return []
+
+            parameters = []
+            for line_fraction in sorted({
+                (-quadratic_b - root) / (2.0 * quadratic_a),
+                (-quadratic_b + root) / (2.0 * quadratic_a),
+            }):
+                if not -line_tolerance <= line_fraction <= 1.0 + line_tolerance:
+                    continue
+                line_fraction = min(1.0, max(0.0, line_fraction))
+                hit = (line_start[0] + line_fraction * dx, line_start[1] + line_fraction * dy)
+                angle = math.atan2(hit[1] - center[1], hit[0] - center[0])
+                offset = (
+                    (start_angle - angle) % (2.0 * math.pi)
+                    if clockwise else (angle - start_angle) % (2.0 * math.pi)
+                )
+                if offset > total_sweep + 1e-9:
+                    continue
+                arc_fraction = min(1.0, max(0.0, offset / total_sweep))
+                parameters.append(line_fraction if parameter_on_first else arc_fraction)
+            return parameters
+
+        def curve_intersections(first_entity, second_entity, first_samples, second_samples):
+            exact = exact_arc_line_parameters(first_entity, second_entity)
+            if exact is not None:
+                return exact
             values = []
             first_count = max(1, len(first_samples) - 1)
             for first_index, (a, b) in enumerate(zip(first_samples, first_samples[1:])):
@@ -4738,7 +4813,7 @@ class SolveWorkspace(Div):
                 other_samples = curve_samples(other)
                 if len(other_samples) >= 2:
                     intersections.extend(curve_intersections(
-                        samples_screen, [project(point) for point in other_samples]
+                        entity, other, samples_screen, [project(point) for point in other_samples]
                     ))
             intersections = unique_parameters(intersections)
             # A free-standing entity has no trim boundary. SolidWorks Power

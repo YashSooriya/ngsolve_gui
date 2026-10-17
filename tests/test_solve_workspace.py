@@ -4790,3 +4790,37 @@ def test_centerpoint_arc_snaps_onto_existing_endpoint_without_open_gap(standalon
     assert arc["points"][-1] == list(end)
     assert math.dist(arc["center"], start) == pytest.approx(math.dist(arc["center"], end))
     assert len(workspace.model["geometry"]["regions"]) == 1
+
+
+def test_power_trim_of_both_tails_on_arc_divider_preserves_both_faces(standalone_components):
+    workspace = SolveWorkspace()
+    start, end = (0.00942, -0.00175), (0.01241, -0.00175)
+    center = (0.01092, -0.00175)
+    assert workspace._add_sketch_entity("line", [start, end])
+    assert workspace._accept_arc_sketch_point(center, variant="centerpoint")
+    assert workspace._accept_arc_sketch_point(start, variant="centerpoint")
+    assert workspace._accept_arc_sketch_point(end, variant="centerpoint")
+    arc = next(entity for entity in workspace.model["geometry"]["sketch_entities"] if entity.get("type") == "arc")
+    cx, cz = arc["center"]
+    assert workspace._add_sketch_entity("line", [(cx, cz + 0.001), (cx, cz - 0.0025)])
+    assert len(workspace.model["geometry"]["regions"]) == 2
+
+    assert workspace._trim_sketch_entities_along_stroke([(cx - 0.0005, cz + 0.0005), (cx + 0.0005, cz + 0.0005)])
+    assert len(workspace.model["geometry"]["regions"]) == 2
+    assert workspace._trim_sketch_entities_along_stroke([(cx - 0.0005, cz - 0.002), (cx + 0.0005, cz - 0.002)])
+    assert len(workspace.model["geometry"]["regions"]) == 2
+
+
+def test_power_trim_preserves_both_faces_at_a_spline_divider_intersection(standalone_components):
+    workspace = SolveWorkspace()
+    start, end, control = (0.006, 0.003), (0.012, 0.003), (0.009, 0.006)
+    assert workspace._add_sketch_entity("line", [start, end])
+    assert workspace._add_sketch_entity("spline3", [start, control, end])
+    divider = (0.009, 0.002), (0.009, 0.005)
+    assert workspace._add_sketch_entity("line", divider)
+    assert len(workspace.model["geometry"]["regions"]) == 2
+
+    assert workspace._trim_sketch_entities_along_stroke([(0.0085, 0.0025), (0.0095, 0.0025)])
+    assert len(workspace.model["geometry"]["regions"]) == 2
+    assert workspace._trim_sketch_entities_along_stroke([(0.0085, 0.0048), (0.0095, 0.0048)])
+    assert len(workspace.model["geometry"]["regions"]) == 2
