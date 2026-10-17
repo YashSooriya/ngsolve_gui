@@ -304,10 +304,29 @@ def test_mesh_preview_invalidates_when_a_mesh_parameter_changes(standalone_compo
     assert workspace._mesh_preview_button.ui_disable
 
 
-def test_ngsolve_mesh_edges_are_deduplicated_and_curved_for_preview():
+def test_ngsolve_mesh_edges_are_complete_unique_and_curved_for_preview():
     from netgen.geom2d import MakeCircle, SplineGeometry, unit_square
     from ngsolve import Mesh, VOL
     from ngsolve_gui.app import _axisymmetric_mesh_edges
+
+    def assert_preview_matches_mesh_topology(mesh, preview_edges):
+        def point_key(point):
+            return tuple(round(float(value), 12) for value in point[:2])
+
+        expected = set()
+        for element in mesh.Elements(VOL):
+            vertices = tuple(element.vertices)
+            for index, start in enumerate(vertices):
+                end = vertices[(index + 1) % len(vertices)]
+                expected.add(tuple(sorted((
+                    point_key(mesh[start].point),
+                    point_key(mesh[end].point),
+                ))))
+
+        actual = [tuple(sorted((point_key(edge[0]), point_key(edge[-1])))) for edge in preview_edges]
+        assert len(actual) == len(expected)
+        assert len(set(actual)) == len(actual)
+        assert set(actual) == expected
 
     mesh = Mesh(unit_square.GenerateMesh(maxh=0.5))
     preview_edges = _axisymmetric_mesh_edges(mesh)
@@ -316,6 +335,7 @@ def test_ngsolve_mesh_edges_are_deduplicated_and_curved_for_preview():
     assert preview_edges
     assert len(preview_edges) < element_edge_count
     assert all(len(point) == 2 for edge in preview_edges for point in edge)
+    assert_preview_matches_mesh_topology(mesh, preview_edges)
 
     circle = SplineGeometry()
     MakeCircle(circle, (0.0, 0.0), 1.0)
@@ -323,6 +343,36 @@ def test_ngsolve_mesh_edges_are_deduplicated_and_curved_for_preview():
     curved_mesh.Curve(4)
     curved_edges = _axisymmetric_mesh_edges(curved_mesh)
     assert any(len(edge) > 2 for edge in curved_edges)
+    assert_preview_matches_mesh_topology(curved_mesh, curved_edges)
+
+    # Small, arc-bounded region: mesh vertex ordering must not cause a curved
+    # boundary edge to disappear from the SVG mesh preview.
+    sketch = SplineGeometry()
+    left = sketch.AppendPoint(0.007, 0.0)
+    right = sketch.AppendPoint(0.012, 0.0)
+    top = sketch.AppendPoint(0.0095, 0.0012)
+    sketch.Append(["line", left, right], leftdomain=1, rightdomain=0, bc="base")
+    sketch.Append(["spline3", right, top, left], leftdomain=1, rightdomain=0, bc="arc")
+    sketch.SetMaterial(1, "Region_1")
+    small_curved_mesh = Mesh(sketch.GenerateMesh(maxh=0.01))
+    small_curved_mesh.Curve(3)
+    small_preview_edges = _axisymmetric_mesh_edges(small_curved_mesh)
+    assert_preview_matches_mesh_topology(small_curved_mesh, small_preview_edges)
+    assert any(len(edge) > 2 for edge in small_preview_edges)
+
+    # A 0.1 mm feature must retain the same complete edge topology.
+    tiny = SplineGeometry()
+    left = tiny.AppendPoint(0.00014, 0.0)
+    right = tiny.AppendPoint(0.00024, 0.0)
+    top = tiny.AppendPoint(0.00019, 0.000024)
+    tiny.Append(["line", left, right], leftdomain=1, rightdomain=0, bc="base")
+    tiny.Append(["spline3", right, top, left], leftdomain=1, rightdomain=0, bc="arc")
+    tiny.SetMaterial(1, "Tiny_Region")
+    tiny_mesh = Mesh(tiny.GenerateMesh(maxh=0.0001))
+    tiny_mesh.Curve(3)
+    tiny_preview_edges = _axisymmetric_mesh_edges(tiny_mesh)
+    assert_preview_matches_mesh_topology(tiny_mesh, tiny_preview_edges)
+    assert any(len(edge) > 2 for edge in tiny_preview_edges)
 
 
 def test_mesh_preview_keeps_curved_edge_polyline_points(standalone_components):
