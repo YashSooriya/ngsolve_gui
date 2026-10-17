@@ -5034,14 +5034,102 @@ class SolveWorkspace(Div):
                 entity_id = target_edge.get("sketch_entity_id") if target_edge else None
                 if entity_id:
                     target_entity_ids = {entity_id}
+        # Recover visible edge fragments left by older/imported models when
+        # their stale entity ID now points to a source curve that no longer
+        # covers them. This prevents trim cleanup from deleting those fragments.
+        reconciliation_snapshot = None
+        entities = geometry.get("sketch_entities", [])
+        edge_points = [
+            (float(point[0]), float(point[1]))
+            for edge in geometry.get("edges", []) if isinstance(edge, dict)
+            for point in edge.get("vertices", [])
+            if isinstance(point, (list, tuple)) and len(point) >= 2
+        ]
+        geometry_span = max(
+            max((point[0] for point in edge_points), default=0.0)
+            - min((point[0] for point in edge_points), default=0.0),
+            max((point[1] for point in edge_points), default=0.0)
+            - min((point[1] for point in edge_points), default=0.0),
+        )
+        match_tolerance = max(1e-12, min(1e-7, geometry_span * 2.5e-5))
+
+        def distance_to_curve(point, samples):
+            result = float("inf")
+            for first, second in zip(samples, samples[1:]):
+                dx, dy = second[0] - first[0], second[1] - first[1]
+                length2 = dx * dx + dy * dy
+                fraction = 0.0 if length2 <= 1e-24 else min(
+                    1.0, max(0.0, ((point[0] - first[0]) * dx + (point[1] - first[1]) * dy) / length2)
+                )
+                result = min(result, math.hypot(
+                    point[0] - first[0] - fraction * dx,
+                    point[1] - first[1] - fraction * dy,
+                ))
+            return result
+
+        for edge in geometry.get("edges", []):
+            if not isinstance(edge, dict) or not edge.get("sketch_entity_id"):
+                continue
+            edge_curve = edge.get("curve")
+            raw_samples = (
+                edge_curve.get("sampled_points") if isinstance(edge_curve, dict) else None
+            ) or edge.get("vertices", [])
+            try:
+                edge_samples = [(float(p[0]), float(p[1])) for p in raw_samples if len(p) >= 2]
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if len(edge_samples) < 2:
+                continue
+            represented = False
+            for entity in entities:
+                try:
+                    samples = [(float(p[0]), float(p[1])) for p in curve_samples(entity)]
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if len(samples) >= 2 and all(
+                    distance_to_curve(point, samples) <= match_tolerance for point in edge_samples
+                ):
+                    represented = True
+                    break
+            if represented:
+                continue
+
+            curve_type = edge_curve.get("type") if isinstance(edge_curve, dict) else None
+            recovered_type = "line" if curve_type == "line" else "spline"
+            recovered_points = (
+                [list(edge_samples[0]), list(edge_samples[-1])]
+                if recovered_type == "line" else [list(p) for p in edge_samples]
+            )
+            if reconciliation_snapshot is None:
+                reconciliation_snapshot = copy.deepcopy(geometry)
+            recovered_id = new_id("curve")
+            recovered_samples = copy.deepcopy(recovered_points)
+            entities.append({
+                "id": recovered_id, "type": recovered_type,
+                "points": recovered_points, "sampled_points": recovered_samples,
+            })
+            edge["sketch_entity_id"] = recovered_id
+            edge["sketch_t0"], edge["sketch_t1"] = 0.0, 1.0
+            if isinstance(edge_curve, dict):
+                edge_curve["type"] = recovered_type
+                edge_curve["sampled_points"] = copy.deepcopy(recovered_samples)
+
         if target_edge_id and not target_entity_ids:
-            if primitive_snapshot is not None:
+            target_edge = next(
+                (edge for edge in geometry.get("edges", []) if edge.get("id") == target_edge_id),
+                None,
+            )
+            entity_id = target_edge.get("sketch_entity_id") if target_edge else None
+            if entity_id:
+                target_entity_ids = {entity_id}
+        if target_edge_id and not target_entity_ids:
+            rollback_snapshot = primitive_snapshot if primitive_snapshot is not None else reconciliation_snapshot
+            if rollback_snapshot is not None:
                 geometry.clear()
-                geometry.update(primitive_snapshot)
+                geometry.update(rollback_snapshot)
             self._message("That edge cannot be trimmed as an editable sketch curve.", error=True)
             return False
 
-        entities = geometry.get("sketch_entities", [])
         def unique_parameters(values):
             result = []
             for value in sorted(max(0.0, min(1.0, float(item))) for item in values):
@@ -5237,9 +5325,10 @@ class SolveWorkspace(Div):
                     replacement_entities.append(fragment)
 
         if not removed_sections:
-            if primitive_snapshot is not None:
+            rollback_snapshot = primitive_snapshot if primitive_snapshot is not None else reconciliation_snapshot
+            if rollback_snapshot is not None:
                 geometry.clear()
-                geometry.update(primitive_snapshot)
+                geometry.update(rollback_snapshot)
             if not touched_curves:
                 self._message("The trim trace did not touch a sketch curve.", error=True)
             else:

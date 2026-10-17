@@ -2090,6 +2090,52 @@ def test_trim_stroke_removes_only_the_intersection_bounded_section(standalone_co
 
 
 
+def test_trim_preserves_visible_line_fragment_with_stale_entity_reference(standalone_components):
+    workspace = SolveWorkspace()
+    geometry = workspace.model["geometry"]
+    left, middle, right = (0.003, -0.00175), (0.005, -0.00175), (0.007, -0.00175)
+    control, top = (0.005, -0.00047), (0.005, -0.00111)
+    geometry["sketch_entities"] = [
+        {"id": "bottom-right", "type": "line", "points": [middle, right], "sampled_points": [middle, right]},
+        {
+            "id": "outer-curve", "type": "spline3", "points": [left, control, right],
+            "control_point": control, "sampled_points": workspace._sample_spline3(left, control, right),
+        },
+        {"id": "divider", "type": "line", "points": [top, middle], "sampled_points": [top, middle]},
+    ]
+    workspace._refresh_sketch_generated_regions()
+    assert len(geometry["regions"]) == 1
+    geometry["edges"].append({
+        "id": "orphan-left-bottom", "name": "Bottom line fragment",
+        "vertices": [left, middle], "curve": {"type": "line", "sampled_points": [left, middle]},
+        "sketch_entity_id": "bottom-right", "sketch_t0": 0.0, "sketch_t1": 0.5,
+        "point_ids": [], "boundary_condition_ids": [],
+    })
+    project, unproject = workspace._canvas_projection()
+    hit = project((0.006, -0.00175))
+    stroke = [unproject((hit[0], hit[1] - 8.0)), unproject((hit[0], hit[1] + 8.0))]
+
+    assert workspace._trim_sketch_entities_along_stroke(stroke)
+
+    horizontal = [
+        entity for entity in geometry["sketch_entities"]
+        if entity.get("type") == "line"
+        and abs(entity["points"][0][1] - left[1]) <= 1e-10
+        and abs(entity["points"][-1][1] - left[1]) <= 1e-10
+    ]
+    assert len(horizontal) == 1
+    assert sorted(tuple(point) for point in horizontal[0]["points"]) == [left, middle]
+    assert not any(item.get("id") == "bottom-right" for item in geometry["sketch_entities"])
+    assert any(item.get("id") == "divider" for item in geometry["sketch_entities"])
+    assert any(item.get("id") == "outer-curve" for item in geometry["sketch_entities"])
+    assert geometry["regions"]
+    assert any(
+        edge.get("sketch_entity_id") == horizontal[0]["id"]
+        and sorted(tuple(point) for point in edge["vertices"]) == [left, middle]
+        for edge in geometry["edges"]
+    )
+
+
 def test_mouse_drawn_geometry_uses_si_values_with_0_01mm_precision(standalone_components):
     workspace = SolveWorkspace()
     project, _ = workspace._canvas_projection()
