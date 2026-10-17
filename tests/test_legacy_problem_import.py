@@ -1,11 +1,12 @@
 import copy
+import json
 import math
 from types import SimpleNamespace
 
 import pytest
 
 from ngapp import utils
-from ngsolve_gui.axisymmetric_model import package_model, serialize_model_json, unpack_model, validate_model
+from ngsolve_gui.axisymmetric_model import migrate_legacy_model, package_model, serialize_model_json, unpack_model, validate_model
 from ngsolve_gui.legacy_problem_import import (
     LegacySplineGeometryCapture,
     import_legacy_problem_file,
@@ -92,6 +93,7 @@ def test_legacy_problem_conversion_preserves_supported_model_data(standalone_com
     assert coil["parent_id"] == outer["id"]
     assert coil["mechanical"] is True
     assert len(model["geometry"]["edges"]) == 8
+    assert [edge["legacy_segment_index"] for edge in model["geometry"]["edges"]] == list(range(8))
     assert len(model["boundary_conditions"]) == 4
     assert model["mesh"]["hp_layers"] == 2
     assert len(model["mesh"]["hp_edge_ids"]) == 4
@@ -219,6 +221,24 @@ def test_json_problem_file_roundtrips_and_ngsmodel_remains_supported(standalone_
     assert archive_layout == layout
 
 
+def test_previously_saved_legacy_contours_migrate_to_native_sketch(standalone_components):
+    model, studies, layout = legacy_problem_to_model(_legacy_test_problem())
+    older_document = copy.deepcopy(model)
+    older_document["geometry"]["sketch_entities"] = []
+    older_document["legacy_import"]["topology_mode"] = "direct_curve_edges"
+    for region in older_document["geometry"]["regions"]:
+        region["shape"] = {"type": "imported_contour", "domain": region["legacy_domain"]}
+    for edge in older_document["geometry"]["edges"]:
+        edge.pop("sketch_entity_id", None)
+
+    restored = migrate_legacy_model(older_document)
+
+    assert all(region["shape"]["type"] == "sketch" for region in restored["geometry"]["regions"])
+    assert len(restored["geometry"]["sketch_entities"]) == len(restored["geometry"]["edges"])
+    assert restored["legacy_import"]["topology_mode"] == "native_sketch"
+    assert validate_model(restored) == []
+
+
 def test_legacy_spline3_import_preserves_control_curve_for_render_and_solver(standalone_components):
     problem = _legacy_test_problem()
     geometry = problem["geometry"]
@@ -232,7 +252,9 @@ def test_legacy_spline3_import_preserves_control_curve_for_render_and_solver(sta
         if edge["curve"].get("type") == "spline3"
     )
 
-    assert model["legacy_import"]["topology_mode"] == "direct_curve_edges"
+    assert model["legacy_import"]["topology_mode"] == "native_sketch"
+    assert spline_edge["sketch_entity_id"]
+    assert isinstance(spline_edge["legacy_segment_index"], int)
     assert spline_edge["curve"]["control_point"] == [1.0, -1.5]
     assert len(spline_edge["curve"]["sampled_points"]) == 33
     assert spline_edge["vertices"] == [[0.0, -1.0], [2.0, -1.0]]
@@ -282,7 +304,12 @@ def test_dragging_nested_legacy_contour_preserves_spline_topology_and_updates_pa
     original_control_coordinates = list(original_control_record["coordinates"])
     path_before = workspace._canvas_region_path_data(outer)
     scripts = []
-    workspace.js = SimpleNamespace(eval=lambda script: scripts.append(script))
+    monkeypatch.setattr(
+        SolveWorkspace,
+        "js",
+        property(lambda _workspace: SimpleNamespace(eval=lambda script: scripts.append(script))),
+        raising=False,
+    )
     rendered = []
     monkeypatch.setattr(workspace, "render_canvas", lambda: rendered.append(True))
     project, _ = workspace._canvas_projection()
@@ -297,9 +324,11 @@ def test_dragging_nested_legacy_contour_preserves_spline_topology_and_updates_pa
         if edge["id"] == spline_id
     )
     assert moved is True
-    assert inner["shape"]["type"] == "imported_contour"
-    assert inner["parent_id"] == outer["id"]
-    assert inner["edge_ids"] == edge_ids
+    moved_inner = next(item for item in workspace.model["geometry"]["regions"] if item["id"] == inner["id"])
+    moved_outer = next(item for item in workspace.model["geometry"]["regions"] if item["id"] == outer["id"])
+    assert moved_inner["shape"]["type"] == "sketch"
+    assert moved_inner["parent_id"] == moved_outer["id"]
+    assert moved_inner["edge_ids"] == edge_ids
     assert len(workspace.model["geometry"]["edges"]) == edge_count
     assert moved_spline["curve"]["type"] == "spline3"
     assert moved_spline["curve"]["control_point"] == pytest.approx([
@@ -313,24 +342,25 @@ def test_dragging_nested_legacy_contour_preserves_spline_topology_and_updates_pa
     assert moved_spline["boundary_condition_ids"] == original_condition_ids
     assert moved_spline["legacy_domain_sides"] == original_domain_sides
     assert moved_spline["curve"]["control_point_id"] == original_control_id
-    assert original_control_record["coordinates"] == pytest.approx([
-        original_control_coordinates[0] + 0.02,
-        original_control_coordinates[1] + 0.02,
-    ])
     moved_control_record = next(
         item for item in workspace.model["geometry"]["points"]
         if item["id"] == moved_spline["curve"]["control_point_id"]
     )
-    assert moved_control_record is original_control_record
+    assert moved_control_record["coordinates"] == pytest.approx([
+        original_control_coordinates[0] + 0.02,
+        original_control_coordinates[1] + 0.02,
+    ])
+    assert moved_control_record["id"] == original_control_id
     assert len(workspace.model["geometry"]["points"]) == len(model["geometry"]["points"])
     parent_hole = next(
-        loop for loop in outer["boundary_loops"]
-        if loop.get("role") == "hole" and loop.get("region_id") == inner["id"]
+        loop for loop in moved_outer["boundary_loops"]
+        if loop.get("role") == "hole" and loop.get("region_id") == moved_inner["id"]
     )
-    assert {item["edge_id"] for item in parent_hole["edges"]} == set(inner["edge_ids"])
-    path_after = workspace._canvas_region_path_data(outer)
+    assert {item["edge_id"] for item in parent_hole["edges"]} == set(moved_inner["edge_ids"])
+    path_after = workspace._canvas_region_path_data(moved_outer)
     assert path_after != path_before
-    assert scripts and json.dumps({"id": outer["id"], "d": path_after}) in scripts[0]
+    assert scripts
+    assert any(moved_spline["id"] in script for script in scripts)
     assert rendered == []
 
 
@@ -373,8 +403,11 @@ def test_imported_contour_bounds_and_spline_points_are_editable(standalone_compo
 
     workspace._set_region_dimension(inner["id"], "width", "0.8")
 
+    inner = next(item for item in workspace.model["geometry"]["regions"] if item["id"] == inner["id"])
+    spline = next(edge for edge in workspace.model["geometry"]["edges"] if edge["id"] == spline["id"])
     new_r = [point[0] for point in inner["vertices"]]
     assert max(new_r) - min(new_r) == pytest.approx(0.8)
+    assert inner["shape"]["type"] == "sketch"
     assert spline["curve"]["type"] == "spline3"
     assert spline["curve"]["control_point"][0] == pytest.approx(
         min(new_r) + (old_curve["control_point"][0] - old_r_min) * 0.8 / (old_r_max - old_r_min)
@@ -385,10 +418,12 @@ def test_imported_contour_bounds_and_spline_points_are_editable(standalone_compo
     workspace.selected_edge_id = spline["id"]
     workspace.selected_edge_ids = [spline["id"]]
     workspace._render_inspector()
-    assert "imported_contour" in workspace._region_dimension_groups
+    assert "sketch" in workspace._region_dimension_groups
     assert workspace._imported_edge_geometry.ui_hidden is False
     old_control_z = spline["curve"]["control_point"][1]
-    workspace._set_imported_edge_coordinate(spline["id"], "control", "z", str(old_control_z + 0.01))
+    spline_id = spline["id"]
+    workspace._set_imported_edge_coordinate(spline_id, "control", "z", str(old_control_z + 0.01))
+    spline = next(edge for edge in workspace.model["geometry"]["edges"] if edge["id"] == spline_id)
     assert spline["curve"]["control_point"][1] == pytest.approx(old_control_z + 0.01)
     assert len(spline["curve"]["sampled_points"]) == 33
 

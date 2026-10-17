@@ -42,6 +42,7 @@ from .axisymmetric_model import (
     builtin_materials,
     evaluate_expression,
     evaluate_sketch_entity,
+    sample_sketch_entity,
     find_closed_sketch_loops,
     migrate_legacy_model,
     migrate_regional_loads,
@@ -6205,6 +6206,8 @@ class SolveWorkspace(Div):
                         continue
                     for key in ("points", "sampled_points"):
                         entity[key] = [[point[0] + dr, point[1] + dz] for point in entity.get(key, [])]
+                    if isinstance(entity.get("control_point"), (list, tuple)):
+                        entity["control_point"] = [entity["control_point"][0] + dr, entity["control_point"][1] + dz]
                     if isinstance(entity.get("center"), list):
                         entity["center"] = [entity["center"][0] + dr, entity["center"][1] + dz]
             elif shape.get("type") == "imported_contour":
@@ -6339,26 +6342,23 @@ class SolveWorkspace(Div):
             return False
 
     def _is_imported_legacy_edge(self, edge):
-        edge_id = edge.get("id")
-        if not edge_id:
+        entity_id = edge.get("sketch_entity_id")
+        if not isinstance(entity_id, str):
             return False
-        return bool(edge.get("legacy_domain_sides")) or any(
-            region.get("shape", {}).get("type") == "imported_contour"
-            and edge_id in region.get("edge_ids", [])
-            for region in self.model.get("geometry", {}).get("regions", [])
-        )
+        entity = next((
+            item for item in self.model.get("geometry", {}).get("sketch_entities", [])
+            if item.get("id") == entity_id
+        ), None)
+        return isinstance(entity, dict) and entity.get("type") in {"line", "spline3"}
 
     @staticmethod
     def _sample_imported_spline3(start, control, end, count=33):
-        return [
-            [
-                (1.0 - t) * (1.0 - t) * float(start[axis])
-                + 2.0 * (1.0 - t) * t * float(control[axis])
-                + t * t * float(end[axis])
-                for axis in (0, 1)
-            ]
-            for t in (index / (count - 1) for index in range(count))
-        ]
+        # Keep this compatibility helper on the same rational definition used
+        # by native sketch topology and the Netgen Spline3 solver adapter.
+        return sample_sketch_entity(
+            {"type": "spline3", "points": [list(start), list(control), list(end)]},
+            count=count,
+        )
 
     def _sync_imported_contour_dimension_expressions(self, region):
         if region.get("shape", {}).get("type") != "imported_contour" or not region.get("vertices"):
@@ -6408,6 +6408,101 @@ class SolveWorkspace(Div):
             if len(vertices) >= 3:
                 region["vertices"] = vertices
                 self._sync_imported_contour_dimension_expressions(region)
+
+    def _transform_sketch_contour_bounds(self, region, target_bounds):
+        """Resize a sketch contour by an affine transform while keeping shared points connected."""
+        shape = region.get("shape", {})
+        entity_ids = set(shape.get("entity_ids", [])) if isinstance(shape, dict) else set()
+        if not entity_ids:
+            raise ValueError("This sketch contour has no editable boundary curves.")
+        regions = self.model.get("geometry", {}).get("regions", [])
+        for other in regions:
+            if other.get("id") == region.get("id"):
+                continue
+            other_shape = other.get("shape", {})
+            if isinstance(other_shape, dict) and entity_ids.intersection(other_shape.get("entity_ids", [])):
+                raise ValueError("This contour shares a curve with another region. Edit its shared edge or endpoint instead of resizing one side.")
+        vertices = region.get("vertices", [])
+        if len(vertices) < 3:
+            raise ValueError("This sketch contour has no closed outline.")
+        old_r = [float(point[0]) for point in vertices]
+        old_z = [float(point[1]) for point in vertices]
+        old_r_min, old_r_max = min(old_r), max(old_r)
+        old_z_min, old_z_max = min(old_z), max(old_z)
+        old_width, old_height = old_r_max - old_r_min, old_z_max - old_z_min
+        new_r_min, new_r_max, new_z_min, new_z_max = (float(value) for value in target_bounds)
+        if old_width <= 1e-15 or old_height <= 1e-15:
+            raise ValueError("This sketch contour must have nonzero radial and axial dimensions.")
+        if new_r_min < -1e-12 or new_r_max <= new_r_min or new_z_max <= new_z_min:
+            raise ValueError("The sketch contour needs r ≥ 0 and positive dimensions.")
+        radial_scale = (new_r_max - new_r_min) / old_width
+        axial_scale = (new_z_max - new_z_min) / old_height
+
+        def transform(point):
+            radial = new_r_min + (float(point[0]) - old_r_min) * radial_scale
+            if radial < -1e-12:
+                raise ValueError("The edit would place part of the contour at r < 0.")
+            return [0.0 if abs(radial) <= 1e-12 else radial,
+                    new_z_min + (float(point[1]) - old_z_min) * axial_scale]
+
+        geometry = self.model["geometry"]
+        entities = geometry.get("sketch_entities", [])
+        entities_by_id = {
+            entity.get("id"): entity for entity in entities
+            if isinstance(entity, dict) and isinstance(entity.get("id"), str)
+        }
+        if not entity_ids.issubset(entities_by_id):
+            raise ValueError("This sketch contour refers to a missing curve.")
+        point_updates = {}
+        for entity_id in entity_ids:
+            entity = entities_by_id[entity_id]
+            points = entity.get("points", [])
+            point_ids = entity.get("point_ids", [])
+            if len(points) != len(point_ids):
+                raise ValueError("A sketch curve is missing persistent point references.")
+            for point_id, point in zip(point_ids, points):
+                candidate = transform(point)
+                previous = point_updates.get(point_id)
+                if previous is not None and math.dist(previous, candidate) > 1e-10:
+                    raise ValueError("Connected sketch curves disagree about a shared point.")
+                point_updates[point_id] = candidate
+
+        affected = set(entity_ids)
+        for entity in entities:
+            entity_points = entity.get("points", [])
+            point_ids = entity.get("point_ids", [])
+            if entity.get("id") in entity_ids:
+                entity["points"] = [transform(point) for point in entity_points]
+                if isinstance(entity.get("control_point"), (list, tuple)):
+                    entity["control_point"] = transform(entity["control_point"])
+                if isinstance(entity.get("center"), (list, tuple)):
+                    entity["center"] = transform(entity["center"])
+                affected.add(entity.get("id"))
+            elif len(entity_points) == len(point_ids) and any(point_id in point_updates for point_id in point_ids):
+                entity["points"] = [
+                    list(point_updates[point_id]) if point_id in point_updates else list(point)
+                    for point_id, point in zip(point_ids, entity_points)
+                ]
+                control_id = entity.get("control_point_id")
+                if control_id in point_updates:
+                    entity["control_point"] = list(point_updates[control_id])
+                affected.add(entity.get("id"))
+            if entity.get("id") in affected:
+                sample_count = max(33, len(entity.get("sampled_points", [])) or 0)
+                entity["sampled_points"] = sample_sketch_entity(entity, sample_count)
+
+        point_records = {
+            point.get("id"): point for point in geometry.get("points", [])
+            if isinstance(point, dict) and point.get("id")
+        }
+        for point_id, coordinates in point_updates.items():
+            record = point_records.get(point_id)
+            if record is None:
+                raise ValueError("A sketch point is missing from the point table.")
+            record["coordinates"] = list(coordinates)
+
+        templates = copy.deepcopy(regions)
+        self._refresh_sketch_generated_regions(source_templates=templates)
 
     def _transform_imported_contour_bounds(self, region, target_bounds):
         """Resize/reposition one legacy contour while retaining curve and edge IDs."""
@@ -6501,92 +6596,90 @@ class SolveWorkspace(Div):
 
     @_history_tracked
     def _set_imported_edge_coordinate(self, edge_id, point_role, axis, value):
-        edge = next((item for item in self.model.get("geometry", {}).get("edges", []) if item.get("id") == edge_id), None)
-        if edge is None or not self._is_imported_legacy_edge(edge):
+        """Edit a native sketch curve point, including curves migrated from legacy Python."""
+        edge = next((
+            item for item in self.model.get("geometry", {}).get("edges", [])
+            if item.get("id") == edge_id
+        ), None)
+        if edge is None or point_role not in {"start", "end", "control"} or axis not in {"r", "z"}:
             return
-        curve = edge.get("curve", {})
-        if point_role not in {"start", "end", "control"} or axis not in {"r", "z"}:
+        entity_id = edge.get("sketch_entity_id")
+        geometry = self.model.get("geometry", {})
+        entity = next((
+            item for item in geometry.get("sketch_entities", [])
+            if isinstance(item, dict) and item.get("id") == entity_id
+        ), None)
+        if not isinstance(entity, dict) or entity.get("type") not in {"line", "spline3"}:
             return
-        if point_role == "control" and curve.get("type") != "spline3":
+        if point_role == "control" and entity.get("type") != "spline3":
             return
-        old_geometry = copy.deepcopy(self.model["geometry"])
+        old_geometry = copy.deepcopy(geometry)
+        old_conditions = copy.deepcopy(self.model.get("boundary_conditions", []))
+        old_mesh = copy.deepcopy(self.model.get("mesh", {}))
+        source_templates = copy.deepcopy(geometry.get("regions", []))
         try:
             parameters = {item["name"]: item for item in self.model.get("parameters", [])}
             coordinate = evaluate_expression(str(value).strip(), parameters)
             if not math.isfinite(coordinate):
                 raise ValueError("Coordinates must be finite SI lengths.")
             self._preserve_canvas_view()
-            point_records = {
-                point.get("id"): point for point in self.model["geometry"].get("points", [])
-                if isinstance(point, dict) and point.get("id")
-            }
+            points = entity.get("points", [])
+            point_ids = entity.get("point_ids", [])
+            if len(points) < 2 or len(points) != len(point_ids):
+                raise ValueError("This sketch curve is missing editable point IDs.")
             axis_index = 0 if axis == "r" else 1
-            if point_role in {"start", "end"}:
-                endpoint_index = 0 if point_role == "start" else 1
-                point_ids = edge.get("point_ids", [])
-                if len(point_ids) != 2 or endpoint_index >= len(edge.get("vertices", [])):
-                    raise ValueError("This legacy edge has incomplete endpoint topology.")
-                point_id = point_ids[endpoint_index]
-                point = point_records.get(point_id, {}).get("coordinates")
-                if not isinstance(point, (list, tuple)) or len(point) < 2:
-                    point = edge["vertices"][endpoint_index]
-                updated = [float(point[0]), float(point[1])]
-                updated[axis_index] = coordinate
-                if updated[0] < -1e-12:
-                    raise ValueError("Axisymmetric geometry must remain at r ≥ 0.")
-                updated[0] = 0.0 if abs(updated[0]) <= 1e-12 else updated[0]
-                if point_id not in point_records:
-                    raise ValueError("This legacy endpoint is missing from the point table.")
-                point_records[point_id]["coordinates"] = updated
-                changed_point_id = point_id
+            if point_role == "start":
+                point_index = 0
+            elif point_role == "end":
+                point_index = len(points) - 1
             else:
-                point_id = curve.get("control_point_id")
-                updated = curve.get("control_point") or []
-                if len(updated) < 2:
-                    raise ValueError("This spline has no editable control point.")
-                updated = [float(updated[0]), float(updated[1])]
-                updated[axis_index] = coordinate
-                if updated[0] < -1e-12:
-                    raise ValueError("Axisymmetric geometry must remain at r ≥ 0.")
-                updated[0] = 0.0 if abs(updated[0]) <= 1e-12 else updated[0]
-                if point_id not in point_records:
-                    raise ValueError("This spline control point is missing from the point table.")
-                point_records[point_id]["coordinates"] = updated
-                changed_point_id = point_id
+                point_index = 1
+            point_id = (
+                entity.get("control_point_id") if point_role == "control"
+                else point_ids[point_index]
+            ) or point_ids[point_index]
+            point_records = {item.get("id"): item for item in geometry.get("points", []) if item.get("id")}
+            if point_id not in point_records:
+                raise ValueError("This sketch point is missing from the point table.")
+            updated = list(point_records[point_id].get("coordinates", points[point_index]))
+            if len(updated) != 2:
+                raise ValueError("This sketch point has invalid coordinates.")
+            updated[axis_index] = coordinate
+            if updated[0] < -1e-12:
+                raise ValueError("Axisymmetric geometry must remain at r ≥ 0.")
+            updated[0] = 0.0 if abs(updated[0]) <= 1e-12 else updated[0]
+            point_records[point_id]["coordinates"] = list(updated)
 
-            for item in self.model["geometry"].get("edges", []):
-                item_curve = item.get("curve", {})
-                point_ids = item.get("point_ids", [])
-                endpoint_changed = False
-                for index, candidate in enumerate(point_ids[:2]):
-                    if candidate == changed_point_id and index < len(item.get("vertices", [])):
-                        item["vertices"][index] = list(point_records[candidate]["coordinates"])
-                        endpoint_changed = True
-                control_changed = isinstance(item_curve, dict) and item_curve.get("control_point_id") == changed_point_id
-                if not endpoint_changed and not control_changed:
-                    continue
-                if not isinstance(item_curve, dict):
-                    continue
-                if item_curve.get("type") == "spline3":
-                    control_id = item_curve.get("control_point_id")
-                    if control_id in point_records:
-                        item_curve["control_point"] = list(point_records[control_id]["coordinates"])
-                    if len(item.get("vertices", [])) == 2 and len(item_curve.get("control_point", [])) >= 2:
-                        item_curve["sampled_points"] = self._sample_imported_spline3(
-                            item["vertices"][0], item_curve["control_point"], item["vertices"][1]
-                        )
-                elif item_curve.get("type") == "line":
-                    item_curve["sampled_points"] = copy.deepcopy(item.get("vertices", []))
-            self._refresh_imported_region_vertices()
-            self._recompute_parent_links()
-            self._rebuild_imported_parent_loops()
+            changed_entities = set()
+            for candidate in geometry.get("sketch_entities", []):
+                candidate_points = candidate.get("points", [])
+                candidate_ids = candidate.get("point_ids", [])
+                changed = False
+                if len(candidate_points) == len(candidate_ids):
+                    for index, candidate_id in enumerate(candidate_ids):
+                        if candidate_id == point_id:
+                            candidate_points[index] = list(updated)
+                            changed = True
+                if candidate.get("control_point_id") == point_id:
+                    candidate["control_point"] = list(updated)
+                    changed = True
+                if changed:
+                    sample_count = max(33, len(candidate.get("sampled_points", [])) or 0)
+                    candidate["sampled_points"] = sample_sketch_entity(candidate, sample_count)
+                    changed_entities.add(candidate.get("id"))
+
+            if not changed_entities:
+                raise ValueError("The selected sketch point is not connected to an editable curve.")
+            self._refresh_sketch_generated_regions(source_templates=source_templates)
             _sync_axis_boundary_conditions(self.model)
             _sync_mechanical_boundary_conditions(self.model)
             self._refresh_model_tree()
             self._render_inspector()
-            self._message("Updated imported geometry point.")
+            self._message("Updated sketch curve point.")
         except (ValueError, TypeError, OverflowError) as error:
             self.model["geometry"] = old_geometry
+            self.model["boundary_conditions"] = old_conditions
+            self.model["mesh"] = old_mesh
             self._refresh_model_tree()
             self._render_inspector()
             self._message(str(error), error=True)
@@ -7479,6 +7572,15 @@ class SolveWorkspace(Div):
             and len(point.get("coordinates")) == 2
             and isinstance(point.get("id"), str)
         }
+        # Entity coordinates are authoritative during edits; retain endpoint
+        # and Spline3 control IDs even while the point table is being rebuilt.
+        for entity in geometry.get("sketch_entities", []):
+            points = entity.get("points", []) if isinstance(entity, dict) else []
+            point_ids = entity.get("point_ids", []) if isinstance(entity, dict) else []
+            for point_id, point in zip(point_ids, points):
+                if isinstance(point_id, str) and isinstance(point, (list, tuple)) and len(point) >= 2:
+                    key = tuple(round(float(value), 12) for value in point[:2])
+                    old_points_by_coordinate.setdefault(key, point_id)
         geometry.setdefault("voids", [])
         old_edges_by_id = {
             edge.get("id"): edge for edge in old_edges
@@ -7579,11 +7681,10 @@ class SolveWorkspace(Div):
             region_loop_refs = []
             shape = region.get("shape", {})
             if isinstance(shape, dict) and shape.get("type") == "sketch":
-                old_by_entity = {
-                    edge.get("sketch_entity_id"): edge
-                    for edge in old_edges
-                    if isinstance(edge, dict) and edge.get("sketch_entity_id")
-                }
+                old_edges_by_entity = {}
+                for old in old_edges:
+                    if isinstance(old, dict) and old.get("sketch_entity_id"):
+                        old_edges_by_entity.setdefault(old["sketch_entity_id"], []).append(old)
                 entities_by_id = {
                     entity.get("id"): entity
                     for entity in geometry.get("sketch_entities", [])
@@ -7594,16 +7695,37 @@ class SolveWorkspace(Div):
                     entity = entities_by_id.get(entity_id)
                     if not entity:
                         continue
-                    source_edge = old_by_entity.get(entity_id)
                     samples = entity.get("sampled_points") or entity.get("points") or []
+                    start_t = float(reference.get("start_t", 0.0))
+                    end_t = float(reference.get("end_t", 1.0))
+                    low_t, high_t = sorted((start_t, end_t))
+                    source_candidates = [
+                        old for old in old_edges_by_entity.get(entity_id, [])
+                        if max(
+                            min(float(old.get("sketch_t0", 0.0)), float(old.get("sketch_t1", 1.0))),
+                            low_t,
+                        ) < min(
+                            max(float(old.get("sketch_t0", 0.0)), float(old.get("sketch_t1", 1.0))),
+                            high_t,
+                        ) + 1e-10
+                    ]
+                    source_candidates.sort(key=lambda old: (
+                        -max(0.0, min(
+                            max(float(old.get("sketch_t0", 0.0)), float(old.get("sketch_t1", 1.0))),
+                            high_t,
+                        ) - max(
+                            min(float(old.get("sketch_t0", 0.0)), float(old.get("sketch_t1", 1.0))),
+                            low_t,
+                        )),
+                        not bool(_edge_condition_ids(old)),
+                        str(old.get("id", "")),
+                    ))
+                    source_edge = source_candidates[0] if source_candidates else None
                     if len(samples) < 2:
                         continue
                     path = [tuple(float(value) for value in sample[:2]) for sample in samples]
                     if len(path) < 2:
                         continue
-                    start_t = float(reference.get("start_t", 0.0))
-                    end_t = float(reference.get("end_t", 1.0))
-
                     def sample_at(parameter):
                         scaled = min(1.0, max(0.0, parameter)) * (len(path) - 1)
                         index = min(len(path) - 2, int(math.floor(scaled)))
@@ -7619,19 +7741,11 @@ class SolveWorkspace(Div):
                         )
 
                     def sample_interval(first_t, last_t):
-                        # Edge samples use a stable low-to-high parameter order.
-                        # Region traversal direction is stored separately in
-                        # the boundary-loop reference. Reversing the whole
-                        # sample list after collecting interior points in
-                        # ascending order scrambled every descending interval.
+                        # Store geometry samples in source-parameter order.
+                        # Boundary traversal direction stays in the loop ref.
                         low, high = sorted((first_t, last_t))
-                        values = [sample_at(low)]
-                        for sample_index in range(1, len(path) - 1):
-                            parameter = sample_index / (len(path) - 1)
-                            if low + 1e-12 < parameter < high - 1e-12:
-                                values.append(path[sample_index])
-                        values.append(sample_at(high))
-                        return [list(point) for point in values]
+                        count = max(2, int(math.ceil(max(1, len(path) - 1) * (high - low))) + 1)
+                        return sample_sketch_entity(entity, count=count, start=low, end=high)
 
                     interval_samples = sample_interval(start_t, end_t)
                     edge_start, edge_end = interval_samples[0], interval_samples[-1]
@@ -7652,12 +7766,19 @@ class SolveWorkspace(Div):
                         edge.setdefault("boundary_condition_ids", [])
                         edge["vertices"] = [edge_start, edge_end]
                         edge["sketch_entity_id"] = entity_id
-                        curve = copy.deepcopy(entity.get("curve", edge.get("curve", {"type": entity.get("type", "line")})))
-                        if isinstance(curve, dict):
-                            curve["sampled_points"] = copy.deepcopy(interval_samples)
+                        curve = {"type": str(entity.get("type", "line"))}
+                        for curve_key in ("control_point", "control_point_id", "center", "radius", "clockwise", "weight"):
+                            if curve_key in entity:
+                                curve[curve_key] = copy.deepcopy(entity[curve_key])
+                        source_curve = source_edge.get("curve", {}) if isinstance(source_edge, dict) else {}
+                        if curve.get("type") == "spline3" and "control_point" not in curve and isinstance(source_curve, dict):
+                            for curve_key in ("control_point", "control_point_id"):
+                                if curve_key in source_curve:
+                                    curve[curve_key] = copy.deepcopy(source_curve[curve_key])
+                        curve["sampled_points"] = copy.deepcopy(interval_samples)
                         edge["curve"] = curve
-                        edge["sketch_t0"] = start_t
-                        edge["sketch_t1"] = end_t
+                        edge["sketch_t0"] = low_t
+                        edge["sketch_t1"] = high_t
                         edges_by_key[key] = edge
                         edges.append(edge)
                     region_edge_ids.append(edge["id"])
@@ -8217,7 +8338,7 @@ class SolveWorkspace(Div):
             current_edge_ids.add(edge.get("id"))
 
         points_by_coordinate = dict(old_points_by_coordinate)
-        topology_points_by_coordinate = {}
+        topology_points_by_id = {}
         for edge in edges:
             point_ids = []
             for point in edge.get("vertices", []):
@@ -8226,12 +8347,23 @@ class SolveWorkspace(Div):
                 if not point_id:
                     point_id = new_id("point")
                     points_by_coordinate[key] = point_id
-                topology_points_by_coordinate.setdefault(
-                    key, {"id": point_id, "coordinates": list(key)}
+                topology_points_by_id.setdefault(
+                    point_id, {"id": point_id, "coordinates": list(key)}
                 )
                 point_ids.append(point_id)
             edge["point_ids"] = point_ids
-        geometry["points"] = list(topology_points_by_coordinate.values())
+        for entity in geometry.get("sketch_entities", []):
+            entity_points = entity.get("points", []) if isinstance(entity, dict) else []
+            entity_point_ids = entity.get("point_ids", []) if isinstance(entity, dict) else []
+            for point_id, point in zip(entity_point_ids, entity_points):
+                if not isinstance(point_id, str) or not isinstance(point, (list, tuple)) or len(point) < 2:
+                    continue
+                coordinates = [float(point[0]), float(point[1])]
+                topology_points_by_id[point_id] = {"id": point_id, "coordinates": coordinates}
+                points_by_coordinate.setdefault(
+                    tuple(round(value, 12) for value in coordinates), point_id
+                )
+        geometry["points"] = list(topology_points_by_id.values())
         geometry["topology_version"] = 1
         geometry["edges"] = edges
 
@@ -8281,6 +8413,7 @@ class SolveWorkspace(Div):
             edge_id for edge_id in mesh.get("hp_edge_ids", [])
             if edge_id in live_edge_ids
         ]
+        self._rebuild_imported_parent_loops()
         _sync_axis_boundary_conditions(self.model)
         _sync_mechanical_boundary_conditions(self.model)
         if hasattr(self, "selected_edge_ids"):
@@ -9300,6 +9433,7 @@ class SolveWorkspace(Div):
             "rectangle": (("r_min", "Inner radius"), ("z_min", "Bottom"), ("width", "Radial width"), ("height", "Axial height")),
             "circle": (("r_center", "Centre radius"), ("z_center", "Centre height"), ("radius", "Radius")),
             "imported_contour": (("r_min", "Inner radius"), ("z_min", "Bottom"), ("width", "Radial width"), ("height", "Axial height")),
+            "sketch": (("r_min", "Inner radius"), ("z_min", "Bottom"), ("width", "Radial width"), ("height", "Axial height")),
         }.items():
             inputs = []
             for key, label in fields:
@@ -9323,7 +9457,7 @@ class SolveWorkspace(Div):
             Div("GEOMETRY", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted);"),
             self._region_name_input,
             Div("Driving dimensions", ui_style="font-size:11px; font-weight:700; letter-spacing:.05em; padding-top:4px;"),
-            Div("Dimensions are in SI metres (m). Imported legacy contours can be moved and resized here; select one of their edges to edit its endpoints or spline control point.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+            Div("Dimensions are in SI metres (m). Sketch contours can be moved or resized here; select an edge to edit its curve endpoints or Spline3 control point.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
             *[group["group"] for group in self._region_dimension_groups.values()],
             Div("SKETCH CONSTRAINTS", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:6px;"),
             Div("These are built-in relationships for the rectangle and circle tools. This version does not solve general user-defined sketch constraints.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
@@ -9349,13 +9483,13 @@ class SolveWorkspace(Div):
                     "",
                     lambda event, role=point_role, coordinate=axis: self._set_selected_imported_edge_coordinate(role, coordinate, event.value),
                     suffix="m",
-                    hint="Edit in SI metres. Connected legacy edges follow shared endpoints.",
+                    hint="Edit in SI metres. Curves connected at the same sketch point update together.",
                 )
                 self._imported_edge_geometry_fields[(point_role, axis)] = field
                 imported_edge_fields.append(field)
         self._imported_edge_geometry = Div(
-            Div("EDIT LEGACY GEOMETRY", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted);"),
-            Div("Change the endpoints to reshape the imported contour. Spline edges also have an editable control point.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+            Div("EDIT SKETCH CURVE", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted);"),
+            Div("Change a curve endpoint or its Spline3 control point. Connected curves follow shared sketch points.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
             *imported_edge_fields,
             ui_hidden=True,
             ui_style="display:flex; flex-direction:column; gap:7px; padding:8px 0;",
@@ -9484,7 +9618,7 @@ class SolveWorkspace(Div):
             self._region_name_input.ui_model_value = region.get("name", "")
             expressions = shape.get("dimension_expressions", {})
             dimension_values = shape
-            if shape_type == "imported_contour":
+            if shape_type in {"imported_contour", "sketch"}:
                 points = region.get("vertices", [])
                 if points:
                     radial = [float(point[0]) for point in points]
@@ -9519,19 +9653,24 @@ class SolveWorkspace(Div):
                 self._arc_radius_input.ui_hidden = not is_editable_arc
                 if is_editable_arc:
                     self._arc_radius_input.ui_model_value = str(float(curve.get("radius", 0.0)))
-                is_imported_edge = self._is_imported_legacy_edge(edge) and isinstance(curve, dict) and curve.get("type") in {"line", "spline3"}
-                self._imported_edge_geometry.ui_hidden = not is_imported_edge
-                if is_imported_edge:
-                    vertices = edge.get("vertices", [])
+                is_editable_sketch_curve = self._is_imported_legacy_edge(edge) and isinstance(curve, dict) and curve.get("type") in {"line", "spline3"}
+                self._imported_edge_geometry.ui_hidden = not is_editable_sketch_curve
+                if is_editable_sketch_curve:
+                    entity = next((
+                        item for item in self.model.get("geometry", {}).get("sketch_entities", [])
+                        if item.get("id") == edge.get("sketch_entity_id")
+                    ), {})
+                    source_points = entity.get("points", [])
+                    endpoints = [source_points[0], source_points[-1]] if len(source_points) >= 2 else edge.get("vertices", [])
                     for role, index in (("start", 0), ("end", 1)):
-                        point = vertices[index] if len(vertices) > index else (0.0, 0.0)
+                        point = endpoints[index] if len(endpoints) > index else (0.0, 0.0)
                         for axis, coordinate in (("r", 0), ("z", 1)):
                             self._imported_edge_geometry_fields[(role, axis)].ui_model_value = self._dimension_literal_m(float(point[coordinate]))
-                    control = curve.get("control_point") or [0.0, 0.0]
+                    control = entity.get("control_point") or (source_points[1] if len(source_points) >= 3 else [0.0, 0.0])
                     for axis, coordinate in (("r", 0), ("z", 1)):
                         widget = self._imported_edge_geometry_fields[("control", axis)]
-                        widget.ui_hidden = curve.get("type") != "spline3"
-                        if curve.get("type") == "spline3":
+                        widget.ui_hidden = entity.get("type") != "spline3"
+                        if entity.get("type") == "spline3":
                             widget.ui_model_value = self._dimension_literal_m(float(control[coordinate]))
             else:
                 self._imported_edge_geometry.ui_hidden = True
@@ -11461,7 +11600,7 @@ class SolveWorkspace(Div):
         old_shape = copy.deepcopy(region["shape"])
         old_vertices = copy.deepcopy(region["vertices"])
         old_parents = {item["id"]: item.get("parent_id") for item in self.model["geometry"]["regions"]}
-        old_geometry = copy.deepcopy(self.model["geometry"]) if region.get("shape", {}).get("type") == "imported_contour" else None
+        old_geometry = copy.deepcopy(self.model["geometry"]) if region.get("shape", {}).get("type") in {"imported_contour", "sketch"} else None
         try:
             expression = str(value).strip()
             parameters = {item["name"]: item for item in self.model.get("parameters", [])}
@@ -11469,12 +11608,12 @@ class SolveWorkspace(Div):
             if not math.isfinite(dimension) or dimension <= 0 and key not in {"r_min", "z_min", "r_center", "z_center"}:
                 raise ValueError("Dimensions must be finite and positive.")
             shape = region["shape"]
-            if shape.get("type") == "imported_contour":
+            if shape.get("type") in {"imported_contour", "sketch"}:
                 if key not in {"r_min", "z_min", "width", "height"}:
-                    raise ValueError("Imported contours support inner radius, bottom, radial width and axial height edits.")
+                    raise ValueError("Sketch contours support inner radius, bottom, radial width and axial height edits.")
                 vertices = region.get("vertices", [])
                 if len(vertices) < 3:
-                    raise ValueError("This imported contour has no editable closed outline.")
+                    raise ValueError("This sketch contour has no editable closed outline.")
                 radial = [float(point[0]) for point in vertices]
                 axial = [float(point[1]) for point in vertices]
                 old_r_min, old_r_max = min(radial), max(radial)
@@ -11489,15 +11628,24 @@ class SolveWorkspace(Div):
                     new_r_max = old_r_min + dimension
                 else:
                     new_z_max = old_z_min + dimension
-                self._transform_imported_contour_bounds(region, (new_r_min, new_r_max, new_z_min, new_z_max))
-                shape.setdefault("dimension_expressions", {})[key] = expression
+                self._transform_sketch_contour_bounds(
+                    region, (new_r_min, new_r_max, new_z_min, new_z_max)
+                )
+                region = next(
+                    (item for item in self.model["geometry"]["regions"] if item.get("id") == region_id),
+                    None,
+                )
+                if region is None:
+                    raise ValueError("The resized sketch contour no longer encloses a region.")
+                region["shape"].setdefault("dimension_expressions", {})[key] = expression
                 self._recompute_parent_links()
+                self._rebuild_edges()
                 self._rebuild_imported_parent_loops()
                 _sync_axis_boundary_conditions(self.model)
                 _sync_mechanical_boundary_conditions(self.model)
                 self._refresh_model_tree()
                 self._render_inspector()
-                self._message("Updated imported contour dimensions.")
+                self._message("Updated sketch contour dimensions.")
                 self.render_canvas()
                 return
             shape[key] = dimension
@@ -11585,6 +11733,9 @@ class SolveWorkspace(Div):
             return conditions.get(condition_id, {}).get("type", "")
 
         for edge in editable:
+            # Once the user explicitly edits an imported boundary assignment,
+            # the captured Python marker must no longer override that choice.
+            edge.pop("legacy_boundary_tag", None)
             condition_ids = _edge_condition_ids(edge)
             if physics == "mechanical":
                 # Replacing transmission with fixed/prescribed/traction/Robin

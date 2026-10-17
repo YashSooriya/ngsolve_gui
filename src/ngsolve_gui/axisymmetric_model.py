@@ -147,6 +147,22 @@ def evaluate_sketch_entity(entity, parameter):
         return None
 
 
+def sample_sketch_entity(entity, count=33, start=0.0, end=1.0):
+    """Return exact-curve samples for display and planar topology operations."""
+    try:
+        count = max(2, int(count))
+        start, end = float(start), float(end)
+        if not math.isfinite(start) or not math.isfinite(end):
+            return []
+        return [
+            list(point)
+            for index in range(count)
+            if (point := evaluate_sketch_entity(entity, start + (end - start) * index / (count - 1))) is not None
+        ]
+    except (TypeError, ValueError, OverflowError):
+        return []
+
+
 def find_closed_sketch_loops(entities, *, tolerance=1e-12):
     """Return bounded faces after noding all intersections in sampled curves.
 
@@ -1069,10 +1085,238 @@ def _upgrade_sketch_topology(model):
     geometry.setdefault("voids", [])
 
 
-def migrate_legacy_model(model):
-    """Upgrade pre-SI geometry expressions while keeping their geometry fixed."""
-    if not isinstance(model, dict) or model.get("schema_version") != LEGACY_SCHEMA_VERSION:
+def convert_imported_contours_to_sketch(model):
+    """Convert captured legacy contours into editable native line/spline3 sketches."""
+    if not isinstance(model, dict):
         return model
+    source_geometry = model.get("geometry")
+    if not isinstance(source_geometry, dict):
+        return model
+    imported_regions = [
+        region for region in source_geometry.get("regions", [])
+        if isinstance(region, dict)
+        and isinstance(region.get("shape"), dict)
+        and region["shape"].get("type") == "imported_contour"
+    ]
+    if not imported_regions:
+        return model
+
+    converted = copy.deepcopy(model)
+    geometry = converted["geometry"]
+    # Work only against the copy.  Keeping references from source_geometry here
+    # leaves the returned regions in imported_contour form while adding entities.
+    imported_regions = [
+        region for region in geometry.get("regions", [])
+        if isinstance(region, dict)
+        and isinstance(region.get("shape"), dict)
+        and region["shape"].get("type") == "imported_contour"
+    ]
+    regions = geometry.get("regions", [])
+    edges = geometry.get("edges", [])
+    points = geometry.setdefault("points", [])
+    entities = geometry.setdefault("sketch_entities", [])
+    if not isinstance(edges, list) or not isinstance(points, list) or not isinstance(entities, list):
+        raise ValueError("Imported contour topology is incomplete and cannot be converted to editable sketch geometry.")
+
+    edge_by_id = {
+        edge.get("id"): edge for edge in edges
+        if isinstance(edge, dict) and isinstance(edge.get("id"), str)
+    }
+    point_by_id = {
+        point.get("id"): point for point in points
+        if isinstance(point, dict) and isinstance(point.get("id"), str)
+    }
+    point_by_coordinate = {}
+    for point in points:
+        coords = point.get("coordinates") if isinstance(point, dict) else None
+        if isinstance(coords, (list, tuple)) and len(coords) == 2:
+            try:
+                key = tuple(round(float(value), 12) for value in coords)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            point_by_coordinate.setdefault(key, point.get("id"))
+
+    def ensure_point_id(coords, preferred=None):
+        try:
+            key = tuple(round(float(value), 12) for value in coords)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("An imported sketch point has invalid coordinates.")
+        if len(key) != 2 or not all(math.isfinite(value) for value in key):
+            raise ValueError("An imported sketch point must have finite r-z coordinates.")
+        if isinstance(preferred, str) and preferred:
+            record = point_by_id.get(preferred)
+            if record is not None:
+                record["coordinates"] = list(key)
+                point_by_coordinate[key] = preferred
+                return preferred
+        point_id = point_by_coordinate.get(key)
+        if point_id and point_id in point_by_id:
+            return point_id
+        point_id = preferred if isinstance(preferred, str) and preferred and preferred not in point_by_id else None
+        if not point_id:
+            point_id = "legacy-point-" + uuid.uuid5(
+                uuid.NAMESPACE_URL, f"mm-fem-legacy-point:{key[0]:.12g}:{key[1]:.12g}"
+            ).hex
+        record = {"id": point_id, "coordinates": list(key)}
+        points.append(record)
+        point_by_id[point_id] = record
+        point_by_coordinate[key] = point_id
+        return point_id
+
+    edge_ids = set()
+    for region in imported_regions:
+        for edge_id in region.get("edge_ids", []):
+            if isinstance(edge_id, str):
+                edge_ids.add(edge_id)
+        for loop in region.get("boundary_loops", []):
+            if isinstance(loop, dict):
+                edge_ids.update(
+                    item.get("edge_id") for item in loop.get("edges", [])
+                    if isinstance(item, dict) and isinstance(item.get("edge_id"), str)
+                )
+
+    entity_by_id = {
+        entity.get("id"): entity for entity in entities
+        if isinstance(entity, dict) and isinstance(entity.get("id"), str)
+    }
+    entity_ids = set(entity_by_id)
+    entity_id_by_edge = {}
+    for edge_id in sorted(edge_ids):
+        edge = edge_by_id.get(edge_id)
+        if edge is None:
+            raise ValueError(f"Imported contour refers to missing edge {edge_id!r}.")
+        curve = edge.get("curve", {}) if isinstance(edge.get("curve"), dict) else {}
+        curve_type = str(curve.get("type") or "line").lower()
+        if curve_type not in {"line", "spline3"}:
+            raise ValueError(
+                f"Imported edge {edge.get('name', edge_id)!r} uses unsupported curve "
+                f"{curve_type!r}; the original model was left unchanged."
+            )
+        endpoints = edge.get("vertices")
+        if not isinstance(endpoints, (list, tuple)) or len(endpoints) != 2:
+            raise ValueError(f"Imported edge {edge.get('name', edge_id)!r} needs two endpoints.")
+        start, end = ([float(value) for value in point[:2]] for point in endpoints)
+        raw_point_ids = edge.get("point_ids", [])
+        start_id = ensure_point_id(start, raw_point_ids[0] if len(raw_point_ids) > 0 else None)
+        end_id = ensure_point_id(end, raw_point_ids[1] if len(raw_point_ids) > 1 else None)
+        samples = curve.get("sampled_points")
+        if not isinstance(samples, list) or len(samples) < 2:
+            samples = [start, end]
+        else:
+            try:
+                samples = [[float(point[0]), float(point[1])] for point in samples]
+            except (TypeError, ValueError, IndexError, OverflowError):
+                raise ValueError(f"Imported edge {edge.get('name', edge_id)!r} has invalid curve samples.")
+        entity_id = edge.get("sketch_entity_id")
+        entity = entity_by_id.get(entity_id) if isinstance(entity_id, str) else None
+        if entity is not None:
+            # Reuse a curve from a model saved during an interrupted/older
+            # conversion, but never overwrite a curve belonging to another edge.
+            if entity.get("source_edge_id") not in {None, edge_id}:
+                entity = None
+                entity_id = None
+            else:
+                entity["source_edge_id"] = edge_id
+        if entity is None:
+            entity_id = "legacy-curve-" + uuid.uuid5(
+                uuid.NAMESPACE_URL, f"mm-fem-legacy-edge:{edge_id}"
+            ).hex
+            existing = entity_by_id.get(entity_id)
+            if existing is not None and existing.get("source_edge_id") not in {None, edge_id}:
+                entity_id = "legacy-curve-" + uuid.uuid5(
+                    uuid.NAMESPACE_URL, f"mm-fem-legacy-edge-converted:{edge_id}"
+                ).hex
+                existing = entity_by_id.get(entity_id)
+            if existing is not None:
+                entity = existing
+            else:
+                if entity_id in entity_ids:
+                    raise ValueError(f"Imported edge {edge.get('name', edge_id)!r} collides with an existing sketch curve.")
+                entity = {"id": entity_id}
+                entities.append(entity)
+                entity_ids.add(entity_id)
+                entity_by_id[entity_id] = entity
+        entity.update({
+            "type": curve_type,
+            "points": [start, end],
+            "point_ids": [start_id, end_id],
+            "sampled_points": samples,
+            "source_edge_id": edge_id,
+        })
+        if curve_type == "spline3":
+            control = curve.get("control_point")
+            if not isinstance(control, (list, tuple)) or len(control) != 2:
+                raise ValueError(f"Imported spline edge {edge.get('name', edge_id)!r} has no control point.")
+            control = [float(control[0]), float(control[1])]
+            control_id = ensure_point_id(control, curve.get("control_point_id"))
+            entity["points"] = [start, control, end]
+            entity["point_ids"] = [start_id, control_id, end_id]
+            entity["control_point"] = control
+            entity["control_point_id"] = control_id
+            curve["control_point"] = control
+            curve["control_point_id"] = control_id
+        edge["point_ids"] = [start_id, end_id]
+        edge["sketch_entity_id"] = entity_id
+        edge["curve"] = {"type": curve_type, "sampled_points": copy.deepcopy(samples), **({
+            "control_point": copy.deepcopy(entity["control_point"]),
+            "control_point_id": entity["control_point_id"],
+        } if curve_type == "spline3" else {})}
+        entity_id_by_edge[edge_id] = entity_id
+
+    for region in imported_regions:
+        outer = next((
+            loop for loop in region.get("boundary_loops", [])
+            if isinstance(loop, dict) and loop.get("role") == "outer"
+        ), None)
+        if not isinstance(outer, dict) or not outer.get("edges"):
+            raise ValueError(f"Imported region {region.get('name', region.get('id'))!r} has no outer boundary.")
+        boundary = []
+        ordered_entity_ids = []
+        ordered_edge_ids = []
+        for reference in outer["edges"]:
+            if not isinstance(reference, dict):
+                continue
+            edge_id = reference.get("edge_id")
+            entity_id = entity_id_by_edge.get(edge_id)
+            if entity_id is None:
+                raise ValueError(f"Imported region {region.get('name', region.get('id'))!r} refers to a missing curve.")
+            forward = bool(reference.get("forward", True))
+            boundary.append({
+                "entity_id": entity_id,
+                "start_t": 0.0,
+                "end_t": 1.0,
+                "forward": forward,
+            })
+            if entity_id not in ordered_entity_ids:
+                ordered_entity_ids.append(entity_id)
+            if edge_id not in ordered_edge_ids:
+                ordered_edge_ids.append(edge_id)
+        region["shape"] = {
+            "type": "sketch",
+            "entity_ids": ordered_entity_ids,
+            "boundary": boundary,
+        }
+        region["edge_ids"] = ordered_edge_ids
+
+    legacy_import = converted.get("legacy_import")
+    if isinstance(legacy_import, dict):
+        legacy_import["topology_mode"] = "native_sketch"
+    return converted
+
+
+def migrate_legacy_model(model):
+    """Upgrade pre-SI geometry expressions and native-convert older legacy imports."""
+    if not isinstance(model, dict):
+        return model
+    source_geometry = model.get("geometry")
+    has_imported_contours = isinstance(source_geometry, dict) and any(
+        isinstance(region, dict)
+        and isinstance(region.get("shape"), dict)
+        and region["shape"].get("type") == "imported_contour"
+        for region in source_geometry.get("regions", [])
+    )
+    if model.get("schema_version") != LEGACY_SCHEMA_VERSION:
+        return convert_imported_contours_to_sketch(model) if has_imported_contours else model
     model = copy.deepcopy(model)
     geometry = model.get("geometry", {})
     if not isinstance(geometry, dict):
@@ -1080,7 +1324,7 @@ def migrate_legacy_model(model):
     dimension_unit = geometry.get("dimension_expression_unit", "mm")
     if dimension_unit == "m":
         _upgrade_sketch_topology(model)
-        return model
+        return convert_imported_contours_to_sketch(model)
     if dimension_unit != "mm":
         return model
     for parameter in model.get("parameters", []) if isinstance(model.get("parameters", []), list) else []:
@@ -1130,7 +1374,7 @@ def migrate_legacy_model(model):
                         body[key] = _strip_legacy_mm_suffix(expression)
     geometry["dimension_expression_unit"] = "m"
     _upgrade_sketch_topology(model)
-    return model
+    return convert_imported_contours_to_sketch(model)
 
 
 def migrate_legacy_studies(studies):

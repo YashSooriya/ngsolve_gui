@@ -16,7 +16,7 @@ import sys
 import uuid
 from pathlib import Path
 
-from .axisymmetric_model import new_model, new_studies, validate_model, validate_studies
+from .axisymmetric_model import convert_imported_contours_to_sketch, new_model, new_studies, validate_model, validate_studies
 
 
 class LegacySplineGeometryCapture:
@@ -507,6 +507,7 @@ def legacy_problem_to_model(problem, *, name="Imported legacy problem", element_
             "boundary_condition_ids": condition_ids,
             "legacy_boundary_tag": tag,
             "legacy_domain_sides": {"left_region_id": left_region_id, "right_region_id": right_region_id},
+            "legacy_segment_index": segment_index,
         }
         if segment.get("maxh") is not None:
             edge["legacy_maxh"] = segment["maxh"]
@@ -613,7 +614,7 @@ def legacy_problem_to_model(problem, *, name="Imported legacy problem", element_
     model["solver"]["maximum_iterations"] = max(1, int(problem.get("Nfixpoint", 10)))
     model["legacy_import"] = {
         "source_name": str(name),
-        "topology_mode": "direct_curve_edges",
+        "topology_mode": "native_sketch",
         "boundary_keys": {
             "dc_magnetic": sorted(adc_dirichlet),
             "harmonic_electromagnetic": sorted(aac_dirichlet),
@@ -629,6 +630,7 @@ def legacy_problem_to_model(problem, *, name="Imported legacy problem", element_
     }
     model["geometry"]["dimension_expression_unit"] = "m"
 
+    model = convert_imported_contours_to_sketch(model)
     errors = validate_model(model)
     if errors:
         raise ValueError("Imported problem is not a valid MM-FEM model: " + " ".join(errors))
