@@ -4612,8 +4612,86 @@ class SolveWorkspace(Div):
                 parameters.append(line_fraction if parameter_on_first else arc_fraction)
             return parameters
 
+        def exact_spline_line_parameters(first_entity, second_entity):
+            """Refine spline/line crossings so trimmed endpoints stay connected."""
+            curve_types = {"spline", "spline3"}
+            if first_entity.get("type") == "line" and second_entity.get("type") in curve_types:
+                line_entity, curve_entity, parameter_on_first = first_entity, second_entity, True
+            elif first_entity.get("type") in curve_types and second_entity.get("type") == "line":
+                line_entity, curve_entity, parameter_on_first = second_entity, first_entity, False
+            else:
+                return None
+            try:
+                line_points = line_entity.get("points", [])
+                if len(line_points) != 2:
+                    return None
+                line_start = tuple(float(value) for value in line_points[0][:2])
+                line_end = tuple(float(value) for value in line_points[1][:2])
+            except (TypeError, ValueError, IndexError, OverflowError):
+                return None
+            dx, dy = line_end[0] - line_start[0], line_end[1] - line_start[1]
+            line_length_squared = dx * dx + dy * dy
+            if line_length_squared <= 1e-24:
+                return []
+            samples = curve_samples(curve_entity)
+            if len(samples) < 2:
+                return None
+            residual_tolerance = max(1e-24, line_length_squared * 1e-12)
+
+            def signed_distance(parameter):
+                point = evaluate_sketch_entity(curve_entity, parameter)
+                if point is None:
+                    return None
+                return cross((dx, dy), (point[0] - line_start[0], point[1] - line_start[1]))
+
+            roots = []
+            sample_count = len(samples) - 1
+            for index in range(sample_count):
+                low, high = index / sample_count, (index + 1) / sample_count
+                value_low, value_high = signed_distance(low), signed_distance(high)
+                if value_low is None or value_high is None:
+                    return None
+                candidates = []
+                if abs(value_low) <= residual_tolerance:
+                    candidates.append(low)
+                if (value_low < 0) != (value_high < 0):
+                    left, right, left_value = low, high, value_low
+                    for _ in range(48):
+                        middle = 0.5 * (left + right)
+                        middle_value = signed_distance(middle)
+                        if middle_value is None:
+                            break
+                        if abs(middle_value) <= residual_tolerance or right - left <= 1e-13:
+                            left = right = middle
+                            break
+                        if (left_value < 0) != (middle_value < 0):
+                            right = middle
+                        else:
+                            left, left_value = middle, middle_value
+                    candidates.append(0.5 * (left + right))
+                if abs(value_high) <= residual_tolerance:
+                    candidates.append(high)
+                for parameter in candidates:
+                    point = evaluate_sketch_entity(curve_entity, parameter)
+                    if point is None:
+                        continue
+                    line_fraction = (
+                        (point[0] - line_start[0]) * dx + (point[1] - line_start[1]) * dy
+                    ) / line_length_squared
+                    if not -1e-10 <= line_fraction <= 1.0 + 1e-10:
+                        continue
+                    roots.append(line_fraction if parameter_on_first else parameter)
+
+            ordered = []
+            for value in sorted(max(0.0, min(1.0, float(item))) for item in roots):
+                if not ordered or value - ordered[-1] > 1e-9:
+                    ordered.append(value)
+            return ordered
+
         def curve_intersections(first_entity, second_entity, first_samples, second_samples):
             exact = exact_arc_line_parameters(first_entity, second_entity)
+            if exact is None:
+                exact = exact_spline_line_parameters(first_entity, second_entity)
             if exact is not None:
                 return exact
             values = []

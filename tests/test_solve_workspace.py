@@ -4812,15 +4812,20 @@ def test_power_trim_of_both_tails_on_arc_divider_preserves_both_faces(standalone
 
 
 def test_power_trim_preserves_both_faces_at_a_spline_divider_intersection(standalone_components):
+    from ngsolve_gui.axisymmetric_model import evaluate_sketch_entity
+
     workspace = SolveWorkspace()
     start, end, control = (0.006, 0.003), (0.012, 0.003), (0.009, 0.006)
     assert workspace._add_sketch_entity("line", [start, end])
     assert workspace._add_sketch_entity("spline3", [start, control, end])
-    divider = (0.009, 0.002), (0.009, 0.005)
-    assert workspace._add_sketch_entity("line", divider)
+    spline = next(entity for entity in workspace.model["geometry"]["sketch_entities"]
+                  if entity.get("type") == "spline3")
+    hit = evaluate_sketch_entity(spline, 0.371)
+    divider_x = hit[0]
+    assert workspace._add_sketch_entity("line", [(divider_x, 0.002), (divider_x, 0.005)])
     assert len(workspace.model["geometry"]["regions"]) == 2
 
-    assert workspace._trim_sketch_entities_along_stroke([(0.0085, 0.0025), (0.0095, 0.0025)])
+    assert workspace._trim_sketch_entities_along_stroke([(divider_x - 0.0005, 0.0025), (divider_x + 0.0005, 0.0025)])
     assert len(workspace.model["geometry"]["regions"]) == 2
-    assert workspace._trim_sketch_entities_along_stroke([(0.0085, 0.0048), (0.0095, 0.0048)])
+    assert workspace._trim_sketch_entities_along_stroke([(divider_x - 0.0005, 0.0048), (divider_x + 0.0005, 0.0048)])
     assert len(workspace.model["geometry"]["regions"]) == 2
