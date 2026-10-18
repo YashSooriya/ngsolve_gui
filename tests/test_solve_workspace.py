@@ -846,8 +846,10 @@ def test_3d_preview_supports_opaque_translucent_and_hidden_regions_with_axis(
             )
 
     occ = ModuleType("netgen.occ")
+    occ.ArcOfCircle = lambda *_args: object()
     occ.Axis = lambda *_args: object()
     occ.Circle = make_circle
+    occ.Compound = lambda edges: edges
     occ.Dir = lambda *args: args
     occ.Face = lambda profile: profile
     occ.MakePolygon = lambda _vertices: object()
@@ -856,6 +858,8 @@ def test_3d_preview_supports_opaque_translucent_and_hidden_regions_with_axis(
     )
     occ.Pnt = lambda *args: args
     occ.Revolve = lambda profile, *_args: Solid(profile)
+    occ.Segment = lambda *_args: object()
+    occ.SplineInterpolation = lambda *_args, **_kwargs: object()
     occ.Vec = lambda *_args: object()
     occ.Vertex = lambda _point: object()
     occ.Wire = lambda profile: profile
@@ -896,8 +900,8 @@ def test_3d_preview_supports_opaque_translucent_and_hidden_regions_with_axis(
     inner = workspace._preview_3d_renderers["circle-inner"]
     assert outer.faces.active is True
     assert inner.faces.active is True
-    assert outer.edges.active is True
-    assert inner.edges.active is True
+    assert outer.edges.active is False
+    assert inner.edges.active is False
     assert [center for center, _normal, _radius, _profile in circle_profiles] == [
         (0.02, 0.0, 0.0), (0.02, 0.0, 0.0),
     ]
@@ -936,8 +940,90 @@ def test_3d_preview_supports_opaque_translucent_and_hidden_regions_with_axis(
     assert inner.faces.colors[3::4].tolist() == [0.0]
     assert outer.faces.active is True
     assert inner.faces.active is False
-    assert outer.edges.active is True
+    assert outer.edges.active is False
     assert inner.edges.active is False
+    assert "circle-inner" not in workspace._preview_3d_edge_renderers
+
+
+def test_3d_preview_uses_smooth_sketch_arcs_and_hides_circle_seams(
+    standalone_components, monkeypatch
+):
+    import ngapp.components
+    import ngsolve_webgpu
+
+    rendered = []
+
+    class Renderer:
+        def __init__(self, geometry):
+            self.geo = geometry
+            self.faces = SimpleNamespace(active=None, transparent=False)
+            self.edges = SimpleNamespace(active=None)
+            self.faces.set_colors = lambda colors: setattr(self.faces, "colors", colors.copy())
+            self.edges.set_colors = lambda colors: setattr(self.edges, "colors", colors.copy())
+
+        def set_needs_update(self):
+            pass
+
+    class Preview:
+        def __init__(self, **_kwargs):
+            self.ui_class = None
+
+        def on_mounted(self, _callback):
+            pass
+
+        def draw(self, items):
+            rendered.extend(items)
+            return SimpleNamespace(
+                options=SimpleNamespace(camera=SimpleNamespace(reset=lambda *_args: None)),
+                bounding_box=(), render=lambda: None,
+            )
+
+    monkeypatch.setattr(ngapp.components, "WebgpuComponent", Preview)
+    monkeypatch.setattr(ngsolve_webgpu, "GeometryRenderer", Renderer)
+
+    workspace = SolveWorkspace()
+    start = [0.02, 0.0]
+    through = [0.03, 0.01]
+    end = [0.04, 0.0]
+    workspace.model["geometry"]["sketch_entities"] = [
+        {
+            "id": "semicircle", "type": "arc",
+            "points": [start, through, end], "center": [0.03, 0.0],
+            "radius": 0.01, "clockwise": False,
+        },
+        {"id": "chord", "type": "line", "points": [end, start]},
+    ]
+    workspace.model["geometry"]["regions"] = [
+        {
+            "id": "torus", "name": "Circle",
+            "shape": {"type": "circle", "r_center": 0.02, "z_center": 0.0, "radius": 0.005},
+            "vertices": [[0.015, 0.0], [0.025, 0.0], [0.02, 0.005]],
+        },
+        {
+            "id": "arc-region", "name": "Arc region",
+            "shape": {
+                "type": "sketch", "entity_ids": ["semicircle", "chord"],
+                "boundary": [
+                    {"entity_id": "semicircle", "start_t": 0.0, "end_t": 1.0},
+                    {"entity_id": "chord", "start_t": 0.0, "end_t": 1.0},
+                ],
+            },
+            "vertices": [start, through, end],
+        },
+    ]
+
+    workspace._build_3d_preview_component()
+
+    # A revolved circle is a smooth torus; its OCC meridian seam is not a
+    # visible feature edge. The arc-and-chord profile retains its real rims.
+    assert "torus" not in workspace._preview_3d_edge_renderers
+    assert "arc-region" in workspace._preview_3d_edge_renderers
+    assert workspace._preview_3d_renderers["torus"].edges.active is False
+    assert workspace._preview_3d_renderers["arc-region"].edges.active is False
+    arc_edges = workspace._preview_3d_edge_renderers["arc-region"].geo.edges
+    assert len(arc_edges) == 2
+    assert workspace._preview_3d_edge_renderers["arc-region"].edges.active is True
+    assert len(rendered) == 4  # two face renderers, one feature-edge overlay, and axes
 
 
 def test_3d_preview_failure_keeps_editable_sketch_active(standalone_components):

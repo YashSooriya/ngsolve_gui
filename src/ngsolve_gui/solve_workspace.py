@@ -448,6 +448,7 @@ class SolveWorkspace(Div):
         self._preview_3d_component = None
         self._preview_3d_scene = None
         self._preview_3d_renderers = {}
+        self._preview_3d_edge_renderers = {}
         self._preview_region_visibility = {}
         self._preview_visibility_controls = {}
         self._editor_drawer = None
@@ -709,7 +710,7 @@ class SolveWorkspace(Div):
                     "rectangle": {"corner": "mdi-rectangle-outline", "center": "mdi-crosshairs"},
                     "circle": {"center-radius": "mdi-circle-outline", "three-point": "mdi-triangle-outline"},
                     "arc": {
-                        "three-point": "mdi-vector-arc",
+                        "three-point": "mdi-chart-bell-curve",
                         "centerpoint": "mdi-target",
                         "tangent": "mdi-vector-curve",
                         "spline3": "mdi-sine-wave",
@@ -11748,8 +11749,9 @@ class SolveWorkspace(Div):
     def _build_3d_preview_component(self):
         """Revolve the current meridian regions for the modal read-only preview."""
         from netgen.occ import (
-            Axis, Circle, Dir, Face, MakePolygon, OCCGeometry, Pnt,
-            Revolve, Vec, Vertex, Wire,
+            ArcOfCircle, Axis, Circle, Compound, Dir, Face, MakePolygon,
+            OCCGeometry, Pnt, Revolve, Segment, SplineInterpolation, Vec,
+            Vertex, Wire,
         )
         from ngapp.components import WebgpuComponent
         from ngsolve_webgpu import GeometryRenderer
@@ -11765,38 +11767,117 @@ class SolveWorkspace(Div):
             material.get("id"): material.get("name", "")
             for material in self.model.get("materials", [])
         }
-        revolved = {}
-        for region in regions:
-            vertices = region.get("vertices", [])
-            if len(vertices) < 3:
-                raise ValueError(f"Region '{region.get('name', 'unnamed')}' needs at least three vertices.")
+        sketch_entities_by_id = {
+            entity.get("id"): entity
+            for entity in self.model.get("geometry", {}).get("sketch_entities", [])
+            if isinstance(entity, dict) and isinstance(entity.get("id"), str)
+        }
+
+        def point_3d(point):
+            return Pnt(float(point[0]), 0.0, float(point[1]))
+
+        def profile_for_region(region):
+            """Build smooth OCC edges from the editable sketch boundary."""
             shape = region.get("shape", {})
+            if not isinstance(shape, dict):
+                shape = {}
             if shape.get("type") == "circle":
-                # The editable sketch stores circles as a 48-sided polygon for
-                # the solver. Revolving that polygon creates dozens of tiny
-                # OCC edges, which render as distracting rings on the torus.
-                # Use an exact circular profile in the read-only preview.
-                profile = Face(Wire(Circle(
-                    Pnt(
-                        float(shape["r_center"]),
-                        0.0,
-                        float(shape["z_center"]),
-                    ),
+                return Face(Wire(Circle(
+                    point_3d((shape["r_center"], shape["z_center"])),
                     Dir(0.0, 1.0, 0.0),
                     float(shape["radius"]),
                 )))
-            else:
-                profile_vertices = [
-                    Vertex(Pnt(float(radius), 0.0, float(axial)))
-                    for radius, axial in vertices
-                ]
-                profile_vertices.append(profile_vertices[0])
-                profile = Face(MakePolygon(profile_vertices))
-            revolved[region["id"]] = Revolve(
-                profile,
-                Axis(Pnt(0.0, 0.0, 0.0), Vec(0.0, 0.0, 1.0)),
-                360.0,
-            )
+
+            boundary = shape.get("boundary", [])
+            profile_edges = []
+            if shape.get("type") == "sketch" and isinstance(boundary, list) and boundary:
+                for reference in boundary:
+                    if not isinstance(reference, dict):
+                        raise ValueError(f"Region '{region.get('name', 'unnamed')}' has an invalid sketch boundary.")
+                    entity = sketch_entities_by_id.get(reference.get("entity_id"))
+                    if entity is None:
+                        raise ValueError(f"Region '{region.get('name', 'unnamed')}' references a missing sketch curve.")
+                    try:
+                        start_t = float(reference.get("start_t", 0.0))
+                        end_t = float(reference.get("end_t", 1.0))
+                        if not math.isfinite(start_t) or not math.isfinite(end_t):
+                            raise ValueError("non-finite sketch interval")
+                        start_t = min(1.0, max(0.0, start_t))
+                        end_t = min(1.0, max(0.0, end_t))
+                        if not reference.get("forward", True):
+                            start_t, end_t = end_t, start_t
+                        curve_type = entity.get("type")
+                        start = evaluate_sketch_entity(entity, start_t)
+                        end = evaluate_sketch_entity(entity, end_t)
+                        if start is None or end is None:
+                            raise ValueError("sketch endpoint could not be evaluated")
+
+                        if curve_type == "line":
+                            edge = Segment(point_3d(start), point_3d(end))
+                        elif curve_type in {"arc", "circle"}:
+                            middle = evaluate_sketch_entity(entity, 0.5 * (start_t + end_t))
+                            full_circle = (
+                                curve_type == "circle"
+                                and abs(abs(end_t - start_t) - 1.0) <= 1e-9
+                            )
+                            if full_circle:
+                                center = entity.get("center")
+                                if not isinstance(center, (list, tuple)) or len(center) < 2:
+                                    raise ValueError("circle center is missing")
+                                edge = Circle(
+                                    point_3d(center), Dir(0.0, 1.0, 0.0),
+                                    float(entity["radius"]),
+                                )
+                            elif middle is not None:
+                                edge = ArcOfCircle(
+                                    point_3d(start), point_3d(middle), point_3d(end)
+                                )
+                            else:
+                                raise ValueError("arc midpoint could not be evaluated")
+                        else:
+                            # Interpolate one OCC spline edge rather than a
+                            # polygon through every screen sample. This keeps
+                            # revolved spline surfaces smooth and avoids the
+                            # dense black cage of artificial line edges.
+                            samples = [
+                                evaluate_sketch_entity(
+                                    entity, start_t + (end_t - start_t) * index / 32
+                                )
+                                for index in range(33)
+                            ]
+                            if any(point is None for point in samples):
+                                raise ValueError("spline samples could not be evaluated")
+                            edge = SplineInterpolation(
+                                [point_3d(point) for point in samples], tol=1e-9
+                            )
+                        profile_edges.append(edge)
+                    except (KeyError, TypeError, ValueError, OverflowError) as error:
+                        raise ValueError(
+                            f"Region '{region.get('name', 'unnamed')}' has an invalid curved boundary: {error}"
+                        ) from error
+
+            if profile_edges:
+                try:
+                    return Face(Wire(profile_edges))
+                except Exception as error:
+                    raise ValueError(
+                        f"Could not build the smooth boundary for region '{region.get('name', 'unnamed')}': {error}"
+                    ) from error
+
+            vertices = region.get("vertices", [])
+            if len(vertices) < 3:
+                raise ValueError(f"Region '{region.get('name', 'unnamed')}' needs at least three vertices.")
+            profile_vertices = [Vertex(point_3d(point)) for point in vertices]
+            profile_vertices.append(profile_vertices[0])
+            return Face(MakePolygon(profile_vertices))
+
+        axis = Axis(Pnt(0.0, 0.0, 0.0), Vec(0.0, 0.0, 1.0))
+        revolved = {}
+        for region in regions:
+            if len(region.get("vertices", [])) < 3:
+                raise ValueError(f"Region '{region.get('name', 'unnamed')}' needs at least three vertices.")
+            profile = profile_for_region(region)
+            revolved[region["id"]] = Revolve(profile, axis, 360.0)
 
         # A nested 2D region denotes a separate material domain. Cut its
         # immediate children from the parent before combining the solids so
@@ -11810,61 +11891,70 @@ class SolveWorkspace(Div):
             for void in self.model.get("geometry", {}).get("voids", []):
                 if void.get("parent_id") != region["id"]:
                     continue
-                void_shape = void.get("shape", {})
-                void_vertices = void.get("vertices", [])
-                if void_shape.get("type") == "circle":
-                    void_profile = Face(Wire(Circle(
-                        Pnt(
-                            float(void_shape["r_center"]),
-                            0.0,
-                            float(void_shape["z_center"]),
-                        ),
-                        Dir(0.0, 1.0, 0.0),
-                        float(void_shape["radius"]),
-                    )))
-                else:
-                    void_profile_vertices = [
-                        Vertex(Pnt(float(radius), 0.0, float(axial)))
-                        for radius, axial in void_vertices
-                    ]
-                    if len(void_profile_vertices) >= 3:
-                        void_profile_vertices.append(void_profile_vertices[0])
-                        void_profile = Face(MakePolygon(void_profile_vertices))
-                    else:
-                        continue
-                solid = solid - Revolve(
-                    void_profile,
-                    Axis(Pnt(0.0, 0.0, 0.0), Vec(0.0, 0.0, 1.0)),
-                    360.0,
-                )
+                try:
+                    void_profile = profile_for_region({
+                        "name": "void", "shape": void.get("shape", {}),
+                        "vertices": void.get("vertices", []),
+                    })
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    continue
+                solid = solid - Revolve(void_profile, axis, 360.0)
             solid = solid.mat(material_names.get(region.get("material_id")) or region.get("name", "Region"))
             preview_solids.append(solid)
 
+        def true_feature_edges(solid):
+            """Exclude periodic seam edges shared only with the same face."""
+            edge_faces = {}
+            edge_shapes = {}
+            try:
+                for face in solid.faces:
+                    face_id = hash(face)
+                    for edge in face.edges:
+                        edge_id = hash(edge)
+                        edge_faces.setdefault(edge_id, set()).add(face_id)
+                        edge_shapes.setdefault(edge_id, edge)
+            except (AttributeError, TypeError):
+                return []
+            return [
+                edge_shapes[edge_id]
+                for edge_id, adjacent_faces in edge_faces.items()
+                if len(adjacent_faces) > 1
+            ]
+
         renderers = []
         self._preview_3d_renderers = {}
+        self._preview_3d_edge_renderers = {}
         self._preview_3d_scene = None
         self._preview_face_region_ids = {}
         self._preview_edge_region_ids = {}
         if preview_solids:
-            # Keep each region in its own renderer. The WebGPU renderer has a
-            # renderer-wide opaque/transparent pass switch; combining all
-            # regions made one translucent exterior force opaque interiors
-            # through the transparent pass too.
+            # Separate region renderers preserve independent opacity settings.
             for region, solid in zip(regions, preview_solids):
                 for face in solid.faces:
                     self._preview_face_region_ids.setdefault(hash(face), []).append(region["id"])
-                for edge in solid.edges:
-                    self._preview_edge_region_ids.setdefault(hash(edge), set()).add(region["id"])
 
             for region, solid in zip(regions, preview_solids):
                 geometry = OCCGeometry(solid)
                 renderer = GeometryRenderer(geometry)
                 renderer.faces.active = True
-                # Keep true geometric edges, while exact circle profiles avoid
-                # the artificial segmented wire cage on toroidal surfaces.
-                renderer.edges.active = True
+                # OCC includes periodic seam edges in the solid topology. Keep
+                # surface rendering smooth and overlay only true feature edges
+                # shared by distinct faces.
+                renderer.edges.active = False
                 self._preview_3d_renderers[region["id"]] = renderer
                 renderers.append(renderer)
+
+                feature_edges = true_feature_edges(solid)
+                if feature_edges:
+                    edge_geometry = OCCGeometry(Compound(feature_edges))
+                    edge_renderer = GeometryRenderer(edge_geometry)
+                    edge_renderer.faces.active = False
+                    edge_renderer.edges.active = True
+                    self._preview_3d_edge_renderers[region["id"]] = edge_renderer
+                    for edge in edge_geometry.edges:
+                        self._preview_edge_region_ids.setdefault(hash(edge), set()).add(region["id"])
+                    renderers.append(edge_renderer)
+
         axes = CoordinateAxes()
         renderers.append(axes)
 
@@ -12011,21 +12101,28 @@ class SolveWorkspace(Div):
             renderer.faces.transparent = any(0.0 < alpha < 1.0 for alpha in face_alphas)
             renderer.faces.active = any(alpha > 0.0 for alpha in face_alphas)
 
-            edges = list(renderer.geo.edges)
-            edge_colors = np.tile(
-                np.array([0.12, 0.16, 0.21, 1.0], dtype=np.float32), len(edges)
-            )
-            for edge_index, edge in enumerate(edges):
-                region_ids = self._preview_edge_region_ids.get(hash(edge), {own_region_id})
-                alpha = max(
-                    _PREVIEW_VISIBILITY_ALPHA[
-                        self._preview_region_visibility.get(rid, "opaque")
-                    ]
-                    for rid in region_ids
+            # True feature edges are drawn separately from the face renderer;
+            # this prevents OCC seam and polygon segmentation edges appearing
+            # as a dense black cage on curved surfaces.
+            renderer.edges.active = False
+            edge_renderer = getattr(self, "_preview_3d_edge_renderers", {}).get(own_region_id)
+            if edge_renderer is not None:
+                edges = list(edge_renderer.geo.edges)
+                edge_colors = np.tile(
+                    np.array([0.12, 0.16, 0.21, 1.0], dtype=np.float32), len(edges)
                 )
-                edge_colors[4 * edge_index + 3] = 0.0 if alpha == 0.0 else 1.0
-            renderer.edges.set_colors(edge_colors)
-            renderer.edges.active = bool(edges) and any(edge_colors[3::4] > 0.0)
+                for edge_index, edge in enumerate(edges):
+                    region_ids = self._preview_edge_region_ids.get(hash(edge), {own_region_id})
+                    alpha = max(
+                        _PREVIEW_VISIBILITY_ALPHA[
+                            self._preview_region_visibility.get(rid, "opaque")
+                        ]
+                        for rid in region_ids
+                    )
+                    edge_colors[4 * edge_index + 3] = 0.0 if alpha == 0.0 else 1.0
+                edge_renderer.edges.set_colors(edge_colors)
+                edge_renderer.edges.active = any(edge_colors[3::4] > 0.0)
+                edge_renderer.set_needs_update()
             # Alpha changes select a different GPU render pipeline. Invalidate
             # the cached pass so a formerly opaque shell cannot keep writing
             # depth over the opaque child renderers.
@@ -12055,6 +12152,7 @@ class SolveWorkspace(Div):
             self._preview_3d_component = None
             self._preview_3d_scene = None
             self._preview_3d_renderers = {}
+            self._preview_3d_edge_renderers = {}
             self._preview_face_region_ids = {}
             self._preview_edge_region_ids = {}
             self._preview_visibility_controls = {}
