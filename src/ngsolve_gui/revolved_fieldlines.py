@@ -126,7 +126,10 @@ class RevolvedAxisymmetricFieldLines(_FieldLines):
             revolve_meridian_fieldline_arrays(data, plane_count)
         )
         if self.positions.size == 0:
-            return super().update(options)
+            # Keep an empty source trace empty. Re-tracing on the display mesh
+            # changes seed geometry and can create misleading 3D paths.
+            ShapeRenderer.update(self, options)
+            return
 
         bbox = self.mesh.ngmesh.bounding_box
         thickness = (

@@ -487,7 +487,7 @@ def _app_menu_item(label, callback=None, icon=None, shortcut=None, close_menu=No
                 if close is not None:
                     close()
 
-        item.on_click(run_action)
+        item.on("click", run_action)
     return item
 
 
@@ -497,6 +497,7 @@ def _app_menu_button(label, entries):
     def close_menu():
         menu = menu_ref.get("menu")
         if menu is not None:
+            menu.ui_model_value = False
             menu.ui_hide()
 
     items = [
@@ -1302,7 +1303,17 @@ class NGSolveGui(App):
                 "description": description,
                 "accept": accepted_types,
             }]
-        handles = self.js.showOpenFilePicker(picker_options)
+        from .picker_wait import BROWSER_PICKER_WAIT_SECONDS, browser_file_picker_wait
+
+        try:
+            with browser_file_picker_wait():
+                handles = self.js.showOpenFilePicker(picker_options)
+        except TimeoutError as error:
+            minutes = BROWSER_PICKER_WAIT_SECONDS // 60
+            raise TimeoutError(
+                f"The browser file picker did not return within {minutes} minutes. "
+                "Choose the file again and leave the picker open until selection finishes."
+            ) from error
         if not handles:
             return None, None
         js_file = handles[0].getFile()
@@ -1864,7 +1875,10 @@ class NGSolveGui(App):
         import tempfile
 
         try:
-            handles = self.js.showOpenFilePicker({"multiple": False})
+            from .picker_wait import browser_file_picker_wait
+
+            with browser_file_picker_wait():
+                handles = self.js.showOpenFilePicker({"multiple": False})
         except Exception:
             return None
         if not handles:

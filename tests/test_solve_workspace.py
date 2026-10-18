@@ -1069,6 +1069,10 @@ def test_positive_mass_harmonic_mechanics_does_not_require_em_or_a_fixed_edge(st
     workspace.studies["studies"][0]["frequency_hz"] = ["500"]
 
     assert workspace.validation_errors() == []
+    assert any(
+        "has no fixed or spring support" in warning
+        for warning in workspace.validation_warnings()
+    )
 
     workspace.studies["studies"][0]["frequency_hz"] = []
     assert any("positive frequency" in error for error in workspace.validation_errors())
@@ -1710,6 +1714,36 @@ def test_tangent_arc_uses_outward_direction_at_both_curve_endpoints(
     assert tangent_start[1] == pytest.approx(expected_tangent)
 
 
+
+
+
+def test_tangent_arc_prefers_clicked_edge_and_uses_exact_outward_tangent(standalone_components):
+    workspace = SolveWorkspace()
+    shared = (0.004, 0.002)
+    assert workspace._add_sketch_entity("line", [shared, (0.009, 0.002)])
+    horizontal_edge = next(
+        edge for edge in workspace.model["geometry"]["edges"]
+        if edge.get("sketch_entity_id") == workspace.model["geometry"]["sketch_entities"][0]["id"]
+    )
+    assert workspace._add_sketch_entity("line", [shared, (0.004, 0.009)])
+    vertical_edge = next(
+        edge for edge in workspace.model["geometry"]["edges"]
+        if edge.get("sketch_entity_id") == workspace.model["geometry"]["sketch_entities"][1]["id"]
+    )
+
+    horizontal = workspace._tangent_at_sketch_endpoint(
+        shared, preferred_edge_id=horizontal_edge["id"]
+    )
+    vertical = workspace._tangent_at_sketch_endpoint(
+        shared, preferred_edge_id=vertical_edge["id"]
+    )
+
+    assert horizontal[0] == pytest.approx(shared)
+    assert horizontal[1] == pytest.approx((-1.0, 0.0))
+    assert vertical[0] == pytest.approx(shared)
+    assert vertical[1] == pytest.approx((0.0, -1.0))
+
+
 def test_tangent_arc_from_first_endpoint_uses_short_tangent_sweep(standalone_components):
     workspace = SolveWorkspace()
     start = (0.008, 0.002)
@@ -1855,6 +1889,7 @@ def test_live_preview_supports_arc_construction_and_point_markers(standalone_com
     assert "__ngsolveSketchCenterArcClockwise" in script
     assert "Boolean(window.__ngsolveSketchCenterArcClockwise)" in script
     assert "spline3Path" in script
+    assert "gestureSessionId + \":\" + String(finishedGesture)" in script
     assert "arcPathTangent" in script
     assert "const cancelArc" in script
     assert "solve-sketch-construction-points" in script
@@ -2978,6 +3013,24 @@ def test_canvas_drag_on_region_body_moves_region_instead_of_box_selecting_edges(
     assert region["shape"]["r_min"] - before == pytest.approx(0.0002)
     assert workspace.selected_region_id == region["id"]
     assert workspace.selected_edge_ids == []
+
+
+
+
+
+def test_hp_layer_targets_can_be_removed_individually_including_stale_ids(standalone_components):
+    workspace = SolveWorkspace()
+    workspace.model["mesh"]["hp_region_ids"] = ["deleted-region-id"]
+    workspace.model["mesh"]["hp_edge_ids"] = ["deleted-edge-id"]
+    workspace._sync_canvas_selection = lambda: None
+    workspace._render_inspector = lambda: None
+
+    workspace._remove_hp_layer_target("hp_region_ids", "deleted-region-id")
+    assert workspace.model["mesh"]["hp_region_ids"] == []
+    assert workspace.model["mesh"]["hp_edge_ids"] == ["deleted-edge-id"]
+
+    workspace._remove_hp_layer_target("hp_edge_ids", "deleted-edge-id")
+    assert workspace.model["mesh"]["hp_edge_ids"] == []
 
 
 def test_drag_box_selects_enclosed_or_crossed_edges_and_shift_adds(standalone_components):

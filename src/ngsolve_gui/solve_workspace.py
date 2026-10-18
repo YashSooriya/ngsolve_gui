@@ -722,11 +722,16 @@ class SolveWorkspace(Div):
                     ui_clickable=True, ui_dense=True,
                 )
 
-                def choose_variant(event=None, active_tool=tool, selected_variant=variant):
-                    # Hide before refreshing the toolbar; refresh can replace the
-                    # menu component and leave its old popup visible.
+                def close_variant_menu():
+                    menu.ui_model_value = False
                     menu.ui_hide()
+
+                def choose_variant(event=None, active_tool=tool, selected_variant=variant):
+                    # Close before and after changing tools so a reactive toolbar
+                    # update cannot leave the dropdown open or reopen its old state.
+                    close_variant_menu()
                     self.set_sketch_tool(active_tool, variant=selected_variant)
+                    close_variant_menu()
 
                 item.on_click(choose_variant)
                 menu_items.append(item)
@@ -1861,6 +1866,7 @@ class SolveWorkspace(Div):
   let dragMode = null;
   let gestureScreenPoints = [];
   let gestureNumber = 0;
+  const gestureSessionId = String(Date.now()) + "-" + Math.random().toString(36).slice(2);
   let suppressCanvasClickUntil = 0;
   let previewFrame = 0;
   let pendingPreview = null;
@@ -2858,7 +2864,7 @@ class SolveWorkspace(Div):
     dragRegionId = selectionEnabled && region
       ? region.getAttribute('data-sketch-region-id')
       : null;
-    dragEdgeId = (selectionEnabled || tool === 'line') && edge
+    dragEdgeId = (selectionEnabled || tool === 'line' || tool === 'arc') && edge
       ? edge.getAttribute('data-sketch-edge-id')
       : null;
     window.__ngsolveSketchLastRegionId = dragRegionId;
@@ -2939,6 +2945,7 @@ class SolveWorkspace(Div):
         finishedEdgeId || '', finishedSketchPoints,
         window.__ngsolveSketchToolVariant || '', '',
         Boolean(window.__ngsolveSketchCenterArcClockwise),
+        gestureSessionId + ":" + String(finishedGesture),
       ];
       if (wheelCommitTimer) window.clearTimeout(wheelCommitTimer);
       wheelCommitTimer = 0;
@@ -3523,6 +3530,17 @@ class SolveWorkspace(Div):
                 pending_drag = self._canvas_drag or {}
                 pending_operation = pending_drag.get("operation")
                 special_command = str(completed[16]).lower() if len(completed) >= 17 else ""
+                gesture_id = str(completed[18]) if len(completed) >= 19 else ""
+                if operation == "trim" and gesture_id:
+                    handled = getattr(self, "_handled_trim_gesture_ids", None)
+                    if handled is None:
+                        handled = self._handled_trim_gesture_ids = set()
+                    if gesture_id in handled:
+                        return
+                    handled.add(gesture_id)
+                    if len(handled) > 128:
+                        handled.remove(next(iter(handled)))
+
                 if operation == "line_finish":
                     self._canvas_drag = None
                     self._screen_to_svg = None
@@ -3586,6 +3604,7 @@ class SolveWorkspace(Div):
                         self._accept_arc_sketch_point(
                             world_point, variant=tool_variant,
                             centerpoint_clockwise=centerpoint_clockwise,
+                            source_edge_id=edge_id,
                         )
                         if view_changed:
                             self._render_canvas_after_interaction()
@@ -4450,58 +4469,105 @@ class SolveWorkspace(Div):
         self._message(f"Added {kind}; closed sketch loops are detected as regions.")
         return True
 
-    def _tangent_at_sketch_endpoint(self, point, tolerance_px=12.0):
+    def _tangent_at_sketch_endpoint(self, point, tolerance_px=12.0, preferred_edge_id=None):
+        """Return the exact outward tangent at the nearest eligible curve endpoint."""
         project, _ = self._canvas_projection()
         target = project(point)
-        candidates = []
+        geometry = self.model.get("geometry", {})
+        edges = geometry.get("edges", []) if isinstance(geometry, dict) else []
+        entities = geometry.get("sketch_entities", []) if isinstance(geometry, dict) else []
+        edges_by_entity = {}
+        represented = set()
+        for edge in edges:
+            entity_id = edge.get("sketch_entity_id")
+            if entity_id:
+                represented.add(entity_id)
+                edges_by_entity.setdefault(entity_id, []).append(edge)
+
         sources = []
-        for entity in self.model["geometry"].get("sketch_entities", []):
-            samples = entity.get("sampled_points") or entity.get("points") or []
-            if len(samples) >= 2:
-                sources.append(samples)
-        represented = {
-            edge.get("sketch_entity_id")
-            for edge in self.model["geometry"].get("edges", [])
-            if edge.get("sketch_entity_id")
-        }
-        for edge in self.model["geometry"].get("edges", []):
+        for entity in entities:
+            entity_id = entity.get("id")
+            linked_edges = edges_by_entity.get(entity_id, [])
+            if preferred_edge_id:
+                linked_edges = [edge for edge in linked_edges if edge.get("id") == preferred_edge_id]
+                if not linked_edges:
+                    continue
+            if linked_edges:
+                for edge in linked_edges:
+                    curve = edge.get("curve") if isinstance(edge.get("curve"), dict) else entity
+                    samples = curve.get("sampled_points") or edge.get("vertices", [])
+                    if len(samples) >= 2:
+                        sources.append((samples, curve, edge.get("id")))
+            elif not preferred_edge_id:
+                samples = entity.get("sampled_points") or entity.get("points") or []
+                if len(samples) >= 2:
+                    sources.append((samples, entity, None))
+
+        for edge in edges:
             if edge.get("sketch_entity_id") in represented:
                 continue
-            curve = edge.get("curve", {})
-            samples = curve.get("sampled_points") if isinstance(curve, dict) else None
-            samples = samples if isinstance(samples, list) and len(samples) >= 2 else edge.get("vertices", [])
+            if preferred_edge_id and edge.get("id") != preferred_edge_id:
+                continue
+            curve = edge.get("curve") if isinstance(edge.get("curve"), dict) else {}
+            samples = curve.get("sampled_points") or edge.get("vertices", [])
             if len(samples) >= 2:
-                sources.append(samples)
-        for samples in sources:
-            # Tangent arcs continue outward from whichever endpoint the user
-            # chooses. At the first sample this points opposite the curve's
-            # parameter direction; at the last sample it follows it.
-            for endpoint, neighbor in (
-                (samples[0], samples[1]),
-                (samples[-1], samples[-2]),
+                sources.append((samples, curve, edge.get("id")))
+
+        candidates = []
+        selected_edge_id = preferred_edge_id or getattr(self, "selected_edge_id", None)
+        for samples, curve, edge_id in sources:
+            try:
+                points = [tuple(float(value) for value in sample[:2]) for sample in samples]
+            except (TypeError, ValueError, IndexError, OverflowError):
+                continue
+            if len(points) < 2:
+                continue
+            curve_type = curve.get("type")
+            control = curve.get("control_point")
+            center = curve.get("center")
+            for at_start, endpoint, neighbor in (
+                (True, points[0], points[1]),
+                (False, points[-1], points[-2]),
             ):
                 screen = project(endpoint)
                 distance = math.hypot(target[0] - screen[0], target[1] - screen[1])
-                tangent = (
-                    endpoint[0] - neighbor[0],
-                    endpoint[1] - neighbor[1],
-                )
+                if distance > tolerance_px:
+                    continue
+
+                tangent = (endpoint[0] - neighbor[0], endpoint[1] - neighbor[1])
+                if curve_type == "spline3" and isinstance(control, (list, tuple)) and len(control) >= 2:
+                    tangent = (endpoint[0] - float(control[0]), endpoint[1] - float(control[1]))
+                elif curve_type == "arc" and isinstance(center, (list, tuple)) and len(center) >= 2:
+                    radial = (endpoint[0] - float(center[0]), endpoint[1] - float(center[1]))
+                    direction = -1.0 if curve.get("clockwise", False) else 1.0
+                    forward = (-direction * radial[1], direction * radial[0])
+                    tangent = (-forward[0], -forward[1]) if at_start else forward
+
                 norm = math.hypot(*tangent)
-                if distance <= tolerance_px and norm > 1e-15:
-                    candidates.append((distance, tuple(endpoint), (tangent[0] / norm, tangent[1] / norm)))
+                if norm <= 1e-15:
+                    continue
+                preferred = 0 if edge_id == selected_edge_id else 1
+                candidates.append((
+                    distance, preferred, tuple(endpoint),
+                    (tangent[0] / norm, tangent[1] / norm),
+                ))
         if not candidates:
             return None
-        _, endpoint, tangent = min(candidates, key=lambda item: item[0])
+        _, _, endpoint, tangent = min(candidates, key=lambda item: (item[0], item[1]))
         return endpoint, tangent
 
-    def _accept_arc_sketch_point(self, point, *, variant=None, centerpoint_clockwise=None):
+    def _accept_arc_sketch_point(
+        self, point, *, variant=None, centerpoint_clockwise=None, source_edge_id=None
+    ):
         variant = variant or self._sketch_tool_variant.get("arc", "three-point")
         point = tuple(float(value) for value in point)
         pending = self._pending_arc_points
 
         if variant == "tangent":
             if not pending:
-                tangent_start = self._tangent_at_sketch_endpoint(point)
+                tangent_start = self._tangent_at_sketch_endpoint(
+                    point, preferred_edge_id=source_edge_id
+                )
                 if tangent_start is None:
                     self._message("Tangent arc must start at an existing line or curve endpoint.", error=True)
                     return False
@@ -7192,7 +7258,7 @@ class SolveWorkspace(Div):
         text = str(issue).casefold()
         if "young's modulus" in text or "material" in text:
             return "materials"
-        if any(term in text for term in ("mechanical region", "mechanical regions", "robin support", "stiffnesses must be non-negative", "region to include in mechanics", "axial motion")):
+        if any(term in text for term in ("mechanical region", "mechanical regions", "mechanical component", "robin support", "stiffnesses must be non-negative", "region to include in mechanics", "axial motion")):
             return "mechanics"
         if any(term in text for term in ("regional load", "source", "current density", "body force")):
             return "loads"
@@ -10854,6 +10920,18 @@ class SolveWorkspace(Div):
         self._sync_canvas_selection()
         self._render_inspector()
 
+    def _remove_hp_layer_target(self, key, target_id, *args):
+        if key not in {"hp_region_ids", "hp_edge_ids"}:
+            return
+        self._set_hp_layer_target(key, target_id, False)
+        mesh = self.model.setdefault("mesh", {})
+        self.selected_region_ids = list(mesh.get("hp_region_ids", []))
+        self.selected_edge_ids = list(mesh.get("hp_edge_ids", []))
+        self.selected_region_id = None
+        self.selected_edge_id = self.selected_edge_ids[-1] if self.selected_edge_ids else None
+        self._sync_canvas_selection()
+        self._render_inspector()
+
     def _material_properties(self):
         regions = self.model.get("geometry", {}).get("regions", [])
         children = [_section_title("Materials", "Assign a material and mechanical participation to each region.")]
@@ -11118,10 +11196,30 @@ class SolveWorkspace(Div):
             edge_names = {edge.get("id"): edge.get("name", "Boundary") for edge in self.model.get("geometry", {}).get("edges", [])}
             for region_id in mesh.get("hp_region_ids", []):
                 label = names.get(region_id, "Removed region")
-                children.append(Div(QIcon(ui_name="mdi-vector-square-outline"), label, ui_style="display:flex; align-items:center; gap:7px; padding:4px 6px; background:var(--surface-subtle,#f7f9fb); border-radius:5px;"))
+                remove = _icon_button(
+                    "mdi-close", f"Remove {label} from hp-layer targets",
+                    lambda *args, target=region_id: self._remove_hp_layer_target("hp_region_ids", target),
+                    color="negative",
+                )
+                children.append(Div(
+                    QIcon(ui_name="mdi-vector-square-outline"),
+                    Div(label, ui_style="flex:1; min-width:0;"),
+                    remove,
+                    ui_style="display:flex; align-items:center; gap:7px; padding:3px 4px 3px 6px; background:var(--surface-subtle,#f7f9fb); border-radius:5px;",
+                ))
             for edge_id in mesh.get("hp_edge_ids", []):
                 label = edge_names.get(edge_id, "Removed boundary")
-                children.append(Div(QIcon(ui_name="mdi-vector-line"), label, ui_style="display:flex; align-items:center; gap:7px; padding:4px 6px; background:var(--surface-subtle,#f7f9fb); border-radius:5px;"))
+                remove = _icon_button(
+                    "mdi-close", f"Remove {label} from hp-layer targets",
+                    lambda *args, target=edge_id: self._remove_hp_layer_target("hp_edge_ids", target),
+                    color="negative",
+                )
+                children.append(Div(
+                    QIcon(ui_name="mdi-vector-line"),
+                    Div(label, ui_style="flex:1; min-width:0;"),
+                    remove,
+                    ui_style="display:flex; align-items:center; gap:7px; padding:3px 4px 3px 6px; background:var(--surface-subtle,#f7f9fb); border-radius:5px;",
+                ))
             children.append(_button("Clear all targets", "mdi-eraser", self._clear_hp_layer_targets))
         else:
             children.append(Div("No hp layer targets selected.", ui_style="font-size:11px; color:var(--fg-muted);"))
@@ -12357,7 +12455,7 @@ class SolveWorkspace(Div):
         } if key == "hp_region_ids" else {
             edge.get("id") for edge in self.model.get("geometry", {}).get("edges", [])
         }
-        if target_id not in live_ids:
+        if enabled and target_id not in live_ids:
             return
         selected = list(self.model.setdefault("mesh", {}).get(key, []))
         if enabled and target_id not in selected:
@@ -12731,6 +12829,63 @@ class SolveWorkspace(Div):
                     "All active electromagnetic current sources are zero; a zero-field solution may be correct."
                 )
         if mechanics and regions:
+            mechanical_regions, mechanical_components = self._mechanical_components()
+            materials = {
+                item.get("id"): item for item in self.model.get("materials", [])
+                if isinstance(item, dict) and item.get("id")
+            }
+            conditions = {
+                item.get("id"): item for item in boundary_conditions
+                if isinstance(item, dict) and item.get("id")
+            }
+            edges_by_id = {
+                edge.get("id"): edge for edge in geometry.get("edges", [])
+                if isinstance(edge, dict) and edge.get("id")
+            }
+            parameter_map = {
+                item.get("name"): item for item in self.model.get("parameters", [])
+                if isinstance(item, dict) and item.get("name")
+            }
+            for component_region_ids, component_edge_ids in mechanical_components:
+                has_inertia = False
+                for region in mechanical_regions:
+                    if region.get("id") not in component_region_ids:
+                        continue
+                    material = materials.get(region.get("material_id"), {})
+                    try:
+                        density = float(evaluate_expression(
+                            material.get("properties", {}).get("density", "0"), parameter_map
+                        ))
+                        has_inertia = has_inertia or (math.isfinite(density) and density > 0)
+                    except (AttributeError, TypeError, ValueError, SyntaxError, ZeroDivisionError, OverflowError):
+                        pass
+                has_support = False
+                for edge_id in component_edge_ids:
+                    edge = edges_by_id.get(edge_id)
+                    if edge is None:
+                        continue
+                    for condition_id in _edge_condition_ids(edge):
+                        condition = conditions.get(condition_id, {})
+                        kind = condition.get("type")
+                        if kind in {"mechanical_fixed", "mechanical_prescribed"}:
+                            has_support = True
+                        elif kind == "mechanical_robin":
+                            supports, _issue = self._robin_edge_supports_axial_translation(
+                                edge, condition, parameter_map
+                            )
+                            has_support = has_support or supports
+                if has_inertia and not has_support:
+                    component_name = ", ".join(
+                        region.get("name", region.get("id", "unnamed"))
+                        for region in mechanical_regions
+                        if region.get("id") in component_region_ids
+                    )
+                    warnings.append(
+                        f"Mechanical component '{component_name}' has no fixed or spring support. "
+                        "Its positive density allows a time-harmonic solve; inspect the response near "
+                        "rigid-body modes and resonance."
+                    )
+
             mechanical_sources = [
                 str(section("mechanics").get(key, "0")).strip()
                 for key in ("body_force_r", "body_force_z")
