@@ -2021,6 +2021,57 @@ def test_trimming_circle_outside_rectangle_does_not_restore_duplicate_edges(stan
     )
 
 
+
+def test_trimming_large_circle_exterior_removes_the_full_arc_between_rectangle_intersections(standalone_components):
+    workspace = SolveWorkspace()
+    rect = {"r_min": 0.00351, "z_min": -0.00092, "width": 0.00395, "height": 0.00723}
+    workspace._primitive_values.update({("rectangle", key): value for key, value in rect.items()})
+    workspace._add_primitive("rectangle")
+    circle = {"r_center": 0.0111, "z_center": 0.0036, "radius": 0.0065}
+    workspace._primitive_values.update({("circle", key): value for key, value in circle.items()})
+    workspace._add_primitive("circle")
+
+    geometry = workspace.model["geometry"]
+    circle_group = [
+        entity for entity in geometry["sketch_entities"]
+        if str(entity.get("curve_group_id", "")).startswith("circle:")
+    ]
+    assert len(circle_group) == 4
+    rectangle_right = rect["r_min"] + rect["width"]
+    rectangle_top = rect["z_min"] + rect["height"]
+    assert any(
+        point[0] > rectangle_right + 1e-8 or point[1] < rect["z_min"] - 1e-8
+        or point[1] > rectangle_top + 1e-8
+        for entity in circle_group for point in entity.get("sampled_points", [])
+    )
+
+    # Start inside the large circle and drag out through its far-side arc,
+    # matching the viewport gesture without an edge preselection.
+    assert workspace._trim_sketch_entities_along_stroke([
+        (circle["r_center"], circle["z_center"]),
+        (circle["r_center"] + circle["radius"] + 0.0005, circle["z_center"]),
+    ])
+
+    geometry = workspace.model["geometry"]
+    remaining_circle = [
+        entity for entity in geometry["sketch_entities"]
+        if str(entity.get("curve_group_id", "")).startswith("circle:")
+    ]
+    assert remaining_circle
+    assert len(geometry["regions"]) == 2
+    assert all(
+        rect["r_min"] - 1e-8 <= point[0] <= rectangle_right + 1e-8
+        and rect["z_min"] - 1e-8 <= point[1] <= rectangle_top + 1e-8
+        for entity in remaining_circle for point in entity.get("sampled_points", [])
+    ), "The trimmed circle must retain only the arc inside the rectangle."
+
+    edge_ids = [edge.get("id") for edge in geometry["edges"]]
+    assert len(edge_ids) == len(set(edge_ids))
+    assert set(edge_ids) == {
+        edge_id for region in geometry["regions"] for edge_id in region.get("edge_ids", [])
+    }
+
+
 def test_trimming_circle_cap_when_drag_starts_on_edge_removes_whole_cap(standalone_components):
     workspace = SolveWorkspace()
     workspace._primitive_values.update({

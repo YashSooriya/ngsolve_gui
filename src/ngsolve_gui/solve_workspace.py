@@ -5628,8 +5628,27 @@ class SolveWorkspace(Div):
             for entity in entities if isinstance(entity, dict) and isinstance(entity.get("id"), str)
         }
 
+        # Group membership must exist for drag trims as well as edge-pick trims.
+        # A primitive circle is stored as four authored arcs; hitting one segment
+        # must be able to continue through neighboring segments until the real
+        # intersections with the rectangle stop the trim.
+        group_members_by_group = {}
+        for item in entities:
+            if not isinstance(item, dict):
+                continue
+            group_id = item.get("curve_group_id")
+            if not group_id:
+                continue
+            try:
+                group_index = int(item.get("curve_group_index"))
+                group_size = int(item.get("curve_group_size", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if group_size > 1 and 0 <= group_index < group_size:
+                group = group_members_by_group.setdefault(group_id, {"size": group_size, "members": {}})
+                group["members"][group_index] = item
+
         selected_group_id = None
-        group_members_by_index = {}
         if target_edge_id and target_entity_ids:
             selected_id = next(iter(target_entity_ids))
             selected_entity = next(
@@ -5638,21 +5657,16 @@ class SolveWorkspace(Div):
             )
             selected_group_id = selected_entity.get("curve_group_id") if selected_entity else None
             if selected_group_id:
-                group_size = int(selected_entity.get("curve_group_size", 0) or 0)
-                for item in entities:
-                    if item.get("curve_group_id") != selected_group_id:
-                        continue
-                    try:
-                        group_index = int(item.get("curve_group_index"))
-                    except (TypeError, ValueError, OverflowError):
-                        continue
-                    group_members_by_index[group_index] = item
+                group = group_members_by_group.get(selected_group_id, {})
+                group_size = int(group.get("size", 0) or 0)
+                group_members = group.get("members", {})
+                for group_index, item in group_members.items():
                     target_entity_ids.add(item.get("id"))
                     if item.get("id") != selected_id:
                         target_intervals[item.get("id")] = (0.0, 1.0)
                 selected_group_index = int(selected_entity.get("curve_group_index", 0))
                 ordered_group = sorted(
-                    group_members_by_index.values(),
+                    group_members.values(),
                     key=lambda item: (int(item.get("curve_group_index", 0)) - selected_group_index)
                     % max(1, group_size),
                 )
@@ -5800,6 +5814,64 @@ class SolveWorkspace(Div):
             fragment["_trim_parent_t0"] = float(start_t)
             fragment["_trim_parent_t1"] = float(end_t)
             return fragment
+
+        # Process each authored curve group from the segment nearest the trim
+        # stroke outwards. Neighboring seam hits are then queued before the next
+        # segment is handled, independent of the group's storage order.
+        def distance_to_trim_stroke(entity):
+            samples = curve_samples(entity)
+            if len(samples) < 2:
+                return math.inf
+            screen_samples = [project(point) for point in samples]
+            nearest = math.inf
+            for stroke_a, stroke_b in zip(stroke, stroke[1:]):
+                for curve_a, curve_b in zip(screen_samples, screen_samples[1:]):
+                    if segment_hit_parameter(stroke_a, stroke_b, curve_a, curve_b) is not None:
+                        return 0.0
+                    for point in (stroke_a, stroke_b):
+                        nearest = min(nearest, point_segment_distance(point, curve_a, curve_b)[0])
+                    for point in (curve_a, curve_b):
+                        nearest = min(nearest, point_segment_distance(point, stroke_a, stroke_b)[0])
+            return nearest
+
+        entities_by_group = {}
+        for item in entities:
+            group_id = item.get("curve_group_id") if isinstance(item, dict) else None
+            if group_id in group_members_by_group:
+                entities_by_group.setdefault(group_id, []).append(item)
+        ordered_entities = []
+        emitted_groups = set()
+        for item in entities:
+            group_id = item.get("curve_group_id") if isinstance(item, dict) else None
+            if group_id not in group_members_by_group:
+                ordered_entities.append(item)
+                continue
+            if group_id in emitted_groups:
+                continue
+            emitted_groups.add(group_id)
+            group = group_members_by_group[group_id]
+            group_size = group["size"]
+            members = entities_by_group.get(group_id, [])
+            seed_indices = set()
+            for member in members:
+                if distance_to_trim_stroke(member) <= nearest_hit_tolerance_px:
+                    try:
+                        seed_indices.add(int(member.get("curve_group_index")))
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+            if seed_indices:
+                def group_order(member):
+                    index = int(member.get("curve_group_index", 0))
+                    distance = min(
+                        min((index - seed) % group_size, (seed - index) % group_size)
+                        for seed in seed_indices
+                    )
+                    return distance, distance_to_trim_stroke(member), index
+                members = sorted(members, key=group_order)
+            else:
+                members = sorted(members, key=lambda member: int(member.get("curve_group_index", 0)))
+            ordered_entities.extend(members)
+        entities = ordered_entities
 
         replacement_entities = []
         forced_group_hits = {}
@@ -5998,11 +6070,11 @@ class SolveWorkspace(Div):
                             abs(value - 1.0) <= true_intersection_tolerance for value in intersections
                         )
                         if starts_at_authored_seam:
-                            neighbor = group_members_by_index.get((group_index - 1) % group_size)
+                            neighbor = group_members_by_group.get(group_id, {}).get("members", {}).get((group_index - 1) % group_size)
                             if neighbor is not None:
                                 forced_group_hits.setdefault(neighbor.get("id"), []).append(1.0)
                         if ends_at_authored_seam:
-                            neighbor = group_members_by_index.get((group_index + 1) % group_size)
+                            neighbor = group_members_by_group.get(group_id, {}).get("members", {}).get((group_index + 1) % group_size)
                             if neighbor is not None:
                                 forced_group_hits.setdefault(neighbor.get("id"), []).append(0.0)
 
