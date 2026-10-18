@@ -5968,3 +5968,41 @@ def test_trimming_centerpoint_and_tangent_arc_caps(
         for entity in remaining_arcs
         for point in entity.get("sampled_points", [])
     )
+
+
+@pytest.mark.parametrize(
+    ("tool", "variant"),
+    [
+        ("line", None),
+        ("circle", "center-radius"),
+        ("rectangle", "corner"),
+        ("arc", "three-point"),
+        ("trim", None),
+    ],
+)
+def test_sketch_tool_shortcut_action_activates_default_tool(
+    standalone_components, tool, variant
+):
+    workspace = SolveWorkspace()
+    app = SimpleNamespace(
+        _solve_shortcut_context_active=lambda: True,
+        solve_workspace=workspace,
+    )
+
+    assert NGSolveGui._activate_sketch_tool_shortcut(app, tool)
+    assert workspace.sketch_tool == tool
+    if variant is not None:
+        assert workspace._sketch_tool_variant[tool] == variant
+
+
+def test_sketch_tool_shortcut_action_ignores_text_and_postprocess_context(
+    standalone_components
+):
+    workspace = SolveWorkspace()
+    app = SimpleNamespace(
+        _solve_shortcut_context_active=lambda: False,
+        solve_workspace=workspace,
+    )
+
+    assert not NGSolveGui._activate_sketch_tool_shortcut(app, "line")
+    assert workspace.sketch_tool == "select"

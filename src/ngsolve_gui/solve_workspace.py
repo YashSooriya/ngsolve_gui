@@ -693,7 +693,7 @@ class SolveWorkspace(Div):
         select_button = _button(
             "Select", "mdi-cursor-default-outline",
             lambda *a: self.set_sketch_tool("select"),
-            tooltip="Drag regions to move them; drag empty space to select edges; middle-drag to pan. Hold Ctrl or Shift to select multiple regions, then right-click for group, ungroup, or delete.",
+            tooltip="Drag regions to move them; drag empty space to select edges; middle-drag to pan. Hold Ctrl or Shift to select multiple regions, then right-click for group, ungroup, or delete. Press Esc to return to Select.",
             style="flex:0 0 auto; white-space:nowrap;",
         )
         def sketch_tool_group(label, icon, tool, options, tooltip):
@@ -754,28 +754,28 @@ class SolveWorkspace(Div):
         rectangle_button, rectangle_group = sketch_tool_group(
             "Rectangle", "mdi-rectangle-outline", "rectangle",
             (("corner", "Corner rectangle"), ("center", "Center rectangle")),
-            "Choose corner or center rectangle, then drag to size it.",
+            "Choose corner or center rectangle, then drag to size it. Press R to activate a corner rectangle.",
         )
         circle_button, circle_group = sketch_tool_group(
             "Circle", "mdi-circle-outline", "circle",
             (("center-radius", "Centerpoint circle"), ("three-point", "3-point circle")),
-            "Choose a centerpoint circle by dragging or a 3-point circle by clicking three circumference points.",
+            "Choose a centerpoint circle by dragging or a 3-point circle by clicking three circumference points. Press C to activate a centerpoint circle.",
         )
         line_button = _button(
             "Line", "mdi-vector-line",
             lambda *a: self.set_sketch_tool("line"),
-            tooltip="Draw a straight sketch edge by dragging between endpoints.",
+            tooltip="Draw a straight sketch edge by dragging between endpoints. Press L to activate Line.",
             style="flex:0 0 auto; white-space:nowrap;",
         )
         arc_button, arc_group = sketch_tool_group(
             "Arc", "mdi-vector-curve", "arc",
             (("three-point", "3-point arc"), ("centerpoint", "Centerpoint arc"), ("tangent", "Tangent arc"), ("spline3", "Spline")),
-            "Choose a 3-point, centerpoint, tangent, or spline arc.",
+            "Choose a 3-point, centerpoint, tangent, or spline arc. Press A to activate a 3-point arc.",
         )
         trim_button = _button(
             "Trim", "mdi-content-cut",
             lambda *a: self.set_sketch_tool("trim"),
-            tooltip="Trim an open line at its intersections with other sketch curves.",
+            tooltip="Trim an open line at its intersections with other sketch curves. Press T to activate Trim.",
             style="flex:0 0 auto; white-space:nowrap;",
         )
         snap_button = _button("Snap", "mdi-magnet", self.toggle_snap_to_grid, tooltip="Snap sketch points to grid intersections", style="flex:0 0 auto; white-space:nowrap;")

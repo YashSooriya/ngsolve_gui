@@ -818,6 +818,19 @@ class NGSolveGui(App):
         kb.add("ctrl+o", lambda *a: self._run_menu_shortcut(self.load_problem_file), "Open problem", "File")
         kb.add("ctrl+s", lambda *a: self._run_menu_shortcut(self.save_problem_file), "Save problem", "File")
         kb.add("delete", self._delete_selected_region_shortcut, "Delete selected geometry", "Solve")
+        for key, tool, description in (
+            ("l", "line", "Line tool"),
+            ("c", "circle", "Circle tool"),
+            ("r", "rectangle", "Rectangle tool"),
+            ("a", "arc", "3-point arc tool"),
+            ("t", "trim", "Trim tool"),
+        ):
+            kb.add(
+                key,
+                lambda *args, active_tool=tool: self._activate_sketch_tool_shortcut(active_tool),
+                description,
+                "Sketch",
+            )
         kb.add("ctrl+z", self._undo_solve_action, "Undo model change", "Solve")
         kb.add("ctrl+y", self._redo_solve_action, "Redo model change", "Solve")
         kb.add("ctrl+b", self._toggle_navigator, "Toggle navigator", "Panels")
@@ -1090,6 +1103,20 @@ class NGSolveGui(App):
                 return False
         except Exception:
             pass
+        return True
+
+    def _activate_sketch_tool_shortcut(self, tool):
+        if not self._solve_shortcut_context_active():
+            return False
+        workspace = getattr(self, "solve_workspace", None)
+        if workspace is None:
+            return False
+        default_variants = {
+            "rectangle": "corner",
+            "circle": "center-radius",
+            "arc": "three-point",
+        }
+        workspace.set_sketch_tool(tool, variant=default_variants.get(tool))
         return True
 
     def _undo_solve_action(self, *args):
