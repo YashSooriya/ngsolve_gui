@@ -1,6 +1,15 @@
 import os
+import sys
 import threading
 import time
+import copy
+import io
+import json
+import mimetypes
+import re
+import subprocess
+from datetime import datetime as _datetime, timezone as _timezone
+from pathlib import Path
 
 from ngapp.app import App
 from ngapp.components import *
@@ -16,6 +25,183 @@ from . import cerbsim_style as cb
 from .cerbsim_style import theme, kb_theme, flex_fill, panel_full
 from .system_monitor import SystemMonitor, available as system_monitor_available
 from .footer import StatusFooter
+from .solve_workspace import SolveWorkspace, default_run_history_root
+from .mesh_geometry import axisymmetric_mesh_edge_polylines
+from .axisymmetric_model import new_model, new_studies, unpack_model, package_model, serialize_model_json
+from .result_files import (
+    MESH_SUFFIX,
+    SOLUTION_SUFFIX,
+    make_mesh_bundle,
+    make_solution_bundle,
+    problem_fingerprint,
+    read_mesh_bundle,
+)
+
+
+def _request_guest_vm_shutdown():
+    # Only the packaged VM sets this flag; standalone launches quit normally.
+    if os.environ.get("MMFEM_VM_GUEST") != "1":
+        return
+
+    result = subprocess.run(
+        ["sudo", "-n", "/usr/bin/systemctl", "poweroff"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            detail or f"Guest shutdown exited with status {result.returncode}."
+        )
+
+    # Let the guest-side disconnect watchdog avoid issuing a duplicate request.
+    try:
+        (Path.home() / ".mmfem-vm-shutdown-requested").write_text(
+            "File menu requested shutdown.\n", encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def _inject_solve_status_styles(js):
+    style = js.document.createElement("style")
+    style.id = "mmfem-solve-status-styles"
+    style.textContent = """
+@keyframes mmfem-solve-status-flash-a {
+  0%, 100% { background-color: var(--surface); box-shadow: inset 0 0 0 0 transparent; }
+  35%, 65% { background-color: var(--accent-subtle); box-shadow: inset 0 0 0 2px var(--accent); }
+}
+@keyframes mmfem-solve-status-flash-b {
+  0%, 100% { background-color: var(--surface); box-shadow: inset 0 0 0 0 transparent; }
+  35%, 65% { background-color: var(--accent-subtle); box-shadow: inset 0 0 0 2px var(--accent); }
+}
+@keyframes mmfem-condition-edge-pulse {
+  0%, 100% { stroke-opacity: .72; stroke-width: 3.1px; }
+  50% { stroke-opacity: 1; stroke-width: 4px; }
+}
+.mmfem-solve-status-flash-a {
+  animation: mmfem-solve-status-flash-a 0.68s ease-in-out 3;
+}
+.mmfem-solve-status-flash-b {
+  animation: mmfem-solve-status-flash-b 0.68s ease-in-out 3;
+}
+@media (prefers-reduced-motion: reduce) {
+  .mmfem-solve-status-flash-a,
+  .mmfem-solve-status-flash-b {
+    animation-duration: 0.12s;
+    animation-iteration-count: 1;
+  }
+  [style*="mmfem-condition-edge-pulse"] {
+    animation: none !important;
+  }
+}
+.mmfem-compact-app-bar .cb-monitor {
+  box-sizing: border-box;
+  flex: 0 0 464px;
+  width: 464px;
+}
+.mmfem-compact-app-bar .cb-monitor-stat {
+  box-sizing: border-box;
+  flex: 0 0 116px;
+  min-width: 116px;
+  width: 116px;
+  gap: 6px;
+  padding-left: 8px;
+  padding-right: 8px;
+}
+.mmfem-compact-app-bar .cb-monitor-value { font-size: 9.5px; }
+.mmfem-compact-app-bar .cb-monitor-subvalue,
+.mmfem-compact-app-bar .cb-monitor-subbar { display: none; }
+@media (max-width: 1600px) {
+  .mmfem-compact-app-bar .cb-monitor { flex-basis: 420px; width: 420px; }
+  .mmfem-compact-app-bar .cb-monitor-stat {
+    flex-basis: 105px;
+    min-width: 105px;
+    width: 105px;
+    gap: 5px;
+    padding-left: 6px;
+    padding-right: 6px;
+  }
+  .mmfem-compact-app-bar .cb-monitor-icon { display: none; }
+}
+@media (max-width: 1280px) {
+  .mmfem-compact-app-bar .cb-monitor { flex-basis: 336px; width: 336px; }
+  .mmfem-compact-app-bar .cb-monitor-stat {
+    flex-basis: 84px;
+    min-width: 84px;
+    width: 84px;
+    gap: 4px;
+    padding-left: 4px;
+    padding-right: 4px;
+  }
+  .mmfem-compact-app-bar .cb-monitor-label {
+    font-size: 8px;
+    letter-spacing: 0;
+  }
+  .mmfem-compact-app-bar .cb-monitor-value { font-size: 9px; }
+}
+"""
+    js.document.head.appendChild(style)
+
+
+def _set_window_title(js):
+    """Give the standalone browser window the product name."""
+    js.document.title = "MM-FEM"
+
+
+def _set_window_icon(js, icon_data_uri):
+    """Replace ngapp's default favicon with the MM-FEM application icon."""
+    document = js.document
+    old_icons = document.querySelectorAll(
+        'link[rel="icon"], link[rel="shortcut icon"]'
+    )
+    for index in range(old_icons.length):
+        old_icons.item(index).remove()
+
+    icon = document.createElement("link")
+    icon.rel = "icon"
+    icon.type = "image/png"
+    icon.href = icon_data_uri
+    document.head.appendChild(icon)
+
+
+class _WorkspaceLogBuffer(io.StringIO):
+    """Capture solver output and publish it to the Solve log as it arrives."""
+
+    def __init__(self, workspace):
+        super().__init__()
+        self.workspace = workspace
+        self._pending = ""
+        self._write_lock = threading.Lock()
+
+    def write(self, text):
+        if not isinstance(text, str):
+            text = str(text)
+        with self._write_lock:
+            count = super().write(text)
+            self._pending += text
+            complete = self._pending.splitlines(keepends=True)
+            ready = [line.rstrip("\r\n") for line in complete if line.endswith(("\n", "\r"))]
+            self._pending = "".join(line for line in complete if not line.endswith(("\n", "\r")))
+        if ready:
+            self.workspace.append_solver_output(ready)
+        return count
+
+    def flush(self):
+        with self._write_lock:
+            pending, self._pending = self._pending, ""
+            super().flush()
+        if pending.strip():
+            self.workspace.append_solver_output([pending])
+
+
+def _axisymmetric_mesh_edges(mesh):
+    """Return unique mesh edges, sampling curved boundaries for display."""
+    return axisymmetric_mesh_edge_polylines(mesh)
 
 
 class StackHost(Div):
@@ -56,6 +242,63 @@ class StackHost(Div):
         self.ui_children = list(self._panels.values())
 
 
+class WorkspaceModeToggle(Div):
+    """Prominent switch between the Solve and Post Process workspaces."""
+
+    _MODES = ("solve", "post_process")
+
+    def __init__(self, value="solve", on_change=None):
+        if value not in self._MODES:
+            raise ValueError(f"Unknown workspace mode: {value}")
+        self._value = value
+        self._on_change = on_change
+        self._buttons = {}
+
+        for mode, label in (("solve", "Solve"), ("post_process", "Post Process")):
+            button = Div(label, ui_style=self._button_style(mode))
+            button.on("click", lambda event=None, selected=mode: self.select(selected))
+            self._buttons[mode] = button
+
+        super().__init__(
+            self._buttons["solve"], self._buttons["post_process"],
+            ui_style=(
+                "display:flex; width:174px; height:34px; flex:none; "
+                "overflow:hidden; border:1px solid var(--border-strong); "
+                "border-radius:var(--r-sm); background:var(--surface);"
+            ),
+        )
+
+    def _button_style(self, mode):
+        active = mode == self._value
+        style = (
+            "display:flex; flex:1; align-items:center; justify-content:center; "
+            "height:34px; padding:0 5px; white-space:nowrap; cursor:pointer; "
+            "user-select:none; font-size:15px; transition:background-color 100ms ease, color 100ms ease;"
+        )
+        if mode == "post_process":
+            style += " border-left:1px solid var(--border);"
+        if active:
+            style += " background:var(--accent-subtle); color:var(--accent); font-weight:600;"
+        else:
+            style += " background:var(--surface); color:var(--fg-muted); font-weight:500;"
+        return style
+
+    @property
+    def value(self):
+        return self._value
+
+    def select(self, mode):
+        if mode not in self._MODES:
+            raise ValueError(f"Unknown workspace mode: {mode}")
+        if mode == self._value:
+            return
+        self._value = mode
+        for key, button in self._buttons.items():
+            button.ui_style = self._button_style(key)
+        if self._on_change:
+            self._on_change(mode)
+
+
 class Panel(StackHost):
     def __init__(self, app_data):
         self.app_data = app_data
@@ -90,8 +333,8 @@ class Panel(StackHost):
         return info["cls"]
 
 
-class Settings(QMenu):
-    """Designer-styled settings dropdown (sections, segmented theme, switches)."""
+class Settings(Div):
+    """Designer-styled preferences panel (sections, segmented theme, switches)."""
 
     def __init__(self, app):
         self.app = app
@@ -230,13 +473,74 @@ class Settings(QMenu):
 
 
 
+def _app_menu_item(label, callback=None, icon=None, shortcut=None, close_menu=None):
+    leading = []
+    if icon:
+        leading.append(QItemSection(QIcon(ui_name=icon, ui_size="xs"), ui_avatar=True))
+    text = label + (f"   {shortcut}" if shortcut else "")
+    item = QItem(*leading, QItemSection(text), ui_clickable=callback is not None, ui_dense=True)
+    if callback is not None:
+        def run_action(event=None, action=callback, close=close_menu):
+            try:
+                action()
+            finally:
+                if close is not None:
+                    close()
+
+        item.on("click", run_action)
+    return item
+
+
+def _app_menu_button(label, entries):
+    menu_ref = {}
+
+    def close_menu():
+        menu = menu_ref.get("menu")
+        if menu is not None:
+            menu.ui_model_value = False
+            menu.ui_hide()
+
+    items = [
+        QSeparator() if entry is None
+        else _app_menu_item(entry[0], entry[1], entry[2], entry[3], close_menu)
+        for entry in entries
+    ]
+    menu = QMenu(
+        QList(*items, ui_dense=True),
+        ui_anchor="bottom left",
+        ui_self="top left",
+        ui_auto_close=True,
+    )
+    menu_ref["menu"] = menu
+    return QBtn(
+        QTooltip(label), menu,
+        ui_label=label,
+        ui_flat=True, ui_dense=True, ui_no_caps=True,
+        ui_class="mmfem-app-menu-button",
+        ui_style=(
+            "height:32px; min-height:32px; padding:0 10px; "
+            "font-size:13px; font-weight:600;"
+        ),
+    )
+
+
 class NGSolveGui(App):
     def __init__(self, filename=None, local_path=None, script_args=None):
         self._local_path = local_path
         self.script_args = list(script_args or [])
         self.app_data = AppData()
+        self._solver_job_lock = threading.RLock()
+        self._solver_process = None
+        self._solver_job_active = False
+        self._solver_cancel_requested = False
+        self._solver_run_context = None
+        self._pending_problem_replacement = None
+        self._loaded_mesh_path = None
+        self._loaded_mesh_problem_sha256 = None
+        self._solution_import_dirs = []
 
-        # -- Toolbar buttons (compact flat icon buttons, muted like the designer) --
+        # Frequent document and history actions stay one click away; the full
+        # artifact workflow lives in the application menus below.
         def _tbtn(icon, tip, handler=None):
             btn = QBtn(
                 QTooltip(tip), ui_flat=True, ui_dense=True, ui_icon=icon,
@@ -246,34 +550,79 @@ class NGSolveGui(App):
                 btn.on_click(handler)
             return btn
 
-        # File actions
-        upload_file = _tbtn(
-            "mdi-file-plus-outline", "Load file  ·  geometry / mesh / .py", self._load_file
+        new_problem_btn = _tbtn(
+            "mdi-file-plus-outline", "New problem (Ctrl+N)", self.new_problem
         )
-        savebtn = _tbtn("mdi-content-save-outline", "Save Project", self.save_local)
-        loadbtn = _tbtn("mdi-folder-open-outline", "Load Project", self.load_local)
-        file_group = Div(upload_file, savebtn, loadbtn, ui_class=cb.tb_group)
+        open_problem_btn = _tbtn(
+            "mdi-folder-open-outline", "Open problem (Ctrl+O)", self.load_problem_file
+        )
+        save_problem_btn = _tbtn(
+            "mdi-content-save-outline", "Save problem (Ctrl+S)", self.save_problem_file
+        )
+        self._undo_button = _tbtn(
+            "mdi-undo", "Undo model change (Ctrl+Z)", self._undo_solve_action
+        )
+        self._redo_button = _tbtn(
+            "mdi-redo", "Redo model change (Ctrl+Y)", self._redo_solve_action
+        )
+        self._undo_button.ui_disable = True
+        self._redo_button.ui_disable = True
+        quick_actions = Div(
+            new_problem_btn, open_problem_btn, save_problem_btn,
+            Div(ui_class=cb.tb_sep),
+            self._undo_button, self._redo_button,
+            ui_class=cb.tb_group,
+            ui_style="display:flex; align-items:center; gap:2px;",
+        )
 
-        # Settings + quit (panel toggles removed — sidebars are draggable;
-        # theme lives in the settings menu).
-        settings_btn = QBtn(
-            Settings(self), QTooltip("User Settings"),
-            ui_flat=True, ui_dense=True, ui_icon="mdi-cog-outline",
-            ui_class=str(cb.topbar_icon),
+        cancel_new_problem = QBtn(
+            ui_label="Cancel", ui_flat=True, ui_dense=True, ui_no_caps=True,
         )
-        close_btn = _tbtn("mdi-close", "Quit", self.quit)
-        close_btn.ui_class = str(cb.topbar_icon) + " " + str(cb.topbar_icon_danger)
-        view_group = Div(settings_btn, close_btn, ui_class=cb.tb_group)
+        discard_new_problem = QBtn(
+            ui_label="Discard", ui_flat=True, ui_dense=True, ui_no_caps=True,
+            ui_color="negative",
+        )
+        save_new_problem = QBtn(
+            ui_label="Save", ui_flat=True, ui_dense=True, ui_no_caps=True,
+            ui_color="primary",
+        )
+        self._new_problem_dialog = QDialog(
+            QCard(
+                QCardSection(
+                    Div("Save changes?", ui_style="font-size:18px; font-weight:650;")
+                ),
+                QCardSection(
+                    "The current problem has unsaved changes. Save them before replacing it, "
+                    "discard them, or cancel to keep working."
+                ),
+                QCardActions(
+                    cancel_new_problem,
+                    discard_new_problem,
+                    save_new_problem,
+                    ui_align="right",
+                ),
+                ui_style="width:min(460px, 92vw);",
+            ),
+            ui_model_value=False,
+            ui_persistent=True,
+        )
+        cancel_new_problem.on_click(self._close_new_problem_dialog)
+        discard_new_problem.on_click(self._discard_and_continue_problem_replacement)
+        save_new_problem.on_click(self._save_and_continue_problem_replacement)
+
+        # Preferences and application exit are available from the menus.
 
         ngs_logo = Div(
             QImg(
-                ui_src=self.load_asset("ngsolve-mark.png"),
-                ui_height="34px",
-                ui_width="34px",
+                ui_src=self.load_asset("mm-fem-logo.png"),
+                ui_height="42px",
+                ui_width="158px",
                 ui_fit="contain",
             ),
-            Div("Netgen / NGSolve", ui_class=cb.brand_wordmark),
             ui_class=cb.brand,
+        )
+        self._workspace_mode_toggle = WorkspaceModeToggle(
+            "solve", self._set_workspace_mode
         )
 
         self.system_monitor = SystemMonitor() if system_monitor_available() else None
@@ -285,13 +634,16 @@ class NGSolveGui(App):
         self._last_redraw_time = 0.0
         self._redraw_interval = max(0, int(self.usersettings.get("redraw_interval_ms", 50))) / 1000.0
 
+        # Keep the fixed app header compact: brand, workspace switch, common
+        # actions, and system status.
         bar = QBar(
             ngs_logo,
-            file_group,
+            self._workspace_mode_toggle,
+            quick_actions,
             QSpace(),
             *([self.system_monitor, Div(ui_class=cb.tb_sep)] if self.system_monitor is not None else []),
-            view_group,
-            ui_class=cb.app_bar,
+            ui_class=str(cb.app_bar) + " mmfem-compact-app-bar",
+            ui_style="height:60px; min-height:60px;",
         )
 
         # Three-column layout using flex
@@ -301,8 +653,24 @@ class NGSolveGui(App):
         self.property_host = StackHost(ui_class=panel_full)
         self.property_host.show(None, empty_property_panel)
         self.tab_panel = Panel(self.app_data)
+        self._post_process_toolbar = Div(
+            ui_hidden=True,
+            ui_style=(
+                "display:flex; flex-direction:column; flex:none; width:100%; "
+                "min-width:0; background:var(--panel-header);"
+            ),
+        )
         self.controls = ControlBar()
         self.footer = StatusFooter()
+        self._open_solutions_toolbar_button = QBtn(
+            QTooltip("Open a saved solution bundle or field pickle"),
+            ui_icon="mdi-folder-open-outline",
+            ui_label="Open solutions",
+            ui_flat=True, ui_dense=True, ui_no_caps=True,
+            ui_class=str(cb.topbar_icon),
+            ui_style="white-space:nowrap;",
+        )
+        self._open_solutions_toolbar_button.on_click(self.load_solutions_file)
 
         from .meshing_preview import install as _install_meshing_preview
 
@@ -345,6 +713,25 @@ class NGSolveGui(App):
         self._outer_splitter.on_update_model_value(self._on_nav_width_change)
 
         page = self._outer_splitter
+        self._post_process_workspace = Div(
+            self._post_process_toolbar, page, self.controls, self.footer,
+            ui_style=(
+                "display:flex; flex-direction:column; flex:1 1 auto; "
+                "min-height:0; width:100%;"
+            ),
+            ui_hidden=True,
+        )
+        self.solve_workspace = SolveWorkspace(
+            on_run=lambda: self._run_axisymmetric_solver(mesh_only=False),
+            on_mesh=lambda: self._run_axisymmetric_solver(mesh_only=True),
+            on_cancel=self._cancel_axisymmetric_solver,
+            on_open_file=self._open_run_result,
+            on_history_change=self._refresh_solve_history_controls,
+        )
+        self._solve_workspace = Div(
+            self.solve_workspace,
+            ui_style="flex:1 1 auto; min-height:0; width:100%;",
+        )
 
         # Timer / profiling diagnostics dialog (opened from the settings menu).
         self._timer_body = Div()
@@ -359,8 +746,51 @@ class NGSolveGui(App):
             ui_class="cb-timer-card",
         ))
 
+        settings_close = QBtn(
+            ui_label="Close", ui_flat=True, ui_dense=True, ui_no_caps=True,
+        )
+        self._settings_dialog = QDialog(
+            QCard(
+                QCardSection(Div("Preferences", ui_class=cb.prop_title_text)),
+                QCardSection(
+                    Settings(self),
+                    ui_style="max-height:min(78vh, 760px); overflow:auto;",
+                ),
+                QCardActions(settings_close, ui_align="right"),
+                ui_style="width:min(560px, 94vw);",
+            ),
+            ui_model_value=False,
+        )
+        settings_close.on_click(lambda *a: setattr(self._settings_dialog, "ui_model_value", False))
+        about_close = QBtn(
+            ui_label="Close", ui_color="primary", ui_flat=True, ui_dense=True, ui_no_caps=True,
+        )
+        self._about_dialog = QDialog(
+            QCard(
+                QCardSection(
+                    QImg(
+                        ui_src=self.load_asset("mm-fem-logo.png"),
+                        ui_height="40px", ui_width="152px", ui_fit="contain",
+                    ),
+                    ui_style="display:flex; justify-content:center; padding:22px 22px 8px;",
+                ),
+                QCardSection(
+                    "MM-FEM",
+                    Div("Magneto-mechanical finite-element modelling", ui_class=cb.hint),
+                    ui_style="text-align:center;",
+                ),
+                QCardActions(about_close, ui_align="center"),
+                ui_style="width:min(380px, 92vw);",
+            ),
+            ui_model_value=False,
+        )
+        about_close.on_click(lambda *a: setattr(self._about_dialog, "ui_model_value", False))
+        self._menu_bar = self._build_application_menu_bar()
+
         super().__init__(
-            bar, page, self.controls, self.footer, self._timer_dialog,
+            self._menu_bar, bar, self._post_process_workspace,
+            self._solve_workspace, self._timer_dialog, self._new_problem_dialog,
+            self._settings_dialog, self._about_dialog,
             self.kb.indicator, self.kb.help_overlay,
             ui_class=str(cb.app_root),
         )
@@ -372,11 +802,37 @@ class NGSolveGui(App):
         from .webgpu_tab import sync_default_viewport_clear
         sync_default_viewport_clear()
         keybinding_styles.inject(self)
+        self.call_js(_inject_solve_status_styles)
+        self.call_js(_set_window_title)
+        self.call_js(_set_window_icon, self.load_asset("mm-fem-app-icon.png"))
         self.on_load(self.__on_load)
+
+        # Start in Solve while retaining the mounted Post Process workspace so
+        # its viewport and loaded data survive mode switches.
+        self._workspace_mode = "solve"
 
         # -- Global keybindings (always active) --
         kb = self.kb
         kb.add("h", kb.toggle_help, "Show keyboard shortcuts", "General")
+        kb.add("ctrl+n", lambda *a: self._run_menu_shortcut(self.new_problem), "New problem", "File")
+        kb.add("ctrl+o", lambda *a: self._run_menu_shortcut(self.load_problem_file), "Open problem", "File")
+        kb.add("ctrl+s", lambda *a: self._run_menu_shortcut(self.save_problem_file), "Save problem", "File")
+        kb.add("delete", self._delete_selected_region_shortcut, "Delete selected geometry", "Solve")
+        for key, tool, description in (
+            ("l", "line", "Line tool"),
+            ("c", "circle", "Circle tool"),
+            ("r", "rectangle", "Rectangle tool"),
+            ("a", "arc", "3-point arc tool"),
+            ("t", "trim", "Trim tool"),
+        ):
+            kb.add(
+                key,
+                lambda *args, active_tool=tool: self._activate_sketch_tool_shortcut(active_tool),
+                description,
+                "Sketch",
+            )
+        kb.add("ctrl+z", self._undo_solve_action, "Undo model change", "Solve")
+        kb.add("ctrl+y", self._redo_solve_action, "Redo model change", "Solve")
         kb.add("ctrl+b", self._toggle_navigator, "Toggle navigator", "Panels")
         kb.add(
             "ctrl+alt+b", self._toggle_property_panel, "Toggle property panel", "Panels"
@@ -388,7 +844,7 @@ class NGSolveGui(App):
                 f"Select item {i}",
                 "Navigation",
             )
-        self.add_keybinding("escape", lambda e: self.kb.on_escape())
+        self.add_keybinding("escape", self._handle_escape_shortcut)
         self.on_before_save(self.__on_before_save)
         if isinstance(filename, str):
             self._load_with_status(filename)
@@ -396,10 +852,1033 @@ class NGSolveGui(App):
             for f in filename:
                 self._load_with_status(f)
 
+        self._refresh_solve_history_controls()
+
+    def _build_application_menu_bar(self):
+        menus = [
+            ("File", [
+                ("New problem", self.new_problem, "mdi-file-plus-outline", "Ctrl+N"),
+                ("Open problem...", self.load_problem_file, "mdi-folder-open-outline", "Ctrl+O"),
+                ("Save problem", self.save_problem_file, "mdi-content-save-outline", "Ctrl+S"),
+                None,
+                ("Import legacy Python problem...", self._choose_legacy_problem_file, "mdi-language-python", None),
+                ("Open external file...", self._load_file, "mdi-file-import-outline", None),
+                None,
+                ("Load mesh...", self.load_mesh_file, "mdi-folder-open-outline", None),
+                ("Save mesh", self.save_mesh_file, "mdi-content-save-outline", None),
+                ("Load solutions...", self.load_solutions_file, "mdi-folder-open-outline", None),
+                ("Save solutions", self.save_solutions_file, "mdi-content-save-outline", None),
+                None,
+                ("Exit", self._quit_application, "mdi-exit-to-app", None),
+            ]),
+            ("Edit", [
+                ("Undo", self._undo_solve_action, "mdi-undo", "Ctrl+Z"),
+                ("Redo", self._redo_solve_action, "mdi-redo", "Ctrl+Y"),
+                None,
+                ("Delete selected geometry", self._delete_selected_region_shortcut, "mdi-delete-outline", "Delete"),
+                ("Preferences...", self._open_settings, "mdi-cog-outline", None),
+            ]),
+            ("View", [
+                ("Fit view", self._menu_fit_view, "mdi-overscan", None),
+                None,
+                ("Isometric", lambda: self._menu_camera_view("isometric"), "mdi-cube-scan", None),
+                ("View from +X", lambda: self._menu_camera_view("right"), "mdi-axis-x-arrow", None),
+                ("View from -X", lambda: self._menu_camera_view("left"), "mdi-axis-x-arrow", None),
+                ("View from +Y", lambda: self._menu_camera_view("front"), "mdi-axis-y-arrow", None),
+                ("View from -Y", lambda: self._menu_camera_view("back"), "mdi-axis-y-arrow", None),
+                ("View from +Z", lambda: self._menu_camera_view("top"), "mdi-axis-z-arrow", None),
+                ("View from -Z", lambda: self._menu_camera_view("bottom"), "mdi-axis-z-arrow", None),
+                ("Toggle parallel projection", lambda: self._active_view_action("toggle_projection"), "mdi-perspective-less", None),
+                None,
+                ("Toggle axes", lambda: self._active_view_action("toggle_axes"), "mdi-axis-arrow", None),
+                ("Toggle navigation cube", lambda: self._active_view_action("toggle_navcube"), "mdi-cube-outline", None),
+                ("Link or detach camera", lambda: self._active_view_action("toggle_camera_link"), "mdi-link-variant", None),
+                ("Saved camera views", lambda: self._active_view_action("_toggle_bookmarks"), "mdi-bookmark-outline", None),
+                ("Fullscreen viewport", lambda: self._active_view_action("_toggle_fullscreen"), "mdi-fullscreen", None),
+                None,
+                ("Toggle model tree", self._menu_toggle_tree, "mdi-file-tree-outline", None),
+                ("Toggle properties", self._menu_toggle_properties, "mdi-tune-variant", None),
+                ("Messages", self._menu_toggle_messages, "mdi-message-alert-outline", None),
+                ("Solver log", self._menu_toggle_log, "mdi-console", None),
+            ]),
+            ("Model", [
+                ("Geometry", lambda: self._open_solve_section("geometry"), "mdi-vector-square", None),
+                ("Materials", lambda: self._open_solve_section("materials"), "mdi-cube-scan", None),
+                ("Physics & coupling", lambda: self._open_solve_section("physics"), "mdi-magnet", None),
+                ("Boundary conditions", lambda: self._open_solve_section("boundaries"), "mdi-vector-link", None),
+                ("Sources & loads", lambda: self._open_solve_section("sources"), "mdi-flash-outline", None),
+                ("Mesh settings", lambda: self._open_solve_section("mesh"), "mdi-vector-triangle", None),
+                ("Solver settings", lambda: self._open_solve_section("solver"), "mdi-tune-variant", None),
+                ("Study settings", lambda: self._open_solve_section("studies"), "mdi-play-box-multiple-outline", None),
+                ("Run history", lambda: self._open_solve_section("runs"), "mdi-history", None),
+                None,
+                ("Toggle snap to grid", self._menu_toggle_snap, "mdi-magnet", None),
+                ("Rename model...", self._menu_rename_model, "mdi-pencil-outline", None),
+                ("Preview geometry in 3D", self._menu_preview_geometry, "mdi-cube-scan", None),
+            ]),
+            ("Study", [
+                ("Check setup", self._menu_check_setup, "mdi-check-decagram-outline", None),
+                ("Generate mesh", self._menu_generate_mesh, "mdi-vector-triangle", None),
+                ("Run study", self._menu_run_study, "mdi-play", None),
+                ("Cancel current run", self._menu_cancel_run, "mdi-stop-circle-outline", None),
+            ]),
+            ("Results", [
+                ("Open solutions...", self.load_solutions_file, "mdi-folder-open-outline", None),
+                None,
+                ("Field & colour options", lambda: self._open_postprocess_controls("Field"), "mdi-palette", None),
+                ("Display & view options", lambda: self._open_postprocess_controls("Display & view"), "mdi-cube-scan", None),
+                ("Vectors & flow options", lambda: self._open_postprocess_controls("Vectors & flow"), "mdi-vector-triangle", None),
+                None,
+                ("Toggle wireframe", lambda: self._active_view_action("toggle_wireframe"), "mdi-grid", None),
+                ("Toggle clipping", lambda: self._active_view_action("toggle_clipping"), "mdi-content-cut", None),
+                ("Toggle probe", lambda: self._active_view_action("toggle_probe"), "mdi-crosshairs-gps", None),
+            ]),
+            ("Help", [
+                ("Keyboard shortcuts", self.kb.toggle_help, "mdi-keyboard-outline", "H"),
+                ("About MM-FEM", self._open_about, "mdi-information-outline", None),
+            ]),
+        ]
+        buttons = [_app_menu_button(label, entries) for label, entries in menus]
+        return Div(
+            *buttons,
+            ui_class="mmfem-app-menu-bar",
+            ui_style=(
+                "display:flex; align-items:center; gap:2px; flex:0 0 auto; "
+                "min-height:36px; padding:0 12px; box-sizing:border-box; "
+                "background:var(--panel-header); border-bottom:1px solid var(--border);"
+            ),
+        )
+
+    def _quit_application(self, *args):
+        return self._request_problem_replacement(self._close_application_now)
+
+    def _close_application_now(self):
+        try:
+            _request_guest_vm_shutdown()
+        except Exception as error:
+            self._notify(
+                f"Could not shut down the solver VM: {error}",
+                type="negative",
+                timeout=8000,
+            )
+            return False
+        return self.quit()
+
+    def _open_settings(self, *args):
+        self._settings_dialog.ui_model_value = True
+
+    def _open_about(self, *args):
+        self._about_dialog.ui_model_value = True
+
+    def _global_shortcut_context_active(self):
+        try:
+            focused = self.js.eval(
+                "(() => { const e = document.activeElement; return !!e && "
+                "(e.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(e.tagName)); })()"
+            )
+            return not bool(focused)
+        except Exception:
+            return True
+
+    def _run_menu_shortcut(self, callback):
+        if self._global_shortcut_context_active():
+            return callback()
+        return False
+
+    def _handle_escape_shortcut(self, event=None):
+        """Close active overlays first; otherwise return Solve sketching to Select."""
+        kb = getattr(self, "kb", None)
+        overlay_was_open = bool(
+            kb
+            and (
+                getattr(kb, "_mode", None)
+                or getattr(kb, "_help_visible", False)
+            )
+        )
+        if kb is not None:
+            kb.on_escape()
+        if overlay_was_open or getattr(self, "_workspace_mode", None) != "solve":
+            return
+        workspace = getattr(self, "solve_workspace", None)
+        if workspace is not None:
+            workspace._handle_sketch_escape()
+
+    def _open_solve_section(self, section):
+        if self._workspace_mode != "solve":
+            self._workspace_mode_toggle.select("solve")
+        self.solve_workspace.select_section(section)
+
+    def _menu_fit_view(self, *args):
+        if self._workspace_mode == "solve":
+            return self.solve_workspace.fit_canvas_view()
+        return self._active_view_action("reset_camera")
+
+    def _menu_camera_view(self, view):
+        if self._workspace_mode == "solve":
+            if getattr(self.tab_panel, "comp", None) is None:
+                self._notify("Open a result in Post Process before choosing a camera view.", type="info", timeout=3000)
+                return False
+            self._workspace_mode_toggle.select("post_process")
+        return self._active_view_action("set_camera_view", view)
+
+    def _active_view_action(self, method, *args):
+        if self._workspace_mode != "post_process":
+            self._notify("Switch to Post Process to use this view command.", type="info", timeout=3000)
+            return False
+        comp = getattr(getattr(self, "tab_panel", None), "comp", None)
+        callback = getattr(comp, method, None) if comp is not None else None
+        if callable(callback):
+            return callback(*args)
+        self._notify("Load a compatible result in Post Process to use this view command.", type="info", timeout=3000)
+        return False
+
+    def _open_postprocess_controls(self, label):
+        if self._workspace_mode != "post_process":
+            self._workspace_mode_toggle.select("post_process")
+        return self._active_view_action("open_postprocess_controls", label)
+
+    def _menu_toggle_tree(self, *args):
+        if self._workspace_mode == "solve":
+            return self.solve_workspace._toggle_tree_panel()
+        return self._toggle_navigator()
+
+    def _menu_toggle_properties(self, *args):
+        if self._workspace_mode == "solve":
+            return self.solve_workspace._toggle_properties_panel()
+        return self._toggle_property_panel()
+
+    def _menu_toggle_messages(self, *args):
+        return self.solve_workspace.toggle_messages()
+
+    def _menu_toggle_log(self, *args):
+        return self.solve_workspace.toggle_log()
+
+    def _menu_toggle_snap(self, *args):
+        self._open_solve_section("geometry")
+        return self.solve_workspace.toggle_snap_to_grid()
+
+    def _menu_rename_model(self, *args):
+        self._open_solve_section("geometry")
+        return self.solve_workspace._begin_model_rename()
+
+    def _menu_preview_geometry(self, *args):
+        self._open_solve_section("geometry")
+        return self.solve_workspace.toggle_3d_preview()
+
+    def _menu_check_setup(self, *args):
+        self._open_solve_section("studies")
+        return self.solve_workspace.validate_action()
+
+    def _menu_generate_mesh(self, *args):
+        self._open_solve_section("mesh")
+        return self.solve_workspace.run_mesh_action()
+
+    def _menu_run_study(self, *args):
+        self._open_solve_section("studies")
+        return self.solve_workspace.run_study_action()
+
+    def _menu_cancel_run(self, *args):
+        return self.solve_workspace._cancel_solver_job()
+
+    def _refresh_solve_history_controls(self):
+        workspace = getattr(self, "solve_workspace", None)
+        solving = getattr(self, "_workspace_mode", "solve") == "solve"
+        if hasattr(self, "_undo_button"):
+            self._undo_button.ui_disable = not (solving and workspace and workspace.can_undo)
+        if hasattr(self, "_redo_button"):
+            self._redo_button.ui_disable = not (solving and workspace and workspace.can_redo)
+
+    def _solve_shortcut_context_active(self):
+        if getattr(self, "_workspace_mode", None) != "solve":
+            return False
+        # Preserve native text editing shortcuts while an input or editable
+        # control has focus. The fallback keeps callbacks usable in standalone
+        # tests where no browser JavaScript context exists.
+        try:
+            focused_editor = self.js.eval(
+                "(() => { const e = document.activeElement; return !!e && "
+                "(e.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(e.tagName)); })()"
+            )
+            if focused_editor:
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _activate_sketch_tool_shortcut(self, tool):
+        if not self._solve_shortcut_context_active():
+            return False
+        workspace = getattr(self, "solve_workspace", None)
+        if workspace is None:
+            return False
+        default_variants = {
+            "rectangle": "corner",
+            "circle": "center-radius",
+            "arc": "three-point",
+        }
+        workspace.set_sketch_tool(tool, variant=default_variants.get(tool))
+        return True
+
+    def _undo_solve_action(self, *args):
+        if self._solve_shortcut_context_active():
+            return self.solve_workspace.undo()
+        return False
+
+    def _redo_solve_action(self, *args):
+        if self._solve_shortcut_context_active():
+            return self.solve_workspace.redo()
+        return False
+
+    def _replacement_job_active(self):
+        return bool(
+            self._solver_job_active
+            or getattr(getattr(self, "solve_workspace", None), "_job_active", False)
+        )
+
+    def _has_unsaved_problem_changes(self):
+        workspace = self.solve_workspace
+        return bool(
+            workspace.dirty
+            or getattr(workspace, "_editor_drawer", None) is not None
+        )
+
+    def _request_problem_replacement(self, action):
+        """Guard every operation that replaces the current problem document."""
+        if self._replacement_job_active():
+            self._notify(
+                "Wait for the current solve to finish before replacing the problem.",
+                type="warning",
+                timeout=4000,
+            )
+            return False
+        if self._has_unsaved_problem_changes():
+            self._pending_problem_replacement = action
+            self._new_problem_dialog.ui_model_value = True
+            return False
+        return action()
+
+    def new_problem(self, *args):
+        """Start a blank problem, asking before discarding unsaved edits."""
+        request = getattr(self, "_request_problem_replacement", None)
+        if callable(request):
+            return request(self._start_new_problem)
+        # Preserve the old direct-call behavior for lightweight integrations
+        # that invoke this handler on a proxy instead of an NGSolveGui instance.
+        if getattr(self, "_solver_job_active", False) or getattr(
+            getattr(self, "solve_workspace", None), "_job_active", False
+        ):
+            self._notify(
+                "Wait for the current solve to finish before starting a new problem.",
+                type="warning",
+                timeout=4000,
+            )
+            return False
+        if getattr(self.solve_workspace, "dirty", False):
+            self._new_problem_dialog.ui_model_value = True
+            return False
+        return self._start_new_problem()
+
+    def _close_new_problem_dialog(self, *args):
+        self._new_problem_dialog.ui_model_value = False
+        self._pending_problem_replacement = None
+
+    def _continue_problem_replacement(self, save_changes):
+        action = self._pending_problem_replacement
+        self._close_new_problem_dialog()
+        if action is None:
+            return False
+        if save_changes:
+            if getattr(self.solve_workspace, "_editor_drawer", None) is not None:
+                self.solve_workspace._commit_editor()
+                if self.solve_workspace._editor_drawer is not None:
+                    return False
+            if not self.save_problem_file():
+                self._pending_problem_replacement = action
+                self._new_problem_dialog.ui_model_value = True
+                return False
+        return action()
+
+    def _discard_and_continue_problem_replacement(self, *args):
+        return self._continue_problem_replacement(save_changes=False)
+
+    def _save_and_continue_problem_replacement(self, *args):
+        return self._continue_problem_replacement(save_changes=True)
+
+    def _discard_and_start_new_problem(self, *args):
+        return self._start_new_problem()
+
+    def _save_and_start_new_problem(self, *args):
+        self._close_new_problem_dialog()
+        if not self.save_problem_file():
+            # Keep the decision available if the file picker was cancelled or
+            # saving failed; the current problem must remain intact.
+            self._new_problem_dialog.ui_model_value = True
+            return False
+        return self._start_new_problem()
+
+    def _start_new_problem(self):
+        if self._solver_job_active or getattr(self.solve_workspace, "_job_active", False):
+            self._notify(
+                "Wait for the current solve to finish before starting a new problem.",
+                type="warning",
+                timeout=4000,
+            )
+            return False
+        self._close_new_problem_dialog()
+        self.solve_workspace.set_model(
+            new_model(),
+            new_studies(),
+            {"schema_version": 1, "active_section": "geometry", "camera": "fit"},
+        )
+        self._loaded_mesh_path = None
+        self._loaded_mesh_problem_sha256 = None
+        if self._workspace_mode != "solve":
+            self._workspace_mode_toggle.select("solve")
+        self._notify("Started a new problem.", type="positive", timeout=2500)
+        return True
+
+    def _delete_selected_region_shortcut(self, *args):
+        if not self._solve_shortcut_context_active():
+            return False
+        return self.solve_workspace.delete_selected_geometry()
+
+    def _set_workspace_mode(self, mode):
+        if mode not in WorkspaceModeToggle._MODES:
+            raise ValueError(f"Unknown workspace mode: {mode}")
+
+        solving = mode == "solve"
+        self._workspace_mode = mode
+        self._post_process_workspace.ui_hidden = solving
+        self._solve_workspace.ui_hidden = not solving
+        refresh_history_controls = getattr(self, "_refresh_solve_history_controls", None)
+        if refresh_history_controls:
+            refresh_history_controls()
+
+    def _save_artifact(self, data, filename):
+        # The browser File System Access writer is asynchronous. In the local
+        # Windows application, use an OS save dialog and a synchronous write so
+        # JSON, mesh, and solution bundles are complete before the action returns.
+        if os.name == "nt":
+            from .native_dialog import save_file_dialog
+
+            initialdir = (
+                self._local_path
+                or self.usersettings.get("save_dir", "")
+                or self.usersettings.get("load_dir", "")
+                or os.path.expanduser("~")
+            )
+            suffix = Path(filename).suffix or "*"
+            path = save_file_dialog(
+                title="Save MM-FEM file",
+                initialdir=initialdir,
+                filename=filename,
+                filters=[("MM-FEM file", f"*{suffix}"), ("All Files", "*")],
+            )
+            if not path:
+                return False
+            payload = data.encode("utf-8") if isinstance(data, str) else bytes(data)
+            Path(path).write_bytes(payload)
+            self._local_path = str(Path(path).parent)
+            self.usersettings.set("save_dir", self._local_path)
+            self.usersettings.set("load_dir", self._local_path)
+            return True
+
+        from ngapp.utils import get_environment
+
+        write = get_environment().begin_save_file_local(filename)
+        if write is None:
+            return False
+        write(data)
+        return True
+
+    def _pick_artifact(self, *, title, description, extension, additional_extensions=()):
+        """Return ``(path, bytes)`` for a native or browser file selection."""
+        from ngapp.utils import EnvironmentType, get_environment
+
+        env = get_environment()
+        use_browser_picker = os.environ.get("NGSOLVE_GUI_FILE_PICKER", "").strip().lower() == "browser"
+        if env.type == EnvironmentType.LOCAL_APP and not use_browser_picker:
+            from .native_dialog import open_file_dialog
+
+            path = open_file_dialog(
+                title=title,
+                initialdir=self._local_path or self.usersettings.get("load_dir", "") or os.path.expanduser("~"),
+                filters=[(description, " ".join(f"*{suffix}" for suffix in (extension, *additional_extensions)))],
+            )
+            if not path:
+                return None, None
+            self._local_path = os.path.dirname(path)
+            self.usersettings.set("load_dir", self._local_path)
+            with open(path, "rb") as source:
+                return path, source.read()
+
+        picker_options = {"multiple": False}
+        picker_extensions = (extension, *additional_extensions)
+        # Chromium's File System Access API accepts alphanumeric suffixes only.
+        # Our portable bundle suffixes contain hyphens (for example
+        # ``.mmfem-mesh``), so passing them as ``types`` makes the picker throw
+        # before it opens. In that case let the user choose any file and rely
+        # on the bundle validator below to reject unrelated files safely.
+        if all(re.fullmatch(r"\.[a-z0-9]+", suffix, re.IGNORECASE) for suffix in picker_extensions):
+            accepted_types = {}
+            for suffix in picker_extensions:
+                mime_type = {".ngsmodel": "application/zip", ".json": "application/json"}.get(
+                    suffix.lower(), mimetypes.guess_type("file" + suffix)[0]
+                ) or "application/octet-stream"
+                accepted_types.setdefault(mime_type, []).append(suffix)
+            picker_options["types"] = [{
+                "description": description,
+                "accept": accepted_types,
+            }]
+        from .picker_wait import BROWSER_PICKER_WAIT_SECONDS, browser_file_picker_wait
+
+        try:
+            with browser_file_picker_wait():
+                handles = self.js.showOpenFilePicker(picker_options)
+        except TimeoutError as error:
+            minutes = BROWSER_PICKER_WAIT_SECONDS // 60
+            raise TimeoutError(
+                f"The browser file picker did not return within {minutes} minutes. "
+                "Choose the file again and leave the picker open until selection finishes."
+            ) from error
+        if not handles:
+            return None, None
+        js_file = handles[0].getFile()
+        data = bytes(js_file.arrayBuffer())
+        import tempfile
+
+        directory = tempfile.mkdtemp(prefix="mmfem_open_")
+        path = os.path.join(directory, js_file.name)
+        with open(path, "wb") as target:
+            target.write(data)
+        return path, data
+
+    def _choose_legacy_problem_file(self, *args):
+        if self._replacement_job_active():
+            self._notify("Wait for the current solve to finish before replacing the problem.", type="warning", timeout=4000)
+            return False
+        try:
+            path, _data = self._pick_artifact(
+                title="Import legacy Python problem file",
+                description="Legacy Python problem file",
+                extension=".py",
+            )
+            if not path:
+                return
+            from .legacy_problem_import import import_legacy_problem_file
+
+            model, studies, layout = import_legacy_problem_file(path)
+
+            def apply_imported_problem():
+                try:
+                    self.solve_workspace.set_model(model, studies, layout)
+                    self._loaded_mesh_path = None
+                    self._loaded_mesh_problem_sha256 = None
+                    if self._workspace_mode != "solve":
+                        self._workspace_mode_toggle.select("solve")
+                    region_count = len(model.get("geometry", {}).get("regions", []))
+                    boundary_count = len(model.get("boundary_conditions", []))
+                    self._notify(
+                        f"Imported {region_count} regions and {boundary_count} boundary condition types. "
+                        "Review the mesh and study settings, then save this problem as JSON.",
+                        type="positive",
+                        timeout=6500,
+                    )
+                    self.solve_workspace._message(f"Imported legacy problem: {Path(path).name}.")
+                    return True
+                except Exception as error:
+                    self._notify(f"Could not import legacy problem: {error}", type="negative", timeout=9000)
+                    self.solve_workspace._message(f"Legacy import failed: {error}", error=True)
+                    return False
+
+            return self._request_problem_replacement(apply_imported_problem)
+        except Exception as error:
+            self._notify(f"Could not import legacy problem: {error}", type="negative", timeout=9000)
+            self.solve_workspace._message(f"Legacy import failed: {error}", error=True)
+
+    def save_problem_file(self):
+        """Save the problem definition and its study settings."""
+        if getattr(self.solve_workspace, "_editor_drawer", None) is not None:
+            self.solve_workspace._commit_editor()
+            if self.solve_workspace._editor_drawer is not None:
+                return False
+        model = self.solve_workspace.model
+        errors = self.solve_workspace.validation_errors()
+        # Empty sketches are useful drafts; structural errors still prevent
+        # saving, while the status message explains the missing geometry.
+        try:
+            data = serialize_model_json(model, self.solve_workspace.studies, self.solve_workspace.layout)
+            title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in model.get("name", "axisymmetric-model")).strip()
+            filename = (title or "axisymmetric-model") + ".json"
+            if not self._save_artifact(data, filename):
+                return False
+            self.solve_workspace.mark_saved()
+            self._notify("Problem file saved.", type="positive", timeout=2500)
+            self.solve_workspace._message(f"Saved {filename}.")
+            if errors:
+                self._notify("Model saved as a draft. Review Geometry and Physics before running.", type="warning", timeout=5000)
+            return True
+        except Exception as error:
+            self._notify(f"Could not save problem file: {error}", type="negative", timeout=7000)
+            self.solve_workspace._message(f"Save failed: {error}", error=True)
+            return False
+
+    def save_project(self):
+        """Compatibility alias for the former Save Project action."""
+        return self.save_problem_file()
+
+    def load_problem_file(self):
+        """Load a declarative JSON or legacy .ngsmodel problem file."""
+        if self._replacement_job_active():
+            self._notify("Wait for the current solve to finish before replacing the problem.", type="warning", timeout=4000)
+            return False
+        try:
+            path, data = self._pick_artifact(
+                title="Open MM-FEM problem file",
+                description="MM-FEM problem file (.json or .ngsmodel)",
+                extension=".json",
+                additional_extensions=(".ngsmodel",),
+            )
+            if not path:
+                return
+            model, studies, layout = unpack_model(data)
+
+            def apply_problem_file():
+                try:
+                    self.solve_workspace.set_model(model, studies, layout)
+                    self._loaded_mesh_path = None
+                    self._loaded_mesh_problem_sha256 = None
+                    if self._workspace_mode != "solve":
+                        self._workspace_mode_toggle.select("solve")
+                    self._notify("Problem file loaded.", type="positive", timeout=2500)
+                    return True
+                except Exception as error:
+                    self._notify(f"Could not load problem file: {error}", type="negative", timeout=7000)
+                    self.solve_workspace._message(f"Load failed: {error}", error=True)
+                    return False
+
+            return self._request_problem_replacement(apply_problem_file)
+        except Exception as error:
+            self._notify(f"Could not load problem file: {error}", type="negative", timeout=7000)
+            self.solve_workspace._message(f"Load failed: {error}", error=True)
+
+    def load_project(self):
+        """Compatibility alias for the former Load Project action."""
+        return self.load_problem_file()
+
+    def _matching_mesh_path(self):
+        problem_hash = problem_fingerprint(self.solve_workspace.model)
+        if (
+            self._loaded_mesh_path
+            and self._loaded_mesh_problem_sha256 == problem_hash
+            and Path(self._loaded_mesh_path).is_file()
+        ):
+            return Path(self._loaded_mesh_path)
+        for run in reversed(self.solve_workspace.runs):
+            if run.get("status") != "Complete":
+                continue
+            output = Path(run.get("output_path", ""))
+            mesh_path = output / "mesh.vol"
+            if not mesh_path.is_file():
+                continue
+            manifest = self._read_run_manifest(output)
+            if manifest.get("problem_sha256") == problem_hash:
+                return mesh_path
+            # Runs created before mesh bundles carried a digest can still be
+            # matched through their saved problem snapshot.
+            try:
+                saved_model = json.loads((output / "problem.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if problem_fingerprint(saved_model) == problem_hash:
+                return mesh_path
+        return None
+
+    def save_mesh_file(self):
+        """Save the latest mesh generated for the current problem."""
+        try:
+            mesh_path = self._matching_mesh_path()
+            if mesh_path is None:
+                raise ValueError("Generate a mesh for this problem before saving it.")
+            data = make_mesh_bundle(mesh_path.read_bytes(), self.solve_workspace.model)
+            title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in self.solve_workspace.model.get("name", "axisymmetric-model")).strip()
+            filename = (title or "axisymmetric-model") + MESH_SUFFIX
+            if self._save_artifact(data, filename):
+                self._notify("Mesh saved with its matching problem definition.", type="positive", timeout=3000)
+        except Exception as error:
+            self._notify(f"Could not save mesh: {error}", type="negative", timeout=7000)
+
+    def load_mesh_file(self):
+        """Load a mesh only when its problem fingerprint matches the editor."""
+        try:
+            path, data = self._pick_artifact(
+                title="Load mesh for the current problem",
+                description="MM-FEM mesh bundle",
+                extension=MESH_SUFFIX,
+            )
+            if not path:
+                return
+            mesh_data = read_mesh_bundle(data, self.solve_workspace.model)
+            import tempfile
+
+            directory = tempfile.mkdtemp(prefix="mmfem_mesh_")
+            mesh_path = Path(directory) / "mesh.vol"
+            mesh_path.write_bytes(mesh_data)
+            self._loaded_mesh_path = str(mesh_path)
+            self._loaded_mesh_problem_sha256 = problem_fingerprint(self.solve_workspace.model)
+            self.solve_workspace._message("Matching mesh loaded. The next run will reuse it.")
+            self._notify("Mesh loaded for this problem.", type="positive", timeout=3000)
+        except Exception as error:
+            self._notify(f"Could not load mesh: {error}", type="negative", timeout=7000)
+            self.solve_workspace._message(f"Mesh load failed: {error}", error=True)
+
+    def save_solutions_file(self):
+        """Save all GUI fields from the latest completed matching study."""
+        try:
+            model_hash = problem_fingerprint(self.solve_workspace.model)
+            for run in reversed(self.solve_workspace.runs):
+                if run.get("kind") != "Study" or run.get("status") != "Complete":
+                    continue
+                output = Path(run.get("output_path", ""))
+                manifest = self._read_run_manifest(output)
+                if manifest.get("problem_sha256") != model_hash:
+                    continue
+                data, filename = make_solution_bundle(output, self.solve_workspace.model)
+                if self._save_artifact(data, filename):
+                    self._notify("Solution bundle saved.", type="positive", timeout=3000)
+                return
+            raise ValueError("Run a study for the current problem before saving its solutions.")
+        except Exception as error:
+            self._notify(f"Could not save solutions: {error}", type="negative", timeout=7000)
+
+    def load_solutions_file(self):
+        """Open a saved solution bundle in Post Process."""
+        try:
+            path, _data = self._pick_artifact(
+                title="Open MM-FEM solution bundle",
+                description="MM-FEM solution bundle or field pickle",
+                extension=SOLUTION_SUFFIX,
+                additional_extensions=(".pkl",),
+            )
+            if not path:
+                return
+            if self._workspace_mode != "post_process":
+                self._workspace_mode_toggle.select("post_process")
+            self._load_with_status(path)
+        except Exception as error:
+            self._notify(f"Could not load solutions: {error}", type="negative", timeout=7000)
+
+    def _run_axisymmetric_solver(self, *, mesh_only=False):
+        """Run a saved model in a cancellable child process on this computer."""
+        workspace = self.solve_workspace
+        run_kind = "Mesh" if mesh_only else "Study"
+        run_name = f"{run_kind}: {workspace.model.get('name', 'axisymmetric model')}"
+        with self._solver_job_lock:
+            if self._solver_job_active:
+                workspace._message("A mesh or solver job is already running.", error=True)
+                return
+            self._solver_job_active = True
+            self._solver_cancel_requested = False
+            self._solver_process = None
+
+        model = copy.deepcopy(workspace.model)
+        studies = copy.deepcopy(workspace.studies)
+        layout = copy.deepcopy(workspace.layout)
+        model_hash = problem_fingerprint(model)
+        loaded_mesh_path = None
+        if self._loaded_mesh_path:
+            if (
+                self._loaded_mesh_problem_sha256 == model_hash
+                and Path(self._loaded_mesh_path).is_file()
+            ):
+                loaded_mesh_path = self._loaded_mesh_path
+            else:
+                self._loaded_mesh_path = None
+                self._loaded_mesh_problem_sha256 = None
+                workspace._message(
+                    "The loaded mesh no longer matches this problem; generating a fresh mesh."
+                )
+        model_name = re.sub(
+            r"[^A-Za-z0-9_-]+", "_", model.get("name", "axisymmetric_model")
+        ).strip("_") or "axisymmetric_model"
+        stamp = _datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        # Use the same root as run-history discovery. A VM-provided output root
+        # points at its shared folder; standalone runs use the user's home folder.
+        output_dir = default_run_history_root() / f"{model_name}_{stamp}"
+        model_path = output_dir / f"{model_name}.ngsmodel"
+        try:
+            solver_root = self._find_solver_root()
+            runner = solver_root / "scripts" / "run_gui_model.py"
+            if not runner.is_file():
+                raise FileNotFoundError(
+                    f"The solver checkout is missing its GUI runner: {runner}"
+                )
+            output_dir.mkdir(parents=True, exist_ok=False)
+            model_path.write_bytes(package_model(model, studies, layout))
+            manifest = {
+                "schema": "mm-fem.run",
+                "schema_version": 1,
+                "status": "running",
+                "kind": "mesh" if mesh_only else "study",
+                "created_utc": _datetime.now(_timezone.utc).isoformat(),
+                "model_archive": model_path.name,
+                "output_path": str(output_dir),
+                "model_name": model.get("name", "axisymmetric model"),
+                "problem_sha256": model_hash,
+                "physics": copy.deepcopy(model.get("physics", {})),
+                "mesh_settings": copy.deepcopy(model.get("mesh", {})),
+                "solver_settings": copy.deepcopy(model.get("solver", {})),
+                "studies": copy.deepcopy(studies.get("studies", [])),
+            }
+            self._write_run_manifest(output_dir, manifest)
+        except Exception as error:
+            with self._solver_job_lock:
+                self._solver_job_active = False
+            workspace.finish_solver_job(
+                f"Could not prepare solver input: {error}",
+                error=True,
+                run_kind=run_kind,
+                run_name=run_name,
+                output_path=output_dir,
+            )
+            return
+
+        workspace._message(
+            ("Generating mesh" if mesh_only else "Running study")
+            + f" in {output_dir}"
+        )
+
+        def run_job():
+            log_buffer = _WorkspaceLogBuffer(workspace)
+            log_path = output_dir / "solver.log"
+            process = None
+            try:
+                command = [
+                    sys.executable,
+                    str(runner),
+                    "--model",
+                    str(model_path),
+                    "--output-dir",
+                    str(output_dir),
+                    "--kind",
+                    "mesh" if mesh_only else "study",
+                ]
+                if loaded_mesh_path:
+                    command.extend(["--mesh", loaded_mesh_path])
+                popen_options = {
+                    "cwd": str(solver_root),
+                    "stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.STDOUT,
+                    "text": True,
+                    "encoding": "utf-8",
+                    "errors": "replace",
+                    "bufsize": 1,
+                }
+                if os.name == "nt":
+                    popen_options["creationflags"] = getattr(
+                        subprocess, "CREATE_NO_WINDOW", 0
+                    )
+                else:
+                    popen_options["start_new_session"] = True
+                process = subprocess.Popen(command, **popen_options)
+                with self._solver_job_lock:
+                    self._solver_process = process
+                    cancel_now = self._solver_cancel_requested
+                if cancel_now:
+                    process.terminate()
+
+                with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
+                    assert process.stdout is not None
+                    for line in process.stdout:
+                        log_file.write(line)
+                        log_file.flush()
+                        log_buffer.write(line)
+                return_code = process.wait()
+                log_buffer.flush()
+                with self._solver_job_lock:
+                    cancelled = self._solver_cancel_requested and return_code != 0
+
+                manifest = self._read_run_manifest(output_dir)
+                if cancelled:
+                    manifest.update({
+                        "status": "cancelled",
+                        "run_name": run_name,
+                        "finished_utc": _datetime.now(_timezone.utc).isoformat(),
+                    })
+                    self._write_run_manifest(output_dir, manifest)
+                    workspace.finish_solver_job(
+                        f"{run_kind} cancelled. Partial files are in {output_dir}",
+                        cancelled=True,
+                        run_kind=run_kind,
+                        run_name=run_name,
+                        output_path=output_dir,
+                    )
+                    return
+                if return_code != 0:
+                    detail = manifest.get("error") or "See solver.log for details."
+                    manifest.update({
+                        "status": "failed",
+                        "run_name": run_name,
+                        "error": detail,
+                        "finished_utc": _datetime.now(_timezone.utc).isoformat(),
+                    })
+                    self._write_run_manifest(output_dir, manifest)
+                    raise RuntimeError(detail)
+
+                manifest.update({
+                    "status": "complete",
+                    "run_name": run_name,
+                    "finished_utc": _datetime.now(_timezone.utc).isoformat(),
+                    "solver_log": "solver.log",
+                })
+                mesh_preview_path = output_dir / "mesh_preview.json"
+                mesh_edges = []
+                if mesh_preview_path.is_file():
+                    mesh_payload = json.loads(mesh_preview_path.read_text(encoding="utf-8"))
+                    mesh_edges = mesh_payload.get("edges", [])
+                self._write_run_manifest(output_dir, manifest)
+                if mesh_only:
+                    workspace.finish_solver_job(
+                        f"Mesh generated successfully ({len(mesh_edges):,} unique edges): {output_dir}",
+                        run_kind=run_kind,
+                        run_name=run_name,
+                        output_path=output_dir,
+                        mesh_preview_edges=mesh_edges,
+                    )
+                else:
+                    fields_dir = output_dir / "ngsolve_gui" / "fields"
+                    workspace.finish_solver_job(
+                        f"Study complete. GUI-ready fields: {fields_dir}",
+                        run_kind=run_kind,
+                        run_name=run_name,
+                        output_path=output_dir,
+                        mesh_preview_edges=mesh_edges,
+                    )
+                    self._notify(
+                        f"Study complete. Results saved to {output_dir}",
+                        type="positive",
+                        timeout=7000,
+                    )
+            except Exception as error:
+                log_buffer.flush()
+                manifest = self._read_run_manifest(output_dir)
+                manifest.update({
+                    "status": "failed",
+                    "run_name": run_name,
+                    "error": f"{type(error).__name__}: {error}",
+                    "finished_utc": _datetime.now(_timezone.utc).isoformat(),
+                    "solver_log": "solver.log",
+                })
+                self._write_run_manifest(output_dir, manifest)
+                workspace.finish_solver_job(
+                    f"Solver failed: {error}",
+                    error=True,
+                    run_kind=run_kind,
+                    run_name=run_name,
+                    output_path=output_dir,
+                )
+                self._notify(
+                    f"Solver failed: {error}", type="negative", timeout=9000
+                )
+            finally:
+                if process is not None and process.stdout is not None:
+                    process.stdout.close()
+                with self._solver_job_lock:
+                    self._solver_process = None
+                    self._solver_run_context = None
+                    self._solver_job_active = False
+                    self._solver_cancel_requested = False
+
+        self._solver_run_context = {
+            "kind": run_kind,
+            "output_dir": output_dir,
+            "run_name": run_name,
+        }
+        threading.Thread(
+            target=run_job,
+            name="NGSolveAxisymmetricChildJob",
+            daemon=True,
+        ).start()
+
+    def _cancel_axisymmetric_solver(self, *args):
+        """Stop the active solver child process without blocking the UI."""
+        with self._solver_job_lock:
+            if not self._solver_job_active:
+                return
+            self._solver_cancel_requested = True
+            process = self._solver_process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        self.solve_workspace.mark_solver_cancel_requested()
+
+    @staticmethod
+    def _read_run_manifest(output_dir):
+        manifest_path = Path(output_dir) / "run_manifest.json"
+        try:
+            value = json.loads(manifest_path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    @staticmethod
+    def _write_run_manifest(output_dir, manifest):
+        manifest_path = Path(output_dir) / "run_manifest.json"
+        temporary = manifest_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        temporary.replace(manifest_path)
+
+    def _open_run_result(self, filename):
+        """Open a generated field in the existing Post Process workspace."""
+        if not os.path.isfile(filename):
+            self.solve_workspace._message(f"Result file no longer exists: {filename}", error=True)
+            return
+        # Use the toggle as the single source of mode changes so its selected
+        # state stays in sync with the workspace after opening a run result.
+        self._workspace_mode_toggle.select("post_process")
+        self._load_with_status(filename)
+
+    @staticmethod
+    def _find_solver_root():
+        candidates = []
+        configured = os.environ.get("COUPLED_SOLVER_ROOT")
+        if configured:
+            candidates.append(Path(configured).expanduser())
+        candidates.append(Path.cwd())
+        candidates.append(Path(sys.argv[0]).expanduser().resolve().parent)
+        expanded = []
+        for candidate in candidates:
+            try:
+                resolved = candidate.expanduser().resolve()
+            except OSError:
+                continue
+            expanded.extend([resolved, *resolved.parents])
+        for candidate in expanded:
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if (resolved / "main.py").is_file() and (resolved / "src" / "axi").is_dir():
+                return resolved
+        raise FileNotFoundError("The coupled_solver directory is not available from this GUI process")
+
     def _load_file(self):
         from ngapp.utils import EnvironmentType, get_environment
 
-        if get_environment().type == EnvironmentType.LOCAL_APP:
+        # A local app normally uses the host OS dialog. Headless hosts (for
+        # example a GUI served from a VirtualBox guest) have no desktop for
+        # that dialog, so they can explicitly use the browser's file picker.
+        use_browser_picker = (
+            os.environ.get("NGSOLVE_GUI_FILE_PICKER", "").strip().lower()
+            == "browser"
+        )
+        if (
+            get_environment().type == EnvironmentType.LOCAL_APP
+            and not use_browser_picker
+        ):
             from .native_dialog import open_file_dialog
 
             initialdir = (
@@ -423,7 +1902,10 @@ class NGSolveGui(App):
         import tempfile
 
         try:
-            handles = self.js.showOpenFilePicker({"multiple": False})
+            from .picker_wait import browser_file_picker_wait
+
+            with browser_file_picker_wait():
+                handles = self.js.showOpenFilePicker({"multiple": False})
         except Exception:
             return None
         if not handles:
@@ -466,12 +1948,22 @@ class NGSolveGui(App):
     def _activate(self, tabname):
         """Point property panel, footer and keybindings at the active tab."""
         comp = self.tab_panel.comp
+        self._sync_post_process_toolbar(comp)
         tab = self.app_data.get_tab(tabname) if tabname else None
         if comp is not None and hasattr(comp, "sync_camera"):
             comp.sync_camera()
         self._show_property_panel(comp)
         self.footer.set_component(comp, tab.get("type", "") if tab else "")
         self.kb.set_component(comp)
+
+    def _sync_post_process_toolbar(self, comp):
+        """Place active viewport controls above the full three-column page."""
+        get_items = getattr(comp, "_page_toolbar_children", None)
+        items = list(get_items()) if callable(get_items) else []
+        if items:
+            items = [self._open_solutions_toolbar_button, Div(ui_class=cb.vp_sep), *items]
+        self._post_process_toolbar.ui_children = items
+        self._post_process_toolbar.ui_hidden = not bool(items)
 
     def _show_property_panel(self, comp):
         """Host the active component's own property panel (or a placeholder).

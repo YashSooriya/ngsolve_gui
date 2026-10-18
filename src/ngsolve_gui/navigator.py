@@ -23,7 +23,7 @@ from .cerbsim_style import (
 _TYPE_GROUPS = {
     "geometry": ("Geometries", "mdi-cube"),
     "mesh": ("Meshes", "mdi-vector-triangle"),
-    "function": ("Functions", "mdi-function-variant"),
+    "function": ("Solutions", "mdi-function-variant"),
     "plot": ("Plots", "mdi-chart-line"),
 }
 

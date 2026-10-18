@@ -1,6 +1,8 @@
 FROM ghcr.io/cerbsim/ngapp-base:latest
 WORKDIR /app
 COPY . .
+RUN apt-get update && apt-get install -y --no-install-recommends libquadmath0 \
+    && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir --break-system-packages \
     "webgpu @ git+https://github.com/CERBSim/webgpu.git" \
     "ngsolve_webgpu @ git+https://github.com/CERBSim/ngsolve_webgpu.git" \

@@ -24,6 +24,10 @@ class RegionState:
     def __init__(self, mesh):
         self.mesh = mesh
         self.hidden = set()      # hidden volume/material region names
+        # Temporary visibility overrides (for example, hiding a streamline
+        # seed region while its lines are displayed). Keep these separate
+        # from ``hidden`` so the user's saved visibility choices are intact.
+        self.auto_hidden = set()
         self.overrides = {}      # boundary name -> True (show) / False (hide)
 
         self.materials = list(mesh.GetMaterials())
@@ -61,14 +65,19 @@ class RegionState:
     # -- derived alphas ----------------------------------------------------
 
     def vol_alphas(self):
+        hidden = self.hidden | self.auto_hidden
         return np.array(
-            [0.0 if m in self.hidden else 1.0 for m in self.materials],
+            [0.0 if m in hidden else 1.0 for m in self.materials],
             dtype=np.float32,
         )
 
     def surf_alphas(self):
         # cached: the regions panel queries this once per boundary row
-        key = (frozenset(self.hidden), frozenset(self.overrides.items()))
+        key = (
+            frozenset(self.hidden),
+            frozenset(self.auto_hidden),
+            frozenset(self.overrides.items()),
+        )
         if key != self._cache_key:
             self._alphas = self._compute_surf_alphas()
             self._effective = {n for n, a in zip(self.boundaries, self._alphas) if a > 0}
@@ -96,7 +105,7 @@ class RegionState:
     # -- queries for the UI ------------------------------------------------
 
     def material_visible(self, name):
-        return name not in self.hidden
+        return name not in self.hidden and name not in self.auto_hidden
 
     def boundary_effective(self, name):
         """Whether any face descriptor with this name is currently drawn."""
@@ -111,7 +120,7 @@ class RegionState:
 
     def any_hidden(self):
         """True if the current state hides anything relative to the default."""
-        if self.hidden & set(self.materials):
+        if (self.hidden | self.auto_hidden) & set(self.materials):
             return True
         return any(
             self.overrides.get(n) is False for n in self.boundaries

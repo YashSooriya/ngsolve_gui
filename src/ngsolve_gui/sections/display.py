@@ -103,7 +103,7 @@ class FunctionDisplaySection(Section):
         primary = [Chip("Wireframe", "mdi-grid", comp.wireframe_visible)]
         if comp.draw_surf:
             primary.append(Chip("Surface", "mdi-square-outline", comp.elements2d_visible))
-        if comp.mesh.dim == 3 and comp.clippingcf is not None:
+        if comp.mesh.dim == 3 and getattr(comp, "clippingcf", None) is not None:
             primary.append(Chip("Clipping Fn", "mdi-box-cutter", comp.clipping_visible))
         # LIC is toggled inside the "Vectors & Flow" section (grouped with
         # streamlines), not as a top-level Display chip.

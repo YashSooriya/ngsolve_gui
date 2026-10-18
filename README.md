@@ -39,6 +39,10 @@ ngsolve script.py
 
 ngsolve.Draw and ngsolve.Redraw commands are automatically redirected to draw a new GUI item.
 
+For a local app served from a headless machine, set
+`NGSOLVE_GUI_FILE_PICKER=browser` to use the browser's file picker instead of
+opening a native dialog on the server.
+
 ## Reuse
 
 Feel free to use individual components in your own packages or take inspiration if you're building simulation tools with ngapp + webgpu. The main building blocks:
