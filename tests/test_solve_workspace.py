@@ -960,6 +960,7 @@ def test_3d_preview_uses_smooth_sketch_arcs_and_hides_circle_seams(
             self.edges = SimpleNamespace(active=None)
             self.faces.set_colors = lambda colors: setattr(self.faces, "colors", colors.copy())
             self.edges.set_colors = lambda colors: setattr(self.edges, "colors", colors.copy())
+            self.edges.get_shader_code = lambda: "const EDGE_DEPTH_OFFSET: f32 = 2.0e-4;"
 
         def set_needs_update(self):
             pass
@@ -1023,6 +1024,9 @@ def test_3d_preview_uses_smooth_sketch_arcs_and_hides_circle_seams(
     arc_edges = workspace._preview_3d_edge_renderers["arc-region"].geo.edges
     assert len(arc_edges) == 2
     assert workspace._preview_3d_edge_renderers["arc-region"].edges.active is True
+    edge_shader = workspace._preview_3d_edge_renderers["arc-region"].edges.get_shader_code()
+    assert "EDGE_DEPTH_OFFSET: f32 = 2.0e-7;" in edge_shader
+    assert "EDGE_DEPTH_OFFSET: f32 = 2.0e-4;" not in edge_shader
     assert len(rendered) == 4  # two face renderers, one feature-edge overlay, and axes
 
 

@@ -78,6 +78,21 @@ _TREE_GROUPS = (
 _FREQUENCY_RESULT_SUFFIX = re.compile(r"_\d+_([0-9.eE+-]+)Hz$", re.IGNORECASE)
 _HIDDEN_RUN_HISTORY_FILE = ".mm_fem_hidden_run_history.json"
 _CANVAS_GRID_SUBDIVISIONS = 5
+
+
+def _surface_visible_preview_edge_shader(shader_source):
+    """Use a minimal depth bias so the depth buffer hides far-side preview edges."""
+    updated, replacements = re.subn(
+        r"(?m)^(const EDGE_DEPTH_OFFSET: f32 = )[^;]+;",
+        r"\g<1>2.0e-7;",
+        shader_source,
+        count=1,
+    )
+    if replacements != 1:
+        raise RuntimeError("The NGSolve edge shader no longer exposes its depth offset.")
+    return updated
+
+
 _PREVIEW_VISIBILITY_ALPHA = {
     "opaque": 1.0,
     "translucent": 0.38,
@@ -11985,6 +12000,15 @@ class SolveWorkspace(Div):
                 if feature_edges:
                     edge_geometry = OCCGeometry(Compound(feature_edges))
                     edge_renderer = GeometryRenderer(edge_geometry)
+                    # The upstream edge shader pushes lines substantially toward
+                    # the camera, making far-side edges show through opaque faces.
+                    # Keep only a sub-pixel bias for stable surface-edge rasterization;
+                    # the normal depth test then occludes edges behind the solid.
+                    edge_shader_getter = getattr(edge_renderer.edges, "get_shader_code", None)
+                    if callable(edge_shader_getter):
+                        edge_renderer.edges.get_shader_code = lambda getter=edge_shader_getter: (
+                            _surface_visible_preview_edge_shader(getter())
+                        )
                     edge_renderer.faces.active = False
                     edge_renderer.edges.active = True
                     self._preview_3d_edge_renderers[region["id"]] = edge_renderer
