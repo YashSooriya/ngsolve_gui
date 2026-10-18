@@ -1992,6 +1992,11 @@ def test_live_preview_supports_arc_construction_and_point_markers(standalone_com
     assert "observeInferenceScene(svg)" in script
     assert "latchedInferenceCandidate = null" in script
     assert "heldDistance <= 20" in script
+    assert "getBoundingClientRect()" in script
+    assert "const pathLocalPointInCanvas = (svg, path, x, y) =>" in script and "path.getScreenCTM()" in script and "rootToScreen.inverse()" in script
+    assert "updateInferenceForPointer(event, svg)" in script
+    assert "sameAsRecentPointerMove" in script
+    assert "event.type === 'mousemove'" in script
     assert 'attributeFilter:["d","transform","display","data-sketch-curve-type"' in script
 
 def test_power_trim_leaves_curves_without_intersections_unchanged(standalone_components):

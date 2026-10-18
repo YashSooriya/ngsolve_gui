@@ -1868,8 +1868,8 @@ class SolveWorkspace(Div):
         script = r"""
 (() => {
   window.__ngsolveSketchTool = '__SKETCH_TOOL__';
-  if (window.__ngsolveSketchPointerCaptureVersion === 16) return;
-  window.__ngsolveSketchPointerCaptureVersion = 16;
+  if (window.__ngsolveSketchPointerCaptureVersion === 18) return;
+  window.__ngsolveSketchPointerCaptureVersion = 18;
   let active = false;
   let activePointerId = null;
   let dragStart = null;
@@ -2415,16 +2415,25 @@ class SolveWorkspace(Div):
     marker.setAttribute("stroke-width", "3.4");
     marker.setAttribute("display", "inline");
   };
+  const pathLocalPointInCanvas = (svg, path, x, y) => {
+    try {
+      const rootToScreen = svg.getScreenCTM();
+      const pathToScreen = path.getScreenCTM();
+      if (!rootToScreen || !pathToScreen) return null;
+      const local = svg.createSVGPoint();
+      local.x = x;
+      local.y = y;
+      const screenPoint = local.matrixTransform(pathToScreen);
+      const canvasPoint = screenPoint.matrixTransform(rootToScreen.inverse());
+      return [canvasPoint.x, canvasPoint.y];
+    } catch (_) {
+      return null;
+    }
+  };
   const pathPointInCanvas = (svg, path, distance) => {
     try {
-      const matrix = path.getCTM();
-      if (!matrix) return null;
       const local = path.getPointAtLength(distance);
-      const point = svg.createSVGPoint();
-      point.x = local.x;
-      point.y = local.y;
-      const canvasPoint = point.matrixTransform(matrix);
-      return [canvasPoint.x, canvasPoint.y];
+      return pathLocalPointInCanvas(svg, path, local.x, local.y);
     } catch (_) {
       return null;
     }
@@ -2476,14 +2485,10 @@ class SolveWorkspace(Div):
         const cxValue = path.getAttribute("data-sketch-curve-center-x");
         const cyValue = path.getAttribute("data-sketch-curve-center-y");
         const cx = Number(cxValue), cy = Number(cyValue);
-        const matrix = path.getCTM();
         if (cxValue !== null && cxValue !== "" && cyValue !== null && cyValue !== ""
-          && Number.isFinite(cx) && Number.isFinite(cy) && matrix) {
-          const local = svg.createSVGPoint();
-          local.x = cx;
-          local.y = cy;
-          const center = local.matrixTransform(matrix);
-          addPoint("center", [center.x, center.y], edgeId + ":center");
+          && Number.isFinite(cx) && Number.isFinite(cy)) {
+          const center = pathLocalPointInCanvas(svg, path, cx, cy);
+          if (center) addPoint("center", center, edgeId + ":center");
         }
       }
       const sampleCount = Math.min(512, Math.max(2, Math.ceil(length / 6)));
@@ -3212,6 +3217,30 @@ class SolveWorkspace(Div):
       target.dispatchEvent(settled);
     }, 140);
   };
+  let lastPointerMoveAt = -Infinity;
+  let lastPointerMoveClient = null;
+  const updateInferenceForPointer = (event, svg) => {
+    if (!svg) return;
+    const bounds = svg.getBoundingClientRect();
+    const inside = event.clientX >= bounds.left && event.clientX <= bounds.right
+      && event.clientY >= bounds.top && event.clientY <= bounds.bottom;
+    if (!inside) {
+      clearInferenceMarker(svg);
+      return;
+    }
+    const screen = svgPoint(svg, event);
+    if (!screen) return;
+    const point = sketchPoint(toScenePoint(screen), svg);
+    const state = window.__ngsolveSketchConstruction || {};
+    const tool = window.__ngsolveSketchTool || 'select';
+    const hasPending = tool === 'line'
+      ? (Array.isArray(state.linePoints) && state.linePoints.length > 0)
+      : (tool === 'arc'
+        ? (Array.isArray(state.arcPoints) && state.arcPoints.length > 0)
+        : (tool === 'circle' && state.circleVariant === 'three-point'
+          && Array.isArray(state.circlePoints) && state.circlePoints.length > 0));
+    if (hasPending) updateConstructionPreview(svg, point);
+  };
   const capture = (event) => {
     if (forwardedEvents.has(event)) return;
     const svg = currentSvg();
@@ -3237,6 +3266,17 @@ class SolveWorkspace(Div):
         if (event.button === 1) event.preventDefault();
       }
       else if (event.type === 'mouseup' && (targetIsCanvas || active)) remember(event);
+      else if (event.type === 'mousemove') {
+        const sameAsRecentPointerMove = lastPointerMoveClient
+          && performance.now() - lastPointerMoveAt < 40
+          && Math.abs(event.clientX - lastPointerMoveClient[0]) < 0.5
+          && Math.abs(event.clientY - lastPointerMoveClient[1]) < 0.5;
+        if (!sameAsRecentPointerMove) {
+          updateHover(event, svg);
+          moveGesture(event, svg);
+          if (!active) updateInferenceForPointer(event, svg);
+        }
+      }
       return;
     }
     if (event.type === 'mousedown') {
@@ -3253,28 +3293,12 @@ class SolveWorkspace(Div):
   if (pointerSupported) {
     document.addEventListener('pointerdown', event => beginGesture(event, currentSvg()), true);
     document.addEventListener('pointermove', event => {
+      lastPointerMoveAt = performance.now();
+      lastPointerMoveClient = [event.clientX, event.clientY];
       const svg = currentSvg();
       updateHover(event, svg);
       moveGesture(event, svg);
-      if (!active && svg) {
-        if (!targetIsSvg(event, svg)) {
-          clearInferenceMarker(svg);
-          return;
-        }
-        const screen = svgPoint(svg, event);
-        if (screen) {
-          const point = sketchPoint(toScenePoint(screen), svg);
-          const state = window.__ngsolveSketchConstruction || {};
-          const tool = window.__ngsolveSketchTool || 'select';
-          const hasPending = tool === 'line'
-            ? (Array.isArray(state.linePoints) && state.linePoints.length > 0)
-            : (tool === 'arc'
-              ? (Array.isArray(state.arcPoints) && state.arcPoints.length > 0)
-              : (tool === 'circle' && state.circleVariant === 'three-point'
-                && Array.isArray(state.circlePoints) && state.circlePoints.length > 0));
-          if (hasPending) updateConstructionPreview(svg, point);
-        }
-      }
+      if (!active) updateInferenceForPointer(event, svg);
     }, true);
     document.addEventListener('pointerup', event => finishGesture(event, currentSvg()), true);
     document.addEventListener('pointercancel', event => finishGesture(event, currentSvg(), true), true);
