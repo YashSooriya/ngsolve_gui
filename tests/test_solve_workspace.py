@@ -1981,6 +1981,13 @@ def test_live_preview_supports_arc_construction_and_point_markers(standalone_com
     assert "solve-sketch-construction-points" in script
     assert "window.__ngsolveRefreshConstructionPreview" in script
     assert "hasPending" in script and "updateConstructionPreview" in script
+    assert "solve-sketch-inference-label" in script
+    assert "solve-sketch-inference-label-bg" in script
+    assert 'labels = {endpoint:"Endpoint", midpoint:"Line midpoint", center:"Curve centre", edge:"On edge"}' in script
+    assert 'const r = kind === "endpoint" ? 9' in script
+    assert 'item.distance <= 14' in script
+    assert 'labelBackground.setAttribute("display", "inline")' in script
+    assert 'label.setAttribute("display", "inline")' in script
 
 def test_power_trim_leaves_curves_without_intersections_unchanged(standalone_components):
     workspace = SolveWorkspace()

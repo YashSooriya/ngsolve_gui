@@ -556,15 +556,28 @@ class SolveWorkspace(Div):
             "g",
             _svg(
                 "path", id="solve-sketch-inference-halo", d="", display="none",
-                fill="none", stroke="#ffffff", stroke_width="6",
+                fill="none", stroke="#ffffff", stroke_width="8",
                 stroke_linecap="round", stroke_linejoin="round",
-                style="pointer-events:none;",
+                style="pointer-events:none; vector-effect:non-scaling-stroke;",
             ),
             _svg(
                 "path", id="solve-sketch-inference-marker", d="", display="none",
-                fill="none", stroke="#16814a", stroke_width="2.4",
+                fill="none", stroke="#16814a", stroke_width="3.2",
                 stroke_linecap="round", stroke_linejoin="round",
-                style="pointer-events:none;",
+                style="pointer-events:none; vector-effect:non-scaling-stroke;",
+            ),
+            _svg(
+                "rect", id="solve-sketch-inference-label-bg", x="0", y="0",
+                width="68", height="22", rx="4", display="none",
+                fill="#ffffff", fill_opacity="0.98", stroke="#16814a", stroke_width="2",
+                style="pointer-events:none; vector-effect:non-scaling-stroke;",
+            ),
+            _svg(
+                "text", id="solve-sketch-inference-label", x="0", y="0",
+                display="none", font_size="13", font_weight="700",
+                fill="#16814a", stroke="#ffffff", stroke_width="3",
+                stroke_linejoin="round", paint_order="stroke",
+                style="pointer-events:none; user-select:none; -webkit-user-select:none;",
             ),
             ui_style="pointer-events:none;",
         )
@@ -764,13 +777,13 @@ class SolveWorkspace(Div):
         line_button = _button(
             "Line", "mdi-vector-line",
             lambda *a: self.set_sketch_tool("line"),
-            tooltip="Draw a straight sketch edge by dragging between endpoints. Press L to activate Line.",
+            tooltip="Draw a straight sketch edge. Hover near a square Endpoint, diamond Midpoint, or curve Centre marker to auto-snap. Press L for Line.",
             style="flex:0 0 auto; white-space:nowrap;",
         )
         arc_button, arc_group = sketch_tool_group(
             "Arc", "mdi-vector-curve", "arc",
             (("three-point", "3-point arc"), ("centerpoint", "Centerpoint arc"), ("tangent", "Tangent arc"), ("spline3", "Spline")),
-            "Choose a 3-point, centerpoint, tangent, or spline arc. Press A to activate a 3-point arc.",
+            "Choose a 3-point, centerpoint, tangent, or spline arc. Hover near an endpoint, midpoint, curve centre, or edge to see its snap marker. Press A for a 3-point arc.",
         )
         trim_button = _button(
             "Trim", "mdi-content-cut",
@@ -778,7 +791,7 @@ class SolveWorkspace(Div):
             tooltip="Trim an open line at its intersections with other sketch curves. Press T to activate Trim.",
             style="flex:0 0 auto; white-space:nowrap;",
         )
-        snap_button = _button("Snap", "mdi-magnet", self.toggle_snap_to_grid, tooltip="Snap sketch points to grid intersections", style="flex:0 0 auto; white-space:nowrap;")
+        snap_button = _button("Snap", "mdi-magnet", self.toggle_snap_to_grid, tooltip="Grid snapping to visible intersections. While drawing Line or Arc, endpoint, midpoint, centre and edge snapping is automatic.", style="flex:0 0 auto; white-space:nowrap;")
         sketch_toolbar_separator = QSeparator(ui_vertical=True)
         fit_view_button = _button(
             "Fit view", "mdi-fit-to-screen-outline",
@@ -2343,41 +2356,69 @@ class SolveWorkspace(Div):
     if (!svg) return;
     const halo = svg.querySelector("#solve-sketch-inference-halo");
     const marker = svg.querySelector("#solve-sketch-inference-marker");
+    const label = svg.querySelector("#solve-sketch-inference-label");
+    const labelBackground = svg.querySelector("#solve-sketch-inference-label-bg");
     if (halo) halo.setAttribute("display", "none");
     if (marker) marker.setAttribute("display", "none");
+    if (label) label.setAttribute("display", "none");
+    if (labelBackground) labelBackground.setAttribute("display", "none");
   };
   window.__ngsolveClearSketchInferenceMarker = () => clearInferenceMarker(currentSvg());
   const inferenceMarkerPath = (point, kind) => {
     const x = point[0], y = point[1];
-    const r = kind === "endpoint" ? 5.5 : 5;
+    const r = kind === "endpoint" ? 9 : (kind === "center" ? 9 : (kind === "midpoint" ? 8 : 7));
     if (kind === "endpoint") {
       return "M" + (x-r) + "," + (y-r) + " H" + (x+r) + " V" + (y+r) + " H" + (x-r) + " Z"
-        + " M" + (x-2) + "," + y + " H" + (x+2) + " M" + x + "," + (y-2) + " V" + (y+2);
+        + " M" + (x-3.5) + "," + y + " H" + (x+3.5) + " M" + x + "," + (y-3.5) + " V" + (y+3.5);
     }
     if (kind === "midpoint") {
       return "M" + x + "," + (y-r) + " L" + (x+r) + "," + y + " L" + x + "," + (y+r) + " L" + (x-r) + "," + y + " Z"
-        + " M" + (x-2) + "," + y + " H" + (x+2);
+        + " M" + (x-3.5) + "," + y + " H" + (x+3.5) + " M" + x + "," + (y-3.5) + " V" + (y+3.5);
     }
     if (kind === "center") {
       return "M" + (x-r) + "," + y + " A" + r + "," + r + " 0 1 0 " + (x+r) + "," + y
         + " A" + r + "," + r + " 0 1 0 " + (x-r) + "," + y
-        + " M" + (x-8) + "," + y + " H" + (x+8) + " M" + x + "," + (y-8) + " V" + (y+8);
+        + " M" + (x-11) + "," + y + " H" + (x+11) + " M" + x + "," + (y-11) + " V" + (y+11);
     }
     return "M" + (x-r) + "," + y + " A" + r + "," + r + " 0 1 0 " + (x+r) + "," + y
       + " A" + r + "," + r + " 0 1 0 " + (x-r) + "," + y
-      + " M" + (x-2) + "," + y + " H" + (x+2) + " M" + x + "," + (y-2) + " V" + (y+2);
+      + " M" + (x-3.5) + "," + y + " H" + (x+3.5) + " M" + x + "," + (y-3.5) + " V" + (y+3.5);
   };
   const showInferenceMarker = (svg, candidate) => {
     if (!svg || !candidate) return clearInferenceMarker(svg);
     const halo = svg.querySelector("#solve-sketch-inference-halo");
     const marker = svg.querySelector("#solve-sketch-inference-marker");
-    if (!halo || !marker) return;
+    const label = svg.querySelector("#solve-sketch-inference-label");
+    const labelBackground = svg.querySelector("#solve-sketch-inference-label-bg");
+    if (!halo || !marker || !label || !labelBackground) return;
     const d = inferenceMarkerPath(candidate.point, candidate.kind);
+    const colors = {endpoint:"#16814a", midpoint:"#b56b00", center:"#7a43b6", edge:"#1176b8"};
+    const labels = {endpoint:"Endpoint", midpoint:"Line midpoint", center:"Curve centre", edge:"On edge"};
+    const labelWidths = {endpoint:70, midpoint:104, center:96, edge:66};
+    const color = colors[candidate.kind] || colors.edge;
     halo.setAttribute("d", d);
     halo.setAttribute("display", "inline");
     marker.setAttribute("d", d);
-    marker.setAttribute("stroke", ({endpoint:"#16814a", midpoint:"#d18a0a", center:"#7a43b6", edge:"#1176b8"})[candidate.kind] || "#1176b8");
+    marker.setAttribute("stroke", color);
+    marker.setAttribute("stroke-width", "3.2");
     marker.setAttribute("display", "inline");
+    const box = svg.viewBox && svg.viewBox.baseVal;
+    const labelWidth = labelWidths[candidate.kind] || labelWidths.edge;
+    const labelLeft = box && candidate.point[0] > box.x + box.width - labelWidth - 20
+      ? candidate.point[0] - labelWidth - 18 : candidate.point[0] + 18;
+    const labelTop = box && candidate.point[1] < box.y + 30
+      ? candidate.point[1] + 18 : candidate.point[1] - 30;
+    labelBackground.setAttribute("x", String(labelLeft));
+    labelBackground.setAttribute("y", String(labelTop));
+    labelBackground.setAttribute("width", String(labelWidth));
+    labelBackground.setAttribute("height", "24");
+    labelBackground.setAttribute("stroke", color);
+    labelBackground.setAttribute("display", "inline");
+    label.setAttribute("x", String(labelLeft + 7));
+    label.setAttribute("y", String(labelTop + 16));
+    label.setAttribute("fill", color);
+    label.textContent = labels[candidate.kind] || labels.edge;
+    label.setAttribute("display", "inline");
   };
   const pathPointInCanvas = (svg, path, distance) => {
     try {
@@ -2492,9 +2533,9 @@ class SolveWorkspace(Div):
     const pointCandidates = cache.points.map(item => ({
       kind:item.kind, point:item.point, key:item.key, priority:item.priority,
       distance:Math.hypot(pointer[0]-item.point[0], pointer[1]-item.point[1]),
-    })).filter(item => item.distance <= 10);
+    })).filter(item => item.distance <= 14);
     pointCandidates.sort((a,b) => a.distance-b.distance || a.priority-b.priority);
-    const candidate = pointCandidates[0] || closestEdgeCandidate(cache, pointer, 10);
+    const candidate = pointCandidates[0] || closestEdgeCandidate(cache, pointer, 14);
     if (!candidate) {
       clearInferenceMarker(svg);
       return null;
