@@ -36,6 +36,7 @@ from .result_files import (
     problem_fingerprint,
     read_mesh_bundle,
 )
+from .three_d_workspace import ThreeDProjectDialog
 
 
 def _request_guest_vm_shutdown():
@@ -785,12 +786,13 @@ class NGSolveGui(App):
             ui_model_value=False,
         )
         about_close.on_click(lambda *a: setattr(self._about_dialog, "ui_model_value", False))
+        self._three_d_project_dialog = ThreeDProjectDialog(self)
         self._menu_bar = self._build_application_menu_bar()
 
         super().__init__(
             self._menu_bar, bar, self._post_process_workspace,
             self._solve_workspace, self._timer_dialog, self._new_problem_dialog,
-            self._settings_dialog, self._about_dialog,
+            self._settings_dialog, self._about_dialog, self._three_d_project_dialog,
             self.kb.indicator, self.kb.help_overlay,
             ui_class=str(cb.app_root),
         )
@@ -861,6 +863,9 @@ class NGSolveGui(App):
                 ("Open problem...", self.load_problem_file, "mdi-folder-open-outline", "Ctrl+O"),
                 ("Save problem", self.save_problem_file, "mdi-content-save-outline", "Ctrl+S"),
                 None,
+                ("New 3D project...", self._new_3d_project, "mdi-cube-scan", None),
+                ("Open 3D project...", self._open_3d_project, "mdi-folder-open-outline", None),
+                None,
                 ("Import legacy Python problem...", self._choose_legacy_problem_file, "mdi-language-python", None),
                 ("Open external file...", self._load_file, "mdi-file-import-outline", None),
                 None,
@@ -915,6 +920,7 @@ class NGSolveGui(App):
                 ("Toggle snap to grid", self._menu_toggle_snap, "mdi-magnet", None),
                 ("Rename model...", self._menu_rename_model, "mdi-pencil-outline", None),
                 ("Preview geometry in 3D", self._menu_preview_geometry, "mdi-cube-scan", None),
+                ("Import STEP and wire traces...", self._new_3d_project, "mdi-cube-scan", None),
             ]),
             ("Study", [
                 ("Check setup", self._menu_check_setup, "mdi-check-decagram-outline", None),
@@ -951,6 +957,13 @@ class NGSolveGui(App):
 
     def _quit_application(self, *args):
         return self._request_problem_replacement(self._close_application_now)
+
+    def _new_3d_project(self, *args):
+        self._three_d_project_dialog.show_new()
+
+    def _open_3d_project(self, *args):
+        self._three_d_project_dialog.ui_model_value = True
+        self._three_d_project_dialog.open_project()
 
     def _close_application_now(self):
         try:
