@@ -704,7 +704,7 @@ def test_3d_preview_opens_large_modal_and_exit_restores_editable_sketch(standalo
     assert workspace._preview_3d_component is preview
     assert workspace._preview_3d_dialog.ui_model_value is True
     assert workspace._preview_3d_viewport.ui_children == [preview]
-    assert workspace._canvas_host.ui_children == [original_canvas, workspace._canvas_resize_observer, workspace._canvas_context_menu]
+    assert workspace._canvas_host.ui_children == [original_canvas, workspace._canvas_resize_observer, workspace._canvas_context_menu, workspace._canvas_dimension_editor]
     assert workspace._preview_3d_dialog._props["maximized"] is True
     assert workspace._preview_3d_dialog._props["persistent"] is True
     assert workspace._preview_3d_exit_button.ui_label == "Exit 3D Preview"
@@ -717,7 +717,7 @@ def test_3d_preview_opens_large_modal_and_exit_restores_editable_sketch(standalo
     assert workspace._preview_3d_dialog.ui_model_value is False
     assert workspace._preview_3d_component is None
     assert workspace._preview_3d_viewport.ui_children == []
-    assert workspace._canvas_host.ui_children == [original_canvas, workspace._canvas_resize_observer, workspace._canvas_context_menu]
+    assert workspace._canvas_host.ui_children == [original_canvas, workspace._canvas_resize_observer, workspace._canvas_context_menu, workspace._canvas_dimension_editor]
     assert workspace._preview_3d_button.ui_label == "Preview in 3D"
     assert all(not control.ui_hidden for control in workspace._sketch_view_controls)
 
@@ -1038,7 +1038,7 @@ def test_3d_preview_failure_keeps_editable_sketch_active(standalone_components):
 
     assert not workspace._preview_3d_active
     assert workspace._preview_3d_dialog.ui_model_value is False
-    assert workspace._canvas_host.ui_children == [workspace._canvas, workspace._canvas_resize_observer, workspace._canvas_context_menu]
+    assert workspace._canvas_host.ui_children == [workspace._canvas, workspace._canvas_resize_observer, workspace._canvas_context_menu, workspace._canvas_dimension_editor]
     assert workspace._preview_3d_button.ui_label == "Preview in 3D"
     assert "invalid profile" in workspace.message
 
@@ -3049,6 +3049,9 @@ def test_moving_nested_region_refreshes_parent_cutout_without_redrawing(standalo
         if item["id"] in inner["edge_ids"]
     }
     path_before = workspace._canvas_region_path_data(outer)
+    parts_before = workspace._canvas_region_path_parts(outer)
+    assert parts_before["outer"]
+    assert [hole["id"] for hole in parts_before["holes"]] == [inner["id"]]
     scripts = []
     workspace_js = SimpleNamespace(eval=lambda script: scripts.append(script))
     monkeypatch.setattr(SolveWorkspace, "js", property(lambda _self: workspace_js))
@@ -3064,8 +3067,12 @@ def test_moving_nested_region_refreshes_parent_cutout_without_redrawing(standalo
     )
 
     path_after = workspace._canvas_region_path_data(outer)
+    parts_after = workspace._canvas_region_path_parts(outer)
     assert moved is True
     assert path_after != path_before
+    assert parts_after["outer"] == parts_before["outer"]
+    assert parts_after["holes"][0]["id"] == inner["id"]
+    assert parts_after["holes"][0]["d"] != parts_before["holes"][0]["d"]
     assert inner["parent_id"] == outer["id"]
     assert inner["vertices"] != vertices_before
     for vertex, before in zip(inner["vertices"], vertices_before):
@@ -3076,7 +3083,10 @@ def test_moving_nested_region_refreshes_parent_cutout_without_redrawing(standalo
         for point, before in zip(edge["vertices"], edges_before[edge["id"]]):
             assert point == pytest.approx([before[0] + 0.001, before[1]])
     assert any("__ngsolveCommitSketchRegionMove" in script for script in scripts)
-    assert any(json.dumps({"id": outer["id"], "d": path_after}) in script for script in scripts)
+    assert any(
+        f'"id": {json.dumps(outer["id"])}, "d": {json.dumps(path_after)}, "outer":' in script
+        for script in scripts
+    )
 
     # Moving fully outside the container must remove its now-stale cutout too.
     moved_outside = workspace._move_region_from_canvas_drag(
@@ -3087,7 +3097,7 @@ def test_moving_nested_region_refreshes_parent_cutout_without_redrawing(standalo
     assert moved_outside is True
     assert inner["parent_id"] is None
     assert path_outside.count("M") == 1
-    assert json.dumps({"id": outer["id"], "d": path_outside}) in scripts[-1]
+    assert f'"id": {json.dumps(outer["id"])}, "d": {json.dumps(path_outside)}, "outer":' in scripts[-1]
     assert rendered == []
 
 
@@ -3638,9 +3648,9 @@ def test_region_click_updates_selection_without_rebuilding_sketch_scene(standalo
     assert not workspace._region_panel.ui_hidden
     assert workspace._region_name_input.ui_model_value == "square 1"
     dimension_labels = [
-        child._props["textContent"]
+            child.ui_children[1]._props["textContent"]
         for child in workspace._canvas_dimensions.ui_children
-        if child._props.get("textContent")
+            if child._props.get("data-sketch-dimension-key")
     ]
     assert dimension_labels == ["W 0.02 m", "H 0.02 m"]
 
@@ -3844,7 +3854,11 @@ def test_canvas_drag_suppresses_the_click_that_follows_mouseup(standalone_compon
         "const updatePreview = (svg, point, screenPoint = null) => {", 1
     )[1].split("const beginGesture", 1)[0]
     assert "regionElements(svg, dragRegionId)" in preview_body
+    assert "data-sketch-region-parent-id" in preview_body
+    assert "data-sketch-region-hole-paths" in preview_body
+    assert "hole.id === dragRegionId" in preview_body
     assert "querySelectorAll('[data-sketch-region-id]')" not in preview_body
+    assert "document.addEventListener('selectstart'" in scripts[0]
 
 
 def test_stationary_region_pointer_gesture_selects_region_after_pointer_capture(standalone_components, monkeypatch):
@@ -5486,6 +5500,8 @@ def test_canvas_context_menu_offers_group_delete_ungroup_for_current_selection(s
     assert context_menu._id == "solve-sketch-context-menu"
     assert context_menu._props["class"] == "solve-sketch-context-menu"
     assert "display:none" in context_menu._props["style"]
+    assert "user-select:none" in context_menu._props["style"]
+    assert "-webkit-user-select:none" in context_menu._props["style"]
 
     def strings(component):
         if isinstance(component, str):
@@ -5496,6 +5512,13 @@ def test_canvas_context_menu_offers_group_delete_ungroup_for_current_selection(s
     assert "Delete selected regions" in labels
     assert "Group selected regions" in labels
     assert "Ungroup selected regions" in labels
+    assert "Create region here" in labels
+    assert "Edit dimensions" in labels
+    assert "Assign material" in labels
+    assert "Set mesh size" in labels
+    assert "Boundary conditions" in labels
+    assert "Fit view" in labels
+    assert "Undo" in labels and "Redo" in labels
     assert set(workspace.selected_region_ids) == {first["id"], second["id"]}
     for region_id in (first["id"], second["id"]):
         assert workspace._canvas_region_nodes[region_id]._props["data-sketch-region-selected"] == "true"
@@ -5511,6 +5534,108 @@ def test_canvas_context_menu_offers_group_delete_ungroup_for_current_selection(s
     assert "new MouseEvent('mouseup'" in scripts[0]
     assert "svg.dispatchEvent(forwarded)" in scripts[0]
     assert "svg.focus({preventScroll: true})" in scripts[0]
+
+
+def test_viewport_dimension_labels_open_an_inline_editor(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    workspace.select_region(region["id"])
+    labels = [
+        item for item in workspace._canvas_dimension_components()
+        if item._props.get("data-sketch-dimension-key")
+    ]
+
+    assert {item._props["data-sketch-dimension-key"] for item in labels} == {"width", "height"}
+    assert all(item._props["data-sketch-dimension-owner"] == region["id"] for item in labels)
+
+    monkeypatch.setattr(SolveWorkspace, "js", property(lambda self: SimpleNamespace(eval=lambda script: [100, 100])), raising=False)
+    assert workspace._open_canvas_dimension_editor("region", region["id"], "width", label_id=labels[0]._id)
+    assert workspace._canvas_dimension_input.ui_model_value == str(region["shape"]["width"])
+    workspace._canvas_dimension_editor_value = "0.006"
+    assert workspace._commit_canvas_dimension_edit()
+    assert region["shape"]["width"] == pytest.approx(0.006)
+    assert workspace._canvas_dimension_editor_target is None
+
+
+@pytest.mark.parametrize("payload", ["Enter", {"key": "Enter"}])
+def test_dimension_keyboard_commit_is_one_undoable_edit(standalone_components, payload):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    region = workspace.model["geometry"]["regions"][0]
+    before = region["shape"]["width"]
+    workspace._canvas_dimension_editor_target = ("region", region["id"], "width")
+    workspace._canvas_dimension_editor_value = str(before * 1.2)
+    workspace._on_canvas_dimension_keydown(SimpleNamespace(value=payload))
+    assert region["shape"]["width"] == pytest.approx(before * 1.2)
+    assert workspace._canvas_dimension_editor_target is None
+    workspace.undo()
+    assert workspace.model["geometry"]["regions"][0]["shape"]["width"] == pytest.approx(before)
+
+
+def test_circle_radius_annotation_opens_the_same_viewport_editor(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("circle")
+    region = workspace.model["geometry"]["regions"][0]
+    workspace.select_region(region["id"])
+    label = next(
+        item for item in workspace._canvas_dimension_components()
+        if item._props.get("data-sketch-dimension-key") == "radius"
+    )
+    monkeypatch.setattr(SolveWorkspace, "js", property(lambda self: SimpleNamespace(eval=lambda script: [100, 100])), raising=False)
+    assert workspace._open_canvas_dimension_editor("region", region["id"], "radius", label_id=label._id)
+    workspace._canvas_dimension_editor_value = "0.005"
+    assert workspace._commit_canvas_dimension_edit()
+    assert region["shape"]["radius"] == pytest.approx(0.005)
+
+
+def test_selected_arc_displays_editable_radius_annotation(standalone_components, monkeypatch):
+    workspace = SolveWorkspace()
+    for point in ((0.004, 0.002), (0.010, 0.002), (0.007, 0.005)):
+        workspace._accept_arc_sketch_point(point, variant="three-point")
+    edge = next(item for item in workspace.model["geometry"]["edges"] if item.get("curve", {}).get("type") == "arc")
+    workspace.select_edge(edge["id"])
+    labels = [
+        item for item in workspace._canvas_dimension_components()
+        if item._props.get("data-sketch-dimension-key") == "radius"
+    ]
+    assert len(labels) == 1
+    assert labels[0]._props["data-sketch-dimension-owner"] == edge["id"]
+    # Exercise the actual mounted annotation layer, not just the builder.
+    assert any(item._props.get("data-sketch-dimension-key") == "radius"
+               for item in workspace._canvas_dimensions.ui_children)
+
+    monkeypatch.setattr(SolveWorkspace, "js", property(lambda self: SimpleNamespace(eval=lambda script: [100, 100])), raising=False)
+    assert workspace._open_canvas_dimension_editor("edge", edge["id"], "radius", label_id=labels[0]._id)
+    workspace._canvas_dimension_editor_value = "0.004"
+    assert workspace._commit_canvas_dimension_edit()
+    updated = next(item for item in workspace.model["geometry"]["edges"] if item.get("curve", {}).get("type") == "arc")
+    assert updated["curve"]["radius"] == pytest.approx(0.004)
+
+
+def test_create_region_from_deleted_inner_rectangle_restores_hole(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    outer = workspace.model["geometry"]["regions"][0]
+    workspace._primitive_values.update({
+        ("rectangle", "r_min"): outer["shape"]["r_min"] + 0.002,
+        ("rectangle", "z_min"): outer["shape"]["z_min"] + 0.002,
+        ("rectangle", "width"): 0.004,
+        ("rectangle", "height"): 0.004,
+    })
+    workspace._add_primitive("rectangle")
+    inner = workspace.model["geometry"]["regions"][1]
+    assert inner["parent_id"] == outer["id"]
+    assert workspace.delete_regions([inner["id"]])
+    void = workspace.model["geometry"]["voids"][0]
+
+    assert workspace._create_region_from_void(void["id"])
+    restored = workspace.model["geometry"]["regions"][-1]
+    assert restored["parent_id"] == outer["id"]
+    assert restored["vertices"] == inner["vertices"]
+    assert workspace.model["geometry"]["voids"] == []
+    assert workspace.delete_regions([restored["id"]])
+    assert len(workspace.model["geometry"]["voids"]) == 1
 
 
 def test_group_deletion_removes_all_selected_regions_and_stale_assignments(standalone_components):

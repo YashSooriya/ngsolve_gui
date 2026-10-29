@@ -360,7 +360,7 @@ def _svg(tag, **props):
             # property, keeping the text inside the SVG namespace.
             component._props["textContent"] = str(children)
         else:
-            component.ui_slots["default"] = [children]
+            component.ui_slots["default"] = list(children) if isinstance(children, (list, tuple)) else [children]
     return component
 
 
@@ -491,7 +491,10 @@ class SolveWorkspace(Div):
         self._canvas_grid_signature = None
         self._canvas_scene_component_ids = None
         self._canvas_region_nodes = {}
+        self._canvas_void_nodes = {}
         self._canvas_context_menu = None
+        self._canvas_dimension_editor_target = None
+        self._canvas_dimension_editor_value = ""
         self._canvas_edge_nodes = {}
         self._pending_arc_points = []
         self._pending_line_points = []
@@ -674,13 +677,58 @@ class SolveWorkspace(Div):
         )
         self._canvas_resize_observer = QResizeObserver(ui_debounce=80)
         self._canvas_resize_observer.on_resize(self._on_canvas_resize)
-        # Mount one context menu on the canvas host so right-clicking a selected
-        # region set opens the actions at the pointer, regardless of SVG nesting.
+        self._canvas_dimension_input = QInput(
+            ui_label="Dimension",
+            ui_model_value="",
+            ui_dense=True,
+            ui_filled=True,
+            ui_hide_bottom_space=True,
+            ui_style="width:170px;",
+        )
+        self._canvas_dimension_input.on_update_model_value(self._on_canvas_dimension_input)
+        self._canvas_dimension_input.on("keydown", self._on_canvas_dimension_keydown)
+        self._canvas_dimension_apply = _button(
+            "Apply", "mdi-check", lambda *args: self._commit_canvas_dimension_edit(),
+            color="primary", style="min-height:30px;",
+        )
+        self._canvas_dimension_cancel = _button(
+            "Cancel", "mdi-close", lambda *args: self._cancel_canvas_dimension_edit(),
+            style="min-height:30px;",
+        )
+        self._canvas_dimension_title = Div("Dimension", ui_style="flex:1; font-weight:600;")
+        self._canvas_dimension_expand = _button(
+            "", "mdi-open-in-new", lambda *_args: self.js.eval("window.__mmfemDimensionEditor.expand()"),
+            tooltip="Open movable dimension editor", style="min-width:26px; padding:2px;",
+        )
+        self._canvas_dimension_error = Div("", ui_style="color:var(--negative); font-size:12px;")
+        self._canvas_dimension_editor = Div(
+            Div(self._canvas_dimension_title, ui_class="dimension-editor-header"),
+            Div(self._canvas_dimension_input, self._canvas_dimension_expand,
+                ui_class="dimension-editor-value", ui_style="display:flex; align-items:center; gap:3px;"),
+            self._canvas_dimension_error,
+            Div(
+                self._canvas_dimension_apply,
+                self._canvas_dimension_cancel,
+                ui_class="dimension-editor-actions",
+                ui_style="display:flex; gap:6px; justify-content:flex-end;",
+            ),
+            id="solve-sketch-dimension-editor",
+            ui_class="solve-sketch-dimension-editor",
+            ui_style=(
+                "display:none; position:absolute; z-index:10001; width:190px; "
+                "padding:8px; border:1px solid var(--border, #d6dde5); "
+                "border-radius:8px; background:var(--surface, #fff); "
+                "box-shadow:0 8px 24px #14263830;"
+            ),
+        )
+        # Mount one context menu on the canvas host so right-clicks can target
+        # a region, an edge, a hole, or the empty canvas.
         self._canvas_context_menu = self._region_context_menu()
         self._canvas_host = Div(
             self._canvas,
             self._canvas_resize_observer,
             self._canvas_context_menu,
+            self._canvas_dimension_editor,
             ui_class="relative-position",
             ui_style="position:relative; display:flex; flex:1 1 0%; height:0; flex-direction:column; min-width:0; min-height:0; overflow:hidden;",
         )
@@ -1868,8 +1916,8 @@ class SolveWorkspace(Div):
         script = r"""
 (() => {
   window.__ngsolveSketchTool = '__SKETCH_TOOL__';
-  if (window.__ngsolveSketchPointerCaptureVersion === 18) return;
-  window.__ngsolveSketchPointerCaptureVersion = 18;
+  if (window.__ngsolveSketchPointerCaptureVersion === 19) return;
+  window.__ngsolveSketchPointerCaptureVersion = 19;
   let active = false;
   let activePointerId = null;
   let dragStart = null;
@@ -1915,18 +1963,68 @@ class SolveWorkspace(Div):
     const svg = currentSvg();
     const menu = document.querySelector('.solve-sketch-context-menu');
     if (!menu || !targetIsSvg(event, svg)) return;
-    if (!svg.querySelector('[data-sketch-region-selected="true"]')) return;
     event.preventDefault();
     const host = menu.parentElement;
     if (!host) return;
-    menu.style.display = 'block';
+    const target = event.target;
+    const edge = target && target.closest ? target.closest('[data-sketch-edge-id]') : null;
+    const voidShape = target && target.closest ? target.closest('[data-sketch-void-id]') : null;
+    const dimension = target && target.closest ? target.closest('[data-sketch-dimension-key]') : null;
+    const region = !edge && !voidShape && target && target.closest
+      ? target.closest('[data-sketch-region-id]') : null;
+    const dimensionOwner = dimension ? dimension.getAttribute('data-sketch-dimension-owner') : null;
+    const dimensionOwnerKind = dimension ? dimension.getAttribute('data-sketch-dimension-owner-kind') : null;
+    const regionId = region ? region.getAttribute('data-sketch-region-id')
+      : (dimensionOwnerKind === 'region' ? dimensionOwner : null);
+    const edgeId = edge ? edge.getAttribute('data-sketch-edge-id')
+      : (dimensionOwnerKind === 'edge' ? dimensionOwner : null);
+    const voidId = voidShape ? voidShape.getAttribute('data-sketch-void-id') : null;
+    const selected = [...svg.querySelectorAll('[data-sketch-region-selected="true"]')];
+    const targetSelected = Boolean(region && region.getAttribute('data-sketch-region-selected') === 'true');
+    const selectedCount = targetSelected ? selected.length : (regionId ? 1 : selected.length);
+    const selectedGrouped = targetSelected
+      ? selected.some(node => node.getAttribute('data-sketch-region-grouped') === 'true')
+      : Boolean(region && region.getAttribute('data-sketch-region-grouped') === 'true');
+    const canEditRadius = edge && edge.getAttribute('data-sketch-edge-editable-radius') === 'true';
+    const visible = new Set(['fit_view', 'toggle_snap', 'toggle_grid', 'toggle_geometry', 'undo', 'redo']);
+    if (voidId) visible.add('create_region');
+    if (regionId || selectedCount) {
+      if (regionId || selectedCount === 1) {
+        visible.add('edit_dimensions'); visible.add('assign_material'); visible.add('mesh_size');
+      }
+      visible.add('delete');
+      if (selectedCount > 1) visible.add('group');
+      if (selectedGrouped) visible.add('ungroup');
+    }
+    if (edgeId) {
+      visible.add('edge_conditions');
+      visible.add('delete_edge');
+      if (canEditRadius) visible.add('edit_radius');
+    }
+    menu.querySelectorAll('[data-sketch-context-action]').forEach((node) => {
+      node.style.display = visible.has(node.getAttribute('data-sketch-context-action')) ? 'flex' : 'none';
+    });
+    const menuPoint = svgPoint(svg, event);
+    const scenePoint = menuPoint ? toScenePoint(menuPoint) : null;
     const bounds = host.getBoundingClientRect();
+    window.__ngsolveSketchContextRequest = {
+      regionId, edgeId, voidId,
+      point: scenePoint,
+      hostPoint: [event.clientX - bounds.left, event.clientY - bounds.top],
+      selectedCount,
+    };
+    menu.style.display = 'block';
     const maxLeft = Math.max(0, host.clientWidth - menu.offsetWidth);
     const maxTop = Math.max(0, host.clientHeight - menu.offsetHeight);
     menu.style.left = Math.max(0, Math.min(event.clientX - bounds.left, maxLeft)) + 'px';
     menu.style.top = Math.max(0, Math.min(event.clientY - bounds.top, maxTop)) + 'px';
   };
   document.addEventListener('contextmenu', openSketchContextMenu, true);
+  document.addEventListener('selectstart', (event) => {
+    if (event.target && event.target.closest && event.target.closest('.solve-sketch-context-menu')) {
+      event.preventDefault();
+    }
+  }, true);
   document.addEventListener('pointerdown', (event) => {
     if (event.button === 2) {
       openSketchContextMenu(event);
@@ -1934,9 +2032,21 @@ class SolveWorkspace(Div):
     }
     const menu = document.querySelector('.solve-sketch-context-menu');
     if (menu && menu.style.display !== 'none' && !menu.contains(event.target)) hideSketchContextMenu();
+    const editor = document.querySelector('.solve-sketch-dimension-editor');
+    const onDimension = event.target && event.target.closest
+      && event.target.closest('[data-sketch-dimension-key]');
+    if (editor && editor.style.display !== 'none' && !editor.contains(event.target) && !onDimension) {
+      if (window.__mmfemDimensionEditor) window.__mmfemDimensionEditor.close();
+      else editor.style.display = 'none';
+    }
   }, true);
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') hideSketchContextMenu();
+    if (event.key === 'Escape') {
+      hideSketchContextMenu();
+      const editor = document.querySelector('.solve-sketch-dimension-editor');
+      if (window.__mmfemDimensionEditor) window.__mmfemDimensionEditor.close();
+      else if (editor) editor.style.display = 'none';
+    }
     const svg = currentSvg();
     const state = window.__ngsolveSketchConstruction || {};
     const target = event.target;
@@ -2228,11 +2338,17 @@ class SolveWorkspace(Div):
   const remember = (event) => {
     window.__ngsolveSketchPointer = [event.clientX, event.clientY];
     const targetRegion = event.target && event.target.closest
-      ? (event.target.closest('[data-sketch-region-id]') || {}).getAttribute('data-sketch-region-id')
+      ? event.target.closest('[data-sketch-region-id]')?.getAttribute('data-sketch-region-id')
       : null;
     const targetEdge = event.target && event.target.closest
-      ? (event.target.closest('[data-sketch-edge-id]') || {}).getAttribute('data-sketch-edge-id')
+      ? event.target.closest('[data-sketch-edge-id]')?.getAttribute('data-sketch-edge-id')
       : null;
+    const dimension = event.target && event.target.closest
+      ? event.target.closest('[data-sketch-dimension-key]')
+      : null;
+    const dimensionOwner = dimension ? dimension.getAttribute('data-sketch-dimension-owner') : null;
+    const dimensionOwnerKind = dimension ? dimension.getAttribute('data-sketch-dimension-owner-kind') : null;
+    const dimensionKey = dimension ? dimension.getAttribute('data-sketch-dimension-key') : null;
     const fallbackRegion = event.type === 'mousedown'
       && window.__ngsolveSketchRegionForNextMouseDownKnown
       ? window.__ngsolveSketchRegionForNextMouseDown
@@ -2247,6 +2363,7 @@ class SolveWorkspace(Div):
       y: event.clientY,
       regionId: targetRegion || fallbackRegion || null,
       edgeId: targetEdge || null,
+      dimensionOwner, dimensionOwnerKind, dimensionKey,
       regionKnown,
     });
     if (event.type === 'mousedown') {
@@ -2328,6 +2445,14 @@ class SolveWorkspace(Div):
         dragRegionId,
         preserveCommitted ? committedRegionOffsets.get(dragRegionId) || null : null,
       );
+    }
+    for (const shape of svg.querySelectorAll('[data-sketch-region-role="shape"]')) {
+      const outer = shape.getAttribute('data-sketch-region-outer-path');
+      if (outer === null) continue;
+      try {
+        const holes = JSON.parse(shape.getAttribute('data-sketch-region-hole-paths') || '[]');
+        shape.setAttribute('d', [outer, ...holes.map((hole) => hole.d)].filter(Boolean).join(' '));
+      } catch (_) { /* Keep the current fill if preview metadata is invalid. */ }
     }
     window.__ngsolveSketchLastRegionId = null;
     if (resetView) resetCanvasTransform(svg);
@@ -2770,11 +2895,31 @@ class SolveWorkspace(Div):
       const dy = grid && grid.enabled ? end[1] - start[1] : quantize(end[1] - start[1]);
       const baseOffset = committedRegionOffsets.get(dragRegionId) || [0, 0];
       for (const shape of regionElements(svg, dragRegionId)) {
-        const isFilledRegion = shape.getAttribute('data-sketch-region-role') === 'shape';
-        const totalX = (isFilledRegion ? 0 : baseOffset[0]) + dx;
-        const totalY = (isFilledRegion ? 0 : baseOffset[1]) + dy;
+        const totalX = baseOffset[0] + dx;
+        const totalY = baseOffset[1] + dy;
         if (totalX === 0 && totalY === 0) shape.removeAttribute('transform');
         else shape.setAttribute('transform', `translate(${totalX} ${totalY})`);
+      }
+      const regionShape = Array.from(regionElements(svg, dragRegionId)).find(
+        (node) => node.getAttribute('data-sketch-region-role') === 'shape'
+      );
+      const parentId = regionShape && regionShape.getAttribute('data-sketch-region-parent-id');
+      if (parentId) {
+        const parentShape = Array.from(svg.querySelectorAll('[data-sketch-region-role="shape"]'))
+          .find((node) => node.getAttribute('data-sketch-region-id') === parentId);
+        if (parentShape) {
+          try {
+            const outer = parentShape.getAttribute('data-sketch-region-outer-path') || '';
+            const holes = JSON.parse(parentShape.getAttribute('data-sketch-region-hole-paths') || '[]');
+            const translated = (path) => path.replace(
+              /([ML])\s*(-?(?:\d+(?:\.\d*)?|\.\d+)),(-?(?:\d+(?:\.\d*)?|\.\d+))/g,
+              (_match, command, x, y) => command + (Number(x) + dx).toFixed(3) + ',' + (Number(y) + dy).toFixed(3)
+            );
+            parentShape.setAttribute('d', [outer, ...holes.map((hole) =>
+              hole.id === dragRegionId ? translated(hole.d) : hole.d
+            )].filter(Boolean).join(' '));
+          } catch (_) { /* Keep the last valid parent fill if preview metadata is unavailable. */ }
+        }
       }
       if (window.__ngsolveSketchSelectedRegionId === dragRegionId) {
         const dimensions = svg.querySelector('#solve-sketch-dimensions');
@@ -2886,6 +3031,7 @@ class SolveWorkspace(Div):
   };
   const beginGesture = (event, svg) => {
     if (!targetIsSvg(event, svg) || ![0, 1].includes(event.button) || event.isPrimary === false) return;
+    if (event.target && event.target.closest && event.target.closest('[data-sketch-dimension-key]')) return;
     // The line-chain tool completes with Enter/Escape. SVG canvases are not
     // reliably focused by pointer capture alone, so focus it explicitly on
     // line-tool gestures to ensure the keyboard event reaches its handler.
@@ -3098,6 +3244,11 @@ class SolveWorkspace(Div):
     for (const update of validFills) {
       const shape = shapesById.get(String(update.id));
       shape.setAttribute('d', update.d);
+      if (typeof update.outer === 'string') {
+        shape.setAttribute('data-sketch-region-outer-path', update.outer);
+        shape.setAttribute('data-sketch-region-hole-paths', JSON.stringify(update.holes || []));
+        shape.setAttribute('data-sketch-region-parent-id', update.parentId || '');
+      }
       shape.removeAttribute('transform');
     }
     for (const update of validEdges) {
@@ -3397,6 +3548,27 @@ class SolveWorkspace(Div):
         except Exception:
             return value.get("edge_id") or value.get("edgeId")
 
+    def _read_canvas_dimension_key(self, value):
+        if not isinstance(value, dict):
+            return None
+        direct = value.get("dimension_key") or value.get("dimensionKey")
+        if direct:
+            return direct
+        timestamp = value.get("timeStamp")
+        try:
+            timestamp_js = "null" if timestamp is None else repr(float(timestamp))
+            key = self.js.eval(
+                "((timestamp) => { const events = window.__ngsolveSketchPointerEvents || []; "
+                "const event = (timestamp === null ? null : events.filter(item => item.type === 'mousedown' "
+                "&& Math.abs(item.timeStamp - timestamp) < 1)[0]) "
+                "|| events.slice().reverse().filter(item => item.type === 'mousedown')[0]; "
+                "return event ? event.dimensionKey || null : null; })"
+                f"({timestamp_js})"
+            )
+            return str(key) if key else None
+        except Exception:
+            return None
+
     def _canvas_event_point(self, event, *, refresh_transform=False):
         value = getattr(event, "value", None)
         if not isinstance(value, dict):
@@ -3427,6 +3599,13 @@ class SolveWorkspace(Div):
     def _on_canvas_mouse_down(self, event):
         value = getattr(event, "value", None)
         if not isinstance(value, dict):
+            return
+        has_dimension_pointer = (
+            value.get("timeStamp") is not None
+            or value.get("dimension_key")
+            or value.get("dimensionKey")
+        )
+        if has_dimension_pointer and self._read_canvas_dimension_key(value):
             return
         try:
             button = int(value.get("button", 0) or 0)
@@ -3539,6 +3718,25 @@ class SolveWorkspace(Div):
             for region in self.model["geometry"].get("regions", [])
             if len(region.get("vertices", [])) >= 3
             and _point_in_or_on_polygon(world_point, region["vertices"])
+        ]
+        return min(candidates)[1] if candidates else None
+
+    def _void_at_canvas_point(self, point):
+        """Return the smallest preserved hole under a canvas point."""
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            return None
+        try:
+            _, unproject = self._canvas_projection()
+            world_point = unproject((float(point[0]), float(point[1])))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        candidates = [
+            (abs(_polygon_area(void.get("vertices", []))), void.get("id"))
+            for void in self.model.get("geometry", {}).get("voids", [])
+            if isinstance(void, dict)
+            and isinstance(void.get("id"), str)
+            and len(void.get("vertices", [])) >= 3
+            and _point_in_or_on_polygon(world_point, void["vertices"])
         ]
         return min(candidates)[1] if candidates else None
 
@@ -7321,11 +7519,22 @@ class SolveWorkspace(Div):
         regions_by_id = {
             item.get("id"): item for item in self.model["geometry"].get("regions", [])
         }
-        fill_updates = [
-            {"id": affected_id, "d": self._canvas_region_path_data(regions_by_id[affected_id])}
-            for affected_id in dict.fromkeys(fill_region_ids)
-            if affected_id in regions_by_id
-        ]
+        fill_updates = []
+        for affected_id in dict.fromkeys(fill_region_ids):
+            region = regions_by_id.get(affected_id)
+            if region is None:
+                continue
+            parts = self._canvas_region_path_parts(region)
+            fill_updates.append({
+                "id": affected_id,
+                "d": " ".join(
+                    path for path in [parts["outer"], *(hole["d"] for hole in parts["holes"])]
+                    if path
+                ),
+                "outer": parts["outer"],
+                "holes": parts["holes"],
+                "parentId": region.get("parent_id") or "",
+            })
         project, _ = self._canvas_projection()
         edge_updates = []
         for edge in self.model["geometry"].get("edges", []):
@@ -9466,37 +9675,128 @@ class SolveWorkspace(Div):
         self._set_selected_regions(list(targets))
 
     def _region_context_menu(self):
-        delete_item = QItem(
-            QItemSection(QIcon(ui_name="mdi-delete-outline", ui_size="xs"), ui_avatar=True),
-            QItemSection("Delete selected regions"),
-            ui_clickable=True, ui_dense=True,
-        )
-        delete_item.on_click(lambda *args: self._run_region_context_action(self.delete_selected_regions))
-        group_item = QItem(
-            QItemSection(QIcon(ui_name="mdi-folder-plus-outline", ui_size="xs"), ui_avatar=True),
-            QItemSection("Group selected regions"),
-            ui_clickable=True, ui_dense=True,
-        )
-        group_item.on_click(lambda *args: self._run_region_context_action(self.group_selected_regions))
-        ungroup_item = QItem(
-            QItemSection(QIcon(ui_name="mdi-folder-remove-outline", ui_size="xs"), ui_avatar=True),
-            QItemSection("Ungroup selected regions"),
-            ui_clickable=True, ui_dense=True,
-        )
-        ungroup_item.on_click(lambda *args: self._run_region_context_action(self.ungroup_selected_regions))
+        def item(action, label, icon):
+            result = QItem(
+                QItemSection(QIcon(ui_name=icon, ui_size="xs"), ui_avatar=True),
+                QItemSection(label),
+                ui_clickable=True, ui_dense=True,
+                ui_style="display:none;",
+            )
+            result._props["data-sketch-context-action"] = action
+            result.on_click(lambda *args, selected_action=action: self._run_canvas_context_action(selected_action))
+            return result
+
+        separator = Div(ui_style="display:none; height:1px; margin:3px 0; background:var(--border, #d6dde5);")
+        separator._props["data-sketch-context-separator"] = "region"
         menu = Div(
-            delete_item, group_item, ungroup_item,
+            item("create_region", "Create region here", "mdi-vector-square-plus"),
+            item("edit_dimensions", "Edit dimensions", "mdi-resize"),
+            item("assign_material", "Assign material", "mdi-cube-outline"),
+            item("mesh_size", "Set mesh size", "mdi-vector-triangle"),
+            item("edit_radius", "Edit radius", "mdi-radius-outline"),
+            item("edge_conditions", "Boundary conditions", "mdi-vector-link"),
+            item("delete_edge", "Delete selected edge", "mdi-delete-outline"),
+            item("delete", "Delete selected regions", "mdi-delete-outline"),
+            item("group", "Group selected regions", "mdi-folder-plus-outline"),
+            item("ungroup", "Ungroup selected regions", "mdi-folder-remove-outline"),
+            separator,
+            item("fit_view", "Fit view", "mdi-fit-to-screen-outline"),
+            item("toggle_snap", "Toggle grid snapping", "mdi-magnet-on"),
+            item("toggle_grid", "Show / hide grid", "mdi-grid"),
+            item("toggle_geometry", "Show / hide geometry", "mdi-eye-outline"),
+            item("undo", "Undo", "mdi-undo"),
+            item("redo", "Redo", "mdi-redo"),
             id="solve-sketch-context-menu",
             ui_class="solve-sketch-context-menu",
             ui_style=(
                 "display:none; position:absolute; z-index:10000; min-width:220px; "
+                "max-height:calc(100% - 8px); overflow-y:auto; "
                 "padding:4px; border:1px solid var(--border, #d6dde5); "
                 "border-radius:8px; background:var(--surface, #fff); "
-                "box-shadow:0 8px 24px #14263830;"
+                "box-shadow:0 8px 24px #14263830; user-select:none; -webkit-user-select:none;"
             ),
         )
-        menu.on("click", lambda *_: self._hide_region_context_menu())
         return menu
+
+    def _canvas_context_request(self):
+        try:
+            request = self.js.eval("window.__ngsolveSketchContextRequest || null")
+            if isinstance(request, str):
+                request = json.loads(request)
+            return request if isinstance(request, dict) else {}
+        except Exception:
+            return {}
+
+    def _select_context_region(self, region_id):
+        if not region_id or not any(item.get("id") == region_id for item in self.model["geometry"]["regions"]):
+            return None
+        if region_id not in self._selected_region_ids_live():
+            self.select_region(region_id)
+        return self._selected_region()
+
+    def _select_context_edge(self, edge_id):
+        if not edge_id or not any(item.get("id") == edge_id for item in self.model["geometry"]["edges"]):
+            return None
+        if edge_id != self.selected_edge_id:
+            self.select_edge(edge_id)
+        return self._selected_edge()
+
+    def _run_canvas_context_action(self, action):
+        request = self._canvas_context_request()
+        region_id = request.get("regionId")
+        edge_id = request.get("edgeId")
+        void_id = request.get("voidId")
+        if not region_id:
+            selected = self._selected_region_ids_live()
+            region_id = selected[0] if len(selected) == 1 else None
+        if action == "create_region":
+            result = self._create_region_from_void(void_id, point=request.get("point"))
+        elif action == "edit_dimensions":
+            result = self._select_context_region(region_id)
+        elif action == "assign_material":
+            region = self._select_context_region(region_id)
+            result = self._open_region_material_editor(region.get("id")) if region else None
+        elif action == "mesh_size":
+            region = self._select_context_region(region_id)
+            result = self._open_region_mesh_size_editor(region.get("id")) if region else None
+        elif action == "edit_radius":
+            edge = self._select_context_edge(edge_id)
+            if edge and isinstance(edge.get("curve"), dict) and edge["curve"].get("type") == "arc":
+                result = self._open_canvas_dimension_editor(
+                    "edge", edge_id, "radius", position=request.get("hostPoint"),
+                )
+            else:
+                result = None
+        elif action == "edge_conditions":
+            edge = self._select_context_edge(edge_id)
+            result = self.select_section("boundaries") if edge else None
+        elif action == "delete_edge":
+            edge = self._select_context_edge(edge_id)
+            result = self.delete_selected_sketch_edges() if edge else None
+        elif action == "delete":
+            if region_id:
+                self._select_context_region(region_id)
+            result = self.delete_selected_regions()
+        elif action == "group":
+            result = self.group_selected_regions()
+        elif action == "ungroup":
+            result = self.ungroup_selected_regions()
+        elif action == "fit_view":
+            result = self.fit_canvas_view()
+        elif action == "toggle_snap":
+            result = self.toggle_snap_to_grid()
+        elif action == "toggle_grid":
+            result = self.toggle_canvas_background()
+        elif action == "toggle_geometry":
+            result = self.toggle_canvas_geometry()
+        elif action == "undo":
+            result = self.undo()
+        elif action == "redo":
+            result = self.redo()
+        else:
+            result = None
+        self._hide_region_context_menu()
+        return result
 
     def _run_region_context_action(self, action):
         try:
@@ -9703,6 +10003,59 @@ class SolveWorkspace(Div):
             self._refresh_model_tree()
             self._render_inspector()
             self.render_canvas()
+        return True
+
+    @_history_tracked
+    def _create_region_from_void(self, void_id=None, *, point=None):
+        geometry = self.model.setdefault("geometry", {})
+        voids = geometry.setdefault("voids", [])
+        if not void_id:
+            void_id = self._void_at_canvas_point(point)
+        void = next((item for item in voids if item.get("id") == void_id), None)
+        if not isinstance(void, dict):
+            self._message("Right-click inside an enclosed opening to create a region.", error=True)
+            return False
+        vertices = copy.deepcopy(void.get("vertices", []))
+        shape = copy.deepcopy(void.get("shape", {}))
+        if len(vertices) < 3 or not isinstance(shape, dict):
+            self._message("This opening does not have a valid closed contour.", error=True)
+            return False
+        shape_type = shape.get("type")
+        region_ids = [item.get("id") for item in geometry.get("regions", [])]
+        existing_names = {str(item.get("name", "")) for item in geometry.get("regions", [])}
+        index = len(region_ids) + 1
+        name = f"Region {index}"
+        while name in existing_names:
+            index += 1
+            name = f"Region {index}"
+        region = {
+            "id": new_id("region"),
+            "name": name,
+            "shape": shape,
+            "vertices": vertices,
+            "material_id": None,
+            "parent_id": void.get("parent_id"),
+            "mechanical": False,
+            "sources": {
+                "dc_current_density": "0",
+                "ac_current_density_real": "0",
+                "ac_current_density_imaginary": "0",
+                "mechanical_body_force": {"r": "0", "z": "0"},
+            },
+            "edge_ids": copy.deepcopy(void.get("edge_ids", [])),
+            "boundary_loops": copy.deepcopy(void.get("boundary_loops", [])),
+            "constraints": self._primitive_constraints(shape_type) if shape_type in {"rectangle", "circle"} else [],
+        }
+        self._preserve_canvas_view()
+        geometry["regions"].append(region)
+        geometry["voids"] = [item for item in voids if item.get("id") != void_id]
+        self._recompute_parent_links()
+        self._rebuild_edges()
+        self._refresh_model_tree()
+        self._render_inspector()
+        self.render_canvas()
+        self.select_region(region["id"])
+        self._message(f"Created {region['name']} in the opening.")
         return True
 
     def _on_canvas_region_click(self, region_id, event=None):
@@ -9918,7 +10271,40 @@ class SolveWorkspace(Div):
     def _canvas_dimension_components(self):
         """Build the selected region's dimension annotations separately."""
         region = self._selected_region()
-        return self._region_dimension_components(region)
+        if region is not None:
+            return self._region_dimension_components(region)
+        return self._edge_dimension_components(self._selected_edge())
+
+    def _editable_dimension_label(self, owner_kind, owner_id, key, label_id, x, y, text, *, anchor="middle"):
+        width = max(48, len(text) * 6.5 + 12)
+        label = _svg(
+            "g",
+            id=label_id,
+            x=x,
+            y=y,
+            text_anchor=anchor,
+            fill="#263746",
+            font_size="11",
+            font_weight="600",
+            data_sketch_dimension_key=key,
+            data_sketch_dimension_owner=owner_id,
+            data_sketch_dimension_owner_kind=owner_kind,
+            style=(
+                "pointer-events:all; cursor:text; user-select:none; "
+                "paint-order:stroke; stroke:#f4f6f8; stroke-width:4px; stroke-linejoin:round;"
+            ),
+            children=[
+                _svg("rect", x=x - (width / 2 if anchor == "middle" else 6), y=y - 17,
+                     width=width, height=27, fill="transparent", stroke="none", style="pointer-events:all;"),
+                _svg("text", x=x, y=y, text_anchor=anchor, children=text),
+            ],
+        )
+        label.on(
+            "click",
+            lambda event, kind=owner_kind, oid=owner_id, dimension=key, lid=label_id:
+                self._open_canvas_dimension_editor(kind, oid, dimension, label_id=lid),
+        )
+        return label
 
     def _region_dimension_components(self, region):
         """Build dimensions for a region, whether or not it is selected."""
@@ -9932,17 +10318,22 @@ class SolveWorkspace(Div):
             width_m = float(shape_data.get("width", 0))
             height_m = float(shape_data.get("height", 0))
             dim_style = "stroke:#455f78; stroke-width:1; fill:none; pointer-events:none;"
-            text_style = "fill:#263746; font-size:11px; font-weight:600; pointer-events:none;"
             offset = 18
             return [
                 _svg("line", x1=p0[0], y1=p0[1] + offset, x2=p1[0], y2=p1[1] + offset, style=dim_style),
                 _svg("line", x1=p0[0], y1=p0[1] + 4, x2=p0[0], y2=p0[1] + offset + 3, style=dim_style),
                 _svg("line", x1=p1[0], y1=p1[1] + 4, x2=p1[0], y2=p1[1] + offset + 3, style=dim_style),
-                _svg("text", x=(p0[0] + p1[0]) / 2, y=p0[1] + offset + 14, text_anchor="middle", style=text_style, children=f"W {width_m:.4g} m"),
+                self._editable_dimension_label(
+                    "region", region["id"], "width", f"solve-sketch-dimension-{region['id']}-width",
+                    (p0[0] + p1[0]) / 2, p0[1] + offset + 14, f"W {width_m:.4g} m",
+                ),
                 _svg("line", x1=p1[0] + offset, y1=p1[1], x2=p2[0] + offset, y2=p2[1], style=dim_style),
                 _svg("line", x1=p1[0] + 4, y1=p1[1], x2=p1[0] + offset + 3, y2=p1[1], style=dim_style),
                 _svg("line", x1=p2[0] + 4, y1=p2[1], x2=p2[0] + offset + 3, y2=p2[1], style=dim_style),
-                _svg("text", x=p1[0] + offset + 5, y=(p1[1] + p2[1]) / 2, style=text_style, children=f"H {height_m:.4g} m"),
+                self._editable_dimension_label(
+                    "region", region["id"], "height", f"solve-sketch-dimension-{region['id']}-height",
+                    p1[0] + offset + 5, (p1[1] + p2[1]) / 2, f"H {height_m:.4g} m", anchor="start",
+                ),
             ]
         if shape_data.get("type") == "circle":
             center = xy((shape_data["r_center"], shape_data["z_center"]))
@@ -9950,14 +10341,161 @@ class SolveWorkspace(Div):
             radius_m = float(shape_data.get("radius", 0))
             return [
                 _svg("line", x1=center[0], y1=center[1], x2=radial[0], y2=radial[1], stroke="#455f78", stroke_width="1", style="pointer-events:none;"),
-                _svg("text", x=(center[0] + radial[0]) / 2, y=center[1] - 7, text_anchor="middle", fill="#263746", font_size="11", font_weight="600", style="pointer-events:none;", children=f"R {radius_m:.4g} m"),
+                self._editable_dimension_label(
+                    "region", region["id"], "radius", f"solve-sketch-dimension-{region['id']}-radius",
+                    (center[0] + radial[0]) / 2, center[1] - 7, f"R {radius_m:.4g} m",
+                ),
             ]
         return []
+
+    def _edge_dimension_components(self, edge):
+        if not isinstance(edge, dict):
+            return []
+        curve = edge.get("curve", {})
+        if not isinstance(curve, dict) or curve.get("type") != "arc":
+            return []
+        entity_id = edge.get("sketch_entity_id")
+        entity = next(
+            (item for item in self.model.get("geometry", {}).get("sketch_entities", [])
+             if item.get("id") == entity_id and len(item.get("points", [])) >= 3),
+            None,
+        )
+        if entity is None:
+            return []
+        try:
+            radius = float(curve.get("radius", entity.get("radius")))
+            center = curve.get("center", entity.get("center"))
+            if not math.isfinite(radius) or radius <= 0 or not isinstance(center, (list, tuple)) or len(center) < 2:
+                return []
+            samples = curve.get("sampled_points") or entity.get("sampled_points") or []
+            point = samples[len(samples) // 2] if len(samples) >= 2 else entity["points"][1]
+            xy, _ = self._canvas_projection()
+            center_xy = xy(center)
+            point_xy = xy(point)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return []
+        label_x = (center_xy[0] + point_xy[0]) / 2
+        label_y = (center_xy[1] + point_xy[1]) / 2 - 7
+        return [
+            _svg(
+                "line", x1=center_xy[0], y1=center_xy[1], x2=point_xy[0], y2=point_xy[1],
+                stroke="#455f78", stroke_width="1", style="pointer-events:none;",
+            ),
+            self._editable_dimension_label(
+                "edge", edge["id"], "radius", f"solve-sketch-dimension-{edge['id']}-radius",
+                label_x, label_y, f"R {radius:.4g} m",
+            ),
+        ]
+
+    def _open_canvas_dimension_editor(self, owner_kind, owner_id, key, *, label_id=None, position=None):
+        if owner_kind == "region":
+            owner = next((item for item in self.model["geometry"]["regions"] if item.get("id") == owner_id), None)
+            if owner is None:
+                return False
+            shape = owner.get("shape", {})
+            value = shape.get("dimension_expressions", {}).get(key, shape.get(key))
+        elif owner_kind == "edge":
+            owner = next((item for item in self.model["geometry"]["edges"] if item.get("id") == owner_id), None)
+            if owner is None or key != "radius":
+                return False
+            value = owner.get("curve", {}).get("radius")
+        else:
+            return False
+        if value is None:
+            return False
+        label = {"width": "Width", "height": "Height", "radius": "Radius"}.get(key, key.title())
+        self._canvas_dimension_editor_target = (owner_kind, owner_id, key)
+        self._canvas_dimension_editor_value = str(value)
+        self._canvas_dimension_input.ui_label = None
+        self._canvas_dimension_input.ui_filled = False
+        self._canvas_dimension_input.ui_prefix = {"width": "W", "height": "H", "radius": "R"}.get(key, "")
+        self._canvas_dimension_input.ui_suffix = "m"
+        self._canvas_dimension_title.ui_children = [f"{label} (m)"]
+        self._canvas_dimension_error.ui_children = []
+        self._canvas_dimension_input.ui_model_value = str(value)
+        try:
+            script = (Path(__file__).parent / "assets" / "dimension_editor.js").read_text(encoding="utf-8")
+            self.js.eval(script)
+            self.js.eval(
+                "window.__mmfemDimensionEditor.open("
+                f"{json.dumps(label_id)}, {json.dumps(position)}, {json.dumps(bool(label_id))})"
+            )
+            return True
+        except Exception:
+            pass
+        try:
+            if position is None:
+                label_arg = json.dumps(label_id)
+                position = self.js.eval(
+                    "((labelId) => { const label = document.getElementById(labelId); "
+                    "const editor = document.querySelector('.solve-sketch-dimension-editor'); "
+                    "const host = editor && editor.parentElement; if (!label || !host) return null; "
+                    "const target = label.getBoundingClientRect(), bounds = host.getBoundingClientRect(); "
+                    "return [target.left - bounds.left + target.width / 2, target.bottom - bounds.top + 4]; })"
+                    f"({label_arg})"
+                )
+            if not isinstance(position, (list, tuple)) or len(position) < 2:
+                position = [self._canvas_width / 2, self._canvas_height / 2]
+            x, y = float(position[0]), float(position[1])
+            self.js.eval(
+                "(() => { const editor = document.querySelector('.solve-sketch-dimension-editor'); "
+                "if (!editor) return; const host = editor.parentElement; "
+                "editor.style.display = 'flex'; editor.style.flexDirection = 'column'; "
+                "editor.style.gap = '7px'; const left = Math.max(4, Math.min("
+                f"{x!r} - 92, host.clientWidth - editor.offsetWidth - 4)); "
+                f"const top = Math.max(4, Math.min({y!r}, host.clientHeight - editor.offsetHeight - 4)); "
+                "editor.style.left = left + 'px'; editor.style.top = top + 'px'; "
+                "const input = editor.querySelector('input'); if (input) { input.focus(); input.select(); } })()"
+            )
+        except Exception:
+            pass
+        return True
+
+    def _on_canvas_dimension_input(self, event):
+        self._canvas_dimension_editor_value = str(getattr(event, "value", ""))
+
+    def _on_canvas_dimension_keydown(self, event):
+        value = getattr(event, "value", None)
+        key = value.get("key") if isinstance(value, dict) else getattr(value, "key", None)
+        key = key or getattr(event, "key", None) or (value if isinstance(value, str) else None)
+        if key in {"Enter", "NumpadEnter"}:
+            self._commit_canvas_dimension_edit()
+        elif key == "Escape":
+            self._cancel_canvas_dimension_edit()
+
+    def _commit_canvas_dimension_edit(self):
+        target = self._canvas_dimension_editor_target
+        if not target:
+            return False
+        owner_kind, owner_id, key = target
+        if owner_kind == "region":
+            success = self._set_region_dimension(owner_id, key, self._canvas_dimension_editor_value)
+        else:
+            self.select_edge(owner_id)
+            success = self._set_selected_arc_radius(self._canvas_dimension_editor_value)
+        if success:
+            self._cancel_canvas_dimension_edit()
+        else:
+            self._canvas_dimension_error.ui_children = ["Cannot apply this value. Check the value and geometry constraints."]
+        return bool(success)
+
+    def _cancel_canvas_dimension_edit(self):
+        self._canvas_dimension_editor_target = None
+        self._canvas_dimension_editor_value = ""
+        try:
+            self.js.eval(
+                "(() => { const editor = document.querySelector('.solve-sketch-dimension-editor'); "
+                "if (window.__mmfemDimensionEditor) window.__mmfemDimensionEditor.close(); "
+                "else if (editor) editor.style.display = 'none'; })()"
+            )
+        except Exception:
+            pass
+        return True
 
     def _render_canvas_dimensions(self):
         """Update selected dimensions without replacing the full sketch scene."""
         region = self._selected_region()
-        self._canvas_dimensions.ui_children = self._region_dimension_components(region)
+        self._canvas_dimensions.ui_children = self._canvas_dimension_components()
         _update_svg_props(
             self._canvas_dimensions,
             display="inline" if self._canvas_geometry_visible else "none",
@@ -11527,7 +12065,7 @@ class SolveWorkspace(Div):
             # Standalone tests and non-browser frontends do not expose JS.
             pass
 
-    def _canvas_region_path_data(self, region, project=None):
+    def _canvas_region_path_parts(self, region, project=None):
         if project is None:
             project, _ = self._canvas_projection()
 
@@ -11583,20 +12121,23 @@ class SolveWorkspace(Div):
             return " ".join(commands) + " Z"
 
         regions = geometry.get("regions", [])
-        child_loops = [
-            contour_points(child) for child in regions
+        holes = [
+            {"id": child.get("id"), "d": subpath(contour_points(child))}
+            for child in regions
             if child.get("parent_id") == region.get("id")
         ]
-        void_loops = [
-            contour_points(void) for void in geometry.get("voids", [])
+        holes.extend(
+            {"id": void.get("id"), "d": subpath(contour_points(void))}
+            for void in geometry.get("voids", [])
             if void.get("parent_id") == region.get("id")
-        ]
+        )
+        return {"outer": subpath(contour_points(region)), "holes": holes}
+
+    def _canvas_region_path_data(self, region, project=None):
+        parts = self._canvas_region_path_parts(region, project)
         return " ".join(
-            item for item in [
-                subpath(contour_points(region)),
-                *(subpath(loop) for loop in child_loops),
-                *(subpath(loop) for loop in void_loops),
-            ] if item
+            path for path in [parts["outer"], *(hole["d"] for hole in parts["holes"])]
+            if path
         )
 
     def render_canvas(self):
@@ -11665,12 +12206,48 @@ class SolveWorkspace(Div):
         grid_children.append(_svg("text", x=plot[0] + 8, y=plot[1] + 15, fill="var(--fg-muted, #697586)", font_size="12", style=grid_text_style, children="z  [m]"))
 
         material_index = {item["id"]: index for index, item in enumerate(self.model["materials"])}
+        voids = self.model.get("geometry", {}).get("voids", [])
+        live_void_ids = set()
+        for void in voids:
+            void_id = void.get("id")
+            if not isinstance(void_id, str):
+                continue
+            live_void_ids.add(void_id)
+            props = {
+                "d": self._canvas_region_path_data(void, xy),
+                "id": f"solve-sketch-void-{void_id}",
+                "fill": "transparent",
+                "fill_opacity": "0",
+                "stroke": "none",
+                "display": "inline" if self._canvas_geometry_visible else "none",
+                "data_sketch_void_id": void_id,
+                "style": "pointer-events:fill; cursor:context-menu; fill-rule:evenodd;",
+            }
+            shape = self._canvas_void_nodes.get(void_id)
+            if shape is None:
+                shape = _svg("path", **props)
+                self._canvas_void_nodes[void_id] = shape
+            else:
+                _update_svg_props(shape, **props)
+            scene_children.append(shape)
+        for void_id in self._canvas_void_nodes.keys() - live_void_ids:
+            del self._canvas_void_nodes[void_id]
+
+        grouped_region_ids = {
+            region_id
+            for group in self.model.get("region_groups", [])
+            for region_id in group.get("region_ids", [])
+        }
         region_cursor = "pointer" if self.sketch_tool == "select" else "crosshair"
         live_region_ids = set()
         for region in regions:
             region_id = region["id"]
             live_region_ids.add(region_id)
-            path_data = self._canvas_region_path_data(region, xy)
+            path_parts = self._canvas_region_path_parts(region, xy)
+            path_data = " ".join(
+                path for path in [path_parts["outer"], *(hole["d"] for hole in path_parts["holes"])]
+                if path
+            )
             color = _MATERIAL_COLORS[material_index.get(region.get("material_id"), 0) % len(_MATERIAL_COLORS)]
             selected = region_id in set(self._selected_region_ids_live())
             props = {
@@ -11683,7 +12260,11 @@ class SolveWorkspace(Div):
                 "stroke_width": "0",
                 "data_sketch_region_id": region_id,
                 "data_sketch_region_role": "shape",
+                "data_sketch_region_parent_id": region.get("parent_id") or "",
+                "data_sketch_region_outer_path": path_parts["outer"],
+                "data_sketch_region_hole_paths": json.dumps(path_parts["holes"], separators=(",", ":")),
                 "data_sketch_region_selected": "true" if selected else "false",
+                "data_sketch_region_grouped": "true" if region_id in grouped_region_ids else "false",
                 "style": f"cursor:{region_cursor}; fill-rule:evenodd; outline:none;",
             }
             shape = self._canvas_region_nodes.get(region_id)
@@ -11700,6 +12281,7 @@ class SolveWorkspace(Div):
             self._canvas,
             self._canvas_resize_observer,
             self._canvas_context_menu,
+            self._canvas_dimension_editor,
         ]
 
         if self.mesh_preview_visible and self.mesh_preview_edges:
@@ -11748,6 +12330,11 @@ class SolveWorkspace(Div):
             condition_highlight = edge_id in highlighted_edges
             edge_color = "#ff8738" if condition_highlight else ("#0877b9" if selected else "#263746")
             curve_type = str(curve.get("type", "line")) if isinstance(curve, dict) else "line"
+            editable_radius = curve_type == "arc" and any(
+                entity.get("id") == edge.get("sketch_entity_id")
+                and len(entity.get("points", [])) >= 3
+                for entity in self.model.get("geometry", {}).get("sketch_entities", [])
+            )
             curve_center = curve.get("center") if isinstance(curve, dict) else None
             curve_center_x = curve_center[0] if isinstance(curve_center, (list, tuple)) and len(curve_center) >= 2 else None
             curve_center_y = curve_center[1] if isinstance(curve_center, (list, tuple)) and len(curve_center) >= 2 else None
@@ -11761,6 +12348,8 @@ class SolveWorkspace(Div):
                 "data_sketch_edge_id": edge_id,
                 "data_sketch_edge_role": "visible",
                 "data_sketch_curve_type": curve_type,
+                "data_sketch_edge_type": curve_type,
+                "data_sketch_edge_editable_radius": str(editable_radius).lower(),
                 "data_sketch_curve_center_x": curve_center_x,
                 "data_sketch_curve_center_y": curve_center_y,
                 "data_sketch_selected": str(selected).lower(),
@@ -11775,6 +12364,8 @@ class SolveWorkspace(Div):
                 "display": "inline" if self._canvas_geometry_visible else "none",
                 "data_sketch_edge_id": edge_id,
                 "data_sketch_edge_role": "hit",
+                "data_sketch_edge_type": curve_type,
+                "data_sketch_edge_editable_radius": str(editable_radius).lower(),
                 "data_sketch_region_id": region_id,
                 "style": f"cursor:{region_cursor}; pointer-events:stroke;",
             }
@@ -12271,7 +12862,7 @@ class SolveWorkspace(Div):
     def _set_region_value(self, region_id, key, value):
         region = next((item for item in self.model["geometry"]["regions"] if item["id"] == region_id), None)
         if region is None:
-            return
+            return False
         if key == "material_id" and value:
             material = next((item for item in self.model["materials"] if item["id"] == value), None)
             if material is None:
@@ -12298,6 +12889,7 @@ class SolveWorkspace(Div):
         old_vertices = copy.deepcopy(region["vertices"])
         old_parents = {item["id"]: item.get("parent_id") for item in self.model["geometry"]["regions"]}
         old_geometry = copy.deepcopy(self.model["geometry"]) if region.get("shape", {}).get("type") in {"imported_contour", "sketch"} else None
+        success = False
         try:
             expression = str(value).strip()
             parameters = {item["name"]: item for item in self.model.get("parameters", [])}
@@ -12344,7 +12936,7 @@ class SolveWorkspace(Div):
                 self._render_inspector()
                 self._message("Updated sketch contour dimensions.")
                 self.render_canvas()
-                return
+                return True
             shape[key] = dimension
             shape.setdefault("dimension_expressions", {})[key] = expression
             if shape["type"] == "rectangle":
@@ -12367,6 +12959,7 @@ class SolveWorkspace(Div):
             self._refresh_model_tree()
             self._render_inspector()
             self._message("Updated sketch dimension.")
+            success = True
         except (ValueError, TypeError, OverflowError) as error:
             if old_geometry is not None:
                 self.model["geometry"] = old_geometry
@@ -12379,6 +12972,7 @@ class SolveWorkspace(Div):
             self._render_inspector()
             self._message(str(error), error=True)
         self.render_canvas()
+        return success
 
     @_history_tracked
     def _set_edge_name(self, edge_id, value):
