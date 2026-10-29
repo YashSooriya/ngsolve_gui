@@ -25,9 +25,9 @@ from . import cerbsim_style as cb
 from .cerbsim_style import theme, kb_theme, flex_fill, panel_full
 from .system_monitor import SystemMonitor, available as system_monitor_available
 from .footer import StatusFooter
-from .solve_workspace import SolveWorkspace, default_run_history_root
 from .mesh_geometry import axisymmetric_mesh_edge_polylines
 from .axisymmetric_model import new_model, new_studies, unpack_model, package_model, serialize_model_json
+from .three_d_project import PROJECT_SUFFIX, unpack_3d_project
 from .result_files import (
     MESH_SUFFIX,
     SOLUTION_SUFFIX,
@@ -35,8 +35,8 @@ from .result_files import (
     make_solution_bundle,
     problem_fingerprint,
     read_mesh_bundle,
+    write_solution_bundle,
 )
-from .three_d_workspace import ThreeDProjectDialog
 
 
 def _request_guest_vm_shutdown():
@@ -526,8 +526,44 @@ def _app_menu_button(label, entries):
 
 
 class NGSolveGui(App):
+    @property
+    def solve_workspace(self):
+        if self._solve_workspace_instance is None:
+            from .solve_workspace import SolveWorkspace
+
+            workspace = SolveWorkspace(
+                on_run=lambda: self._run_axisymmetric_solver(mesh_only=False),
+                on_mesh=lambda: self._run_axisymmetric_solver(mesh_only=True),
+                on_cancel=self._cancel_axisymmetric_solver,
+                on_open_file=self._open_run_result,
+                on_history_change=self._refresh_solve_history_controls,
+            )
+            self._solve_workspace_instance = workspace
+            self._solve_workspace.ui_children = [workspace]
+        return self._solve_workspace_instance
+
+    @solve_workspace.setter
+    def solve_workspace(self, workspace):
+        self._solve_workspace_instance = workspace
+        if hasattr(self, "_solve_workspace"):
+            self._solve_workspace.ui_children = [workspace] if workspace is not None else []
+
+    @property
+    def _three_d_workspace(self):
+        if self._three_d_workspace_instance is None:
+            from .three_d_workspace import ThreeDWorkspace
+
+            workspace = ThreeDWorkspace(self)
+            self._three_d_workspace_instance = workspace
+            self._three_d_project_dialog = workspace
+            self._three_d_workspace_container.ui_children = [workspace]
+        return self._three_d_workspace_instance
+
     def __init__(self, filename=None, local_path=None, script_args=None):
         self._local_path = local_path
+        self._last_saved_path = None
+        self._active_project_type = None
+        self._pending_project_type = None
         self.script_args = list(script_args or [])
         self.app_data = AppData()
         self._solver_job_lock = threading.RLock()
@@ -555,10 +591,10 @@ class NGSolveGui(App):
             "mdi-file-plus-outline", "New problem (Ctrl+N)", self.new_problem
         )
         open_problem_btn = _tbtn(
-            "mdi-folder-open-outline", "Open problem (Ctrl+O)", self.load_problem_file
+            "mdi-folder-open-outline", "Open project (Ctrl+O)", self.open_project_file
         )
         save_problem_btn = _tbtn(
-            "mdi-content-save-outline", "Save problem (Ctrl+S)", self.save_problem_file
+            "mdi-content-save-outline", "Save project (Ctrl+S)", self.save_problem_file
         )
         self._undo_button = _tbtn(
             "mdi-undo", "Undo model change (Ctrl+Z)", self._undo_solve_action
@@ -593,7 +629,7 @@ class NGSolveGui(App):
                     Div("Save changes?", ui_style="font-size:18px; font-weight:650;")
                 ),
                 QCardSection(
-                    "The current problem has unsaved changes. Save them before replacing it, "
+                    "The current project has unsaved changes. Save them before replacing it, "
                     "discard them, or cancel to keep working."
                 ),
                 QCardActions(
@@ -722,15 +758,9 @@ class NGSolveGui(App):
             ),
             ui_hidden=True,
         )
-        self.solve_workspace = SolveWorkspace(
-            on_run=lambda: self._run_axisymmetric_solver(mesh_only=False),
-            on_mesh=lambda: self._run_axisymmetric_solver(mesh_only=True),
-            on_cancel=self._cancel_axisymmetric_solver,
-            on_open_file=self._open_run_result,
-            on_history_change=self._refresh_solve_history_controls,
-        )
+        self._solve_workspace_instance = None
         self._solve_workspace = Div(
-            self.solve_workspace,
+            ui_hidden=True,
             ui_style="flex:1 1 auto; min-height:0; width:100%;",
         )
 
@@ -786,14 +816,90 @@ class NGSolveGui(App):
             ui_model_value=False,
         )
         about_close.on_click(lambda *a: setattr(self._about_dialog, "ui_model_value", False))
-        self._three_d_project_dialog = ThreeDProjectDialog(self)
+        self._three_d_workspace_instance = None
+        self._three_d_workspace_container = Div(ui_hidden=True)
+        # Keep the older attribute for the project save/load helpers.
+        self._three_d_project_dialog = None
         self._menu_bar = self._build_application_menu_bar()
+
+        self._startup_status = Div(
+            "",
+            ui_style="min-height:20px; padding:0 24px 10px; color:var(--negative); font-size:13px;",
+        )
+        self._startup_recent_list = Div(
+            ui_style="display:flex; flex-direction:column; gap:6px; max-height:38vh; overflow:auto;",
+        )
+        axisymmetric_choice = QBtn(
+            ui_label="Axisymmetric",
+            ui_icon="mdi-axis-arrow",
+            ui_color="primary",
+            ui_no_caps=True,
+            ui_class="full-width",
+        )
+        axisymmetric_choice.on_click(self._start_axisymmetric_from_chooser)
+        three_d_choice = QBtn(
+            ui_label="3D",
+            ui_icon="mdi-cube-scan",
+            ui_outline=True,
+            ui_no_caps=True,
+            ui_class="full-width",
+        )
+        three_d_choice.on_click(self._start_3d_from_chooser)
+        open_project_choice = QBtn(
+            ui_label="Open project",
+            ui_icon="mdi-folder-open-outline",
+            ui_outline=True,
+            ui_no_caps=True,
+        )
+        open_project_choice.on_click(self.open_project_file)
+        self._startup_card = QCard(
+            QCardSection(
+                Div("MM-FEM", ui_style="font-size:26px; font-weight:700; color:var(--fg);"),
+                Div("Choose what you want to work on.", ui_style="font-size:14px; color:var(--fg-muted); margin-top:4px;"),
+                ui_style="padding:28px 28px 18px;",
+            ),
+            QCardSection(
+                Div("New project", ui_style="font-size:13px; font-weight:650; margin-bottom:10px;"),
+                Div(
+                    axisymmetric_choice,
+                    three_d_choice,
+                    ui_style="display:grid; grid-template-columns:1fr 1fr; gap:10px;",
+                ),
+                ui_style="padding:0 28px 16px;",
+            ),
+            QCardSection(
+                Div(open_project_choice, ui_style="display:flex; justify-content:flex-end;"),
+                ui_style="padding:0 28px 12px;",
+            ),
+            QCardSection(
+                Div("Recent projects", ui_style="font-size:13px; font-weight:650; margin-bottom:10px;"),
+                self._startup_recent_list,
+                ui_style="padding:0 28px 8px;",
+            ),
+            self._startup_status,
+            ui_style=(
+                "box-sizing:border-box; width:min(820px, 92vw); "
+                "max-height:88vh; overflow:hidden; border-radius:14px; "
+                "box-shadow:0 16px 56px #14263818;"
+            ),
+        )
+        self._startup_screen = Div(
+            self._startup_card,
+            ui_hidden=bool(filename),
+            ui_style=(
+                "position:fixed; inset:0; z-index:1500; display:grid; "
+                "place-items:center; box-sizing:border-box; padding:24px; "
+                "overflow:hidden; background:#fff;"
+            ),
+        )
+        self._refresh_recent_projects_view()
 
         super().__init__(
             self._menu_bar, bar, self._post_process_workspace,
-            self._solve_workspace, self._timer_dialog, self._new_problem_dialog,
-            self._settings_dialog, self._about_dialog, self._three_d_project_dialog,
-            self.kb.indicator, self.kb.help_overlay,
+            self._solve_workspace, self._three_d_workspace_container,
+            self._timer_dialog, self._new_problem_dialog,
+            self._settings_dialog, self._about_dialog,
+            self.kb.indicator, self.kb.help_overlay, self._startup_screen,
             ui_class=str(cb.app_root),
         )
 
@@ -817,7 +923,7 @@ class NGSolveGui(App):
         kb = self.kb
         kb.add("h", kb.toggle_help, "Show keyboard shortcuts", "General")
         kb.add("ctrl+n", lambda *a: self._run_menu_shortcut(self.new_problem), "New problem", "File")
-        kb.add("ctrl+o", lambda *a: self._run_menu_shortcut(self.load_problem_file), "Open problem", "File")
+        kb.add("ctrl+o", lambda *a: self._run_menu_shortcut(self.open_project_file), "Open project", "File")
         kb.add("ctrl+s", lambda *a: self._run_menu_shortcut(self.save_problem_file), "Save problem", "File")
         kb.add("delete", self._delete_selected_region_shortcut, "Delete selected geometry", "Solve")
         for key, tool, description in (
@@ -848,23 +954,311 @@ class NGSolveGui(App):
             )
         self.add_keybinding("escape", self._handle_escape_shortcut)
         self.on_before_save(self.__on_before_save)
-        if isinstance(filename, str):
-            self._load_with_status(filename)
-        elif isinstance(filename, list):
-            for f in filename:
+        startup_files = [filename] if isinstance(filename, str) else filename or []
+        if startup_files:
+            first, *remaining = startup_files
+            if Path(str(first)).suffix.lower() in {".json", ".ngsmodel", PROJECT_SUFFIX}:
+                self._open_project_path(first, from_startup=True)
+            else:
+                self._load_with_status(first)
+            for f in remaining:
                 self._load_with_status(f)
 
         self._refresh_solve_history_controls()
+
+    @staticmethod
+    def _project_path_key(path):
+        return os.path.normcase(os.path.normpath(os.path.abspath(os.path.expanduser(str(path)))))
+
+    def _recent_project_entries(self):
+        try:
+            stored = self.usersettings.get("recent_projects", [])
+        except Exception:
+            return []
+        if not isinstance(stored, list):
+            return []
+        entries = []
+        seen = set()
+        for item in stored:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                continue
+            path = os.path.abspath(os.path.expanduser(item["path"]))
+            key = self._project_path_key(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append({
+                "name": str(item.get("name") or Path(path).stem),
+                "path": path,
+                "kind": item.get("kind") if item.get("kind") in {"axisymmetric", "3d"} else "",
+            })
+        return entries[:8]
+
+    def _refresh_recent_projects_view(self):
+        if not hasattr(self, "_startup_recent_list"):
+            return
+        entries = self._recent_project_entries()
+        if not entries:
+            self._startup_recent_list.ui_children = [
+                Div("No recent projects.", ui_style="padding:10px 12px; color:var(--fg-muted); font-size:13px;")
+            ]
+            return
+        rows = []
+        for entry in entries:
+            exists = Path(entry["path"]).is_file()
+            open_button = QBtn(
+                ui_label="Open" if exists else "Locate",
+                ui_flat=True,
+                ui_dense=True,
+                ui_no_caps=True,
+                ui_color="primary",
+            )
+            if exists:
+                open_button.on_click(
+                    lambda *_args, item=dict(entry): self._open_recent_project(item)
+                )
+            else:
+                open_button.on_click(
+                    lambda *_args, item=dict(entry): self._locate_recent_project(item)
+                )
+            remove_button = QBtn(
+                QTooltip("Remove from recent"),
+                ui_icon="mdi-close",
+                ui_flat=True,
+                ui_dense=True,
+                ui_round=True,
+                ui_size="sm",
+            )
+            remove_button.on_click(
+                lambda *_args, item=dict(entry): self._remove_recent_project(item["path"])
+            )
+            rows.append(Div(
+                Div(
+                    Div(entry["name"], ui_style="font-size:13px; font-weight:600;"),
+                    Div(str(Path(entry["path"]).parent), ui_style="font-size:11px; color:var(--fg-muted); overflow-wrap:anywhere;"),
+                    ui_style="flex:1 1 auto; min-width:0;",
+                ),
+                open_button,
+                remove_button,
+                ui_style=(
+                    "display:flex; align-items:center; gap:8px; padding:7px 10px; "
+                    "border:1px solid var(--border); border-radius:8px; min-width:0;"
+                ),
+            ))
+        self._startup_recent_list.ui_children = rows
+
+    def _set_startup_status(self, message, *, error=True):
+        self._startup_status.ui_children = [str(message)] if message else []
+        self._startup_status.ui_style = (
+            "min-height:20px; padding:0 24px 10px; font-size:13px; "
+            + ("color:var(--negative);" if error else "color:var(--positive);")
+        )
+
+    def _hide_startup_chooser(self):
+        if hasattr(self, "_startup_screen"):
+            self._startup_screen.ui_hidden = True
+            self._startup_card.ui_hidden = False
+
+    def _remember_recent_project(self, path, *, kind, name=None):
+        if not path:
+            return
+        try:
+            actual_path = str(Path(path).expanduser().resolve(strict=False))
+            if not Path(actual_path).is_file():
+                return
+            key = self._project_path_key(actual_path)
+            entries = [
+                item for item in self._recent_project_entries()
+                if self._project_path_key(item["path"]) != key
+            ]
+            entries.insert(0, {
+                "name": str(name or Path(actual_path).stem),
+                "path": actual_path,
+                "kind": kind,
+            })
+            entries = entries[:8]
+            self.usersettings.set("recent_projects", entries)
+            self._refresh_recent_projects_view()
+        except (OSError, TypeError, ValueError):
+            return
+
+    def _remove_recent_project(self, path):
+        key = self._project_path_key(path)
+        entries = [
+            item for item in self._recent_project_entries()
+            if self._project_path_key(item["path"]) != key
+        ]
+        self.usersettings.set("recent_projects", entries)
+        self._refresh_recent_projects_view()
+
+    def _open_recent_project(self, entry):
+        return self._open_project_path(entry["path"], from_startup=True)
+
+    def _locate_recent_project(self, _entry):
+        return self.open_project_file()
+
+    @staticmethod
+    def _decode_project_file(data):
+        three_d_error = None
+        try:
+            project, assets = unpack_3d_project(data)
+            return "3d", project, assets
+        except Exception as error:
+            three_d_error = error
+        try:
+            model, studies, layout = unpack_model(data)
+            return "axisymmetric", (model, studies, layout), None
+        except Exception as axis_error:
+            raise ValueError(
+                "This file is not a supported MM-FEM project. "
+                f"3D check: {three_d_error}. Axisymmetric check: {axis_error}"
+            ) from axis_error
+
+    def _open_project_path(self, path, *, from_startup=False):
+        try:
+            actual_path = str(Path(path).expanduser().resolve(strict=True))
+            data = Path(actual_path).read_bytes()
+            kind, content, assets = self._decode_project_file(data)
+            startup_context = from_startup or not getattr(
+                getattr(self, "_startup_screen", None), "ui_hidden", True
+            )
+            project_name = (
+                content.get("name", Path(actual_path).stem)
+                if kind == "3d"
+                else content[0].get("name", Path(actual_path).stem)
+            )
+            def apply_project():
+                try:
+                    if kind == "axisymmetric":
+                        model, studies, layout = content
+                        self.solve_workspace.set_model(model, studies, layout)
+                        self._loaded_mesh_path = None
+                        self._loaded_mesh_problem_sha256 = None
+                        if self._workspace_mode != "solve":
+                            self._workspace_mode_toggle.select("solve")
+                        if self._three_d_workspace_instance is not None:
+                            self._three_d_workspace_instance.ui_hidden = True
+                            self._three_d_workspace_container.ui_hidden = True
+                        self._active_project_type = "axisymmetric"
+                        self._set_3d_workspace_active(False)
+                        self._hide_startup_chooser()
+                    else:
+                        if not self._three_d_workspace.load_project_data(content, assets):
+                            return False
+                        self._active_project_type = "3d"
+                        self._set_3d_workspace_active(True)
+                        self._hide_startup_chooser()
+                    self._remember_recent_project(
+                        actual_path, kind=kind, name=project_name
+                    )
+                    self._set_startup_status("")
+                    return True
+                except Exception as error:
+                    self._show_project_open_error(error, reveal_startup=startup_context)
+                    return False
+
+            return self._request_problem_replacement(apply_project)
+        except Exception as error:
+            self._show_project_open_error(
+                error,
+                reveal_startup=from_startup or not getattr(
+                    getattr(self, "_startup_screen", None), "ui_hidden", True
+                ),
+            )
+            return False
+
+    def _show_project_open_error(self, error, *, reveal_startup=False):
+        message = f"Could not open project: {error}"
+        screen = getattr(self, "_startup_screen", None)
+        if screen is not None and reveal_startup:
+            screen.ui_hidden = False
+            self._startup_card.ui_hidden = False
+            self._set_startup_status(message)
+        else:
+            self._notify(message, type="negative", timeout=8000)
+
+    def open_project_file(self, *_args):
+        startup_at_start = not getattr(
+            getattr(self, "_startup_screen", None), "ui_hidden", True
+        )
+        try:
+            path, data = self._pick_artifact(
+                title="Open MM-FEM project",
+                description="MM-FEM projects",
+                extension=".json",
+                additional_extensions=(".ngsmodel", PROJECT_SUFFIX),
+                force_native=True,
+            )
+            if not path:
+                return False
+            kind, content, assets = self._decode_project_file(data)
+            # Keep project identification independent of the selected suffix.
+            try:
+                actual_path = str(Path(path).expanduser().resolve(strict=True))
+            except OSError:
+                actual_path = path
+            startup_context = not getattr(
+                getattr(self, "_startup_screen", None), "ui_hidden", True
+            )
+            project_name = (
+                content.get("name", Path(actual_path).stem)
+                if kind == "3d"
+                else content[0].get("name", Path(actual_path).stem)
+            )
+            def apply_project():
+                try:
+                    if kind == "axisymmetric":
+                        model, studies, layout = content
+                        self.solve_workspace.set_model(model, studies, layout)
+                        self._loaded_mesh_path = None
+                        self._loaded_mesh_problem_sha256 = None
+                        if self._workspace_mode != "solve":
+                            self._workspace_mode_toggle.select("solve")
+                        if self._three_d_workspace_instance is not None:
+                            self._three_d_workspace_instance.ui_hidden = True
+                            self._three_d_workspace_container.ui_hidden = True
+                        self._active_project_type = "axisymmetric"
+                        self._set_3d_workspace_active(False)
+                        self._hide_startup_chooser()
+                    else:
+                        if not self._three_d_workspace.load_project_data(content, assets):
+                            return False
+                        self._active_project_type = "3d"
+                        self._set_3d_workspace_active(True)
+                        self._hide_startup_chooser()
+                    self._remember_recent_project(actual_path, kind=kind, name=project_name)
+                    self._set_startup_status("")
+                    return True
+                except Exception as error:
+                    self._show_project_open_error(error, reveal_startup=startup_context)
+                    return False
+
+            return self._request_problem_replacement(apply_project)
+        except Exception as error:
+            self._show_project_open_error(error, reveal_startup=startup_at_start)
+            return False
+
+    def _start_axisymmetric_from_chooser(self, *_args):
+        def start():
+            result = self._start_new_problem()
+            if result:
+                self._active_project_type = "axisymmetric"
+                self._hide_startup_chooser()
+                self._set_startup_status("")
+            return result
+        return self._request_problem_replacement(start)
+
+    def _start_3d_from_chooser(self, *_args):
+        return self._request_problem_replacement(self._start_3d_project_from_menu)
 
     def _build_application_menu_bar(self):
         menus = [
             ("File", [
                 ("New problem", self.new_problem, "mdi-file-plus-outline", "Ctrl+N"),
-                ("Open problem...", self.load_problem_file, "mdi-folder-open-outline", "Ctrl+O"),
-                ("Save problem", self.save_problem_file, "mdi-content-save-outline", "Ctrl+S"),
+                ("Open project...", self.open_project_file, "mdi-folder-open-outline", "Ctrl+O"),
+                ("Save project", self.save_problem_file, "mdi-content-save-outline", "Ctrl+S"),
                 None,
                 ("New 3D project...", self._new_3d_project, "mdi-cube-scan", None),
-                ("Open 3D project...", self._open_3d_project, "mdi-folder-open-outline", None),
                 None,
                 ("Import legacy Python problem...", self._choose_legacy_problem_file, "mdi-language-python", None),
                 ("Open external file...", self._load_file, "mdi-file-import-outline", None),
@@ -920,7 +1314,8 @@ class NGSolveGui(App):
                 ("Toggle snap to grid", self._menu_toggle_snap, "mdi-magnet", None),
                 ("Rename model...", self._menu_rename_model, "mdi-pencil-outline", None),
                 ("Preview geometry in 3D", self._menu_preview_geometry, "mdi-cube-scan", None),
-                ("Import STEP and wire traces...", self._new_3d_project, "mdi-cube-scan", None),
+                ("Import STEP model...", self._menu_import_step, "mdi-cube-scan", None),
+                ("Import wire traces...", self._menu_import_wire_trace, "mdi-vector-polyline", None),
             ]),
             ("Study", [
                 ("Check setup", self._menu_check_setup, "mdi-check-decagram-outline", None),
@@ -959,11 +1354,56 @@ class NGSolveGui(App):
         return self._request_problem_replacement(self._close_application_now)
 
     def _new_3d_project(self, *args):
-        self._three_d_project_dialog.show_new()
+        return self._request_problem_replacement(self._start_3d_project_from_menu)
+
+    def _menu_import_step(self, *args):
+        if self._active_project_type == "3d":
+            return self._three_d_workspace.import_step()
+        return self._request_problem_replacement(
+            lambda: self._start_3d_and_import(self._three_d_workspace.import_step)
+        )
+
+    def _menu_import_wire_trace(self, *args):
+        if self._active_project_type == "3d":
+            return self._three_d_workspace.import_wire_trace()
+        return self._request_problem_replacement(
+            lambda: self._start_3d_and_import(self._three_d_workspace.import_wire_trace)
+        )
+
+    def _start_3d_and_import(self, importer):
+        if not self._start_3d_project_from_menu():
+            return False
+        return importer()
 
     def _open_3d_project(self, *args):
-        self._three_d_project_dialog.ui_model_value = True
-        self._three_d_project_dialog.open_project()
+        return self.open_project_file(*args)
+
+    def _start_3d_project_from_menu(self):
+        if not self._three_d_workspace.show_new():
+            return False
+        self._active_project_type = "3d"
+        self._hide_startup_chooser()
+        self._set_3d_workspace_active(True)
+        return True
+
+    def _set_3d_workspace_active(self, active):
+        active = bool(active)
+        workspace = self._three_d_workspace_instance
+        if active:
+            workspace = self._three_d_workspace
+            self._three_d_workspace_container.ui_hidden = False
+        else:
+            self._three_d_workspace_container.ui_hidden = True
+        if workspace is not None:
+            workspace.ui_hidden = not active
+        self._workspace_mode_toggle.ui_hidden = active
+        if active:
+            self._solve_workspace.ui_hidden = True
+            self._post_process_workspace.ui_hidden = True
+        else:
+            self._solve_workspace.ui_hidden = self._workspace_mode != "solve"
+            self._post_process_workspace.ui_hidden = self._workspace_mode == "solve"
+        self._refresh_solve_history_controls()
 
     def _close_application_now(self):
         try:
@@ -1012,21 +1452,28 @@ class NGSolveGui(App):
             kb.on_escape()
         if overlay_was_open or getattr(self, "_workspace_mode", None) != "solve":
             return
-        workspace = getattr(self, "solve_workspace", None)
+        workspace = getattr(self, "_solve_workspace_instance", None)
         if workspace is not None:
             workspace._handle_sketch_escape()
 
     def _open_solve_section(self, section):
+        if self._active_project_type == "3d":
+            self._notify("Axisymmetric model sections are not part of the 3D workspace.", type="info", timeout=3000)
+            return False
         if self._workspace_mode != "solve":
             self._workspace_mode_toggle.select("solve")
         self.solve_workspace.select_section(section)
 
     def _menu_fit_view(self, *args):
+        if self._active_project_type == "3d":
+            return self._three_d_workspace.reset_camera()
         if self._workspace_mode == "solve":
             return self.solve_workspace.fit_canvas_view()
         return self._active_view_action("reset_camera")
 
     def _menu_camera_view(self, view):
+        if self._active_project_type == "3d":
+            return self._active_view_action("set_camera_view", view)
         if self._workspace_mode == "solve":
             if getattr(self.tab_panel, "comp", None) is None:
                 self._notify("Open a result in Post Process before choosing a camera view.", type="info", timeout=3000)
@@ -1035,6 +1482,12 @@ class NGSolveGui(App):
         return self._active_view_action("set_camera_view", view)
 
     def _active_view_action(self, method, *args):
+        if self._active_project_type == "3d":
+            callback = getattr(self._three_d_workspace, method, None)
+            if callable(callback):
+                return callback(*args)
+            self._notify("That view command is not available in the 3D workspace yet.", type="info", timeout=3000)
+            return False
         if self._workspace_mode != "post_process":
             self._notify("Switch to Post Process to use this view command.", type="info", timeout=3000)
             return False
@@ -1046,16 +1499,23 @@ class NGSolveGui(App):
         return False
 
     def _open_postprocess_controls(self, label):
+        if self._active_project_type == "3d":
+            self._notify("Post Process controls apply to solved result files.", type="info", timeout=3000)
+            return False
         if self._workspace_mode != "post_process":
             self._workspace_mode_toggle.select("post_process")
         return self._active_view_action("open_postprocess_controls", label)
 
     def _menu_toggle_tree(self, *args):
+        if self._active_project_type == "3d":
+            return self._three_d_workspace.toggle_tree()
         if self._workspace_mode == "solve":
             return self.solve_workspace._toggle_tree_panel()
         return self._toggle_navigator()
 
     def _menu_toggle_properties(self, *args):
+        if self._active_project_type == "3d":
+            return self._three_d_workspace.toggle_properties()
         if self._workspace_mode == "solve":
             return self.solve_workspace._toggle_properties_panel()
         return self._toggle_property_panel()
@@ -1094,15 +1554,21 @@ class NGSolveGui(App):
         return self.solve_workspace._cancel_solver_job()
 
     def _refresh_solve_history_controls(self):
-        workspace = getattr(self, "solve_workspace", None)
-        solving = getattr(self, "_workspace_mode", "solve") == "solve"
+        workspace = getattr(self, "_solve_workspace_instance", None)
+        solving = (
+            getattr(self, "_workspace_mode", "solve") == "solve"
+            and getattr(self, "_active_project_type", None) != "3d"
+        )
         if hasattr(self, "_undo_button"):
             self._undo_button.ui_disable = not (solving and workspace and workspace.can_undo)
         if hasattr(self, "_redo_button"):
             self._redo_button.ui_disable = not (solving and workspace and workspace.can_redo)
 
     def _solve_shortcut_context_active(self):
-        if getattr(self, "_workspace_mode", None) != "solve":
+        if (
+            getattr(self, "_workspace_mode", None) != "solve"
+            or getattr(self, "_active_project_type", None) == "3d"
+        ):
             return False
         # Preserve native text editing shortcuts while an input or editable
         # control has focus. The fallback keeps callbacks usable in standalone
@@ -1121,7 +1587,10 @@ class NGSolveGui(App):
     def _activate_sketch_tool_shortcut(self, tool):
         if not self._solve_shortcut_context_active():
             return False
-        workspace = getattr(self, "solve_workspace", None)
+        if hasattr(self, "_solve_workspace_instance"):
+            workspace = self._solve_workspace_instance
+        else:
+            workspace = getattr(self, "solve_workspace", None)
         if workspace is None:
             return False
         default_variants = {
@@ -1145,7 +1614,7 @@ class NGSolveGui(App):
     def _replacement_job_active(self):
         return bool(
             self._solver_job_active
-            or getattr(getattr(self, "solve_workspace", None), "_job_active", False)
+            or getattr(getattr(self, "_solve_workspace_instance", None), "_job_active", False)
         )
 
     def _has_unsaved_problem_changes(self):
@@ -1155,8 +1624,16 @@ class NGSolveGui(App):
             or getattr(workspace, "_editor_drawer", None) is not None
         )
 
+    def _has_unsaved_project_changes(self):
+        active = getattr(self, "_active_project_type", None)
+        if active == "3d":
+            return bool(getattr(getattr(self, "_three_d_project_dialog", None), "dirty", False))
+        if active == "axisymmetric":
+            return self._has_unsaved_problem_changes()
+        return False
+
     def _request_problem_replacement(self, action):
-        """Guard every operation that replaces the current problem document."""
+        """Guard every operation that replaces the active project."""
         if self._replacement_job_active():
             self._notify(
                 "Wait for the current solve to finish before replacing the problem.",
@@ -1164,8 +1641,17 @@ class NGSolveGui(App):
                 timeout=4000,
             )
             return False
-        if self._has_unsaved_problem_changes():
+        if self._has_unsaved_project_changes():
             self._pending_problem_replacement = action
+            active = getattr(self, "_active_project_type", None)
+            if active == "3d" or (
+                active is None
+                and getattr(getattr(self, "_three_d_project_dialog", None), "dirty", False)
+                and not self._has_unsaved_problem_changes()
+            ):
+                self._pending_project_type = "3d"
+            else:
+                self._pending_project_type = "axisymmetric"
             self._new_problem_dialog.ui_model_value = True
             return False
         return action()
@@ -1194,21 +1680,38 @@ class NGSolveGui(App):
     def _close_new_problem_dialog(self, *args):
         self._new_problem_dialog.ui_model_value = False
         self._pending_problem_replacement = None
+        self._pending_project_type = None
 
     def _continue_problem_replacement(self, save_changes):
         action = self._pending_problem_replacement
+        project_type = self._pending_project_type
         self._close_new_problem_dialog()
         if action is None:
             return False
         if save_changes:
-            if getattr(self.solve_workspace, "_editor_drawer", None) is not None:
-                self.solve_workspace._commit_editor()
-                if self.solve_workspace._editor_drawer is not None:
-                    return False
-            if not self.save_problem_file():
+            if project_type == "3d":
+                saved = self._three_d_project_dialog.save_project()
+            else:
+                if getattr(self.solve_workspace, "_editor_drawer", None) is not None:
+                    self.solve_workspace._commit_editor()
+                    if self.solve_workspace._editor_drawer is not None:
+                        return False
+                saved = self.save_problem_file()
+            if not saved:
                 self._pending_problem_replacement = action
+                self._pending_project_type = project_type
                 self._new_problem_dialog.ui_model_value = True
                 return False
+        elif project_type == "3d":
+            self._three_d_project_dialog.discard_project()
+        elif project_type == "axisymmetric":
+            self.solve_workspace.set_model(
+                new_model(),
+                new_studies(),
+                {"schema_version": 1, "active_section": "geometry", "camera": "fit"},
+            )
+            self._loaded_mesh_path = None
+            self._loaded_mesh_problem_sha256 = None
         return action()
 
     def _discard_and_continue_problem_replacement(self, *args):
@@ -1243,14 +1746,26 @@ class NGSolveGui(App):
             new_studies(),
             {"schema_version": 1, "active_section": "geometry", "camera": "fit"},
         )
+        if self._three_d_workspace_instance is not None:
+            self._three_d_workspace_instance.ui_hidden = True
+            self._three_d_workspace_container.ui_hidden = True
+        self._active_project_type = "axisymmetric"
+        hide_chooser = getattr(self, "_hide_startup_chooser", None)
+        if callable(hide_chooser):
+            hide_chooser()
         self._loaded_mesh_path = None
         self._loaded_mesh_problem_sha256 = None
         if self._workspace_mode != "solve":
             self._workspace_mode_toggle.select("solve")
+        set_3d_active = getattr(self, "_set_3d_workspace_active", None)
+        if callable(set_3d_active):
+            set_3d_active(False)
         self._notify("Started a new problem.", type="positive", timeout=2500)
         return True
 
     def _delete_selected_region_shortcut(self, *args):
+        if getattr(self, "_active_project_type", None) == "3d":
+            return self._three_d_workspace.delete_selected()
         if not self._solve_shortcut_context_active():
             return False
         return self.solve_workspace.delete_selected_geometry()
@@ -1261,6 +1776,11 @@ class NGSolveGui(App):
 
         solving = mode == "solve"
         self._workspace_mode = mode
+        if getattr(self, "_active_project_type", None) == "3d":
+            self._three_d_workspace.ui_hidden = False
+            self._post_process_workspace.ui_hidden = True
+            self._solve_workspace.ui_hidden = True
+            return
         self._post_process_workspace.ui_hidden = solving
         self._solve_workspace.ui_hidden = not solving
         refresh_history_controls = getattr(self, "_refresh_solve_history_controls", None)
@@ -1268,6 +1788,7 @@ class NGSolveGui(App):
             refresh_history_controls()
 
     def _save_artifact(self, data, filename):
+        self._last_saved_path = None
         # The browser File System Access writer is asynchronous. In the local
         # Windows application, use an OS save dialog and a synchronous write so
         # JSON, mesh, and solution bundles are complete before the action returns.
@@ -1291,6 +1812,7 @@ class NGSolveGui(App):
                 return False
             payload = data.encode("utf-8") if isinstance(data, str) else bytes(data)
             Path(path).write_bytes(payload)
+            self._last_saved_path = path
             self._local_path = str(Path(path).parent)
             self.usersettings.set("save_dir", self._local_path)
             self.usersettings.set("load_dir", self._local_path)
@@ -1304,13 +1826,16 @@ class NGSolveGui(App):
         write(data)
         return True
 
-    def _pick_artifact(self, *, title, description, extension, additional_extensions=()):
+    def _pick_artifact(
+        self, *, title, description, extension, additional_extensions=(),
+        force_native=False, read_bytes=True,
+    ):
         """Return ``(path, bytes)`` for a native or browser file selection."""
         from ngapp.utils import EnvironmentType, get_environment
 
         env = get_environment()
         use_browser_picker = os.environ.get("NGSOLVE_GUI_FILE_PICKER", "").strip().lower() == "browser"
-        if env.type == EnvironmentType.LOCAL_APP and not use_browser_picker:
+        if env.type == EnvironmentType.LOCAL_APP and (force_native or not use_browser_picker):
             from .native_dialog import open_file_dialog
 
             path = open_file_dialog(
@@ -1322,6 +1847,8 @@ class NGSolveGui(App):
                 return None, None
             self._local_path = os.path.dirname(path)
             self.usersettings.set("load_dir", self._local_path)
+            if not read_bytes:
+                return path, None
             with open(path, "rb") as source:
                 return path, source.read()
 
@@ -1364,7 +1891,7 @@ class NGSolveGui(App):
         path = os.path.join(directory, js_file.name)
         with open(path, "wb") as target:
             target.write(data)
-        return path, data
+        return path, data if read_bytes else None
 
     def _choose_legacy_problem_file(self, *args):
         if self._replacement_job_active():
@@ -1411,6 +1938,8 @@ class NGSolveGui(App):
 
     def save_problem_file(self):
         """Save the problem definition and its study settings."""
+        if getattr(self, "_active_project_type", None) == "3d":
+            return self._three_d_workspace.save_project()
         if getattr(self.solve_workspace, "_editor_drawer", None) is not None:
             self.solve_workspace._commit_editor()
             if self.solve_workspace._editor_drawer is not None:
@@ -1426,6 +1955,13 @@ class NGSolveGui(App):
             if not self._save_artifact(data, filename):
                 return False
             self.solve_workspace.mark_saved()
+            remember = getattr(self, "_remember_recent_project", None)
+            if callable(remember):
+                remember(
+                    getattr(self, "_last_saved_path", None),
+                    kind="axisymmetric",
+                    name=model.get("name", "Axisymmetric project"),
+                )
             self._notify("Problem file saved.", type="positive", timeout=2500)
             self.solve_workspace._message(f"Saved {filename}.")
             if errors:
@@ -1441,39 +1977,8 @@ class NGSolveGui(App):
         return self.save_problem_file()
 
     def load_problem_file(self):
-        """Load a declarative JSON or legacy .ngsmodel problem file."""
-        if self._replacement_job_active():
-            self._notify("Wait for the current solve to finish before replacing the problem.", type="warning", timeout=4000)
-            return False
-        try:
-            path, data = self._pick_artifact(
-                title="Open MM-FEM problem file",
-                description="MM-FEM problem file (.json or .ngsmodel)",
-                extension=".json",
-                additional_extensions=(".ngsmodel",),
-            )
-            if not path:
-                return
-            model, studies, layout = unpack_model(data)
-
-            def apply_problem_file():
-                try:
-                    self.solve_workspace.set_model(model, studies, layout)
-                    self._loaded_mesh_path = None
-                    self._loaded_mesh_problem_sha256 = None
-                    if self._workspace_mode != "solve":
-                        self._workspace_mode_toggle.select("solve")
-                    self._notify("Problem file loaded.", type="positive", timeout=2500)
-                    return True
-                except Exception as error:
-                    self._notify(f"Could not load problem file: {error}", type="negative", timeout=7000)
-                    self.solve_workspace._message(f"Load failed: {error}", error=True)
-                    return False
-
-            return self._request_problem_replacement(apply_problem_file)
-        except Exception as error:
-            self._notify(f"Could not load problem file: {error}", type="negative", timeout=7000)
-            self.solve_workspace._message(f"Load failed: {error}", error=True)
+        """Compatibility alias for the unified project picker."""
+        return self.open_project_file()
 
     def load_project(self):
         """Compatibility alias for the former Load Project action."""
@@ -1556,6 +2061,34 @@ class NGSolveGui(App):
                 manifest = self._read_run_manifest(output)
                 if manifest.get("problem_sha256") != model_hash:
                     continue
+                if os.name == "nt":
+                    from .native_dialog import save_file_dialog
+
+                    filename = ("".join(
+                        c if c.isalnum() or c in "-_ " else "_"
+                        for c in self.solve_workspace.model.get("name", "axisymmetric-model")
+                    ).strip() or "axisymmetric-model") + SOLUTION_SUFFIX
+                    initialdir = (
+                        self._local_path
+                        or self.usersettings.get("save_dir", "")
+                        or self.usersettings.get("load_dir", "")
+                        or os.path.expanduser("~")
+                    )
+                    path = save_file_dialog(
+                        title="Save MM-FEM solution bundle",
+                        initialdir=initialdir,
+                        filename=filename,
+                        filters=[("MM-FEM solution bundle", f"*{SOLUTION_SUFFIX}"), ("All Files", "*")],
+                    )
+                    if not path:
+                        return
+                    write_solution_bundle(output, self.solve_workspace.model, path)
+                    self._last_saved_path = path
+                    self._local_path = str(Path(path).parent)
+                    self.usersettings.set("save_dir", self._local_path)
+                    self.usersettings.set("load_dir", self._local_path)
+                    self._notify("Solution bundle saved.", type="positive", timeout=3000)
+                    return
                 data, filename = make_solution_bundle(output, self.solve_workspace.model)
                 if self._save_artifact(data, filename):
                     self._notify("Solution bundle saved.", type="positive", timeout=3000)
@@ -1572,6 +2105,7 @@ class NGSolveGui(App):
                 description="MM-FEM solution bundle or field pickle",
                 extension=SOLUTION_SUFFIX,
                 additional_extensions=(".pkl",),
+                read_bytes=False,
             )
             if not path:
                 return
@@ -1617,6 +2151,8 @@ class NGSolveGui(App):
         stamp = _datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         # Use the same root as run-history discovery. A VM-provided output root
         # points at its shared folder; standalone runs use the user's home folder.
+        from .solve_workspace import default_run_history_root
+
         output_dir = default_run_history_root() / f"{model_name}_{stamp}"
         model_path = output_dir / f"{model_name}.ngsmodel"
         try:
@@ -1993,11 +2529,15 @@ class NGSolveGui(App):
         self.property_host.show(comp, comp.build_property_panel)
 
     def _toggle_navigator(self):
+        if self._active_project_type == "3d":
+            return self._three_d_workspace.toggle_tree()
         self._nav_visible = not self._nav_visible
         self.usersettings.set("nav_visible", self._nav_visible)
         self._apply_panel_visibility()
 
     def _toggle_property_panel(self):
+        if self._active_project_type == "3d":
+            return self._three_d_workspace.toggle_properties()
         self._prop_visible = not self._prop_visible
         self.usersettings.set("prop_visible", self._prop_visible)
         self._apply_panel_visibility()

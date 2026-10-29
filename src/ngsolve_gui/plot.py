@@ -109,6 +109,15 @@ class PlotComponent(PropertyPanelMixin, Div):
         for plot, fig in zip(self._plots, self._figures):
             plot.draw(fig)
 
+    def update_figure(self, figure):
+        """Update a single scene while keeping its WebGL canvas and camera alive."""
+        self.data = {"obj": figure}
+        if len(self._plots) == 1 and len(self._figures) == 1:
+            self._figures = [figure]
+            self._plots[0].draw(figure)
+        else:
+            self.draw()
+
     def set_component(self, comp):
         self.ui_children = [comp]
 

@@ -309,10 +309,6 @@ def test_solution_bundle_loader_draws_all_fields_in_one_script(monkeypatch, tmp_
     captured = {}
 
     monkeypatch.setattr(
-        "ngsolve_gui.result_files.extract_solution_bundle",
-        lambda _data: (str(fields_dir.parent.parent), [str(field_path)]),
-    )
-    monkeypatch.setattr(
         file_loader,
         "_run_script",
         lambda code, globals_, app: captured.update(
@@ -329,7 +325,9 @@ def test_solution_bundle_loader_draws_all_fields_in_one_script(monkeypatch, tmp_
     result = file_loader.load_file(bundle, app)
 
     assert result == ("thread", "done")
-    assert str(field_path) in captured["code"].co_consts
+    assert "extract_solution_bundle_from_path" in captured["code"].co_names
+    assert str(bundle.resolve()) in captured["code"].co_consts
     assert "_draw_pickle_object" in captured["code"].co_names
-    assert app._solution_import_dirs == [str(fields_dir.parent.parent)]
+    assert captured["globals"]["_mmfem_solution_app"] is app
+    assert app._solution_import_dirs == []
     assert captured["code"].co_filename == str(bundle.resolve())

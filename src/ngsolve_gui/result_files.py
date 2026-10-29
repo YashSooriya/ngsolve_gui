@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from pathlib import Path, PurePosixPath
 import tempfile
 import zipfile
@@ -47,6 +48,10 @@ def _read_archive(data: bytes) -> zipfile.ZipFile:
         archive = zipfile.ZipFile(io.BytesIO(data), "r")
     except (OSError, zipfile.BadZipFile) as error:
         raise ValueError("The selected file is not a valid MM-FEM bundle.") from error
+    return _validate_archive(archive)
+
+
+def _validate_archive(archive: zipfile.ZipFile) -> zipfile.ZipFile:
     infos = archive.infolist()
     if len(infos) > MAX_ENTRIES:
         archive.close()
@@ -112,8 +117,8 @@ def read_mesh_bundle(data: bytes, expected_model: dict) -> bytes:
         return mesh_data
 
 
-def make_solution_bundle(run_directory: str | Path, expected_model: dict) -> tuple[bytes, str]:
-    """Package one completed solver run, including all GUI fields and mesh."""
+def _solution_bundle_inputs(run_directory: str | Path, expected_model: dict):
+    """Validate one run and return small metadata plus file-backed archive members."""
     run_directory = Path(run_directory)
     try:
         run_manifest = json.loads((run_directory / "run_manifest.json").read_text(encoding="utf-8"))
@@ -135,76 +140,178 @@ def make_solution_bundle(run_directory: str | Path, expected_model: dict) -> tup
         "problem.json": (json.dumps(model, indent=2, sort_keys=True) + "\n").encode("utf-8"),
         "run_manifest.json": (json.dumps(run_manifest, indent=2, sort_keys=True) + "\n").encode("utf-8"),
     }
+    files: dict[str, Path] = {}
     studies_path = run_directory / "studies.json"
     if studies_path.is_file():
-        entries["studies.json"] = studies_path.read_bytes()
+        files["studies.json"] = studies_path
     mesh_path = run_directory / "mesh.vol"
     if mesh_path.is_file():
-        entries["mesh.vol"] = mesh_path.read_bytes()
+        files["mesh.vol"] = mesh_path
     metadata_path = run_directory / "ngsolve_gui" / "metadata.json"
     if metadata_path.is_file():
-        entries["ngsolve_gui/metadata.json"] = metadata_path.read_bytes()
+        files["ngsolve_gui/metadata.json"] = metadata_path
     field_names = []
     for path in field_paths:
         relative = path.relative_to(run_directory).as_posix()
         if not relative.startswith("ngsolve_gui/fields/"):
             raise ValueError("A solution field is outside the supported fields folder.")
-        entries[relative] = path.read_bytes()
+        files[relative] = path
         field_names.append(relative)
+    title = "".join(char if char.isalnum() or char in "-_ " else "_" for char in model.get("name", "axisymmetric-model")).strip()
+    filename = (title or "axisymmetric-model") + ".mmfem-solutions"
+    return expected_hash, entries, files, field_names, filename
+
+
+def _solution_manifest_from_checksums(expected_hash, entries, file_checksums, field_names):
     manifest = {
         "schema": SOLUTION_SCHEMA,
         "schema_version": 1,
         "problem_sha256": expected_hash,
         "fields": field_names,
-        "sha256": {name: hashlib.sha256(content).hexdigest() for name, content in entries.items()},
+        "sha256": {
+            **{name: hashlib.sha256(content).hexdigest() for name, content in entries.items()},
+            **file_checksums,
+        },
     }
-    entries["solution_manifest.json"] = (json.dumps(manifest, indent=2) + "\n").encode("utf-8")
-    title = "".join(char if char.isalnum() or char in "-_ " else "_" for char in model.get("name", "axisymmetric-model")).strip()
-    return _zip_bytes(entries), (title or "axisymmetric-model") + ".mmfem-solutions"
+    return (json.dumps(manifest, indent=2) + "\n").encode("utf-8")
+
+
+def make_solution_bundle(run_directory: str | Path, expected_model: dict) -> tuple[bytes, str]:
+    """Compatibility API that returns a completed study as an in-memory bundle."""
+    expected_hash, entries, files, field_names, filename = _solution_bundle_inputs(
+        run_directory, expected_model
+    )
+    file_data = {name: path.read_bytes() for name, path in files.items()}
+    manifest = _solution_manifest_from_checksums(
+        expected_hash,
+        entries,
+        {name: hashlib.sha256(content).hexdigest() for name, content in file_data.items()},
+        field_names,
+    )
+    entries.update(file_data)
+    entries["solution_manifest.json"] = manifest
+    return _zip_bytes(entries), filename
+
+
+def write_solution_bundle(
+    run_directory: str | Path, expected_model: dict, destination: str | Path,
+) -> str:
+    """Write a solution archive incrementally and atomically beside its destination."""
+    expected_hash, entries, files, field_names, filename = _solution_bundle_inputs(
+        run_directory, expected_model
+    )
+    metadata_size = sum(map(len, entries.values()))
+    if metadata_size + sum(path.stat().st_size for path in files.values()) > MAX_ARCHIVE_BYTES:
+        raise ValueError("The solution bundle is larger than the 2 GB uncompressed limit.")
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent, delete=False
+    )
+    temporary = Path(handle.name)
+    handle.close()
+    try:
+        file_checksums = {}
+        uncompressed_size = metadata_size
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+            for name, content in entries.items():
+                archive.writestr(name, content)
+            for name, path in files.items():
+                digest = hashlib.sha256()
+                info = zipfile.ZipInfo(name)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                with path.open("rb") as source, archive.open(info, "w", force_zip64=True) as member:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        member.write(chunk)
+                        digest.update(chunk)
+                        uncompressed_size += len(chunk)
+                file_checksums[name] = digest.hexdigest()
+            manifest = _solution_manifest_from_checksums(
+                expected_hash, entries, file_checksums, field_names
+            )
+            if uncompressed_size + len(manifest) > MAX_ARCHIVE_BYTES:
+                raise ValueError("The solution bundle is larger than the 2 GB uncompressed limit.")
+            archive.writestr("solution_manifest.json", manifest)
+        os.replace(temporary, destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return filename
 
 
 def extract_solution_bundle(data: bytes) -> tuple[str, list[str]]:
     """Validate and safely extract fields from a saved solution bundle."""
     with _read_archive(data) as archive:
-        names = set(archive.namelist())
-        if "solution_manifest.json" not in names or "problem.json" not in names:
-            raise ValueError("This file is not a complete MM-FEM solution bundle.")
-        try:
-            manifest = json.loads(archive.read("solution_manifest.json"))
-            model = json.loads(archive.read("problem.json"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError("The solution bundle metadata is invalid.") from error
-        if manifest.get("schema") != SOLUTION_SCHEMA or manifest.get("schema_version") != 1:
-            raise ValueError("This MM-FEM solution bundle version is not supported.")
-        if problem_fingerprint(model) != manifest.get("problem_sha256"):
-            raise ValueError("The solution bundle problem data failed its integrity check.")
-        fields = manifest.get("fields")
-        checksums = manifest.get("sha256")
-        if not isinstance(fields, list) or not fields or not isinstance(checksums, dict):
-            raise ValueError("The solution bundle contains no fields or an invalid file manifest.")
-        required = {"solution_manifest.json", "problem.json", "run_manifest.json"}
-        optional = {"studies.json", "mesh.vol", "ngsolve_gui/metadata.json"}
-        allowed = required | optional | set(fields)
-        if not required.issubset(names) or not names.issubset(allowed):
-            raise ValueError("The solution bundle contains missing or unsupported files.")
-        if len(fields) != len(set(fields)):
-            raise ValueError("The solution bundle repeats a field file.")
-        if not set(fields).issubset(names):
-            raise ValueError("The solution bundle is missing one or more field files.")
-        for field in fields:
-            path = PurePosixPath(field)
-            if path.is_absolute() or ".." in path.parts or not field.startswith("ngsolve_gui/fields/") or not field.endswith(".pkl"):
-                raise ValueError(f"The solution bundle contains an invalid field path: {field}")
-        for name, expected_hash in checksums.items():
-            if name not in names or hashlib.sha256(archive.read(name)).hexdigest() != expected_hash:
-                raise ValueError(f"The solution bundle file failed its integrity check: {name}")
-        if set(checksums) != names - {"solution_manifest.json"}:
-            raise ValueError("The solution bundle file manifest is incomplete.")
+        return _extract_solution_archive(archive)
 
-        destination = Path(tempfile.mkdtemp(prefix="mmfem_solutions_"))
+
+def extract_solution_bundle_from_path(path: str | Path) -> tuple[str, list[str]]:
+    """Validate and extract a bundle from disk without copying the archive into RAM."""
+    path = Path(path)
+    try:
+        if path.stat().st_size > MAX_ARCHIVE_BYTES:
+            raise ValueError("The selected bundle is larger than the 2 GB limit.")
+    except OSError as error:
+        raise ValueError("The selected solution bundle could not be read.") from error
+    try:
+        archive = _validate_archive(zipfile.ZipFile(path, "r"))
+    except (OSError, zipfile.BadZipFile) as error:
+        raise ValueError("The selected file is not a valid MM-FEM bundle.") from error
+    with archive:
+        return _extract_solution_archive(archive)
+
+
+def _extract_solution_archive(archive: zipfile.ZipFile) -> tuple[str, list[str]]:
+    names = set(archive.namelist())
+    if "solution_manifest.json" not in names or "problem.json" not in names:
+        raise ValueError("This file is not a complete MM-FEM solution bundle.")
+    try:
+        manifest = json.loads(archive.read("solution_manifest.json"))
+        model = json.loads(archive.read("problem.json"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("The solution bundle metadata is invalid.") from error
+    if manifest.get("schema") != SOLUTION_SCHEMA or manifest.get("schema_version") != 1:
+        raise ValueError("This MM-FEM solution bundle version is not supported.")
+    if problem_fingerprint(model) != manifest.get("problem_sha256"):
+        raise ValueError("The solution bundle problem data failed its integrity check.")
+    fields = manifest.get("fields")
+    checksums = manifest.get("sha256")
+    if not isinstance(fields, list) or not fields or not isinstance(checksums, dict):
+        raise ValueError("The solution bundle contains no fields or an invalid file manifest.")
+    required = {"solution_manifest.json", "problem.json", "run_manifest.json"}
+    optional = {"studies.json", "mesh.vol", "ngsolve_gui/metadata.json"}
+    allowed = required | optional | set(fields)
+    if not required.issubset(names) or not names.issubset(allowed):
+        raise ValueError("The solution bundle contains missing or unsupported files.")
+    if len(fields) != len(set(fields)):
+        raise ValueError("The solution bundle repeats a field file.")
+    if not set(fields).issubset(names):
+        raise ValueError("The solution bundle is missing one or more field files.")
+    for field in fields:
+        member_path = PurePosixPath(field)
+        if member_path.is_absolute() or ".." in member_path.parts or not field.startswith("ngsolve_gui/fields/") or not field.endswith(".pkl"):
+            raise ValueError(f"The solution bundle contains an invalid field path: {field}")
+    if set(checksums) != names - {"solution_manifest.json"}:
+        raise ValueError("The solution bundle file manifest is incomplete.")
+    for name, expected_hash in checksums.items():
+        digest = hashlib.sha256()
+        with archive.open(name, "r") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != expected_hash:
+            raise ValueError(f"The solution bundle file failed its integrity check: {name}")
+
+    destination = Path(tempfile.mkdtemp(prefix="mmfem_solutions_"))
+    try:
         for name in names - {"solution_manifest.json"}:
             target = destination.joinpath(*PurePosixPath(name).parts)
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(archive.read(name))
+            with archive.open(name, "r") as source, target.open("wb") as output:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    output.write(chunk)
+    except BaseException:
+        import shutil
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
     field_paths = [str(destination.joinpath(*PurePosixPath(name).parts)) for name in fields]
     return str(destination), field_paths

@@ -69,6 +69,58 @@ def test_workspace_mode_switch_changes_workspace_and_keeps_header_visible():
     assert all(not item.ui_hidden for item in header_components)
 
 
+def test_three_d_workspace_replaces_axisymmetric_views_and_restores_active_mode():
+    three_d = SimpleNamespace(ui_hidden=True)
+    toggle = SimpleNamespace(ui_hidden=False)
+    solve = SimpleNamespace(ui_hidden=False)
+    post_process = SimpleNamespace(ui_hidden=True)
+    app = SimpleNamespace(
+        _three_d_workspace=three_d,
+        _workspace_mode_toggle=toggle,
+        _solve_workspace=solve,
+        _post_process_workspace=post_process,
+        _workspace_mode="post_process",
+        _refresh_solve_history_controls=lambda: None,
+    )
+
+    NGSolveGui._set_3d_workspace_active(app, True)
+
+    assert three_d.ui_hidden is False
+    assert toggle.ui_hidden is True
+    assert solve.ui_hidden is True
+    assert post_process.ui_hidden is True
+
+    NGSolveGui._set_3d_workspace_active(app, False)
+
+    assert three_d.ui_hidden is True
+    assert toggle.ui_hidden is False
+    assert solve.ui_hidden is True
+    assert post_process.ui_hidden is False
+
+
+def test_discarding_axisymmetric_before_switching_clears_hidden_model():
+    old_model = {"name": "Unsaved axisymmetric model"}
+    saved = []
+    called = []
+    app = SimpleNamespace(
+        _pending_problem_replacement=lambda: called.append("continue") or True,
+        _pending_project_type="axisymmetric",
+        _close_new_problem_dialog=lambda: None,
+        solve_workspace=SimpleNamespace(
+            set_model=lambda *args: saved.append(args),
+        ),
+        _loaded_mesh_path="stale.vol",
+        _loaded_mesh_problem_sha256="stale-hash",
+    )
+
+    assert NGSolveGui._continue_problem_replacement(app, save_changes=False) is True
+
+    assert called == ["continue"]
+    assert saved[0][0]["name"] != old_model["name"]
+    assert app._loaded_mesh_path is None
+    assert app._loaded_mesh_problem_sha256 is None
+
+
 def test_opening_a_run_result_keeps_the_mode_toggle_in_sync(monkeypatch):
     loaded = []
     app = SimpleNamespace(

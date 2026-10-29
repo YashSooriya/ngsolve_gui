@@ -30,7 +30,7 @@ ngsolve_gui = "ngsolve_gui.run:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-ngsolve_gui = ["assets/*.png"]
+ngsolve_gui = ["assets/*.png", "assets/*.js"]
 
 [tool.setuptools_scm]
 version_file = "src/ngsolve_gui/_version.py"

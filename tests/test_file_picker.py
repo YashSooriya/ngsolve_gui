@@ -23,6 +23,42 @@ def test_local_app_can_use_browser_file_picker(monkeypatch):
     assert loaded == ["/tmp/selected.vol"]
 
 
+def test_project_picker_can_force_native_path_picker(monkeypatch):
+    monkeypatch.setenv("NGSOLVE_GUI_FILE_PICKER", "browser")
+    monkeypatch.setattr(
+        ngapp.utils,
+        "get_environment",
+        lambda: SimpleNamespace(type=ngapp.utils.EnvironmentType.LOCAL_APP),
+    )
+    from ngsolve_gui import native_dialog
+    from unittest.mock import mock_open
+
+    calls = []
+    monkeypatch.setattr(
+        native_dialog,
+        "open_file_dialog",
+        lambda **kwargs: calls.append(kwargs) or r"C:\models\shield.json",
+    )
+    monkeypatch.setattr("builtins.open", mock_open(read_data=b"project-data"))
+
+    gui = SimpleNamespace(
+        _local_path=r"C:\models",
+        usersettings=SimpleNamespace(get=lambda *_: "", set=lambda *_: None),
+    )
+    path, data = NGSolveGui._pick_artifact(
+        gui,
+        title="Open project",
+        description="MM-FEM project",
+        extension=".json",
+        additional_extensions=(".ngsmodel", ".mmfem3d"),
+        force_native=True,
+    )
+
+    assert path == r"C:\models\shield.json"
+    assert data == b"project-data"
+    assert calls[0]["initialdir"] == r"C:\models"
+
+
 def test_browser_picker_omits_invalid_hyphenated_bundle_extension(monkeypatch):
     monkeypatch.setattr(
         ngapp.utils,

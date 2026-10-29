@@ -19,6 +19,7 @@ def tessellate_step(data, *, units="m", max_triangles=_MAX_SURFACE_TRIANGLES):
     if units not in LENGTH_UNITS:
         raise ValueError(f"Unsupported STEP length unit: {units!r}.")
     try:
+        import numpy as np
         from netgen.occ import OCCGeometry
     except ImportError as error:
         raise RuntimeError("STEP preview requires the Netgen/NGSolve runtime.") from error
@@ -34,20 +35,19 @@ def tessellate_step(data, *, units="m", max_triangles=_MAX_SURFACE_TRIANGLES):
         raw_vertices = visual.get("vertices")
         if raw_vertices is None or not len(raw_vertices) or len(raw_vertices) % 9:
             raise ValueError("The STEP file did not produce a valid surface for preview.")
-        triangle_count = len(raw_vertices) // 9
+        vertices = np.asarray(raw_vertices, dtype=np.float64).reshape((-1, 3))
+        triangle_count = len(vertices) // 3
         if triangle_count > max_triangles:
             raise ValueError(
                 f"The STEP preview is too detailed ({triangle_count:,} surface triangles). "
                 "Simplify the CAD geometry before importing it."
             )
-        vertices = [
-            tuple(float(raw_vertices[offset + axis]) * scale for axis in range(3))
-            for offset in range(0, len(raw_vertices), 3)
-        ]
-        triangles = [
-            (index, index + 1, index + 2)
-            for index in range(0, len(vertices), 3)
-        ]
+        vertices *= scale
+        # OCC repeats every triangle's three corners. Share identical corners
+        # before transmission; this changes no surface positions or triangles.
+        vertices, inverse = np.unique(vertices, axis=0, return_inverse=True)
+        triangles = inverse.astype(np.int32).reshape((-1, 3))
+        vertices = vertices.astype(np.float32)
     return {"vertices": vertices, "triangles": triangles}
 
 
@@ -103,26 +103,27 @@ def _sample_trace_points(points, limit):
 def preview_figure(payload):
     """Create a combined Plotly scene from display mesh and sampled wire paths."""
     try:
+        import numpy as np
         import plotly.graph_objects as go
     except ImportError as error:
         raise RuntimeError("The 3D project preview requires Plotly.") from error
 
     figure = go.Figure()
     for index, item in enumerate(payload.get("geometry", [])):
-        vertices = item["vertices"]
-        triangles = item["triangles"]
-        if not vertices or not triangles:
+        vertices = np.asarray(item["vertices"])
+        triangles = np.asarray(item["triangles"])
+        if vertices.size == 0 or triangles.size == 0:
             continue
         figure.add_trace(go.Mesh3d(
-            x=[point[0] for point in vertices],
-            y=[point[1] for point in vertices],
-            z=[point[2] for point in vertices],
-            i=[face[0] for face in triangles],
-            j=[face[1] for face in triangles],
-            k=[face[2] for face in triangles],
+            x=vertices[:, 0],
+            y=vertices[:, 1],
+            z=vertices[:, 2],
+            i=triangles[:, 0],
+            j=triangles[:, 1],
+            k=triangles[:, 2],
             name=item.get("name", "Geometry"),
             color=_MATERIAL_COLORS[index % len(_MATERIAL_COLORS)],
-            opacity=0.55,
+            opacity=1.0,
             flatshading=True,
             hoverinfo="name",
             showscale=False,
@@ -141,9 +142,11 @@ def preview_figure(payload):
     figure.update_layout(
         margin={"l": 0, "r": 0, "t": 0, "b": 0},
         showlegend=True,
+        uirevision="mmfem-3d-camera",
         legend={"orientation": "h", "y": 1.02, "x": 0.02},
         scene={
             "aspectmode": "data",
+            "dragmode": "orbit",
             "xaxis_title": "X (m)",
             "yaxis_title": "Y (m)",
             "zaxis_title": "Z (m)",
