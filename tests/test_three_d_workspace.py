@@ -1,9 +1,12 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 from ngapp.components import Component
 import plotly.graph_objects as go
+import numpy as np
 
 from ngsolve_gui.three_d_workspace import ThreeDWorkspace
+from ngsolve_gui.three_d_project import add_step_geometry, new_3d_project, package_3d_project, unpack_3d_project
 
 
 def test_three_d_workspace_is_persistent_and_keeps_unsaved_imports(monkeypatch):
@@ -349,3 +352,115 @@ def test_selected_mesh_figure_is_styled_before_asynchronous_plotly_render(monkey
     assert figure.data[1].line.width == 2.5
     assert updates[0]["color"] == "#f59e0b"
     assert updates[1]["line.color"] == "#33475b"
+
+
+def _workspace_with_test_mesh(monkeypatch):
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+    workspace = ThreeDWorkspace(SimpleNamespace())
+    project = new_3d_project("Named selection test")
+    assets = {}
+    fixture = Path(__file__).parent / "fixtures" / "magnet_shield_4k.step"
+    geometry = add_step_geometry(project, assets, fixture.name, fixture.read_bytes(), units="mm")
+    workspace.project = project
+    workspace.assets = assets
+    workspace._selection = ("geometry", geometry["id"])
+    workspace._selection_draft["geometry_id"] = geometry["id"]
+    workspace._mesh_results[geometry["id"]] = {
+        "status": "ready",
+        "volume_elements": 4,
+        "surface_faces": 3,
+        "boundary_region_ids": np.asarray([0, 1, 2], dtype=np.int32),
+        "boundary_regions": [
+            {"id": 0, "name": "Boundary 1", "elements": 1},
+            {"id": 1, "name": "Boundary 2", "elements": 1},
+            {"id": 2, "name": "Boundary 3", "elements": 1},
+        ],
+        "domain_regions": [{"id": 0, "name": "Shield", "elements": 4}],
+        "tetra_quality": {
+            "minimum": 0.3,
+            "p05": 0.4,
+            "median": 0.7,
+            "mean": 0.65,
+            "below_0_1": 0,
+            "below_0_1_percent": 0.0,
+        },
+    }
+    workspace._rebuild_preview = lambda: None
+    workspace._rebuild_items()
+    workspace._rebuild_properties()
+    return workspace, geometry
+
+
+def test_mesh_quality_and_named_domain_boundary_selections_persist(monkeypatch):
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    workspace._set_selection_draft_regions(geometry, SimpleNamespace(value=[0, 2]))
+    workspace._set_selection_draft_name(SimpleNamespace(value="Symmetry surfaces"))
+
+    assert workspace._save_named_selection(geometry) is True
+
+    selection = geometry["boundary_selections"][0]
+    assert selection["name"] == "Symmetry surfaces"
+    assert selection["boundary_ids"] == [0, 2]
+    assert "median 0.700" in workspace._mesh_quality_message(geometry["id"])
+    assert workspace._selection == ("named_selection", selection["id"])
+    assert workspace._active_boundary_region_ids(geometry["id"]) == [0, 2]
+
+    restored, _assets = unpack_3d_project(package_3d_project(workspace.project, workspace.assets))
+    assert restored["geometries"][0]["boundary_selections"] == [selection]
+
+    workspace.select_item("named_selection", selection["id"])
+    assert workspace._selection_draft["region_ids"] == [0, 2]
+
+
+def test_named_volume_domain_selection_is_saved_with_region_indices(monkeypatch):
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    workspace._set_selection_draft_kind(geometry, SimpleNamespace(value="domain"))
+    workspace._set_selection_draft_regions(geometry, SimpleNamespace(value=[0]))
+    workspace._set_selection_draft_name(SimpleNamespace(value="Shield volume"))
+
+    assert workspace._save_named_selection(geometry) is True
+    assert geometry["domain_selections"] == [{
+        "id": workspace._selection[1],
+        "name": "Shield volume",
+        "domain_ids": [0],
+    }]
+
+
+def test_plot_mesh_face_click_selects_boundary_region_and_visibility_controls(monkeypatch):
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    figure = go.Figure([
+        go.Mesh3d(
+            x=[0, 1, 0], y=[0, 0, 1], z=[0, 0, 0], i=[0, 0, 0], j=[1, 1, 1], k=[2, 2, 2],
+            meta={
+                "mmfem_kind": "geometry",
+                "mmfem_item_id": geometry["id"],
+                "mmfem_base_color": "#6886ac",
+                "mmfem_generated_mesh": True,
+            },
+        ),
+        go.Scatter3d(
+            x=[0, 1], y=[0, 0], z=[0, 0], mode="lines",
+            meta={
+                "mmfem_kind": "geometry",
+                "mmfem_item_id": geometry["id"],
+                "mmfem_base_color": "#33475b",
+                "mmfem_mesh_edges": True,
+            },
+        ),
+    ])
+    workspace._preview._figures = [figure]
+
+    workspace._on_preview_plotly_click(0, 0, 1)
+    assert workspace._selection_draft["region_ids"] == [1]
+    assert workspace._active_boundary_region_ids(geometry["id"]) == [1]
+    updates = workspace._style_preview_figure(figure)
+    assert figure.data[0].visible is True
+
+    workspace.toggle_mesh_edges()
+    workspace._style_preview_figure(figure)
+    assert figure.data[1].visible is False
+    assert updates[1]["line.color"] == "#33475b"
+
+    workspace.toggle_mesh_surface()
+    workspace._style_preview_figure(figure)
+    assert figure.data[0].visible is False

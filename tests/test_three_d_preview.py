@@ -93,3 +93,28 @@ def test_generated_volume_mesh_uses_boundary_facets_and_edge_trace():
     assert list(figure.data[1].x) == [
         0.0, 1.0, None, 0.0, 0.0, None, 0.0, 0.0, None
     ]
+
+
+def test_selected_mesh_boundary_draws_an_outline_overlay_without_changing_the_surface():
+    figure = preview_figure({
+        "geometry": [{
+            "id": "geometry-1",
+            "name": "box.step",
+            "vertices": [
+                [0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],
+            ],
+            "triangles": [[0, 1, 2], [1, 3, 2]],
+            "edges": [],
+            "generated_mesh": True,
+            "boundary_region_ids": [4, 4],
+            "highlighted_boundary_ids": [4],
+        }],
+        "traces": [],
+    })
+
+    assert len(figure.data) == 2
+    assert figure.data[0].meta["mmfem_generated_mesh"] is True
+    assert figure.data[0].color == "#6886ac"
+    assert figure.data[1].meta["mmfem_boundary_overlay"] is True
+    assert figure.data[1].line.color == "#f59e0b"
+    assert len(figure.data[1].x) == 12

@@ -14,6 +14,28 @@ from ngapp.e2e_webgpu import assert_matches_baseline
 from .helpers import _draw
 
 
+def test_click_dispatch_keeps_two_argument_callbacks_and_passes_point_index() -> None:
+    from ngsolve_gui.plot import _make_click_handler
+
+    two_argument_events = []
+    two_argument = _make_click_handler(
+        lambda figure, curve: two_argument_events.append((figure, curve)), 0
+    )
+    two_argument(2, 7)
+
+    three_argument_events = []
+    three_argument = _make_click_handler(
+        lambda figure, curve, point: three_argument_events.append(
+            (figure, curve, point)
+        ),
+        0,
+    )
+    three_argument(2, 7)
+
+    assert two_argument_events == [(0, 2)]
+    assert three_argument_events == [(0, 2, 7)]
+
+
 @app_test("ngsolve_gui.appconfig")
 def test_plot_single_figure(page: Page, app) -> None:
     """Single plotly scatter figure renders correctly."""

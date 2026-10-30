@@ -1,12 +1,35 @@
 from __future__ import annotations
 
 import logging
+import inspect
 import threading
 
 from ngapp.components import *
 from ngapp.components.visualization import PlotlyComponent
 
 from .property_panel import PropertyPanelMixin
+
+
+def _make_click_handler(callback, figure_index):
+    try:
+        parameters = inspect.signature(callback).parameters.values()
+        accepts_point_number = any(
+            parameter.kind == inspect.Parameter.VAR_POSITIONAL
+            for parameter in parameters
+        ) or sum(
+            parameter.kind in {
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            }
+            for parameter in parameters
+        ) >= 3
+    except (TypeError, ValueError):
+        accepts_point_number = False
+
+    return lambda curve, point_number=None: (
+        callback(figure_index, curve, point_number)
+        if accepts_point_number else callback(figure_index, curve)
+    )
 
 
 class _InteractivePlotlyComponent(PlotlyComponent):
@@ -120,7 +143,14 @@ class _InteractivePlotlyComponent(PlotlyComponent):
             curve_number = point.get("curveNumber")
         if curve_number is None or self._click_handler is None:
             return
-        self._click_handler(int(curve_number))
+        point_number = getattr(point, "pointNumber", None)
+        if point_number is None and isinstance(point, dict):
+            point_number = point.get("pointNumber")
+        try:
+            point_number = None if point_number is None else int(point_number)
+        except (TypeError, ValueError, OverflowError):
+            point_number = None
+        self._click_handler(int(curve_number), point_number)
 
     def _on_unmount(self):
         self._click_unmounted = True
@@ -249,9 +279,7 @@ class PlotComponent(PropertyPanelMixin, Div):
             plot = _InteractivePlotlyComponent(id=f"{self.name}_plot_{idx}")
             if self._on_plotly_click is not None:
                 plot.set_click_handler(
-                    lambda curve, figure_index=idx: self._on_plotly_click(
-                        figure_index, curve
-                    )
+                    _make_click_handler(self._on_plotly_click, idx)
                 )
             plot.ui_class = "full-width"
             plot.ui_style = (

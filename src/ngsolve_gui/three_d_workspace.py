@@ -8,6 +8,7 @@ import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 from ngapp.components import Div, QBtn, QIcon, QInput, QSelect, QSplitter, QTooltip
 
@@ -27,6 +28,7 @@ from .three_d_project import (
     package_3d_project,
     step_unit_scale,
     unpack_3d_project,
+    validate_3d_project,
 )
 from .workspace_components import panel_header, property_editor_body
 
@@ -94,6 +96,15 @@ class ThreeDWorkspace(Div):
         self._mesh_job = None
         self._mesh_worker_active = False
         self._mesh_results = {}
+        self._mesh_surface_visible = True
+        self._mesh_edges_visible = True
+        self._selection_draft = {
+            "geometry_id": None,
+            "kind": "boundary",
+            "selection_id": None,
+            "name": "",
+            "region_ids": [],
+        }
         self._preview_lock = threading.Lock()
         self._preview_running = False
         self._preview_pending = None
@@ -286,6 +297,22 @@ class ThreeDWorkspace(Div):
             tooltip="Generate a Netgen volume mesh for the selected geometry",
         )
         self._generate_mesh_button.ui_disable = True
+        self._mesh_surface_button = _button(
+            "Surface mesh",
+            "mdi-eye-outline",
+            self.toggle_mesh_surface,
+            color="primary",
+            tooltip="Show or hide generated mesh facets",
+        )
+        self._mesh_edges_button = _button(
+            "Mesh edges",
+            "mdi-vector-square",
+            self.toggle_mesh_edges,
+            color="primary",
+            tooltip="Show or hide generated mesh edges",
+        )
+        self._mesh_surface_button.ui_disable = True
+        self._mesh_edges_button.ui_disable = True
         self._unit_controls = Div(
             self._geometry_units,
             self._trace_units,
@@ -310,6 +337,8 @@ class ThreeDWorkspace(Div):
             Div(ui_style="width:1px; height:24px; margin:0 2px; background:var(--border);"),
             self._fit_view_button,
             self._generate_mesh_button,
+            self._mesh_surface_button,
+            self._mesh_edges_button,
             self._view_select,
             self._axes_button,
             self._transparency_button,
@@ -455,17 +484,72 @@ class ThreeDWorkspace(Div):
         self._mesh_generation += 1
         self._mesh_job = None
         self._mesh_results = {}
+        self._mesh_surface_visible = True
+        self._mesh_edges_visible = True
+        self._selection_draft = {
+            "geometry_id": None,
+            "kind": "boundary",
+            "selection_id": None,
+            "name": "",
+            "region_ids": [],
+        }
         self._refresh_mesh_controls()
 
     def _refresh_mesh_controls(self):
-        button = getattr(self, "_generate_mesh_button", None)
-        if button is None:
+        if getattr(self, "_generate_mesh_button", None) is None:
             return
-        kind, item_id = getattr(self, "_selection", ("project", None))
-        selected = kind == "geometry" and any(
-            item.get("id") == item_id for item in self.project.get("geometries", [])
+        geometry = self._selected_geometry()
+        self._generate_mesh_button.ui_disable = (
+            self._mesh_worker_active or geometry is None
         )
-        button.ui_disable = self._mesh_worker_active or not selected
+        has_mesh = bool(
+            geometry
+            and self._mesh_results.get(geometry["id"], {}).get("status") == "ready"
+        )
+        self._mesh_surface_button.ui_disable = self._mesh_worker_active or not has_mesh
+        self._mesh_surface_button.ui_color = (
+            "primary" if self._mesh_surface_visible else None
+        )
+        self._mesh_surface_button.ui_flat = not self._mesh_surface_visible
+        wireframe_available = bool(
+            has_mesh
+            and self._mesh_results.get(geometry["id"], {}).get("wireframe_available", True)
+        )
+        self._mesh_edges_button.ui_disable = (
+            self._mesh_worker_active or not wireframe_available
+        )
+        self._mesh_edges_button.ui_color = "primary" if self._mesh_edges_visible else None
+        self._mesh_edges_button.ui_flat = not self._mesh_edges_visible
+
+    def _selected_geometry(self):
+        kind, item_id = getattr(self, "_selection", ("project", None))
+        if kind == "geometry":
+            return next(
+                (item for item in self.project.get("geometries", []) if item.get("id") == item_id),
+                None,
+            )
+        if kind == "named_selection":
+            context = self._find_named_selection(item_id)
+            return context[0] if context else None
+        return None
+
+    def _find_named_selection(self, selection_id):
+        for geometry in self.project.get("geometries", []):
+            for kind in ("domain", "boundary"):
+                for selection in geometry.get(f"{kind}_selections", []):
+                    if selection.get("id") == selection_id:
+                        return geometry, kind, selection
+        return None
+
+    def toggle_mesh_surface(self, *_args):
+        self._mesh_surface_visible = not self._mesh_surface_visible
+        self._refresh_mesh_controls()
+        self._update_preview_selection()
+
+    def toggle_mesh_edges(self, *_args):
+        self._mesh_edges_visible = not self._mesh_edges_visible
+        self._refresh_mesh_controls()
+        self._update_preview_selection()
 
     def _mesh_tree_label(self, item_id):
         result = self._mesh_results.get(item_id, {})
@@ -699,6 +783,63 @@ class ThreeDWorkspace(Div):
         row.on("click", lambda _event=None, k=kind, key=item_id: self.select_item(k, key))
         return row
 
+    def _named_selection_tree_item(self, geometry, kind, selection):
+        selected = self._selection == ("named_selection", selection["id"])
+        label = Div(
+            selection["name"],
+            ui_style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px;",
+        )
+        label._props["title"] = selection["name"]
+        row = Div(
+            QIcon(
+                ui_name="mdi-select-group",
+                ui_size="14px",
+                ui_color="primary" if selected else "grey-7",
+            ),
+            label,
+            Div(
+                "Domain" if kind == "domain" else "Boundary",
+                ui_class="cb-muted",
+                ui_style="font-size:9px; padding:1px 4px; border-radius:4px; background:var(--panel-header);",
+            ),
+            _button(
+                "",
+                "mdi-delete-outline",
+                lambda *_args, g=geometry, k=kind, s=selection: self._remove_named_selection(g, k, s),
+                tooltip="Remove named selection",
+            ),
+            ui_style=(
+                "display:flex; align-items:center; gap:5px; min-width:0; padding:3px 5px 3px 36px; "
+                "border-radius:5px; cursor:pointer; "
+                + ("background:var(--accent-subtle); color:var(--accent);" if selected else "")
+            ),
+        )
+        row.on(
+            "click",
+            lambda _event=None, selection_id=selection["id"]: self.select_item(
+                "named_selection", selection_id
+            ),
+        )
+        return row
+
+    def _remove_named_selection(self, geometry, kind, selection):
+        collection = geometry.get(f"{kind}_selections", [])
+        if selection in collection:
+            collection.remove(selection)
+            if self._selection == ("named_selection", selection["id"]):
+                self._selection = ("geometry", geometry["id"])
+                self._selection_draft = {
+                    "geometry_id": geometry["id"],
+                    "kind": kind,
+                    "selection_id": None,
+                    "name": "",
+                    "region_ids": [],
+                }
+            self._mark_changed()
+            self._rebuild_items()
+            self._rebuild_properties()
+            self._rebuild_preview()
+
     def _rebuild_items(self):
         selected_project = self._selection == ("project", None)
         self._project_node.ui_children = [
@@ -712,8 +853,9 @@ class ThreeDWorkspace(Div):
             "display:flex; align-items:center; gap:6px; min-width:0; padding:5px 8px; border-radius:5px; cursor:pointer; "
             + ("background:var(--accent-subtle); color:var(--accent);" if selected_project else "")
         )
-        geometry_rows = [
-            self._tree_item(
+        geometry_rows = []
+        for geometry in self.project.get("geometries", []):
+            geometry_rows.append(self._tree_item(
                 geometry["name"], "geometry", geometry["id"], "mdi-cube-outline",
                 lambda *_a, asset=geometry["asset"]: self._remove_geometry(asset),
                 material=(
@@ -721,9 +863,22 @@ class ThreeDWorkspace(Div):
                     if self._mesh_tree_label(geometry["id"]) is None else None
                 ),
                 mesh_status=self._mesh_tree_label(geometry["id"]),
-            )
-            for geometry in self.project.get("geometries", [])
-        ]
+            ))
+            selections = [
+                (kind, selection)
+                for kind in ("domain", "boundary")
+                for selection in geometry.get(f"{kind}_selections", [])
+            ]
+            if selections:
+                geometry_rows.append(Div(
+                    "NAMED SELECTIONS",
+                    ui_class="cb-muted",
+                    ui_style="padding:6px 4px 1px 36px; font-size:9px; letter-spacing:.06em; font-weight:650;",
+                ))
+                geometry_rows.extend(
+                    self._named_selection_tree_item(geometry, kind, selection)
+                    for kind, selection in selections
+                )
         trace_rows = [
             self._tree_item(
                 trace_set["name"], "trace_set", trace_set["id"], "mdi-vector-polyline",
@@ -781,6 +936,250 @@ class ThreeDWorkspace(Div):
         widget.on_update_model_value(callback)
         return widget
 
+    def _multi_select_options(self, label, values, callback, options, *, disabled=False):
+        widget = QSelect(
+            ui_label=label,
+            ui_options=options,
+            ui_option_label="label",
+            ui_option_value="value",
+            ui_emit_value=True,
+            ui_map_options=True,
+            ui_multiple=True,
+            ui_use_chips=True,
+            ui_hide_selected=True,
+            ui_model_value=values,
+            ui_dense=True,
+            ui_filled=True,
+            ui_hide_bottom_space=True,
+            ui_disable=disabled,
+            ui_style="width:100%;",
+        )
+        widget.on_update_model_value(callback)
+        return widget
+
+    def _ensure_selection_draft(self, geometry):
+        if self._selection_draft.get("geometry_id") != geometry["id"]:
+            self._selection_draft = {
+                "geometry_id": geometry["id"],
+                "kind": "boundary",
+                "selection_id": None,
+                "name": "",
+                "region_ids": [],
+            }
+        return self._selection_draft
+
+    def _set_selection_draft_kind(self, geometry, event):
+        kind = str(getattr(event, "value", event) or "boundary")
+        if kind not in {"domain", "boundary"}:
+            return
+        draft = self._ensure_selection_draft(geometry)
+        if draft["kind"] == kind:
+            return
+        draft.update({"kind": kind, "selection_id": None, "name": "", "region_ids": []})
+        self._selection = ("geometry", geometry["id"])
+        self._rebuild_properties()
+        self._rebuild_preview()
+
+    def _set_selection_draft_regions(self, geometry, event):
+        draft = self._ensure_selection_draft(geometry)
+        value = getattr(event, "value", event)
+        if value is None:
+            value = []
+        if not isinstance(value, (list, tuple, set)):
+            value = [value]
+        region_ids = []
+        for region_id in value:
+            try:
+                region_id = int(region_id)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if region_id >= 0 and region_id not in region_ids:
+                region_ids.append(region_id)
+        draft["region_ids"] = sorted(region_ids)
+        self._rebuild_preview()
+
+    def _set_selection_draft_name(self, event):
+        value = getattr(event, "value", event)
+        self._selection_draft["name"] = str(value or "").strip()
+
+    def _new_named_selection(self, geometry):
+        draft = self._ensure_selection_draft(geometry)
+        draft.update({"selection_id": None, "name": "", "region_ids": []})
+        self._selection = ("geometry", geometry["id"])
+        self._rebuild_items()
+        self._rebuild_properties()
+        self._rebuild_preview()
+
+    def _save_named_selection(self, geometry):
+        draft = self._ensure_selection_draft(geometry)
+        kind = draft["kind"]
+        name = str(draft.get("name", "")).strip()
+        region_ids = sorted(set(draft.get("region_ids", [])))
+        if not name or len(name) > 100:
+            self._set_status("Enter a name up to 100 characters for this selection.", error=True)
+            return False
+        if not region_ids:
+            self._set_status("Select at least one domain or boundary region.", error=True)
+            return False
+        result = self._mesh_results.get(geometry["id"], {})
+        if result.get("status") != "ready":
+            self._set_status("Generate a volume mesh before saving region selections.", error=True)
+            return False
+        region_key = "domain_regions" if kind == "domain" else "boundary_regions"
+        valid_ids = {int(region["id"]) for region in result.get(region_key, [])}
+        if not set(region_ids).issubset(valid_ids):
+            self._set_status("One or more selected regions are not in the current mesh.", error=True)
+            return False
+
+        collection_key = f"{kind}_selections"
+        collection = geometry.setdefault(collection_key, [])
+        selection_id = draft.get("selection_id")
+        existing = next(
+            (selection for selection in collection if selection.get("id") == selection_id),
+            None,
+        ) if selection_id else None
+        if any(
+            selection is not existing
+            and selection.get("name", "").casefold() == name.casefold()
+            for selection in collection
+        ):
+            self._set_status(f"A {kind} selection named {name!r} already exists.", error=True)
+            return False
+        if existing is None:
+            selection_id = uuid4().hex
+            existing = {"id": selection_id}
+            collection.append(existing)
+        existing["name"] = name
+        existing["domain_ids" if kind == "domain" else "boundary_ids"] = region_ids
+        draft.update({"selection_id": selection_id, "region_ids": region_ids})
+        self._selection = ("named_selection", selection_id)
+        self._mark_changed()
+        validate_3d_project(self.project, self.assets)
+        self._rebuild_items()
+        self._rebuild_properties()
+        self._rebuild_preview()
+        self._set_status(f"Saved {kind} selection {name!r}.")
+        return True
+
+    def _active_boundary_region_ids(self, geometry_id):
+        kind, item_id = self._selection
+        draft = self._selection_draft
+        if (
+            draft.get("geometry_id") == geometry_id
+            and draft.get("kind") == "boundary"
+            and (kind == "geometry" or draft.get("selection_id") == item_id)
+        ):
+            return draft.get("region_ids", [])
+        if kind == "named_selection":
+            context = self._find_named_selection(item_id)
+            if context and context[0]["id"] == geometry_id and context[1] == "boundary":
+                return context[2].get("boundary_ids", [])
+        return []
+
+    def _mesh_quality_message(self, item_id):
+        result = self._mesh_results.get(item_id, {})
+        quality = result.get("tetra_quality")
+        if result.get("status") != "ready":
+            return None
+        if quality is None:
+            return "Quality metrics are unavailable for this volume element type."
+        return (
+            "Tetrahedral mean ratio (0 to 1) · "
+            f"minimum {quality['minimum']:.3f} · 5th percentile {quality['p05']:.3f} · "
+            f"median {quality['median']:.3f} · "
+            f"{quality['below_0_1']:,} below 0.100 "
+            f"({quality['below_0_1_percent']:.2f}%)"
+        )
+
+    def _mesh_setup_properties(self, geometry):
+        item_id = geometry["id"]
+        result = self._mesh_results.get(item_id, {})
+        ready = result.get("status") == "ready"
+        draft = self._ensure_selection_draft(geometry)
+        kind = draft["kind"]
+        regions = result.get(
+            "domain_regions" if kind == "domain" else "boundary_regions", []
+        )
+        region_options = [
+            {
+                "label": (
+                    f"{region['name']} · {region['elements']:,} "
+                    f"{'volume elements' if kind == 'domain' else 'surface triangles'}"
+                ),
+                "value": int(region["id"]),
+            }
+            for region in regions
+        ]
+        children = []
+        quality_message = self._mesh_quality_message(item_id)
+        if quality_message:
+            children.extend([
+                Div("Mesh quality", ui_style="font-size:13px; font-weight:650; margin-top:8px;"),
+                Div(
+                    quality_message,
+                    ui_class="cb-muted",
+                    ui_style="font-size:11px; line-height:1.4; overflow-wrap:anywhere;",
+                ),
+            ])
+        children.extend([
+            Div("Named selections", ui_style="font-size:13px; font-weight:650; margin-top:8px;"),
+            Div(
+                "Click mesh facets or choose regions below. Save domain and boundary groups for later setup.",
+                ui_class="cb-muted",
+                ui_style="font-size:10px; line-height:1.35;",
+            ),
+            self._select_options(
+                "Entity type",
+                kind,
+                lambda event, item=geometry: self._set_selection_draft_kind(item, event),
+                [
+                    {"label": "Boundary regions", "value": "boundary"},
+                    {"label": "Volume domains", "value": "domain"},
+                ],
+            ),
+            self._multi_select_options(
+                "Boundary regions" if kind == "boundary" else "Volume domains",
+                draft.get("region_ids", []),
+                lambda event, item=geometry: self._set_selection_draft_regions(item, event),
+                region_options,
+                disabled=not ready,
+            ),
+            _input(
+                "Selection name",
+                draft.get("name", ""),
+                self._set_selection_draft_name,
+                width="100%",
+            ),
+            Div(
+                _button(
+                    "Update selection" if draft.get("selection_id") else "Save selection",
+                    "mdi-content-save-outline",
+                    lambda *_args, item=geometry: self._save_named_selection(item),
+                    color="primary",
+                ),
+                _button(
+                    "New selection",
+                    "mdi-plus",
+                    lambda *_args, item=geometry: self._new_named_selection(item),
+                    tooltip="Clear the editor and create another named selection",
+                ),
+                ui_style="display:flex; flex-wrap:wrap; gap:6px;",
+            ),
+        ])
+        if not ready:
+            children.append(Div(
+                "Generate a volume mesh to identify domains and boundaries.",
+                ui_class="cb-muted",
+                ui_style="font-size:10px; line-height:1.35;",
+            ))
+        elif not region_options:
+            children.append(Div(
+                "The generated mesh did not expose any named regions for this selection type.",
+                ui_class="cb-muted",
+                ui_style="font-size:10px; line-height:1.35;",
+            ))
+        return children
+
     def _mesh_property_message(self, item_id):
         result = self._mesh_results.get(item_id, {})
         state = result.get("status")
@@ -805,11 +1204,34 @@ class ThreeDWorkspace(Div):
         kind, item_id = self._selection
         children = []
         self._mesh_property_status = None
+        named_context = (
+            self._find_named_selection(item_id) if kind == "named_selection" else None
+        )
         if kind == "geometry":
-            item = next((entry for entry in self.project["geometries"] if entry["id"] == item_id), None)
+            item = next(
+                (entry for entry in self.project["geometries"] if entry["id"] == item_id),
+                None,
+            )
+        elif named_context:
+            item = named_context[0]
+        else:
+            item = None
+        if kind in {"geometry", "named_selection"}:
             if item is None:
                 self._selection = ("project", None)
                 return self._rebuild_properties()
+            draft = self._ensure_selection_draft(item)
+            if named_context and draft.get("selection_id") != item_id:
+                geometry, selection_kind, selection = named_context
+                draft.update({
+                    "geometry_id": geometry["id"],
+                    "kind": selection_kind,
+                    "selection_id": selection["id"],
+                    "name": selection["name"],
+                    "region_ids": list(selection.get(
+                        "domain_ids" if selection_kind == "domain" else "boundary_ids", []
+                    )),
+                })
             mesh_size_input = _input(
                 "Maximum element size (mm)",
                 item.get("mesh_maxh_mm", 30.0),
@@ -819,7 +1241,12 @@ class ThreeDWorkspace(Div):
             )
             mesh_size_input.ui_disable = self._mesh_worker_active
             children.extend([
-                Div("Geometry model", ui_style="font-size:13px; font-weight:650;"),
+                Div(
+                    "Named boundary selection" if named_context and named_context[1] == "boundary"
+                    else "Named domain selection" if named_context
+                    else "Geometry model",
+                    ui_style="font-size:13px; font-weight:650;",
+                ),
                 _input("Name", item["name"], lambda event, obj=item: self._set_value(obj, "name", event), width="100%"),
                 self._select_options(
                     "Material reference", item.get("material", "Shield"),
@@ -843,7 +1270,7 @@ class ThreeDWorkspace(Div):
                 Div("3D mesh", ui_style="font-size:13px; font-weight:650; margin-top:8px;"),
                 mesh_size_input,
                 Div(
-                    self._mesh_property_message(item_id),
+                    self._mesh_property_message(item["id"]),
                     ui_class="cb-muted",
                     ui_style="font-size:11px; line-height:1.4; overflow-wrap:anywhere;",
                 ),
@@ -855,6 +1282,7 @@ class ThreeDWorkspace(Div):
                 ),
             ])
             self._mesh_property_status = children[-2]
+            children.extend(self._mesh_setup_properties(item))
         elif kind == "trace_set":
             item = next((entry for entry in self.project["wire_trace_sets"] if entry["id"] == item_id), None)
             if item is None:
@@ -904,11 +1332,33 @@ class ThreeDWorkspace(Div):
         self._properties.ui_children = children
 
     def select_item(self, kind, item_id=None):
+        if kind == "geometry":
+            geometry = next(
+                (entry for entry in self.project.get("geometries", []) if entry.get("id") == item_id),
+                None,
+            )
+            if geometry:
+                self._ensure_selection_draft(geometry)
+        elif kind == "named_selection":
+            context = self._find_named_selection(item_id)
+            if context:
+                geometry, selection_kind, selection = context
+                self._selection_draft = {
+                    "geometry_id": geometry["id"],
+                    "kind": selection_kind,
+                    "selection_id": selection["id"],
+                    "name": selection["name"],
+                    "region_ids": list(selection.get(
+                        "domain_ids" if selection_kind == "domain" else "boundary_ids", []
+                    )),
+                }
         self._selection = (kind, item_id)
         self._rebuild_items()
         self._rebuild_properties()
+        if kind == "named_selection":
+            self._rebuild_preview()
 
-    def _on_preview_plotly_click(self, figure_index, curve_number):
+    def _on_preview_plotly_click(self, figure_index, curve_number, point_number=None):
         if figure_index != 0 or not self._preview._figures:
             return
         traces = self._preview._figures[0].data
@@ -919,6 +1369,51 @@ class ThreeDWorkspace(Div):
         item_id = metadata.get("mmfem_item_id")
         if kind not in {"geometry", "trace_set"} or not item_id:
             return
+        if (
+            kind == "geometry"
+            and metadata.get("mmfem_generated_mesh")
+            and not metadata.get("mmfem_mesh_edges")
+            and point_number is not None
+        ):
+            result = self._mesh_results.get(item_id, {})
+            region_ids = result.get("boundary_region_ids", [])
+            if 0 <= point_number < len(region_ids):
+                context = (
+                    self._find_named_selection(self._selection[1])
+                    if self._selection[0] == "named_selection" else None
+                )
+                continue_editing = bool(
+                    context
+                    and context[0]["id"] == item_id
+                    and context[1] == "boundary"
+                )
+                draft = self._selection_draft
+                if not continue_editing and not (
+                    draft.get("geometry_id") == item_id and draft.get("kind") == "boundary"
+                    and self._selection == ("geometry", item_id)
+                ):
+                    self._selection_draft = {
+                        "geometry_id": item_id,
+                        "kind": "boundary",
+                        "selection_id": None,
+                        "name": "",
+                        "region_ids": [],
+                    }
+                region_id = int(region_ids[point_number])
+                draft_ids = self._selection_draft["region_ids"]
+                if region_id in draft_ids:
+                    draft_ids.remove(region_id)
+                else:
+                    draft_ids.append(region_id)
+                    draft_ids.sort()
+                self._selection = (
+                    ("named_selection", context[2]["id"])
+                    if continue_editing else ("geometry", item_id)
+                )
+                self._rebuild_items()
+                self._rebuild_properties()
+                self._rebuild_preview()
+                return
         exists = any(
             item.get("id") == item_id
             for item in self.project.get("geometries" if kind == "geometry" else "wire_trace_sets", [])
@@ -940,17 +1435,29 @@ class ThreeDWorkspace(Div):
                 trace.opacity = 0.4 if self._transparent_shield else 1.0
                 color = "#f59e0b" if selected else base_color
                 trace.color = color
+                generated_mesh = bool(metadata.get("mmfem_generated_mesh"))
+                if generated_mesh:
+                    trace.visible = self._mesh_surface_visible
                 updates = {"color": color, "opacity": trace.opacity}
+                if generated_mesh:
+                    updates["visible"] = trace.visible
             else:
                 if metadata.get("mmfem_mesh_edges"):
                     color = base_color
                     width = 2.5 if selected else 1
+                    trace.visible = self._mesh_edges_visible
+                elif metadata.get("mmfem_boundary_overlay"):
+                    color = "#f59e0b"
+                    width = 4
+                    trace.visible = self._mesh_surface_visible
                 else:
                     color = "#f59e0b" if selected else base_color
                     width = 8 if selected else 5
                 trace.line.color = color
                 trace.line.width = width
                 updates = {"line.color": color, "line.width": width}
+                if metadata.get("mmfem_mesh_edges") or metadata.get("mmfem_boundary_overlay"):
+                    updates["visible"] = trace.visible
             trace_updates.append(updates)
         return trace_updates
 
@@ -1035,11 +1542,8 @@ class ThreeDWorkspace(Div):
         self._set_status("Mesh size updated. Generate a new mesh to apply it.")
 
     def generate_mesh(self, *_args):
-        kind, item_id = self._selection
-        item = next(
-            (entry for entry in self.project.get("geometries", []) if entry.get("id") == item_id),
-            None,
-        ) if kind == "geometry" else None
+        item = self._selected_geometry()
+        item_id = item.get("id") if item else None
         if item is None:
             self._set_status("Select a geometry model before generating a mesh.", error=True)
             return False
@@ -1353,6 +1857,10 @@ class ThreeDWorkspace(Div):
             for item_id, result in self._mesh_results.items()
             if result.get("status") == "ready"
         }
+        highlighted_regions = {
+            item["id"]: list(self._active_boundary_region_ids(item["id"]))
+            for item in project.get("geometries", [])
+        }
         if not project["geometries"] and not project["wire_trace_sets"]:
             with self._preview_lock:
                 self._preview_generation += 1
@@ -1369,7 +1877,7 @@ class ThreeDWorkspace(Div):
         with self._preview_lock:
             self._preview_generation += 1
             generation = self._preview_generation
-            self._preview_pending = (generation, project, assets, meshes)
+            self._preview_pending = (generation, project, assets, meshes, highlighted_regions)
             if self._preview_running:
                 return
             self._preview_running = True
@@ -1413,11 +1921,12 @@ class ThreeDWorkspace(Div):
         self._cache_preview_item(key, value)
         return value
 
-    def _build_preview_figure(self, project, assets, meshes=None):
+    def _build_preview_figure(self, project, assets, meshes=None, highlighted_regions=None):
         from .three_d_preview import _sample_trace_points, preview_figure, tessellate_step
         from .three_d_project import parse_wire_trace
 
         meshes = meshes or {}
+        highlighted_regions = highlighted_regions or {}
         geometry_payload = []
         for item in project.get("geometries", []):
             data = assets[item["asset"]]
@@ -1436,6 +1945,8 @@ class ThreeDWorkspace(Div):
                     "triangles": generated_mesh["triangles"],
                     "edges": generated_mesh.get("edges"),
                     "generated_mesh": True,
+                    "boundary_region_ids": generated_mesh.get("boundary_region_ids"),
+                    "highlighted_boundary_ids": highlighted_regions.get(item["id"], []),
                 })
                 continue
             key = ("geometry", item.get("sha256"), item.get("units", "m"))
@@ -1490,9 +2001,11 @@ class ThreeDWorkspace(Div):
                 if job is None:
                     self._preview_running = False
                     return
-            generation, project, assets, meshes = job
+            generation, project, assets, meshes, highlighted_regions = job
             try:
-                figure = self._build_preview_figure(project, assets, meshes)
+                figure = self._build_preview_figure(
+                    project, assets, meshes, highlighted_regions
+                )
                 self._dispatch_preview_result(generation, figure=figure)
             except Exception as error:
                 self._dispatch_preview_result(generation, error=error)

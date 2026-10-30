@@ -22,6 +22,8 @@ PROJECT_ENTRY = "project.json"
 MAX_PROJECT_BYTES = 512_000_000
 MAX_ASSET_BYTES = 256_000_000
 MAX_PROJECT_ITEMS = 500
+MAX_NAMED_SELECTIONS = 500
+MAX_SELECTION_REGIONS = 100_000
 MIN_MESH_SIZE_MM = 0.01
 MAX_MESH_SIZE_MM = 100_000.0
 
@@ -184,6 +186,8 @@ def add_step_geometry(project, assets, filename, data, *, units="m", material="S
         "units": units,
         "asset": asset,
         "sha256": hashlib.sha256(payload).hexdigest(),
+        "domain_selections": [],
+        "boundary_selections": [],
     }
     project["geometries"].append(item)
     assets[asset] = payload
@@ -245,6 +249,48 @@ def _validate_asset_reference(item, assets, *, kind, extension):
     return bytes(payload)
 
 
+def _validate_named_selections(geometry, key, region_key, label):
+    selections = geometry.setdefault(key, [])
+    if not isinstance(selections, list) or len(selections) > MAX_NAMED_SELECTIONS:
+        raise ValueError(
+            f"Each geometry can contain at most {MAX_NAMED_SELECTIONS} named {label} selections."
+        )
+    used_ids = set()
+    used_names = set()
+    for selection in selections:
+        if not isinstance(selection, dict):
+            raise ValueError(f"Named {label} selections must be objects.")
+        selection_id = selection.get("id")
+        name = selection.get("name")
+        region_ids = selection.get(region_key)
+        if not isinstance(selection_id, str) or not selection_id.strip() or len(selection_id) > 128:
+            raise ValueError(f"Each named {label} selection must have an id.")
+        if selection_id in used_ids:
+            raise ValueError(f"Named {label} selection ids must be unique.")
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 100:
+            raise ValueError(f"Each named {label} selection needs a name of at most 100 characters.")
+        normalized_name = name.strip().casefold()
+        if normalized_name in used_names:
+            raise ValueError(f"Named {label} selection names must be unique within a geometry.")
+        if (
+            not isinstance(region_ids, list)
+            or not region_ids
+            or len(region_ids) > MAX_SELECTION_REGIONS
+        ):
+            raise ValueError(
+                f"Each named {label} selection must include between 1 and "
+                f"{MAX_SELECTION_REGIONS:,} regions."
+            )
+        if any(type(region_id) is not int or region_id < 0 for region_id in region_ids):
+            raise ValueError(f"Named {label} selection region ids must be non-negative integers.")
+        if len(set(region_ids)) != len(region_ids):
+            raise ValueError(f"Named {label} selection region ids must be unique.")
+        selection["name"] = name.strip()
+        selection[region_key] = sorted(region_ids)
+        used_ids.add(selection_id)
+        used_names.add(normalized_name)
+
+
 def validate_3d_project(project, assets):
     if not isinstance(project, dict) or project.get("schema") != PROJECT_SCHEMA:
         raise ValueError("This is not an MM-FEM 3D project.")
@@ -277,6 +323,12 @@ def validate_3d_project(project, assets):
                 raise ValueError(
                     f"Invalid maximum mesh size for {geometry['name']!r}: {error}"
                 ) from error
+        _validate_named_selections(
+            geometry, "domain_selections", "domain_ids", "domain"
+        )
+        _validate_named_selections(
+            geometry, "boundary_selections", "boundary_ids", "boundary"
+        )
         payload = _validate_asset_reference(geometry, assets, kind="geometry", extension=".step")
         validate_step_file(geometry.get("name", "geometry.step"), payload)
         referenced.add(geometry["asset"])

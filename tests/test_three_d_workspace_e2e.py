@@ -21,7 +21,7 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
         units="mm",
         material="Shield",
     )
-    geometry["mesh_maxh_mm"] = 30.0
+    geometry["mesh_maxh_mm"] = 40.0
     add_wire_trace(
         project,
         assets,
@@ -70,9 +70,91 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     assert browser_traces[0]["color"] == "#f59e0b"
     assert browser_traces[1]["lineColor"] == "#33475b"
     page.get_by_text("Ready ·", exact=False).wait_for(timeout=10_000)
+    page.get_by_text("Tetrahedral mean ratio", exact=False).wait_for(timeout=10_000)
+    selected_boundary = int(workspace._mesh_results[geometry["id"]]["boundary_region_ids"][0])
+    graph.evaluate(
+        "element => element.emit('plotly_click', {points: [{curveNumber: 0, pointNumber: 0}]})"
+    )
+    deadline = time.monotonic() + 10
+    while (
+        selected_boundary not in workspace._selection_draft.get("region_ids", [])
+        and time.monotonic() < deadline
+    ):
+        page.wait_for_timeout(100)
+    assert selected_boundary in workspace._selection_draft["region_ids"]
+    page.get_by_label("Selection name").fill("Selected STEP boundary")
+    deadline = time.monotonic() + 10
+    while (
+        workspace._selection_draft.get("name") != "Selected STEP boundary"
+        and time.monotonic() < deadline
+    ):
+        page.wait_for_timeout(100)
+    assert workspace._selection_draft["name"] == "Selected STEP boundary"
+    page.get_by_role("button", name="Save selection").click()
+    live_geometry = workspace.project["geometries"][0]
+    deadline = time.monotonic() + 10
+    while not live_geometry.get("boundary_selections") and time.monotonic() < deadline:
+        page.wait_for_timeout(100)
+    assert live_geometry.get("boundary_selections")
+    assert live_geometry["boundary_selections"][0]["boundary_ids"] == [selected_boundary]
+    page.wait_for_function(
+        """() => {
+            const graph = document.querySelector('.mmfem-3d-viewport .js-plotly-plot');
+            return graph && graph.data && graph.data.some(
+                trace => trace.meta && trace.meta.mmfem_boundary_overlay
+            );
+        }""",
+        timeout=20_000,
+    )
+    page.get_by_role("button", name="Mesh edges").click()
+    page.wait_for_function(
+        """() => {
+            const graph = document.querySelector('.mmfem-3d-viewport .js-plotly-plot');
+            return graph && graph.data && graph.data[1] && graph.data[1].visible === false;
+        }""",
+        timeout=10_000,
+    )
+    page.get_by_role("button", name="Surface mesh").click()
+    page.wait_for_function(
+        """() => {
+            const graph = document.querySelector('.mmfem-3d-viewport .js-plotly-plot');
+            return graph && graph.data && graph.data[0] && graph.data[0].visible === false;
+        }""",
+        timeout=10_000,
+    )
+    page.get_by_role("button", name="Surface mesh").click()
+    page.get_by_role("button", name="Mesh edges").click()
+    page.wait_for_function(
+        """() => {
+            const graph = document.querySelector('.mmfem-3d-viewport .js-plotly-plot');
+            return graph && graph.data && graph.data[0] && graph.data[0].visible !== false
+                && graph.data[1] && graph.data[1].visible !== false;
+        }""",
+        timeout=10_000,
+    )
     page.wait_for_timeout(2500)
+    properties = page.locator(".mmfem-property-editor-body")
+    properties.evaluate("element => { element.scrollTop = 0; }")
+    page.wait_for_timeout(500)
     page.screenshot(
-        path=str(Path(tempfile.gettempdir()) / "mmfem_stage3_3d_volume_mesh.png"),
+        path=str(Path(tempfile.gettempdir()) / "mmfem_stage4_3d_mesh_inspection.png"),
+        full_page=True,
+    )
+    properties.evaluate(
+        """element => {
+            const title = Array.from(element.children).find(
+                child => child.textContent.trim() === 'Named selections'
+            );
+            if (!title) return;
+            const offset = title.getBoundingClientRect().top
+                - element.getBoundingClientRect().top + element.scrollTop;
+            const maxScroll = Math.max(0, element.scrollHeight - element.clientHeight);
+            element.scrollTop = Math.max(0, Math.min(offset - 8, maxScroll - 12));
+        }"""
+    )
+    page.wait_for_timeout(500)
+    page.screenshot(
+        path=str(Path(tempfile.gettempdir()) / "mmfem_stage4_3d_named_selections.png"),
         full_page=True,
     )
     page.set_viewport_size({"width": 960, "height": 680})
@@ -85,7 +167,9 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
         timeout=10_000,
     )
     page.wait_for_timeout(1000)
+    properties.evaluate("element => { element.scrollTop = 0; }")
+    page.wait_for_timeout(500)
     page.screenshot(
-        path=str(Path(tempfile.gettempdir()) / "mmfem_stage3_3d_volume_mesh_compact.png"),
+        path=str(Path(tempfile.gettempdir()) / "mmfem_stage4_3d_mesh_inspection_compact.png"),
         full_page=True,
     )

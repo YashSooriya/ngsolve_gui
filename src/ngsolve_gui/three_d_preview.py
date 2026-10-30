@@ -116,7 +116,8 @@ def preview_figure(payload):
         triangles = np.asarray(item["triangles"])
         if vertices.size == 0 or triangles.size == 0:
             continue
-        figure.add_trace(go.Mesh3d(
+        base_color = _MATERIAL_COLORS[index % len(_MATERIAL_COLORS)]
+        mesh_trace = go.Mesh3d(
             # Send ordinary lists through ngapp's websocket bridge. NumPy arrays
             # are accepted by Plotly in Python but are not reliably marshalled
             # to the browser component by the app's cross-process serializer.
@@ -130,7 +131,7 @@ def preview_figure(payload):
                 f"{item.get('name', 'Geometry')} volume mesh"
                 if item.get("generated_mesh") else item.get("name", "Geometry")
             ),
-            color=_MATERIAL_COLORS[index % len(_MATERIAL_COLORS)],
+            color=base_color,
             opacity=1.0,
             flatshading=True,
             hoverinfo="name",
@@ -138,10 +139,11 @@ def preview_figure(payload):
             meta={
                 "mmfem_kind": "geometry",
                 "mmfem_item_id": item.get("id"),
-                "mmfem_base_color": _MATERIAL_COLORS[index % len(_MATERIAL_COLORS)],
+                "mmfem_base_color": base_color,
                 "mmfem_generated_mesh": bool(item.get("generated_mesh")),
             },
-        ))
+        )
+        figure.add_trace(mesh_trace)
         edges = item.get("edges")
         if item.get("generated_mesh") and edges is not None and len(edges):
             edge_coordinates = vertices[np.asarray(edges, dtype=np.int32)]
@@ -168,6 +170,52 @@ def preview_figure(payload):
                     "mmfem_mesh_edges": True,
                 },
             ))
+        boundary_region_ids = item.get("boundary_region_ids")
+        selected_region_ids = set(item.get("highlighted_boundary_ids", []))
+        if (
+            item.get("generated_mesh")
+            and boundary_region_ids is not None
+            and selected_region_ids
+        ):
+            region_ids = np.asarray(boundary_region_ids, dtype=np.int32)
+            if len(region_ids) == len(triangles):
+                selected_triangles = triangles[np.isin(region_ids, list(selected_region_ids))]
+                if len(selected_triangles):
+                    selected_edges = np.concatenate((
+                        selected_triangles[:, [0, 1]],
+                        selected_triangles[:, [1, 2]],
+                        selected_triangles[:, [2, 0]],
+                    ), axis=0)
+                    selected_edges.sort(axis=1)
+                    unique_edges, edge_counts = np.unique(
+                        selected_edges, axis=0, return_counts=True
+                    )
+                    outline = unique_edges[edge_counts == 1]
+                    if len(outline):
+                        edge_coordinates = vertices[outline]
+                        edge_x = []
+                        edge_y = []
+                        edge_z = []
+                        for start, end in edge_coordinates:
+                            edge_x.extend((float(start[0]), float(end[0]), None))
+                            edge_y.extend((float(start[1]), float(end[1]), None))
+                            edge_z.extend((float(start[2]), float(end[2]), None))
+                        figure.add_trace(go.Scatter3d(
+                            x=edge_x,
+                            y=edge_y,
+                            z=edge_z,
+                            mode="lines",
+                            name=f"{item.get('name', 'Geometry')} selected boundary",
+                            line={"color": "#f59e0b", "width": 4},
+                            hoverinfo="skip",
+                            showlegend=False,
+                            meta={
+                                "mmfem_kind": "boundary_overlay",
+                                "mmfem_item_id": item.get("id"),
+                                "mmfem_base_color": "#f59e0b",
+                                "mmfem_boundary_overlay": True,
+                            },
+                        ))
     for index, item in enumerate(payload.get("traces", [])):
         points = item["points"]
         figure.add_trace(go.Scatter3d(

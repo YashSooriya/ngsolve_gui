@@ -83,6 +83,8 @@ def test_project_round_trip_keeps_step_trace_metadata_and_solver_filenames(tmp_p
     assets = {}
     geometry = add_step_geometry(project, assets, "shield.stp", STEP, units="mm")
     geometry["mesh_maxh_mm"] = 30.0
+    geometry["domain_selections"] = [{"id": "domain-selection-1", "name": "Shield volume", "domain_ids": [0]}]
+    geometry["boundary_selections"] = [{"id": "boundary-selection-1", "name": "Cryostat ends", "boundary_ids": [0, 2]}]
     trace_set = add_wire_trace(
         project, assets, "x_gradient.csv", b"0,0,0\n0,0.1,0\n", units="cm"
     )
@@ -95,6 +97,8 @@ def test_project_round_trip_keeps_step_trace_metadata_and_solver_filenames(tmp_p
     assert restored["name"] == "Shielded magnet"
     assert restored["geometries"][0]["units"] == "mm"
     assert restored["geometries"][0]["mesh_maxh_mm"] == 30.0
+    assert restored["geometries"][0]["domain_selections"] == geometry["domain_selections"]
+    assert restored["geometries"][0]["boundary_selections"] == geometry["boundary_selections"]
     assert restored_assets[geometry["asset"]] == STEP
     points = parse_wire_trace(restored_assets[trace_set["traces"][0]["filename"]])
     assert points == [(0.0, 0.0, 0.0), (0.0, 0.001, 0.0)]
@@ -120,6 +124,38 @@ def test_project_rejects_invalid_persisted_mesh_size(maxh):
     geometry["mesh_maxh_mm"] = maxh
 
     with pytest.raises(ValueError, match="Invalid maximum mesh size"):
+        package_3d_project(project, assets)
+
+
+def test_older_geometry_without_named_selection_fields_remains_compatible():
+    project = new_3d_project()
+    assets = {}
+    geometry = add_step_geometry(project, assets, "shield.step", STEP)
+    geometry.pop("domain_selections")
+    geometry.pop("boundary_selections")
+
+    restored, _assets = unpack_3d_project(package_3d_project(project, assets))
+
+    assert restored["geometries"][0]["domain_selections"] == []
+    assert restored["geometries"][0]["boundary_selections"] == []
+
+
+@pytest.mark.parametrize(
+    "key,selection,error",
+    [
+        ("boundary_selections", {"id": "s1", "name": "", "boundary_ids": [0]}, "needs a name"),
+        ("boundary_selections", {"id": "s1", "name": "Outside", "boundary_ids": [True]}, "non-negative integers"),
+        ("domain_selections", {"id": "s1", "name": "Core", "domain_ids": []}, "must include"),
+        ("domain_selections", {"id": "s1", "name": "Core", "domain_ids": [0, 0]}, "must be unique"),
+    ],
+)
+def test_project_rejects_invalid_named_region_selections(key, selection, error):
+    project = new_3d_project()
+    assets = {}
+    geometry = add_step_geometry(project, assets, "shield.step", STEP)
+    geometry[key] = [selection]
+
+    with pytest.raises(ValueError, match=error):
         package_3d_project(project, assets)
 
 
