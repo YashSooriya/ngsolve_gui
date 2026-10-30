@@ -9,6 +9,8 @@ from netgen.occ import Box, Pnt
 from playwright.sync_api import Page
 
 from ngsolve_gui.axisymmetric_model import builtin_materials
+from ngsolve_gui.sections.regions import RegionsSection
+from ngsolve_gui.sections.study_info import StudyInfoSection
 from ngsolve_gui.three_d_project import add_step_geometry, add_wire_trace, new_3d_project
 import ngsolve_gui.solve_workspace as solve_workspace
 
@@ -90,13 +92,38 @@ def _exercise_3d_run_handoff(page, app, tmp_path):
     assert app.app_data.get_tabs()
     assert workspace.ui_hidden is True
     assert app._post_process_workspace.ui_hidden is False
-
     component = app.tab_panel.comp
     assert component is not None
     assert component.mesh.ne > 0
     assert component.cf.dim == 3
-    page.wait_for_timeout(1500)
-    page.get_by_role("button", name="Fit view").click()
+    assert component.run_metadata["frequency_hz"] == 50.0
+    assert component.run_metadata["status"] == "complete"
+    assert component.field_metadata["field_key"] == "gfAAC"
+    alternate_field = next(
+        item for item in component.available_result_fields
+        if item["field_key"] == "gfBAC"
+    )
+    assert alternate_field["label"].startswith("AC magnetic flux density [T]")
+    assert callable(component._ngsolve_gui_open_result_field)
+    assert StudyInfoSection in component.property_sections
+    assert RegionsSection in component.property_sections
+    assert StudyInfoSection not in component.hidden_sections
+    assert RegionsSection not in component.hidden_sections
+    assert component.property_xref()["label"] == "Open as mesh"
+    assert {str(name) for name in component.mesh.GetMaterials()} >= {"Copper", "Air"}
+
+    component._ngsolve_gui_open_result_field(alternate_field["path"])
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        loaded_component = app.tab_panel.comp
+        if (
+            loaded_component is not None
+            and loaded_component.field_metadata
+            and loaded_component.field_metadata.get("field_key") == "gfBAC"
+        ):
+            break
+        page.wait_for_timeout(100)
+    assert app.tab_panel.comp.field_metadata["field_key"] == "gfBAC"
 
     app._workspace_mode_toggle.select("solve")
     assert workspace.ui_hidden is False

@@ -2401,11 +2401,20 @@ class NGSolveGui(App):
         return True
 
     def _dispatch_to_ui(self, callback, *args):
-        """Schedule a worker result on ngapp's event loop when it is running."""
-        loop = getattr(self, "loop", None)
-        if loop is not None:
-            if not loop.is_running():
-                return False
+        """Run a callback on the thread that handles ngapp component events."""
+        try:
+            from webgpu import platform
+
+            server = platform.websocket_server
+            loop = getattr(server, "_callback_loop", None)
+            thread = getattr(server, "_callback_thread", None)
+        except Exception:
+            loop = thread = None
+
+        if loop is not None and loop.is_running():
+            if thread is not None and threading.get_ident() == thread.ident:
+                callback(*args)
+                return True
             try:
                 loop.call_soon_threadsafe(callback, *args)
                 return True
@@ -2797,7 +2806,7 @@ class NGSolveGui(App):
         if data is not None:
             self.app_data._data.update(data)
         self._update()
-        self.app_data._update = self._update
+        self.app_data._update = self._update_from_app_data
 
     def _click_tab(self, tabname):
         if tabname == self.app_data.active_tab and self.tab_panel.comp is not None:
@@ -2988,3 +2997,7 @@ class NGSolveGui(App):
         self.navigator.update()
         self.tab_panel.set_tab()
         self._activate(self.app_data.active_tab)
+
+    def _update_from_app_data(self):
+        """Apply worker-scheduled tab changes on the UI event-loop thread."""
+        self._dispatch_to_ui(self._update)

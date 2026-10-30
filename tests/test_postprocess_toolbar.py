@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import threading
 
 from ngapp.components import Div
 
@@ -133,3 +134,52 @@ def test_3d_solve_camera_actions_still_target_the_model_workspace():
 
     assert NGSolveGui._menu_fit_view(app) == "model-fit"
     assert NGSolveGui._menu_camera_view(app, "isometric") == "model-isometric"
+
+
+def test_worker_ui_updates_are_scheduled_on_ngapp_event_loop(monkeypatch):
+    from webgpu import platform
+
+    scheduled = []
+
+    class Loop:
+        def is_running(self):
+            return True
+
+        def call_soon_threadsafe(self, callback, *args):
+            scheduled.append((callback, args))
+
+    thread = SimpleNamespace(ident=threading.get_ident() + 1)
+    monkeypatch.setattr(
+        platform,
+        "websocket_server",
+        SimpleNamespace(_callback_loop=Loop(), _callback_thread=thread),
+    )
+    callback = lambda value: value
+    app = SimpleNamespace()
+
+    assert NGSolveGui._dispatch_to_ui(app, callback, "ready") is True
+    assert scheduled == [(callback, ("ready",))]
+
+
+def test_ui_updates_run_inline_when_already_on_ngapp_event_loop(monkeypatch):
+    from webgpu import platform
+
+    called = []
+
+    class Loop:
+        def is_running(self):
+            return True
+
+        def call_soon_threadsafe(self, callback, *args):
+            raise AssertionError("same-thread UI updates should run inline")
+
+    thread = SimpleNamespace(ident=threading.get_ident())
+    monkeypatch.setattr(
+        platform,
+        "websocket_server",
+        SimpleNamespace(_callback_loop=Loop(), _callback_thread=thread),
+    )
+    app = SimpleNamespace()
+
+    assert NGSolveGui._dispatch_to_ui(app, called.append, "ready") is True
+    assert called == ["ready"]

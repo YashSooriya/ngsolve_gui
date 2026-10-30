@@ -1,6 +1,7 @@
 """The 3D result view preserves meridian values through a full revolution."""
 
 import math
+import time
 
 import ngsolve as ngs
 from netgen.geom2d import SplineGeometry
@@ -234,10 +235,15 @@ def test_axisymmetric_revolution_control_switches_viewport_dimension(
         assert section_ui._head_main.ui_children[2].ui_children == [
             "Revolved 3D View"
         ]
-
         original_tool_dock = component._tool_dock
         component.axisymmetric_revolved.value = True
         assert component.mesh.dim == 3
+        deadline = time.monotonic() + 5
+        while (
+            component._tool_dock not in app._post_process_toolbar.ui_children
+            and time.monotonic() < deadline
+        ):
+            page.wait_for_timeout(20)
         assert component._tool_dock is not original_tool_dock
         assert component._tool_dock in app._post_process_toolbar.ui_children
         assert component._camera_view_group.ui_hidden is False
@@ -250,6 +256,12 @@ def test_axisymmetric_revolution_control_switches_viewport_dimension(
         assert component._clip_toolbar is not None
         component.axisymmetric_revolved.value = False
         assert component.mesh.dim == 2
+        deadline = time.monotonic() + 5
+        while (
+            component._tool_dock not in app._post_process_toolbar.ui_children
+            and time.monotonic() < deadline
+        ):
+            page.wait_for_timeout(20)
         assert not component.slice_available
         assert not component.slice_feature_available
         assert component._camera_view_group.ui_hidden is False

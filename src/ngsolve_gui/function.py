@@ -135,6 +135,16 @@ class FunctionComponent(WebgpuTab):
         self.app_data = app_data
         cf = data["obj"]
         self.name = name
+        self.run_metadata = data.get("_ngsolve_gui_run_metadata")
+        self.field_metadata = data.get("_ngsolve_gui_field_metadata")
+        self.available_result_fields = list(
+            data.get("_ngsolve_gui_result_fields", [])
+        )
+        # The loader owns this transient app callback. Resolve it at component
+        # construction time, before its property sections are instantiated.
+        from . import file_loader
+
+        self._ngsolve_gui_open_result_field = file_loader._open_result_field_func
         self.mdata = None
         self.cf = cf
         component_names = data.get("_ngsolve_gui_component_names")
@@ -320,6 +330,15 @@ class FunctionComponent(WebgpuTab):
         # Leave only Regions in the narrow properties sidebar.
         from .sections.colorbar import ColorbarSection
         from .sections.regions import RegionsSection
+        run_info_section = None
+        if isinstance(self.run_metadata, dict):
+            from .sections.study_info import StudyInfoSection
+
+            sections = list(self.property_sections)
+            if StudyInfoSection not in sections:
+                sections.insert(0, StudyInfoSection)
+            self.property_sections = sections
+            run_info_section = StudyInfoSection
         section_by_name = {section.__name__: section for section in self.property_sections}
         self._postprocess_toolbar_groups = [
             ("Field", "mdi-palette", [ColorbarSection, section_by_name.get("ComplexSection")]),
@@ -334,7 +353,7 @@ class FunctionComponent(WebgpuTab):
         ]
         self.hidden_sections = tuple(
             section for section in self.property_sections
-            if section is not RegionsSection
+            if section not in (RegionsSection, run_info_section)
         )
 
         cv = data.get("clipping_vectors", False)

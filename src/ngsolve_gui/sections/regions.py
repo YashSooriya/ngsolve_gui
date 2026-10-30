@@ -45,7 +45,11 @@ class RegionsSection(Section):
 
         super().__init__(
             icon="mdi-layers-outline", title="Regions",
-            opened=bool(st.any_hidden()), head_actions=[show_all],
+            opened=(
+                bool(st.any_hidden())
+                or isinstance(getattr(comp, "run_metadata", None), dict)
+            ),
+            head_actions=[show_all],
         )
         if self._open:
             self._build_rows()

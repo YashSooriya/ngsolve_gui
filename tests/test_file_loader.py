@@ -119,6 +119,11 @@ def test_default_3d_magnetic_flux_pickle_uses_axial_vector_parity(monkeypatch, t
         '"label":"DC magnetic flux density [T]"}}',
         encoding="utf-8",
     )
+    (tmp_path / "run_manifest.json").write_text(
+        '{"schema":"mm-fem.run","status":"complete",'
+        '"frequency_hz":50,"materials":["Air","Copper"]}',
+        encoding="utf-8",
+    )
     captured = {}
     monkeypatch.setattr(
         file_loader,
@@ -132,6 +137,93 @@ def test_default_3d_magnetic_flux_pickle_uses_axial_vector_parity(monkeypatch, t
 
     assert captured["object"] is grid_function
     assert captured["_ngsolve_gui_symmetry_vector_kind"] == "axial"
+    assert captured["_ngsolve_gui_field_metadata"]["field_key"] == "gfBDC"
+    assert captured["_ngsolve_gui_run_metadata"]["frequency_hz"] == 50
+
+
+def test_run_manifest_lookup_finds_the_result_run_directory(tmp_path):
+    result_directory = tmp_path / "run" / "ngsolve_gui" / "fields"
+    result_directory.mkdir(parents=True)
+    field_path = result_directory / "B_AC.pkl"
+    field_path.write_bytes(b"field")
+    (tmp_path / "run" / "run_manifest.json").write_text(
+        '{"schema":"mm-fem.run","status":"complete",'
+        '"model_name":"Copper coil"}',
+        encoding="utf-8",
+    )
+
+    manifest = file_loader._run_manifest_for_path(field_path)
+
+    assert manifest["model_name"] == "Copper coil"
+
+
+def test_result_field_choices_resolve_siblings_and_exclude_current_field(tmp_path):
+    gui_directory = tmp_path / "ngsolve_gui"
+    fields_directory = gui_directory / "fields"
+    fields_directory.mkdir(parents=True)
+    current_path = fields_directory / "potential.pkl"
+    other_path = fields_directory / "magnetic_flux_density.pkl"
+    current_path.write_bytes(b"current")
+    other_path.write_bytes(b"other")
+    metadata = {
+        "field_files": [
+            {
+                "file": "fields/potential.pkl",
+                "field_key": "gfAAC",
+                "snapshot_index": 0,
+                "label": "AC magnetic vector potential [Wb/m]",
+            },
+            {
+                "file": "fields/magnetic_flux_density.pkl",
+                "field_key": "gfBAC",
+                "snapshot_index": 0,
+                "label": "AC magnetic flux density [T]",
+            },
+            {
+                "file": "fields/missing.pkl",
+                "field_key": "gfHAC",
+                "snapshot_index": 0,
+                "label": "AC magnetic field [A/m]",
+            },
+        ]
+    }
+    (gui_directory / "metadata.json").write_text("{}", encoding="utf-8")
+
+    choices = file_loader._result_field_choices(
+        current_path,
+        metadata,
+        {"field_key": "gfAAC", "snapshot_index": 0},
+    )
+
+    assert choices == [{
+        "path": str(other_path.resolve()),
+        "label": "AC magnetic flux density [T]",
+        "field_key": "gfBAC",
+        "snapshot_index": 0,
+    }]
+
+
+def test_result_field_choices_keep_legacy_entries_without_field_keys(tmp_path):
+    gui_directory = tmp_path / "ngsolve_gui"
+    fields_directory = gui_directory / "fields"
+    fields_directory.mkdir(parents=True)
+    current_path = fields_directory / "current.pkl"
+    legacy_path = fields_directory / "legacy.pkl"
+    current_path.write_bytes(b"current")
+    legacy_path.write_bytes(b"legacy")
+    (gui_directory / "metadata.json").write_text("{}", encoding="utf-8")
+    metadata = {
+        "field_files": [
+            {"file": "fields/current.pkl", "label": "Current"},
+            {"file": "fields/legacy.pkl", "label": "Legacy exported field"},
+        ]
+    }
+
+    choices = file_loader._result_field_choices(
+        current_path, metadata, {"label": "Current"}
+    )
+
+    assert [choice["label"] for choice in choices] == ["Legacy exported field"]
 
 
 def test_vector_component_selector_uses_axisymmetric_names():
@@ -196,6 +288,34 @@ def test_draw_preserves_gridfunction_for_function_component(monkeypatch):
     assert captured["component"] is file_loader.FunctionComponent
     assert captured["data"]["obj"] is grid_function
     assert captured["data"]["mesh"] is mesh
+
+
+def test_result_component_creation_is_dispatched_to_the_ui_thread(monkeypatch):
+    captured = {}
+
+    class FakeAppData:
+        def add_tab(self, name, component, *args, **kwargs):
+            captured.update(name=name, component=component, args=args, kwargs=kwargs)
+            return "created"
+
+    calls = []
+
+    def dispatch(callback):
+        calls.append(callback)
+        callback()
+        return True
+
+    monkeypatch.setattr(file_loader, "_appdata", FakeAppData(), raising=False)
+    monkeypatch.setattr(file_loader, "_ui_thread_id", -1)
+    monkeypatch.setattr(file_loader, "_ui_dispatch_func", dispatch)
+
+    result = file_loader._add_tab("field", file_loader.FunctionComponent, {"x": 1})
+
+    assert result == "created"
+    assert len(calls) == 1
+    assert captured["name"] == "field"
+    assert captured["component"] is file_loader.FunctionComponent
+    assert captured["args"] == ({"x": 1},)
 
 
 def test_pickle_loader_escapes_windows_paths():

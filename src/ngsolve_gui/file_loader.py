@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import threading
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from pathlib import Path
 import numpy as np
@@ -21,6 +22,9 @@ from ngapp.components import Component
 
 _appdata: AppData
 _redraw_func: Callable | None = None
+_ui_dispatch_func: Callable | None = None
+_ui_thread_id: int | None = None
+_open_result_field_func: Callable | None = None
 
 
 def _file_extension_matches(path: Path, suffixes: Iterable[str]) -> bool:
@@ -337,6 +341,36 @@ def _is_plot_candidate(obj: Any) -> bool:
     return mod.startswith("plotly.") or mod.startswith("matplotlib.")
 
 
+def _add_tab(title: str, component: type, *args, **kwargs):
+    """Create result components on the app loop when loading a file in a worker.
+
+    Script execution and pickle reads stay off the UI loop, but WebGPU-backed
+    components own frontend references and must be created on the thread that
+    services the app's UI events.
+    """
+    if (
+        not callable(_ui_dispatch_func)
+        or _ui_thread_id is None
+        or threading.get_ident() == _ui_thread_id
+    ):
+        return _appdata.add_tab(title, component, *args, **kwargs)
+
+    result = Future()
+
+    def create_component():
+        try:
+            result.set_result(_appdata.add_tab(title, component, *args, **kwargs))
+        except BaseException as error:
+            result.set_exception(error)
+
+    if not _ui_dispatch_func(create_component):
+        return _appdata.add_tab(title, component, *args, **kwargs)
+    try:
+        return result.result(timeout=60)
+    except FutureTimeoutError as error:
+        raise RuntimeError("Timed out while creating a result view") from error
+
+
 def DrawImpl(
     obj: Any,
     mesh: ngs.Mesh | ngs.Region | None = None,
@@ -367,7 +401,7 @@ def DrawImpl(
         from .plot import PlotComponent
 
         data["obj"] = obj
-        return _appdata.add_tab(name or "Plot", PlotComponent, data, _appdata)
+        return _add_tab(name or "Plot", PlotComponent, data, _appdata)
 
     if isinstance(obj, ngs.GridFunction):
         # Keep the GridFunction object intact. Besides retaining its FESpace
@@ -384,7 +418,7 @@ def DrawImpl(
     else:
         default_name, comp = _DRAW_DISPATCH[type(obj)]
     data["obj"] = obj
-    return _appdata.add_tab(name or default_name, comp, data, _appdata)
+    return _add_tab(name or default_name, comp, data, _appdata)
 
 
 def _pickle_metadata_for_path(filename):
@@ -419,6 +453,81 @@ def _pickle_metadata_for_path(filename):
             except (OSError, TypeError, ValueError):
                 continue
     return None, None
+
+
+def _run_manifest_for_path(filename):
+    """Find the completed or in-progress run that owns a result field."""
+    if not filename:
+        return None
+    try:
+        source_path = Path(filename).resolve()
+    except (OSError, TypeError, ValueError):
+        return None
+    for directory in source_path.parents:
+        manifest_path = directory / "run_manifest.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if isinstance(manifest, dict) and manifest.get("schema") == "mm-fem.run":
+            return manifest
+    return None
+
+
+def _result_field_choices(filename, metadata, field_metadata):
+    """Resolve sibling GUI field pickles for the study information panel."""
+    if not filename or not isinstance(metadata, dict):
+        return []
+    try:
+        source_path = Path(filename).resolve()
+    except (OSError, TypeError, ValueError):
+        return []
+
+    metadata_directory = next(
+        (
+            directory
+            for directory in source_path.parents
+            if (directory / "metadata.json").is_file()
+        ),
+        None,
+    )
+    if metadata_directory is None:
+        return []
+
+    current_key = field_metadata.get("field_key") if isinstance(field_metadata, dict) else None
+    current_snapshot = (
+        field_metadata.get("snapshot_index") if isinstance(field_metadata, dict) else None
+    )
+    choices = []
+    for item in metadata.get("field_files", []):
+        if not isinstance(item, dict) or not item.get("file"):
+            continue
+        try:
+            path = (metadata_directory / item["file"]).resolve()
+        except (OSError, TypeError, ValueError):
+            continue
+        if not path.is_file():
+            continue
+        field_key = item.get("field_key")
+        snapshot_index = item.get("snapshot_index")
+        same_field_snapshot = (
+            current_key is not None
+            and field_key == current_key
+            and (current_snapshot is None or snapshot_index == current_snapshot)
+        )
+        same_path = os.path.normcase(str(path)) == os.path.normcase(str(source_path))
+        if same_field_snapshot or same_path:
+            continue
+        label = item.get("label") or field_key or path.stem
+        choices.append({
+            "path": str(path),
+            "label": str(label),
+            "field_key": field_key,
+            "snapshot_index": snapshot_index,
+        })
+    return choices
 
 
 def _mesh_has_nonnegative_radial_coordinate(mesh) -> bool:
@@ -492,6 +601,14 @@ def _draw_pickle_object(obj, name: str, field_path=None):
         "fieldlines_thickness": 0.0001,
     }
     _metadata, field_metadata = _pickle_metadata_for_path(field_path)
+    if isinstance(field_metadata, dict):
+        draw_options["_ngsolve_gui_field_metadata"] = field_metadata
+    field_choices = _result_field_choices(field_path, _metadata, field_metadata)
+    if field_choices:
+        draw_options["_ngsolve_gui_result_fields"] = field_choices
+    run_metadata = _run_manifest_for_path(field_path)
+    if run_metadata is not None:
+        draw_options["_ngsolve_gui_run_metadata"] = run_metadata
     if mesh.dim == 3:
         field_description = " ".join(
             str(value)
@@ -559,9 +676,22 @@ def load_file(filename, app):
     :param app: The running application instance providing app data and redraw hooks.
     :return: ``(thread, done_event)`` tuple, or ``None`` if no loading was started.
     """
-    global _appdata, _redraw_func
+    global _appdata, _redraw_func, _ui_dispatch_func, _ui_thread_id
+    global _open_result_field_func
     _appdata = app.app_data
     _redraw_func = app.redraw
+    _ui_dispatch_func = getattr(app, "_dispatch_to_ui", None)
+    _open_result_field_func = getattr(app, "_open_run_result", None)
+    try:
+        from webgpu import platform
+
+        _ui_thread_id = getattr(
+            getattr(platform.websocket_server, "_callback_thread", None),
+            "ident",
+            None,
+        )
+    except Exception:
+        _ui_thread_id = None
     if filename is None:
         return None
 
