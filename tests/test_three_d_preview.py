@@ -34,9 +34,15 @@ def test_realistic_magnet_shield_step_imports_and_combines_with_golay_trace():
     assert surface["vertices"][:, 0].max() == pytest.approx(0.88204, abs=1e-3)
     assert surface["vertices"][:, 2].max() == pytest.approx(0.6579, abs=1e-3)
     assert len(surface["vertices"]) < len(surface["triangles"]) * 3
+    assert surface["id"] == restored["geometries"][0]["id"]
+    assert payload["traces"][0]["trace_set_id"] == restored["wire_trace_sets"][0]["id"]
     assert len(figure.data) == 2
     assert figure.data[0].type == "mesh3d"
+    assert figure.data[0].meta["mmfem_kind"] == "geometry"
+    assert figure.data[0].meta["mmfem_item_id"] == surface["id"]
     assert figure.data[1].type == "scatter3d"
+    assert figure.data[1].meta["mmfem_kind"] == "trace_set"
+    assert figure.data[1].meta["mmfem_item_id"] == payload["traces"][0]["trace_set_id"]
 
 
 def test_golay_conductors_fit_inside_the_realistic_shield_bore():

@@ -55,6 +55,7 @@ def project_preview_payload(project, assets):
     geometry = []
     for item in project.get("geometries", []):
         geometry.append({
+            "id": item["id"],
             "name": item["name"],
             "material": item.get("material", "Shield"),
             **tessellate_step(
@@ -67,6 +68,7 @@ def project_preview_payload(project, assets):
             points = parse_wire_trace(assets[trace["filename"]], "m")
             points = _sample_trace_points(points, _MAX_TRACE_POINTS)
             traces.append({
+                "trace_set_id": trace_set["id"],
                 "name": trace.get("name", trace_set.get("name", "Wire trace")),
                 "material": trace.get("material", trace_set.get("material", "Air")),
                 "points": points,
@@ -115,18 +117,26 @@ def preview_figure(payload):
         if vertices.size == 0 or triangles.size == 0:
             continue
         figure.add_trace(go.Mesh3d(
-            x=vertices[:, 0],
-            y=vertices[:, 1],
-            z=vertices[:, 2],
-            i=triangles[:, 0],
-            j=triangles[:, 1],
-            k=triangles[:, 2],
+            # Send ordinary lists through ngapp's websocket bridge. NumPy arrays
+            # are accepted by Plotly in Python but are not reliably marshalled
+            # to the browser component by the app's cross-process serializer.
+            x=vertices[:, 0].tolist(),
+            y=vertices[:, 1].tolist(),
+            z=vertices[:, 2].tolist(),
+            i=triangles[:, 0].tolist(),
+            j=triangles[:, 1].tolist(),
+            k=triangles[:, 2].tolist(),
             name=item.get("name", "Geometry"),
             color=_MATERIAL_COLORS[index % len(_MATERIAL_COLORS)],
             opacity=1.0,
             flatshading=True,
             hoverinfo="name",
             showscale=False,
+            meta={
+                "mmfem_kind": "geometry",
+                "mmfem_item_id": item.get("id"),
+                "mmfem_base_color": _MATERIAL_COLORS[index % len(_MATERIAL_COLORS)],
+            },
         ))
     for index, item in enumerate(payload.get("traces", [])):
         points = item["points"]
@@ -138,6 +148,11 @@ def preview_figure(payload):
             name=item.get("name", "Wire trace"),
             line={"color": _MATERIAL_COLORS[(index + 2) % len(_MATERIAL_COLORS)], "width": 5},
             hovertemplate="x=%{x:.5g} m<br>y=%{y:.5g} m<br>z=%{z:.5g} m<extra>%{fullData.name}</extra>",
+            meta={
+                "mmfem_kind": "trace_set",
+                "mmfem_item_id": item.get("trace_set_id"),
+                "mmfem_base_color": _MATERIAL_COLORS[(index + 2) % len(_MATERIAL_COLORS)],
+            },
         ))
     figure.update_layout(
         margin={"l": 0, "r": 0, "t": 0, "b": 0},
