@@ -82,6 +82,7 @@ def test_project_round_trip_keeps_step_trace_metadata_and_solver_filenames(tmp_p
     project = new_3d_project("Shielded magnet")
     assets = {}
     geometry = add_step_geometry(project, assets, "shield.stp", STEP, units="mm")
+    geometry["mesh_maxh_mm"] = 30.0
     trace_set = add_wire_trace(
         project, assets, "x_gradient.csv", b"0,0,0\n0,0.1,0\n", units="cm"
     )
@@ -93,6 +94,7 @@ def test_project_round_trip_keeps_step_trace_metadata_and_solver_filenames(tmp_p
 
     assert restored["name"] == "Shielded magnet"
     assert restored["geometries"][0]["units"] == "mm"
+    assert restored["geometries"][0]["mesh_maxh_mm"] == 30.0
     assert restored_assets[geometry["asset"]] == STEP
     points = parse_wire_trace(restored_assets[trace_set["traces"][0]["filename"]])
     assert points == [(0.0, 0.0, 0.0), (0.0, 0.001, 0.0)]
@@ -108,6 +110,17 @@ def test_project_round_trip_keeps_step_trace_metadata_and_solver_filenames(tmp_p
     solver_inputs = build_3d_solver_inputs(restored, paths)
     assert solver_inputs["geometries"][0]["unit_scale"] == 0.001
     assert solver_inputs["wire_trace_sets"][0]["traces"][0]["filename"].endswith(".txt")
+
+
+@pytest.mark.parametrize("maxh", [0, -1, float("nan"), float("inf"), "invalid"])
+def test_project_rejects_invalid_persisted_mesh_size(maxh):
+    project = new_3d_project()
+    assets = {}
+    geometry = add_step_geometry(project, assets, "shield.step", STEP)
+    geometry["mesh_maxh_mm"] = maxh
+
+    with pytest.raises(ValueError, match="Invalid maximum mesh size"):
+        package_3d_project(project, assets)
 
 
 def test_project_archive_rejects_corrupt_asset_checksum():

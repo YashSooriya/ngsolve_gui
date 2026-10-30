@@ -22,6 +22,8 @@ PROJECT_ENTRY = "project.json"
 MAX_PROJECT_BYTES = 512_000_000
 MAX_ASSET_BYTES = 256_000_000
 MAX_PROJECT_ITEMS = 500
+MIN_MESH_SIZE_MM = 0.01
+MAX_MESH_SIZE_MM = 100_000.0
 
 LENGTH_UNITS = {
     "m": 1.0,
@@ -262,6 +264,19 @@ def validate_3d_project(project, assets):
             raise ValueError("Each geometry must have a file name.")
         if not isinstance(geometry.get("material"), str) or not geometry["material"].strip():
             raise ValueError("Each geometry must have a material name.")
+        if "mesh_maxh_mm" in geometry:
+            try:
+                maxh = float(geometry["mesh_maxh_mm"])
+                if not math.isfinite(maxh) or not MIN_MESH_SIZE_MM <= maxh <= MAX_MESH_SIZE_MM:
+                    raise ValueError(
+                        f"Maximum mesh size must be between {MIN_MESH_SIZE_MM:g} "
+                        f"and {MAX_MESH_SIZE_MM:g} mm."
+                    )
+                geometry["mesh_maxh_mm"] = maxh
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(
+                    f"Invalid maximum mesh size for {geometry['name']!r}: {error}"
+                ) from error
         payload = _validate_asset_reference(geometry, assets, kind="geometry", extension=".step")
         validate_step_file(geometry.get("name", "geometry.step"), payload)
         referenced.add(geometry["asset"])
