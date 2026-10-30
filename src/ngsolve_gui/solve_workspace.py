@@ -55,6 +55,7 @@ from .axisymmetric_model import (
 )
 from .units import UNIT_OPTIONS
 from .material_library import MaterialLibrary
+from .workspace_components import panel_header, property_editor_body
 
 
 _SECTIONS = [
@@ -634,7 +635,7 @@ class SolveWorkspace(Div):
         self._canvas.on("keydown", self._on_canvas_keydown)
         self._canvas._props["tabindex"] = "0"
         self._canvas.on("wheel", self._on_canvas_wheel)
-        self._inspector = Div(ui_style="display:flex; flex-direction:column; gap:12px; padding:12px; overflow:auto; min-height:0;")
+        self._inspector = property_editor_body(gap=12)
         self._status = Div(ui_style="display:flex; align-items:center; gap:8px; min-width:0; overflow:hidden; white-space:nowrap;")
         self._log_body = Div(
             *[Div(line) for line in self._log_messages],
@@ -732,20 +733,22 @@ class SolveWorkspace(Div):
             ui_class="relative-position",
             ui_style="position:relative; display:flex; flex:1 1 0%; height:0; flex-direction:column; min-width:0; min-height:0; overflow:hidden;",
         )
-        tree_header = Div(
-            Div("MODEL TREE", ui_style="font-size:11px; font-weight:700; letter-spacing:.08em;"),
-            _button("", "mdi-chevron-left", self._toggle_tree_panel, tooltip="Collapse model tree", style="margin-left:auto;"),
-            ui_style="display:flex; align-items:center; padding:14px 12px 10px; border-bottom:1px solid var(--border); color:var(--fg-muted);",
+        tree_header = panel_header(
+            "Model tree",
+            on_collapse=self._toggle_tree_panel,
+            icon="mdi-chevron-left",
+            tooltip="Collapse model tree",
         )
         self._tree = Div(
             tree_header,
             self._left_items,
             ui_style="display:flex; flex-direction:column; min-width:0; min-height:0; overflow:auto; background:var(--surface);",
         )
-        self._right_header = Div(
-            Div("PROPERTIES", ui_style="font-size:11px; font-weight:700; letter-spacing:.08em; color:var(--fg-muted);"),
-            _button("", "mdi-chevron-right", self._toggle_properties_panel, tooltip="Collapse properties", style="margin-left:auto;"),
-            ui_style="display:flex; align-items:center; padding:14px 12px 10px; border-bottom:1px solid var(--border); flex:none;",
+        self._right_header = panel_header(
+            "Properties",
+            on_collapse=self._toggle_properties_panel,
+            icon="mdi-chevron-right",
+            tooltip="Collapse properties",
         )
         self._right = Div(
             self._right_header,

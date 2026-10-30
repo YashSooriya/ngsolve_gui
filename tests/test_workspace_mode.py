@@ -98,6 +98,66 @@ def test_three_d_workspace_replaces_axisymmetric_views_and_restores_active_mode(
     assert post_process.ui_hidden is False
 
 
+def test_3d_context_hides_axisymmetric_commands_and_restores_them():
+    buttons = {
+        name: SimpleNamespace(ui_hidden=False)
+        for name in ("File", "Edit", "View", "Model", "Study", "Results", "Help")
+    }
+    items = {
+        "File": {
+            "Open project...": SimpleNamespace(ui_hidden=False),
+            "Load mesh...": SimpleNamespace(ui_hidden=False),
+        },
+        "Edit": {"Undo": SimpleNamespace(ui_hidden=False)},
+        "View": {
+            "Isometric": SimpleNamespace(ui_hidden=False),
+            "Toggle navigation cube": SimpleNamespace(ui_hidden=False),
+        },
+    }
+    app = SimpleNamespace(
+        _application_menu_buttons=buttons,
+        _application_menu_items=items,
+    )
+
+    NGSolveGui._set_application_menu_context(app, True)
+
+    assert buttons["Model"].ui_hidden is True
+    assert buttons["Study"].ui_hidden is True
+    assert buttons["Results"].ui_hidden is True
+    assert items["File"]["Open project..."].ui_hidden is False
+    assert items["File"]["Load mesh..."].ui_hidden is True
+    assert items["Edit"]["Undo"].ui_hidden is True
+    assert items["View"]["Isometric"].ui_hidden is False
+    assert items["View"]["Toggle navigation cube"].ui_hidden is True
+
+    NGSolveGui._set_application_menu_context(app, False)
+
+    assert all(button.ui_hidden is False for button in buttons.values())
+    assert all(item.ui_hidden is False for menu in items.values() for item in menu.values())
+
+
+def test_new_problem_uses_the_active_3d_project_type():
+    called = []
+
+    def start_3d():
+        called.append("3d")
+        return True
+
+    def start_axisymmetric():
+        called.append("axisymmetric")
+        return True
+
+    app = SimpleNamespace(
+        _active_project_type="3d",
+        _start_3d_project_from_menu=start_3d,
+        _start_new_problem=start_axisymmetric,
+        _request_problem_replacement=lambda action: action(),
+    )
+
+    assert NGSolveGui.new_problem(app) is True
+    assert called == ["3d"]
+
+
 def test_discarding_axisymmetric_before_switching_clears_hidden_model():
     old_model = {"name": "Unsaved axisymmetric model"}
     saved = []

@@ -501,11 +501,15 @@ def _app_menu_button(label, entries):
             menu.ui_model_value = False
             menu.ui_hide()
 
-    items = [
-        QSeparator() if entry is None
-        else _app_menu_item(entry[0], entry[1], entry[2], entry[3], close_menu)
-        for entry in entries
-    ]
+    items = []
+    menu_items = {}
+    for entry in entries:
+        if entry is None:
+            items.append(QSeparator())
+            continue
+        item = _app_menu_item(entry[0], entry[1], entry[2], entry[3], close_menu)
+        items.append(item)
+        menu_items[entry[0]] = item
     menu = QMenu(
         QList(*items, ui_dense=True),
         ui_anchor="bottom left",
@@ -513,7 +517,7 @@ def _app_menu_button(label, entries):
         ui_auto_close=True,
     )
     menu_ref["menu"] = menu
-    return QBtn(
+    button = QBtn(
         QTooltip(label), menu,
         ui_label=label,
         ui_flat=True, ui_dense=True, ui_no_caps=True,
@@ -523,6 +527,8 @@ def _app_menu_button(label, entries):
             "font-size:13px; font-weight:600;"
         ),
     )
+    button._mmfem_menu_items = menu_items
+    return button
 
 
 class NGSolveGui(App):
@@ -588,7 +594,7 @@ class NGSolveGui(App):
             return btn
 
         new_problem_btn = _tbtn(
-            "mdi-file-plus-outline", "New problem (Ctrl+N)", self.new_problem
+            "mdi-file-plus-outline", "New project of the active type (Ctrl+N)", self.new_problem
         )
         open_problem_btn = _tbtn(
             "mdi-folder-open-outline", "Open project (Ctrl+O)", self.open_project_file
@@ -817,7 +823,13 @@ class NGSolveGui(App):
         )
         about_close.on_click(lambda *a: setattr(self._about_dialog, "ui_model_value", False))
         self._three_d_workspace_instance = None
-        self._three_d_workspace_container = Div(ui_hidden=True)
+        self._three_d_workspace_container = Div(
+            ui_hidden=True,
+            ui_style=(
+                "display:flex; flex-direction:column; flex:1 1 0%; width:100%; height:0; "
+                "min-width:0; min-height:0; overflow:hidden;"
+            ),
+        )
         # Keep the older attribute for the project save/load helpers.
         self._three_d_project_dialog = None
         self._menu_bar = self._build_application_menu_bar()
@@ -1254,7 +1266,7 @@ class NGSolveGui(App):
     def _build_application_menu_bar(self):
         menus = [
             ("File", [
-                ("New problem", self.new_problem, "mdi-file-plus-outline", "Ctrl+N"),
+                ("New axisymmetric problem...", self._new_axisymmetric_project, "mdi-axis-arrow", None),
                 ("Open project...", self.open_project_file, "mdi-folder-open-outline", "Ctrl+O"),
                 ("Save project", self.save_problem_file, "mdi-content-save-outline", "Ctrl+S"),
                 None,
@@ -1339,9 +1351,14 @@ class NGSolveGui(App):
                 ("About MM-FEM", self._open_about, "mdi-information-outline", None),
             ]),
         ]
-        buttons = [_app_menu_button(label, entries) for label, entries in menus]
+        self._application_menu_buttons = {}
+        self._application_menu_items = {}
+        for label, entries in menus:
+            button = _app_menu_button(label, entries)
+            self._application_menu_buttons[label] = button
+            self._application_menu_items[label] = button._mmfem_menu_items
         return Div(
-            *buttons,
+            *self._application_menu_buttons.values(),
             ui_class="mmfem-app-menu-bar",
             ui_style=(
                 "display:flex; align-items:center; gap:2px; flex:0 0 auto; "
@@ -1350,11 +1367,50 @@ class NGSolveGui(App):
             ),
         )
 
+    def _set_application_menu_context(self, three_d):
+        """Hide commands that are specific to the inactive project workflow."""
+        menu_buttons = getattr(self, "_application_menu_buttons", {})
+        for label in ("Model", "Study", "Results"):
+            button = menu_buttons.get(label)
+            if button is not None:
+                button.ui_hidden = bool(three_d)
+
+        hidden_in_3d = {
+            "File": (
+                "Import legacy Python problem...",
+                "Open external file...",
+                "Load mesh...",
+                "Save mesh",
+                "Load solutions...",
+                "Save solutions",
+            ),
+            "Edit": ("Undo", "Redo"),
+            "View": (
+                "Toggle parallel projection",
+                "Toggle navigation cube",
+                "Link or detach camera",
+                "Saved camera views",
+                "Fullscreen viewport",
+                "Messages",
+                "Solver log",
+            ),
+        }
+        menu_items = getattr(self, "_application_menu_items", {})
+        for menu, labels in hidden_in_3d.items():
+            items = menu_items.get(menu, {})
+            for label in labels:
+                item = items.get(label)
+                if item is not None:
+                    item.ui_hidden = bool(three_d)
+
     def _quit_application(self, *args):
         return self._request_problem_replacement(self._close_application_now)
 
     def _new_3d_project(self, *args):
         return self._request_problem_replacement(self._start_3d_project_from_menu)
+
+    def _new_axisymmetric_project(self, *args):
+        return self._request_problem_replacement(self._start_new_problem)
 
     def _menu_import_step(self, *args):
         if self._active_project_type == "3d":
@@ -1388,12 +1444,18 @@ class NGSolveGui(App):
 
     def _set_3d_workspace_active(self, active):
         active = bool(active)
-        workspace = self._three_d_workspace_instance
+        workspace = getattr(self, "_three_d_workspace_instance", None)
         if active:
             workspace = self._three_d_workspace
-            self._three_d_workspace_container.ui_hidden = False
+            container = getattr(self, "_three_d_workspace_container", None)
+            if container is not None:
+                container.ui_hidden = False
         else:
-            self._three_d_workspace_container.ui_hidden = True
+            if workspace is None:
+                workspace = getattr(self, "_three_d_workspace", None)
+            container = getattr(self, "_three_d_workspace_container", None)
+            if container is not None:
+                container.ui_hidden = True
         if workspace is not None:
             workspace.ui_hidden = not active
         self._workspace_mode_toggle.ui_hidden = active
@@ -1404,6 +1466,9 @@ class NGSolveGui(App):
             self._solve_workspace.ui_hidden = self._workspace_mode != "solve"
             self._post_process_workspace.ui_hidden = self._workspace_mode == "solve"
         self._refresh_solve_history_controls()
+        sync_menu_context = getattr(self, "_set_application_menu_context", None)
+        if callable(sync_menu_context):
+            sync_menu_context(active)
 
     def _close_application_now(self):
         try:
@@ -1657,10 +1722,13 @@ class NGSolveGui(App):
         return action()
 
     def new_problem(self, *args):
-        """Start a blank problem, asking before discarding unsaved edits."""
+        """Start a blank project of the active type, guarding unsaved edits."""
+        active = getattr(self, "_active_project_type", None)
+        start_name = "_start_3d_project_from_menu" if active == "3d" else "_start_new_problem"
+        start_project = getattr(self, start_name, None)
         request = getattr(self, "_request_problem_replacement", None)
         if callable(request):
-            return request(self._start_new_problem)
+            return request(start_project) if callable(start_project) else False
         # Preserve the old direct-call behavior for lightweight integrations
         # that invoke this handler on a proxy instead of an NGSolveGui instance.
         if getattr(self, "_solver_job_active", False) or getattr(
@@ -1675,7 +1743,7 @@ class NGSolveGui(App):
         if getattr(self.solve_workspace, "dirty", False):
             self._new_problem_dialog.ui_model_value = True
             return False
-        return self._start_new_problem()
+        return start_project() if callable(start_project) else False
 
     def _close_new_problem_dialog(self, *args):
         self._new_problem_dialog.ui_model_value = False
@@ -1746,9 +1814,12 @@ class NGSolveGui(App):
             new_studies(),
             {"schema_version": 1, "active_section": "geometry", "camera": "fit"},
         )
-        if self._three_d_workspace_instance is not None:
-            self._three_d_workspace_instance.ui_hidden = True
-            self._three_d_workspace_container.ui_hidden = True
+        three_d_workspace = getattr(self, "_three_d_workspace_instance", None)
+        if three_d_workspace is not None:
+            three_d_workspace.ui_hidden = True
+            container = getattr(self, "_three_d_workspace_container", None)
+            if container is not None:
+                container.ui_hidden = True
         self._active_project_type = "axisymmetric"
         hide_chooser = getattr(self, "_hide_startup_chooser", None)
         if callable(hide_chooser):
