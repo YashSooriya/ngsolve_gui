@@ -78,6 +78,8 @@ def test_three_d_tree_selection_updates_the_properties_panel(monkeypatch):
     assert workspace._selection == ("geometry", "geometry-1")
     assert workspace._properties.ui_children[0].ui_children == ["Geometry model"]
     assert workspace._geometry_items.ui_children[0].ui_children[1].ui_children == ["shield.step"]
+    labels = {getattr(child, "ui_label", None) for child in workspace._properties.ui_children}
+    assert {"Default material", "Length units", "Maximum element size (mm)"} <= labels
 
 
 def test_viewport_selection_syncs_to_tree_properties_and_preview(monkeypatch):
@@ -174,7 +176,7 @@ def test_material_reference_selection_updates_project_and_tree_badge(monkeypatch
     assert item["material"] == "Copper"
     assert workspace.dirty is True
     assert workspace._geometry_items.ui_children[0].ui_children[2].ui_children == ["Copper"]
-    assert "3D solver material use is not available yet" in workspace._properties.ui_children[3].ui_children[0]
+    assert "Material properties are copied into the project" in workspace._properties.ui_children[3].ui_children[0]
 
 
 def test_preview_worker_dispatches_ui_updates_to_the_application_loop(monkeypatch):
@@ -410,6 +412,27 @@ def test_mesh_quality_and_named_domain_boundary_selections_persist(monkeypatch):
 
     workspace.select_item("named_selection", selection["id"])
     assert workspace._selection_draft["region_ids"] == [0, 2]
+    labels = {getattr(child, "ui_label", None) for child in workspace._properties.ui_children}
+    assert "Length units" not in labels
+    assert "Maximum element size (mm)" not in labels
+    assert "Fallback for unassigned domains" not in labels
+
+
+def test_named_boundary_inspector_only_shows_boundary_properties(monkeypatch):
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    workspace._set_selection_draft_regions(geometry, SimpleNamespace(value=[1]))
+    workspace._set_selection_draft_name(SimpleNamespace(value="Outer boundary"))
+
+    assert workspace._save_named_selection(geometry) is True
+
+    selection = geometry["boundary_selections"][0]
+    workspace.select_item("named_selection", selection["id"])
+    labels = {getattr(child, "ui_label", None) for child in workspace._properties.ui_children}
+    assert "Selection name" in labels
+    assert "Region material" not in labels
+    assert "Default material" not in labels
+    assert "Length units" not in labels
+    assert "Maximum element size (mm)" not in labels
 
 
 def test_named_volume_domain_selection_is_saved_with_region_indices(monkeypatch):
@@ -424,6 +447,38 @@ def test_named_volume_domain_selection_is_saved_with_region_indices(monkeypatch)
         "name": "Shield volume",
         "domain_ids": [0],
     }]
+
+
+def test_named_volume_domain_selection_can_assign_a_project_material(monkeypatch):
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    workspace._set_selection_draft_kind(geometry, SimpleNamespace(value="domain"))
+    workspace._set_selection_draft_regions(geometry, SimpleNamespace(value=[0]))
+    workspace._set_selection_draft_name(SimpleNamespace(value="Copper volume"))
+    workspace._set_selection_draft_material(SimpleNamespace(value="Copper"))
+
+    assert workspace._save_named_selection(geometry) is True
+    selection = geometry["domain_selections"][0]
+    assert selection["material"] == "Copper"
+    assert any(material["name"] == "Copper" for material in workspace.project["materials"])
+
+    workspace.select_item("named_selection", selection["id"])
+    controls = {
+        getattr(child, "ui_label", None): child
+        for child in workspace._properties.ui_children
+    }
+    assert "Region material" in controls
+    assert "Fallback for unassigned domains" not in controls
+    options = controls["Region material"].ui_options
+    assert any(option["value"] == "__inherit__" for option in options)
+
+    assert workspace._set_named_selection_material(
+        selection, SimpleNamespace(value="__inherit__")
+    ) is True
+    assert "material" not in selection
+    assert workspace._set_named_selection_material(
+        selection, SimpleNamespace(value="Copper")
+    ) is True
+    assert selection["material"] == "Copper"
 
 
 def test_plot_mesh_face_click_selects_boundary_region_and_visibility_controls(monkeypatch):

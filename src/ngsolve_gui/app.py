@@ -4,6 +4,7 @@ import threading
 import time
 import copy
 import io
+import hashlib
 import json
 import mimetypes
 import re
@@ -27,7 +28,7 @@ from .system_monitor import SystemMonitor, available as system_monitor_available
 from .footer import StatusFooter
 from .mesh_geometry import axisymmetric_mesh_edge_polylines
 from .axisymmetric_model import new_model, new_studies, unpack_model, package_model, serialize_model_json
-from .three_d_project import PROJECT_SUFFIX, unpack_3d_project
+from .three_d_project import PROJECT_SUFFIX, package_3d_project, unpack_3d_project
 from .result_files import (
     MESH_SUFFIX,
     SOLUTION_SUFFIX,
@@ -1530,14 +1531,14 @@ class NGSolveGui(App):
         self.solve_workspace.select_section(section)
 
     def _menu_fit_view(self, *args):
-        if self._active_project_type == "3d":
+        if self._active_project_type == "3d" and self._workspace_mode == "solve":
             return self._three_d_workspace.reset_camera()
         if self._workspace_mode == "solve":
             return self.solve_workspace.fit_canvas_view()
         return self._active_view_action("reset_camera")
 
     def _menu_camera_view(self, view):
-        if self._active_project_type == "3d":
+        if self._active_project_type == "3d" and self._workspace_mode == "solve":
             return self._active_view_action("set_camera_view", view)
         if self._workspace_mode == "solve":
             if getattr(self.tab_panel, "comp", None) is None:
@@ -1547,7 +1548,7 @@ class NGSolveGui(App):
         return self._active_view_action("set_camera_view", view)
 
     def _active_view_action(self, method, *args):
-        if self._active_project_type == "3d":
+        if self._active_project_type == "3d" and self._workspace_mode == "solve":
             callback = getattr(self._three_d_workspace, method, None)
             if callable(callback):
                 return callback(*args)
@@ -1616,6 +1617,9 @@ class NGSolveGui(App):
         return self.solve_workspace.run_study_action()
 
     def _menu_cancel_run(self, *args):
+        context = getattr(self, "_solver_run_context", None) or {}
+        if context.get("project_type") == "3d":
+            return self.cancel_3d_study(getattr(self, "_three_d_workspace", None))
         return self.solve_workspace._cancel_solver_job()
 
     def _refresh_solve_history_controls(self):
@@ -1848,8 +1852,8 @@ class NGSolveGui(App):
         solving = mode == "solve"
         self._workspace_mode = mode
         if getattr(self, "_active_project_type", None) == "3d":
-            self._three_d_workspace.ui_hidden = False
-            self._post_process_workspace.ui_hidden = True
+            self._three_d_workspace.ui_hidden = not solving
+            self._post_process_workspace.ui_hidden = solving
             self._solve_workspace.ui_hidden = True
             return
         self._post_process_workspace.ui_hidden = solving
@@ -2186,6 +2190,236 @@ class NGSolveGui(App):
         except Exception as error:
             self._notify(f"Could not load solutions: {error}", type="negative", timeout=7000)
 
+    def run_3d_study(self, workspace):
+        """Run the supported 3D harmonic EM study in a cancellable child process."""
+        run_kind = "Study"
+        project_name = str(workspace.project.get("name", "3D project"))
+        run_name = f"{run_kind}: {project_name}"
+        with self._solver_job_lock:
+            if self._solver_job_active:
+                workspace._set_status("A mesh or solver job is already running.", error=True)
+                return False
+            self._solver_job_active = True
+            self._solver_cancel_requested = False
+            self._solver_process = None
+
+        output_dir = None
+        try:
+            workspace._snapshot_referenced_materials()
+            project = copy.deepcopy(workspace.project)
+            assets = dict(workspace.assets)
+            from .three_d_project import validate_3d_project
+            from .three_d_solver import validate_time_harmonic_em_setup
+
+            validate_3d_project(project, assets)
+            setup = validate_time_harmonic_em_setup(project)
+            solver_root = self._find_solver_root()
+            runner = solver_root / "scripts" / "run_gui_3d_model.py"
+            if not runner.is_file():
+                raise FileNotFoundError(f"The solver checkout is missing its 3D GUI runner: {runner}")
+
+            from .solve_workspace import default_run_history_root
+
+            safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", project_name).strip("_") or "3d_project"
+            output_dir = default_run_history_root() / (
+                f"{safe_name}_{_datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+            )
+            output_dir.mkdir(parents=True, exist_ok=False)
+            model_bytes = package_3d_project(project, assets)
+            model_path = output_dir / f"{safe_name}{PROJECT_SUFFIX}"
+            model_path.write_bytes(model_bytes)
+            manifest = {
+                "schema": "mm-fem.run",
+                "schema_version": 1,
+                "status": "running",
+                "kind": "study",
+                "created_utc": _datetime.now(_timezone.utc).isoformat(),
+                "model_archive": model_path.name,
+                "output_path": str(output_dir),
+                "model_name": project_name,
+                "problem_sha256": hashlib.sha256(model_bytes).hexdigest(),
+                "physics": "time-harmonic electromagnetics",
+                "frequency_hz": setup["frequency_hz"],
+                "polynomial_order": setup["polynomial_order"],
+            }
+            self._write_run_manifest(output_dir, manifest)
+        except Exception as error:
+            with self._solver_job_lock:
+                self._solver_job_active = False
+            workspace._set_status(f"Could not prepare study: {error}", error=True)
+            self._notify(f"Could not prepare 3D study: {error}", type="negative", timeout=8000)
+            return False
+
+        workspace._study_running = True
+        workspace._update_study_controls()
+        workspace._set_status(
+            f"Running {setup['frequency_hz']:g} Hz harmonic EM study in {output_dir}…"
+        )
+
+        def run_job():
+            log_path = output_dir / "solver.log"
+            process = None
+            try:
+                command = [
+                    sys.executable,
+                    "-u",
+                    str(runner),
+                    "--model",
+                    str(model_path),
+                    "--output-dir",
+                    str(output_dir),
+                ]
+                popen_options = {
+                    "cwd": str(solver_root),
+                    "stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.STDOUT,
+                    "text": True,
+                    "encoding": "utf-8",
+                    "errors": "replace",
+                    "bufsize": 1,
+                }
+                if os.name == "nt":
+                    popen_options["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                else:
+                    popen_options["start_new_session"] = True
+                process = subprocess.Popen(command, **popen_options)
+                with self._solver_job_lock:
+                    self._solver_process = process
+                    cancel_now = self._solver_cancel_requested
+                if cancel_now:
+                    process.terminate()
+
+                with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
+                    assert process.stdout is not None
+                    for line in process.stdout:
+                        log_file.write(line)
+                        log_file.flush()
+                        text = line.strip()
+                        if text and (
+                            text.startswith("MM-FEM")
+                            or text.startswith("The mesh has")
+                            or text.startswith("Frequency=")
+                            or "degrees of freedom" in text
+                        ):
+                            self._dispatch_to_ui(workspace._set_status, text[:240])
+                return_code = process.wait()
+                manifest = self._read_run_manifest(output_dir)
+                with self._solver_job_lock:
+                    cancelled = self._solver_cancel_requested and return_code != 0
+                if cancelled:
+                    manifest.update({
+                        "status": "cancelled",
+                        "finished_utc": _datetime.now(_timezone.utc).isoformat(),
+                    })
+                    self._write_run_manifest(output_dir, manifest)
+                    self._dispatch_to_ui(
+                        workspace._set_status,
+                        f"Study cancelled. Partial files are in {output_dir}",
+                    )
+                elif return_code != 0:
+                    detail = manifest.get("error") or "See solver.log for details."
+                    manifest.update({
+                        "status": "failed",
+                        "error": detail,
+                        "finished_utc": _datetime.now(_timezone.utc).isoformat(),
+                    })
+                    self._write_run_manifest(output_dir, manifest)
+                    raise RuntimeError(detail)
+                else:
+                    fields_dir = output_dir / "ngsolve_gui" / "fields"
+                    field_files = list(fields_dir.glob("*.pkl")) if fields_dir.is_dir() else []
+                    if not field_files:
+                        raise RuntimeError("The solver finished without exporting any GUI fields.")
+                    manifest.update({
+                        "status": "complete",
+                        "finished_utc": _datetime.now(_timezone.utc).isoformat(),
+                        "solver_log": "solver.log",
+                    })
+                    self._write_run_manifest(output_dir, manifest)
+                    self._dispatch_to_ui(
+                        workspace._set_status,
+                        f"Study complete · results saved to {output_dir}",
+                    )
+                    self._dispatch_to_ui(lambda: self._notify(
+                        f"3D harmonic EM study complete · {output_dir}",
+                        type="positive",
+                        timeout=7000,
+                    ))
+                    self._dispatch_to_ui(
+                        self._open_run_result,
+                        str(output_dir / "ngsolve_gui" / "solution.pkl"),
+                    )
+            except Exception as error:
+                manifest = self._read_run_manifest(output_dir)
+                manifest.update({
+                    "status": "failed",
+                    "error": f"{type(error).__name__}: {error}",
+                    "finished_utc": _datetime.now(_timezone.utc).isoformat(),
+                    "solver_log": "solver.log",
+                })
+                self._write_run_manifest(output_dir, manifest)
+                self._dispatch_to_ui(lambda: workspace._set_status(
+                    f"Study failed: {error}", error=True
+                ))
+                self._dispatch_to_ui(lambda: self._notify(
+                    f"3D study failed: {error}", type="negative", timeout=9000
+                ))
+            finally:
+                if process is not None and process.stdout is not None:
+                    process.stdout.close()
+                self._dispatch_to_ui(lambda: self._finish_3d_study_controls(workspace))
+                with self._solver_job_lock:
+                    self._solver_process = None
+                    self._solver_run_context = None
+                    self._solver_job_active = False
+                    self._solver_cancel_requested = False
+
+        self._solver_run_context = {
+            "kind": run_kind,
+            "output_dir": output_dir,
+            "run_name": run_name,
+            "project_type": "3d",
+        }
+        threading.Thread(target=run_job, name="MMFEM3DStudy", daemon=True).start()
+        return True
+
+    def cancel_3d_study(self, workspace=None):
+        with self._solver_job_lock:
+            context = self._solver_run_context or {}
+            if not self._solver_job_active or context.get("project_type") != "3d":
+                return False
+            self._solver_cancel_requested = True
+            process = self._solver_process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        if workspace is not None:
+            workspace._set_status("Cancellation requested…")
+        return True
+
+    def _dispatch_to_ui(self, callback, *args):
+        """Schedule a worker result on ngapp's event loop when it is running."""
+        loop = getattr(self, "loop", None)
+        if loop is not None:
+            if not loop.is_running():
+                return False
+            try:
+                loop.call_soon_threadsafe(callback, *args)
+                return True
+            except RuntimeError:
+                # The app may be closing while a solver child exits.
+                return False
+        callback(*args)
+        return True
+
+    @staticmethod
+    def _finish_3d_study_controls(workspace):
+        workspace._study_running = False
+        workspace._update_study_controls()
+
     def _run_axisymmetric_solver(self, *, mesh_only=False):
         """Run a saved model in a cancellable child process on this computer."""
         workspace = self.solve_workspace
@@ -2476,6 +2710,14 @@ class NGSolveGui(App):
             except OSError:
                 continue
             expanded.extend([resolved, *resolved.parents])
+            # Development checkouts commonly keep the GUI and solver in
+            # adjacent GitHub directories. Support that layout without making
+            # it a deployment requirement; COUPLED_SOLVER_ROOT still wins.
+            expanded.extend([
+                resolved / "ngsolve-ui" / "coupled_solver",
+                resolved.parent / "ngsolve-ui" / "coupled_solver",
+                resolved / "coupled_solver",
+            ])
         for candidate in expanded:
             try:
                 resolved = candidate.resolve()

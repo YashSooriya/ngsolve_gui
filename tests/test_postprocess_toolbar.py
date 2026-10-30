@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from ngapp.components import Div
 
 from ngsolve_gui.app import NGSolveGui
+from ngsolve_gui import cerbsim_style as cb
 from ngsolve_gui.function import FunctionComponent
 from ngsolve_gui.webgpu_tab import WebgpuTab
 
@@ -66,11 +67,16 @@ def test_active_postprocess_toolbar_is_hosted_above_side_panels():
     host = SimpleNamespace(ui_children=[], ui_hidden=True)
     tools = [Div("Camera controls"), Div("Clipping controls")]
     component = SimpleNamespace(_page_toolbar_children=lambda: tools)
-    app = SimpleNamespace(_post_process_toolbar=host)
+    app = SimpleNamespace(
+        _post_process_toolbar=host,
+        _open_solutions_toolbar_button=Div("Open solutions"),
+    )
 
     NGSolveGui._sync_post_process_toolbar(app, component)
 
-    assert host.ui_children == tools
+    assert host.ui_children[0] is app._open_solutions_toolbar_button
+    assert host.ui_children[1].ui_class == cb.vp_sep
+    assert host.ui_children[2:] == tools
     assert host.ui_hidden is False
 
 
@@ -86,3 +92,44 @@ def test_view_without_page_toolbar_keeps_the_existing_overlay_layout():
     component._sync_viewport_layout(overlays)
 
     assert component.ui_children == overlays
+
+
+def test_3d_postprocess_camera_actions_target_the_active_result():
+    result = SimpleNamespace(
+        reset_camera=lambda: "result-fit",
+        set_camera_view=lambda view: f"result-{view}",
+    )
+    model = SimpleNamespace(
+        reset_camera=lambda: "model-fit",
+        set_camera_view=lambda view: f"model-{view}",
+    )
+    app = SimpleNamespace(
+        _active_project_type="3d",
+        _workspace_mode="post_process",
+        _three_d_workspace=model,
+        tab_panel=SimpleNamespace(comp=result),
+    )
+    app._active_view_action = lambda method, *args: NGSolveGui._active_view_action(
+        app, method, *args
+    )
+
+    assert NGSolveGui._menu_fit_view(app) == "result-fit"
+    assert NGSolveGui._menu_camera_view(app, "isometric") == "result-isometric"
+
+
+def test_3d_solve_camera_actions_still_target_the_model_workspace():
+    model = SimpleNamespace(
+        reset_camera=lambda: "model-fit",
+        set_camera_view=lambda view: f"model-{view}",
+    )
+    app = SimpleNamespace(
+        _active_project_type="3d",
+        _workspace_mode="solve",
+        _three_d_workspace=model,
+    )
+    app._active_view_action = lambda method, *args: NGSolveGui._active_view_action(
+        app, method, *args
+    )
+
+    assert NGSolveGui._menu_fit_view(app) == "model-fit"
+    assert NGSolveGui._menu_camera_view(app, "isometric") == "model-isometric"

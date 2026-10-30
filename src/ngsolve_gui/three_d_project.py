@@ -59,7 +59,38 @@ def new_3d_project(name="Untitled 3D project"):
         "name": str(name),
         "geometries": [],
         "wire_trace_sets": [],
+        "materials": [],
+        "study": {
+            "physics": "harmonic_em",
+            "frequency_hz": 500.0,
+            "polynomial_order": 1,
+            "air_padding": 2.0,
+        },
     }
+
+
+def snapshot_material(project, material):
+    """Keep the first assigned copy of a material inside the project archive."""
+    if not isinstance(material, dict):
+        return False
+    name = str(material.get("name", "")).strip()
+    material_id = str(material.get("id", "")).strip()
+    properties = material.get("properties")
+    if not name or not material_id or not isinstance(properties, dict):
+        return False
+    materials = project.setdefault("materials", [])
+    if any(
+        isinstance(existing, dict)
+        and str(existing.get("name", "")).strip().casefold() == name.casefold()
+        for existing in materials
+    ):
+        return False
+    materials.append(copy.deepcopy({
+        "id": material_id,
+        "name": name,
+        "properties": properties,
+    }))
+    return True
 
 
 def _safe_name(name, fallback):
@@ -302,6 +333,53 @@ def validate_3d_project(project, assets):
         raise ValueError("The project is missing its geometry or wire trace list.")
     if len(geometries) + len(trace_sets) > MAX_PROJECT_ITEMS:
         raise ValueError("A project can contain at most 500 geometry and trace items.")
+
+    study = project.setdefault("study", {})
+    if not isinstance(study, dict):
+        raise ValueError("The 3D study settings must be an object.")
+    physics = study.get("physics", "harmonic_em")
+    if physics != "harmonic_em":
+        raise ValueError("The first 3D study supports time-harmonic electromagnetics only.")
+    try:
+        frequency_hz = float(study.get("frequency_hz", 500.0))
+        polynomial_order = int(study.get("polynomial_order", 1))
+        air_padding = float(study.get("air_padding", 2.0))
+        if not math.isfinite(frequency_hz) or not 0 < frequency_hz <= 1e9:
+            raise ValueError("Frequency must be greater than 0 and no more than 1e9 Hz.")
+        if polynomial_order not in {1, 2, 3, 4}:
+            raise ValueError("Polynomial order must be between 1 and 4.")
+        if not math.isfinite(air_padding) or not 0.25 <= air_padding <= 20:
+            raise ValueError("Air-domain padding must be between 0.25 and 20 model spans.")
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"Invalid 3D study settings: {error}") from error
+    study.update({
+        "physics": physics,
+        "frequency_hz": frequency_hz,
+        "polynomial_order": polynomial_order,
+        "air_padding": air_padding,
+    })
+
+    materials = project.setdefault("materials", [])
+    if not isinstance(materials, list) or len(materials) > MAX_PROJECT_ITEMS:
+        raise ValueError("The project material list is invalid or too large.")
+    material_ids = set()
+    material_names = set()
+    for material in materials:
+        if not isinstance(material, dict):
+            raise ValueError("Each project material must be an object.")
+        material_id = material.get("id")
+        material_name = material.get("name")
+        properties = material.get("properties")
+        if (
+            not isinstance(material_id, str) or not material_id.strip()
+            or not isinstance(material_name, str) or not material_name.strip()
+            or not isinstance(properties, dict)
+        ):
+            raise ValueError("Each project material needs an id, name and properties object.")
+        if material_id in material_ids or material_name.strip().casefold() in material_names:
+            raise ValueError("Project material ids and names must be unique.")
+        material_ids.add(material_id)
+        material_names.add(material_name.strip().casefold())
     referenced = set()
     for geometry in geometries:
         if not isinstance(geometry, dict) or geometry.get("units") not in LENGTH_UNITS:
@@ -326,6 +404,12 @@ def validate_3d_project(project, assets):
         _validate_named_selections(
             geometry, "domain_selections", "domain_ids", "domain"
         )
+        for selection in geometry.get("domain_selections", []):
+            assigned_material = selection.get("material")
+            if assigned_material is not None and (
+                not isinstance(assigned_material, str) or not assigned_material.strip()
+            ):
+                raise ValueError("A domain material assignment must be a material name.")
         _validate_named_selections(
             geometry, "boundary_selections", "boundary_ids", "boundary"
         )

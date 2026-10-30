@@ -26,6 +26,7 @@ from .three_d_project import (
     detect_step_unit,
     new_3d_project,
     package_3d_project,
+    snapshot_material,
     step_unit_scale,
     unpack_3d_project,
     validate_3d_project,
@@ -104,7 +105,9 @@ class ThreeDWorkspace(Div):
             "selection_id": None,
             "name": "",
             "region_ids": [],
+            "material": None,
         }
+        self._study_running = False
         self._preview_lock = threading.Lock()
         self._preview_running = False
         self._preview_pending = None
@@ -183,10 +186,13 @@ class ThreeDWorkspace(Div):
         )
         self._project_node = Div()
         self._project_node.on("click", lambda _event=None: self.select_item("project", None))
+        self._study_node = Div()
+        self._study_node.on("click", lambda _event=None: self.select_item("study", None))
         self._geometry_items = Div(ui_style="display:flex; flex-direction:column; gap:2px;")
         self._trace_items = Div(ui_style="display:flex; flex-direction:column; gap:2px;")
         self._items = Div(
             self._project_node,
+            self._study_node,
             Div(
                 Div(QIcon(ui_name="mdi-cube-outline", ui_size="16px"), "Geometry", ui_style="display:flex; align-items:center; gap:7px; font-weight:650;"),
                 _button("", "mdi-plus", self.import_step, tooltip="Import STEP geometry"),
@@ -199,6 +205,7 @@ class ThreeDWorkspace(Div):
                 ui_style="display:flex; align-items:center; justify-content:space-between; padding:5px 8px; margin-top:10px;",
             ),
             self._trace_items,
+            ui_class="mmfem-3d-model-tree",
             ui_style="display:flex; flex-direction:column; flex:1 1 auto; min-height:0; overflow:auto; padding:8px;",
         )
         self._tree_panel = Div(
@@ -280,6 +287,16 @@ class ThreeDWorkspace(Div):
             "Save project", "mdi-content-save-outline", self.save_project,
             color="primary",
         )
+        self._run_study_button = _button(
+            "Run study", "mdi-play", self.run_study,
+            color="primary",
+            tooltip="Run the 3D time-harmonic electromagnetic study",
+        )
+        self._cancel_study_button = _button(
+            "Cancel", "mdi-stop", self.cancel_study,
+            tooltip="Stop the running 3D study",
+        )
+        self._cancel_study_button.ui_disable = True
         self._import_step_button = _button(
             "Import STEP", "mdi-cube-scan", self.import_step
         )
@@ -321,6 +338,8 @@ class ThreeDWorkspace(Div):
         self._project_toolbar = Div(
             self._project_name,
             Div(
+                self._run_study_button,
+                self._cancel_study_button,
                 self._open_project_button,
                 self._save_project_button,
                 ui_style="display:flex; align-items:center; gap:6px; margin-left:auto;",
@@ -477,6 +496,85 @@ class ThreeDWorkspace(Div):
             + (" color:var(--negative);" if error else "")
         )
 
+    def _update_study_controls(self):
+        running = bool(self._study_running)
+        if hasattr(self, "_run_study_button"):
+            self._run_study_button.ui_disable = (
+                running
+                or not self.project.get("geometries")
+                or not self.project.get("wire_trace_sets")
+            )
+        if hasattr(self, "_cancel_study_button"):
+            self._cancel_study_button.ui_disable = not running
+
+    def run_study(self, *_args):
+        callback = getattr(self.app, "run_3d_study", None)
+        if not callable(callback):
+            self._set_status("3D study execution is unavailable in this session.", error=True)
+            return False
+        return callback(self)
+
+    def cancel_study(self, *_args):
+        callback = getattr(self.app, "cancel_3d_study", None)
+        return callback(self) if callable(callback) else False
+
+    def _material_records(self):
+        records = [*builtin_materials(), *self._material_library.load()]
+        by_name = {}
+        for record in records:
+            name = str(record.get("name", "")).strip()
+            if name:
+                by_name.setdefault(name.casefold(), record)
+        for record in self.project.get("materials", []):
+            name = str(record.get("name", "")).strip()
+            if name:
+                by_name[name.casefold()] = record
+        return by_name
+
+    def _snapshot_material_reference(self, name):
+        material = self._material_records().get(str(name or "").strip().casefold())
+        return snapshot_material(self.project, material) if material else False
+
+    def _snapshot_referenced_materials(self):
+        changed = False
+        names = set()
+        for geometry in self.project.get("geometries", []):
+            names.add(geometry.get("material", ""))
+            names.update(
+                selection.get("material", "")
+                for selection in geometry.get("domain_selections", [])
+            )
+        for trace_set in self.project.get("wire_trace_sets", []):
+            names.add(trace_set.get("material", "Air"))
+            names.update(
+                trace.get("material", trace_set.get("material", "Air"))
+                for trace in trace_set.get("traces", [])
+            )
+        for name in names:
+            changed = self._snapshot_material_reference(name) or changed
+        if changed:
+            self._mark_changed()
+        return changed
+
+    def _set_study_value(self, key, event, *, number=False):
+        study = self.project.setdefault("study", {})
+        old_value = study.get(key)
+        value = getattr(event, "value", event)
+        try:
+            value = float(value) if number else int(value)
+            if number and not math.isfinite(value):
+                raise ValueError("Enter a finite number.")
+            study[key] = value
+            validate_3d_project(self.project, self.assets)
+        except (TypeError, ValueError, OverflowError) as error:
+            study[key] = old_value
+            self._set_status(str(error), error=True)
+            self._rebuild_properties()
+            return False
+        self._mark_changed()
+        self._set_status("3D study settings updated.")
+        return True
+
     def _mark_changed(self):
         self._saved = False
 
@@ -492,7 +590,9 @@ class ThreeDWorkspace(Div):
             "selection_id": None,
             "name": "",
             "region_ids": [],
+            "material": None,
         }
+        self._update_study_controls()
         self._refresh_mesh_controls()
 
     def _refresh_mesh_controls(self):
@@ -520,6 +620,7 @@ class ThreeDWorkspace(Div):
         )
         self._mesh_edges_button.ui_color = "primary" if self._mesh_edges_visible else None
         self._mesh_edges_button.ui_flat = not self._mesh_edges_visible
+        self._update_study_controls()
 
     def _selected_geometry(self):
         kind, item_id = getattr(self, "_selection", ("project", None))
@@ -623,6 +724,7 @@ class ThreeDWorkspace(Div):
                 units=self._read_units(self._trace_units),
                 material="Air",
             )
+            self._snapshot_material_reference(trace_set.get("material", "Air"))
             self._mark_changed()
             self._selection = ("trace_set", trace_set["id"])
             self._rebuild_items()
@@ -681,6 +783,7 @@ class ThreeDWorkspace(Div):
     def save_project(self, *_args):
         try:
             self.project["name"] = str(self.project.get("name", "")).strip() or "3D project"
+            self._snapshot_referenced_materials()
             safe_name = "".join(
                 character if character.isalnum() or character in "-_ " else "_"
                 for character in self.project["name"]
@@ -688,7 +791,7 @@ class ThreeDWorkspace(Div):
             archive = package_3d_project(self.project, self.assets)
             if self.app._save_artifact(archive, safe_name + PROJECT_SUFFIX):
                 self._saved = True
-                self._set_status("3D project saved with STEP files, wire traces and mesh settings.")
+                self._set_status("3D project saved with geometry, material data and study settings.")
                 remember = getattr(self.app, "_remember_recent_project", None)
                 if callable(remember):
                     remember(
@@ -834,6 +937,7 @@ class ThreeDWorkspace(Div):
                     "selection_id": None,
                     "name": "",
                     "region_ids": [],
+                    "material": None,
                 }
             self._mark_changed()
             self._rebuild_items()
@@ -852,6 +956,22 @@ class ThreeDWorkspace(Div):
         self._project_node.ui_style = (
             "display:flex; align-items:center; gap:6px; min-width:0; padding:5px 8px; border-radius:5px; cursor:pointer; "
             + ("background:var(--accent-subtle); color:var(--accent);" if selected_project else "")
+        )
+        selected_study = self._selection == ("study", None)
+        self._study_node.ui_children = [
+            QIcon(
+                ui_name="mdi-waveform",
+                ui_size="15px",
+                ui_color="primary" if selected_study else "grey-7",
+            ),
+            Div(
+                "Time-harmonic EM",
+                ui_style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px;",
+            ),
+        ]
+        self._study_node.ui_style = (
+            "display:flex; align-items:center; gap:6px; min-width:0; padding:5px 8px 5px 20px; border-radius:5px; cursor:pointer; "
+            + ("background:var(--accent-subtle); color:var(--accent);" if selected_study else "")
         )
         geometry_rows = []
         for geometry in self.project.get("geometries", []):
@@ -893,13 +1013,18 @@ class ThreeDWorkspace(Div):
             trace_rows = [Div("No wire traces", ui_class="cb-muted", ui_style="padding:5px 18px; font-size:12px;")]
         self._geometry_items.ui_children = geometry_rows
         self._trace_items.ui_children = trace_rows
+        self._update_study_controls()
         self._update_preview_selection()
         self._refresh_mesh_controls()
 
     def _material_options(self, current):
         options = []
         names = set()
-        material_records = [*builtin_materials(), *self._material_library.load()]
+        material_records = [
+            *self.project.get("materials", []),
+            *builtin_materials(),
+            *self._material_library.load(),
+        ]
         for material in material_records:
             name = str(material.get("name", "")).strip()
             if not name or name.casefold() in names:
@@ -914,7 +1039,7 @@ class ThreeDWorkspace(Div):
     @staticmethod
     def _material_note():
         return Div(
-            "Stored as a project reference. 3D solver material use is not available yet.",
+            "Material properties are copied into the project when assigned.",
             ui_class="cb-muted",
             ui_style="font-size:11px; line-height:1.4; margin-top:-7px;",
         )
@@ -965,6 +1090,7 @@ class ThreeDWorkspace(Div):
                 "selection_id": None,
                 "name": "",
                 "region_ids": [],
+                "material": None,
             }
         return self._selection_draft
 
@@ -975,7 +1101,13 @@ class ThreeDWorkspace(Div):
         draft = self._ensure_selection_draft(geometry)
         if draft["kind"] == kind:
             return
-        draft.update({"kind": kind, "selection_id": None, "name": "", "region_ids": []})
+        draft.update({
+            "kind": kind,
+            "selection_id": None,
+            "name": "",
+            "region_ids": [],
+            "material": None,
+        })
         self._selection = ("geometry", geometry["id"])
         self._rebuild_properties()
         self._rebuild_preview()
@@ -1002,9 +1134,26 @@ class ThreeDWorkspace(Div):
         value = getattr(event, "value", event)
         self._selection_draft["name"] = str(value or "").strip()
 
+    def _set_selection_draft_material(self, event):
+        value = str(getattr(event, "value", event) or "").strip()
+        options = {option["value"] for option in self._material_options(value)}
+        options.add("__inherit__")
+        if value not in options:
+            self._set_status("Choose a material from the available library references.", error=True)
+            return
+        value = None if value == "__inherit__" else value
+        self._selection_draft["material"] = value
+        if value and self._snapshot_material_reference(value):
+            self._mark_changed()
+
     def _new_named_selection(self, geometry):
         draft = self._ensure_selection_draft(geometry)
-        draft.update({"selection_id": None, "name": "", "region_ids": []})
+        draft.update({
+            "selection_id": None,
+            "name": "",
+            "region_ids": [],
+            "material": None,
+        })
         self._selection = ("geometry", geometry["id"])
         self._rebuild_items()
         self._rebuild_properties()
@@ -1051,6 +1200,15 @@ class ThreeDWorkspace(Div):
             collection.append(existing)
         existing["name"] = name
         existing["domain_ids" if kind == "domain" else "boundary_ids"] = region_ids
+        if kind == "domain":
+            assigned_material = str(draft.get("material") or "").strip()
+            if assigned_material:
+                existing["material"] = assigned_material
+                self._snapshot_material_reference(assigned_material)
+            else:
+                existing.pop("material", None)
+        else:
+            existing.pop("material", None)
         draft.update({"selection_id": selection_id, "region_ids": region_ids})
         self._selection = ("named_selection", selection_id)
         self._mark_changed()
@@ -1124,10 +1282,26 @@ class ThreeDWorkspace(Div):
         children.extend([
             Div("Named selections", ui_style="font-size:13px; font-weight:650; margin-top:8px;"),
             Div(
-                "Click mesh facets or choose regions below. Save domain and boundary groups for later setup.",
+                "Choose volume domains to create material assignments, or select boundaries for named groups.",
                 ui_class="cb-muted",
                 ui_style="font-size:10px; line-height:1.35;",
             ),
+        ])
+        if kind == "domain":
+            region_material = draft.get("material")
+            children.extend([
+                self._select_options(
+                    "Region material",
+                    region_material or "__inherit__",
+                    self._set_selection_draft_material,
+                    [
+                        {"label": "Use default material", "value": "__inherit__"},
+                        *self._material_options(None),
+                    ],
+                ),
+                self._material_note(),
+            ])
+        children.extend([
             self._select_options(
                 "Entity type",
                 kind,
@@ -1231,7 +1405,15 @@ class ThreeDWorkspace(Div):
                     "region_ids": list(selection.get(
                         "domain_ids" if selection_kind == "domain" else "boundary_ids", []
                     )),
+                    "material": selection.get("material"),
                 })
+            name_target = named_context[2] if named_context else item
+            name_label = "Selection name" if named_context else "Name"
+            name_callback = (
+                (lambda event, obj=name_target: self._set_named_selection_name(obj, event))
+                if named_context
+                else (lambda event, obj=name_target: self._set_value(obj, "name", event))
+            )
             mesh_size_input = _input(
                 "Maximum element size (mm)",
                 item.get("mesh_maxh_mm", 30.0),
@@ -1240,49 +1422,88 @@ class ThreeDWorkspace(Div):
                 width="100%",
             )
             mesh_size_input.ui_disable = self._mesh_worker_active
+            heading = (
+                "Named boundary selection" if named_context and named_context[1] == "boundary"
+                else "Named domain selection" if named_context
+                else "Geometry model"
+            )
             children.extend([
                 Div(
-                    "Named boundary selection" if named_context and named_context[1] == "boundary"
-                    else "Named domain selection" if named_context
-                    else "Geometry model",
+                    heading,
                     ui_style="font-size:13px; font-weight:650;",
                 ),
-                _input("Name", item["name"], lambda event, obj=item: self._set_value(obj, "name", event), width="100%"),
-                self._select_options(
-                    "Material reference", item.get("material", "Shield"),
-                    lambda event, obj=item: self._set_material_reference(obj, event),
-                    self._material_options(item.get("material", "Shield")),
-                ),
-                self._material_note(),
-                self._select_options(
-                    "Length units", item.get("units", "m"),
-                    lambda event, obj=item: self._set_geometry_units(obj, event),
-                    _UNIT_OPTIONS,
-                ),
-                Div(
-                    Path(item["asset"]).name,
-                    ui_class="cb-muted",
-                    ui_style=(
-                        "font-size:11px; overflow:hidden; text-overflow:ellipsis; "
-                        "white-space:nowrap;"
-                    ),
-                ),
-                Div("3D mesh", ui_style="font-size:13px; font-weight:650; margin-top:8px;"),
-                mesh_size_input,
-                Div(
-                    self._mesh_property_message(item["id"]),
-                    ui_class="cb-muted",
-                    ui_style="font-size:11px; line-height:1.4; overflow-wrap:anywhere;",
-                ),
-                Div(
-                    "Netgen uses this as an upper bound. Mesh data is not saved; "
-                    "it is regenerated from these settings when reopened.",
-                    ui_class="cb-muted",
-                    ui_style="font-size:10px; line-height:1.4; overflow-wrap:anywhere;",
-                ),
+                _input(name_label, name_target["name"], name_callback, width="100%"),
             ])
-            self._mesh_property_status = children[-2]
-            children.extend(self._mesh_setup_properties(item))
+            if named_context:
+                geometry, selection_kind, selection = named_context
+                region_ids = selection.get(
+                    "domain_ids" if selection_kind == "domain" else "boundary_ids", []
+                )
+                region_label = "volume" if selection_kind == "domain" else "boundary"
+                children.append(Div(
+                    f"{len(region_ids)} {region_label} region"
+                    f"{'s' if len(region_ids) != 1 else ''} assigned",
+                    ui_class="cb-muted",
+                    ui_style="font-size:11px;",
+                ))
+                if selection_kind == "domain":
+                    geometry_material = geometry.get("material", "Shield")
+                    children.extend([
+                        self._select_options(
+                            "Region material",
+                            selection.get("material") or "__inherit__",
+                            lambda event, obj=selection: self._set_named_selection_material(obj, event),
+                            [
+                                {
+                                    "label": f"Use geometry default ({geometry_material})",
+                                    "value": "__inherit__",
+                                },
+                                *self._material_options(
+                                    selection.get("material") or geometry_material
+                                ),
+                            ],
+                        ),
+                        self._material_note(),
+                    ])
+                self._mesh_property_status = None
+            else:
+                children.extend([
+                    self._select_options(
+                        "Default material",
+                        item.get("material", "Shield"),
+                        lambda event, obj=item: self._set_material_reference(obj, event),
+                        self._material_options(item.get("material", "Shield")),
+                    ),
+                    self._material_note(),
+                    self._select_options(
+                        "Length units", item.get("units", "m"),
+                        lambda event, obj=item: self._set_geometry_units(obj, event),
+                        _UNIT_OPTIONS,
+                    ),
+                    Div(
+                        Path(item["asset"]).name,
+                        ui_class="cb-muted",
+                        ui_style=(
+                            "font-size:11px; overflow:hidden; text-overflow:ellipsis; "
+                            "white-space:nowrap;"
+                        ),
+                    ),
+                    Div("3D mesh", ui_style="font-size:13px; font-weight:650; margin-top:8px;"),
+                    mesh_size_input,
+                    Div(
+                        self._mesh_property_message(item["id"]),
+                        ui_class="cb-muted",
+                        ui_style="font-size:11px; line-height:1.4; overflow-wrap:anywhere;",
+                    ),
+                    Div(
+                        "Netgen uses this as an upper bound. Mesh data is not saved; "
+                        "it is regenerated from these settings when reopened.",
+                        ui_class="cb-muted",
+                        ui_style="font-size:10px; line-height:1.4; overflow-wrap:anywhere;",
+                    ),
+                ])
+                self._mesh_property_status = children[-2]
+                children.extend(self._mesh_setup_properties(item))
         elif kind == "trace_set":
             item = next((entry for entry in self.project["wire_trace_sets"] if entry["id"] == item_id), None)
             if item is None:
@@ -1309,6 +1530,37 @@ class ThreeDWorkspace(Div):
                 direction,
                 Div(f"{trace.get('points', 0):,} points · source: {trace.get('name', item['name'])}", ui_class="cb-muted", ui_style="font-size:11px; overflow-wrap:anywhere;"),
             ])
+        elif kind == "study":
+            study = self.project.setdefault("study", {})
+            children.extend([
+                Div("Time-harmonic electromagnetic study", ui_style="font-size:13px; font-weight:650;"),
+                Div(
+                    "Solves magnetic vector potential and flux density at one frequency using the existing 3D EM solver.",
+                    ui_class="cb-muted",
+                    ui_style="font-size:11px; line-height:1.45;",
+                ),
+                _input(
+                    "Frequency (Hz)", study.get("frequency_hz", 500.0),
+                    lambda event: self._set_study_value("frequency_hz", event, number=True),
+                    number=True, width="100%",
+                ),
+                self._select_options(
+                    "Finite-element order", study.get("polynomial_order", 1),
+                    lambda event: self._set_study_value("polynomial_order", event),
+                    [{"label": f"{order} · {'linear' if order == 1 else 'quadratic' if order == 2 else 'order ' + str(order)}", "value": order}
+                     for order in (1, 2, 3, 4)],
+                ),
+                _input(
+                    "Air-region padding (model spans)", study.get("air_padding", 2.0),
+                    lambda event: self._set_study_value("air_padding", event, number=True),
+                    number=True, width="100%",
+                ),
+                Div(
+                    "The study creates a surrounding Air volume and applies the magnetic boundary condition to its exterior. Mechanical and DC solves are not enabled in this workflow.",
+                    ui_class="cb-muted",
+                    ui_style="font-size:10px; line-height:1.45; padding:8px; background:var(--panel-header); border-radius:5px;",
+                ),
+            ])
         else:
             children.extend([
                 Div("3D project", ui_style="font-size:13px; font-weight:650;"),
@@ -1320,8 +1572,7 @@ class ThreeDWorkspace(Div):
                     ui_style="font-size:12px; margin-top:6px;",
                 ),
                 Div(
-                    "This workspace provides imported geometry, wire-trace previews and "
-                    "Netgen volume meshing. 3D studies and solver execution are not available yet.",
+                    "Assign material properties to the imported solids, add wire traces, then select the time-harmonic EM study to configure and run it.",
                     ui_style=(
                         "font-size:12px; line-height:1.5; margin-top:10px; padding:10px; "
                         "border:1px solid var(--border); border-radius:6px; "
@@ -1351,6 +1602,7 @@ class ThreeDWorkspace(Div):
                     "region_ids": list(selection.get(
                         "domain_ids" if selection_kind == "domain" else "boundary_ids", []
                     )),
+                    "material": selection.get("material"),
                 }
         self._selection = (kind, item_id)
         self._rebuild_items()
@@ -1398,6 +1650,10 @@ class ThreeDWorkspace(Div):
                         "selection_id": None,
                         "name": "",
                         "region_ids": [],
+                        "material": next(
+                            (item.get("material", "Shield") for item in self.project.get("geometries", []) if item.get("id") == item_id),
+                            "Shield",
+                        ),
                     }
                 region_id = int(region_ids[point_number])
                 draft_ids = self._selection_draft["region_ids"]
@@ -1680,6 +1936,7 @@ class ThreeDWorkspace(Div):
         item["material"] = value
         for trace in item.get("traces", []):
             trace["material"] = value
+        self._snapshot_material_reference(value)
         self._mark_changed()
         self._rebuild_items()
 
@@ -1692,6 +1949,37 @@ class ThreeDWorkspace(Div):
             self._set_status("Choose a material from the available library references.", error=True)
             return
         item["material"] = value
+        self._snapshot_material_reference(value)
+        self._mark_changed()
+        self._rebuild_items()
+
+    def _set_named_selection_material(self, selection, event):
+        value = str(getattr(event, "value", event) or "").strip()
+        options = {option["value"] for option in self._material_options(value)}
+        options.add("__inherit__")
+        if value not in options:
+            self._set_status("Choose a material from the available library references.", error=True)
+            return False
+        if value == "__inherit__":
+            selection.pop("material", None)
+            material = None
+        else:
+            selection["material"] = value
+            material = value
+            self._snapshot_material_reference(value)
+        self._selection_draft["material"] = material
+        self._mark_changed()
+        self._rebuild_items()
+        self._rebuild_properties()
+        return True
+
+    def _set_named_selection_name(self, item, event):
+        value = str(getattr(event, "value", event) or "").strip()
+        if not value:
+            self._set_status("Selection name cannot be empty.", error=True)
+            return
+        item["name"] = value
+        self._selection_draft["name"] = value
         self._mark_changed()
         self._rebuild_items()
 
