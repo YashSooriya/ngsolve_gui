@@ -126,7 +126,10 @@ def preview_figure(payload):
             i=triangles[:, 0].tolist(),
             j=triangles[:, 1].tolist(),
             k=triangles[:, 2].tolist(),
-            name=item.get("name", "Geometry"),
+            name=(
+                f"{item.get('name', 'Geometry')} volume mesh"
+                if item.get("generated_mesh") else item.get("name", "Geometry")
+            ),
             color=_MATERIAL_COLORS[index % len(_MATERIAL_COLORS)],
             opacity=1.0,
             flatshading=True,
@@ -136,8 +139,35 @@ def preview_figure(payload):
                 "mmfem_kind": "geometry",
                 "mmfem_item_id": item.get("id"),
                 "mmfem_base_color": _MATERIAL_COLORS[index % len(_MATERIAL_COLORS)],
+                "mmfem_generated_mesh": bool(item.get("generated_mesh")),
             },
         ))
+        edges = item.get("edges")
+        if item.get("generated_mesh") and edges is not None and len(edges):
+            edge_coordinates = vertices[np.asarray(edges, dtype=np.int32)]
+            edge_x = []
+            edge_y = []
+            edge_z = []
+            for start, end in edge_coordinates:
+                edge_x.extend((float(start[0]), float(end[0]), None))
+                edge_y.extend((float(start[1]), float(end[1]), None))
+                edge_z.extend((float(start[2]), float(end[2]), None))
+            figure.add_trace(go.Scatter3d(
+                x=edge_x,
+                y=edge_y,
+                z=edge_z,
+                mode="lines",
+                name=f"{item.get('name', 'Geometry')} mesh edges",
+                line={"color": "#33475b", "width": 1},
+                hoverinfo="skip",
+                showlegend=False,
+                meta={
+                    "mmfem_kind": "geometry",
+                    "mmfem_item_id": item.get("id"),
+                    "mmfem_base_color": "#33475b",
+                    "mmfem_mesh_edges": True,
+                },
+            ))
     for index, item in enumerate(payload.get("traces", [])):
         points = item["points"]
         figure.add_trace(go.Scatter3d(

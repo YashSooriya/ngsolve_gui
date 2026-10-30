@@ -64,3 +64,32 @@ def test_golay_conductors_fit_inside_the_realistic_shield_bore():
         assert half_length <= sample["BORE_HALF_LENGTH_M"] - sample["CLEARANCE_M"] + 1e-12
         envelope = Cylinder((0, 0, -half_length), Z, r=radius, h=2 * half_length)
         assert (shield * envelope).mass < 1e-12
+
+
+def test_generated_volume_mesh_uses_boundary_facets_and_edge_trace():
+    import numpy as np
+
+    figure = preview_figure({
+        "geometry": [{
+            "id": "geometry-1",
+            "name": "box.step",
+            "vertices": np.asarray([
+                [0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1],
+            ]),
+            "triangles": np.asarray([[0, 1, 2], [0, 1, 3]]),
+            "edges": np.asarray([[0, 1], [0, 2], [0, 3]]),
+            "generated_mesh": True,
+        }],
+        "traces": [],
+    })
+
+    assert len(figure.data) == 2
+    assert figure.data[0].type == "mesh3d"
+    assert figure.data[0].name == "box.step volume mesh"
+    assert figure.data[0].meta["mmfem_generated_mesh"] is True
+    assert figure.data[1].type == "scatter3d"
+    assert figure.data[1].meta["mmfem_item_id"] == "geometry-1"
+    assert figure.data[1].meta["mmfem_mesh_edges"] is True
+    assert list(figure.data[1].x) == [
+        0.0, 1.0, None, 0.0, 0.0, None, 0.0, 0.0, None
+    ]

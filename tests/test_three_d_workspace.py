@@ -47,7 +47,7 @@ def test_3d_side_panels_collapse_and_reopen_without_losing_width(monkeypatch):
     assert workspace._tree_splitter.ui_model_value == 0
     assert workspace._tree_reopen_tab.ui_hidden is False
     workspace.toggle_tree()
-    assert workspace._tree_splitter.ui_model_value == 230
+    assert workspace._tree_splitter.ui_model_value == 250
     assert workspace._tree_reopen_tab.ui_hidden is True
 
     workspace.toggle_properties()
@@ -185,6 +185,9 @@ def test_preview_worker_dispatches_ui_updates_to_the_application_loop(monkeypatc
         def call_soon_threadsafe(self, callback, *args):
             scheduled.append((callback, args))
 
+        def call_later(self, _delay, callback, *args):
+            callback(*args)
+
     workspace = ThreeDWorkspace(SimpleNamespace(loop=Loop()))
     workspace._preview_generation = 4
     drawn = []
@@ -243,3 +246,106 @@ def test_view_controls_keep_geometry_and_plot_canvas(monkeypatch):
     assert [method for method, _args in calls] == ["relayout", "relayout", "restyle"]
     assert calls[0][1][1]["scene.camera"]["eye"]["z"] == 1.8
     assert calls[2][1][2] == [0]
+
+
+def test_mesh_size_changes_are_persisted_and_invalidate_the_display_mesh(monkeypatch):
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+    workspace = ThreeDWorkspace(SimpleNamespace())
+    item = {
+        "id": "geometry-1",
+        "name": "shield.step",
+        "material": "Shield",
+        "units": "mm",
+        "asset": "assets/geometry/shield.step",
+        "sha256": "shield-hash",
+    }
+    workspace.project["geometries"] = [item]
+    workspace.assets[item["asset"]] = b"STEP"
+    workspace._selection = ("geometry", item["id"])
+    workspace._rebuild_items()
+    workspace._rebuild_properties()
+    workspace._mesh_results[item["id"]] = {"status": "ready"}
+    previews = []
+    workspace._rebuild_preview = lambda: previews.append(True)
+
+    workspace._set_mesh_maxh(item, SimpleNamespace(value="12.5"))
+
+    assert item["mesh_maxh_mm"] == 12.5
+    assert workspace.dirty is True
+    assert item["id"] not in workspace._mesh_results
+    assert previews == [True]
+    assert "No mesh generated" in workspace._mesh_property_status.ui_children[0]
+    assert workspace._generate_mesh_button.ui_disable is False
+
+
+def test_mesh_result_updates_tree_inspector_and_viewport_state(monkeypatch):
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+    workspace = ThreeDWorkspace(SimpleNamespace())
+    item = {
+        "id": "geometry-1",
+        "name": "shield.step",
+        "material": "Shield",
+        "units": "mm",
+        "asset": "assets/geometry/shield.step",
+        "sha256": "shield-hash",
+    }
+    workspace.project["geometries"] = [item]
+    workspace._selection = ("geometry", item["id"])
+    workspace._mesh_generation = 3
+    workspace._mesh_job = {
+        "generation": 3,
+        "geometry_id": item["id"],
+        "sha256": item["sha256"],
+        "maxh_mm": 30.0,
+    }
+    workspace._mesh_worker_active = True
+    rebuilt = []
+    workspace._rebuild_preview = lambda: rebuilt.append(True)
+
+    workspace._publish_mesh_result(
+        3,
+        item["id"],
+        item["sha256"],
+        30.0,
+        {
+            "mesh": object(),
+            "vertices_mm": [],
+            "triangles": [],
+            "edges": [],
+            "volume_elements": 1200,
+            "surface_faces": 480,
+            "wireframe_available": True,
+        },
+        None,
+    )
+
+    assert workspace._mesh_results[item["id"]]["status"] == "ready"
+    assert "1,200 volume elements" in workspace._mesh_property_status.ui_children[0]
+    assert workspace._geometry_items.ui_children[0].ui_children[2].ui_name == "mdi-grid"
+    assert workspace._generate_mesh_button.ui_disable is False
+    assert rebuilt == [True]
+    assert "Mesh ready" in workspace._status.ui_children[0]
+
+
+def test_selected_mesh_figure_is_styled_before_asynchronous_plotly_render(monkeypatch):
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+    workspace = ThreeDWorkspace(SimpleNamespace())
+    workspace._selection = ("geometry", "geometry-1")
+    figure = go.Figure([
+        go.Mesh3d(
+            x=[0, 1, 0], y=[0, 0, 1], z=[0, 0, 0], i=[0], j=[1], k=[2],
+            meta={"mmfem_kind": "geometry", "mmfem_item_id": "geometry-1", "mmfem_base_color": "#6886ac"},
+        ),
+        go.Scatter3d(
+            x=[0, 1], y=[0, 0], z=[0, 0], mode="lines",
+            meta={"mmfem_kind": "geometry", "mmfem_item_id": "geometry-1", "mmfem_base_color": "#33475b", "mmfem_mesh_edges": True},
+        ),
+    ])
+
+    updates = workspace._style_preview_figure(figure)
+
+    assert figure.data[0].color == "#f59e0b"
+    assert figure.data[1].line.color == "#33475b"
+    assert figure.data[1].line.width == 2.5
+    assert updates[0]["color"] == "#f59e0b"
+    assert updates[1]["line.color"] == "#33475b"

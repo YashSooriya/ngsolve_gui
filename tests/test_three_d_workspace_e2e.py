@@ -1,5 +1,6 @@
 from pathlib import Path
 import tempfile
+import time
 
 from ngapp.e2e import app_test
 from playwright.sync_api import Page
@@ -20,6 +21,7 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
         units="mm",
         material="Shield",
     )
+    geometry["mesh_maxh_mm"] = 30.0
     add_wire_trace(
         project,
         assets,
@@ -46,7 +48,44 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     graph.evaluate("element => element.emit('plotly_click', {points: [{curveNumber: 0}]})")
     page.get_by_text("Geometry model", exact=True).wait_for(timeout=10_000)
     assert workspace._selection == ("geometry", geometry["id"])
+    assert workspace.generate_mesh() is True
+    deadline = time.monotonic() + 70
+    while workspace._mesh_worker_active and time.monotonic() < deadline:
+        page.wait_for_timeout(250)
+    page.wait_for_function(
+        """() => {
+            const graph = document.querySelector('.mmfem-3d-viewport .js-plotly-plot');
+            return graph && graph.data && graph.data.some(
+                trace => trace.meta && trace.meta.mmfem_generated_mesh
+            );
+        }""",
+        timeout=90_000,
+    )
+    browser_traces = graph.evaluate(
+        "element => element.data.map(trace => ({type: trace.type, name: trace.name, meta: trace.meta, color: trace.color, lineColor: trace.line && trace.line.color}))"
+    )
+    assert workspace._mesh_results[geometry["id"]]["status"] == "ready"
+    assert workspace._mesh_results[geometry["id"]]["volume_elements"] > 0
+    assert workspace._preview._figures[0].data[0].color == "#f59e0b"
+    assert browser_traces[0]["color"] == "#f59e0b"
+    assert browser_traces[1]["lineColor"] == "#33475b"
+    page.get_by_text("Ready ·", exact=False).wait_for(timeout=10_000)
+    page.wait_for_timeout(2500)
     page.screenshot(
-        path=str(Path(tempfile.gettempdir()) / "mmfem_stage2_3d_viewport_selected.png"),
+        path=str(Path(tempfile.gettempdir()) / "mmfem_stage3_3d_volume_mesh.png"),
+        full_page=True,
+    )
+    page.set_viewport_size({"width": 960, "height": 680})
+    page.wait_for_function(
+        """() => {
+            const graph = document.querySelector('.mmfem-3d-viewport .js-plotly-plot');
+            const rect = graph && graph.getBoundingClientRect();
+            return rect && rect.width > 300 && rect.height > 250;
+        }""",
+        timeout=10_000,
+    )
+    page.wait_for_timeout(1000)
+    page.screenshot(
+        path=str(Path(tempfile.gettempdir()) / "mmfem_stage3_3d_volume_mesh_compact.png"),
         full_page=True,
     )

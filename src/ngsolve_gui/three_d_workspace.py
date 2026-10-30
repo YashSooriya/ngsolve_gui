@@ -14,14 +14,18 @@ from ngapp.components import Div, QBtn, QIcon, QInput, QSelect, QSplitter, QTool
 from . import cerbsim_style as cb
 from .axisymmetric_model import builtin_materials
 from .material_library import MaterialLibrary
+from .three_d_mesh import generate_step_mesh
 from .three_d_project import (
     LENGTH_UNITS,
+    MAX_MESH_SIZE_MM,
+    MIN_MESH_SIZE_MM,
     PROJECT_SUFFIX,
     add_step_geometry,
     add_wire_trace,
     detect_step_unit,
     new_3d_project,
     package_3d_project,
+    step_unit_scale,
     unpack_3d_project,
 )
 from .workspace_components import panel_header, property_editor_body
@@ -86,13 +90,17 @@ class ThreeDWorkspace(Div):
         self.project = new_3d_project()
         self.assets = {}
         self._preview_generation = 0
+        self._mesh_generation = 0
+        self._mesh_job = None
+        self._mesh_worker_active = False
+        self._mesh_results = {}
         self._preview_lock = threading.Lock()
         self._preview_running = False
         self._preview_pending = None
         self._preview_cache = {}
         self._preview_cache_order = []
         self._preview_cache_size = 0
-        self._tree_width = 230
+        self._tree_width = 250
         self._property_width = 300
         self._selection = ("project", None)
         self._camera_view = "isometric"
@@ -270,6 +278,19 @@ class ThreeDWorkspace(Div):
         self._fit_view_button = _button(
             "Fit view", "mdi-fit-to-screen-outline", self.fit_view
         )
+        self._generate_mesh_button = _button(
+            "Generate mesh",
+            "mdi-grid",
+            self.generate_mesh,
+            color="primary",
+            tooltip="Generate a Netgen volume mesh for the selected geometry",
+        )
+        self._generate_mesh_button.ui_disable = True
+        self._unit_controls = Div(
+            self._geometry_units,
+            self._trace_units,
+            ui_style="display:flex; align-items:center; flex:none; gap:6px;",
+        )
         self._project_toolbar = Div(
             self._project_name,
             Div(
@@ -288,12 +309,12 @@ class ThreeDWorkspace(Div):
             self._import_trace_button,
             Div(ui_style="width:1px; height:24px; margin:0 2px; background:var(--border);"),
             self._fit_view_button,
+            self._generate_mesh_button,
             self._view_select,
             self._axes_button,
             self._transparency_button,
             Div(ui_style="flex:1 1 auto; min-width:8px;"),
-            self._geometry_units,
-            self._trace_units,
+            self._unit_controls,
             ui_style=(
                 "display:flex; flex-wrap:wrap; align-items:center; gap:6px; "
                 "min-height:44px; padding:6px 12px; box-sizing:border-box; "
@@ -388,6 +409,7 @@ class ThreeDWorkspace(Div):
         self._rebuild_items()
         self._rebuild_properties()
         self._refresh_axes_button()
+        self._refresh_mesh_controls()
 
     @property
     def dirty(self):
@@ -400,6 +422,7 @@ class ThreeDWorkspace(Div):
             return False
         self.project = new_3d_project()
         self.assets = {}
+        self._reset_meshes()
         self._saved = True
         self._project_name.ui_model_value = self.project["name"]
         self._rebuild_items()
@@ -427,6 +450,33 @@ class ThreeDWorkspace(Div):
 
     def _mark_changed(self):
         self._saved = False
+
+    def _reset_meshes(self):
+        self._mesh_generation += 1
+        self._mesh_job = None
+        self._mesh_results = {}
+        self._refresh_mesh_controls()
+
+    def _refresh_mesh_controls(self):
+        button = getattr(self, "_generate_mesh_button", None)
+        if button is None:
+            return
+        kind, item_id = getattr(self, "_selection", ("project", None))
+        selected = kind == "geometry" and any(
+            item.get("id") == item_id for item in self.project.get("geometries", [])
+        )
+        button.ui_disable = self._mesh_worker_active or not selected
+
+    def _mesh_tree_label(self, item_id):
+        result = self._mesh_results.get(item_id, {})
+        state = result.get("status")
+        if state == "generating":
+            return "Meshing"
+        if state == "ready":
+            return "Meshed"
+        if state == "error":
+            return "Mesh error"
+        return None
 
     def _read_units(self, widget):
         value = self._geometry_unit if widget is self._geometry_units else self._trace_unit
@@ -517,6 +567,7 @@ class ThreeDWorkspace(Div):
         project = copy.deepcopy(project)
         assets = dict(assets)
         self._preview_generation += 1
+        self._reset_meshes()
         self.project = project
         self.assets = assets
         self._saved = True
@@ -531,6 +582,7 @@ class ThreeDWorkspace(Div):
 
     def discard_project(self):
         self._preview_generation += 1
+        self._reset_meshes()
         self.project = new_3d_project()
         self.assets = {}
         self._saved = True
@@ -552,7 +604,7 @@ class ThreeDWorkspace(Div):
             archive = package_3d_project(self.project, self.assets)
             if self.app._save_artifact(archive, safe_name + PROJECT_SUFFIX):
                 self._saved = True
-                self._set_status("3D project saved with its STEP and wire trace files.")
+                self._set_status("3D project saved with STEP files, wire traces and mesh settings.")
                 remember = getattr(self.app, "_remember_recent_project", None)
                 if callable(remember):
                     remember(
@@ -570,6 +622,11 @@ class ThreeDWorkspace(Div):
         removed = [item for item in self.project["geometries"] if item["asset"] == asset]
         self.project["geometries"] = [item for item in self.project["geometries"] if item["asset"] != asset]
         self.assets.pop(asset, None)
+        for item in removed:
+            self._mesh_results.pop(item["id"], None)
+            if self._mesh_job and self._mesh_job["geometry_id"] == item["id"]:
+                self._mesh_generation += 1
+                self._mesh_job = None
         if removed and self._selection == ("geometry", removed[0]["id"]):
             self._selection = ("project", None)
         self._mark_changed()
@@ -588,11 +645,19 @@ class ThreeDWorkspace(Div):
         self._rebuild_properties()
         self._rebuild_preview()
 
-    def _tree_item(self, label, kind, item_id, icon, on_delete, material=None):
+    def _tree_item(
+        self, label, kind, item_id, icon, on_delete, material=None, mesh_status=None
+    ):
         selected = self._selection == (kind, item_id)
+        label_node = Div(
+            label,
+            ui_style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px;",
+        )
+        label_node._props["title"] = label
+        label_node._props["aria-label"] = label
         children = [
             QIcon(ui_name=icon, ui_size="15px", ui_color="primary" if selected else "grey-7"),
-            Div(label, ui_style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px;"),
+            label_node,
         ]
         if material:
             children.append(Div(
@@ -603,6 +668,25 @@ class ThreeDWorkspace(Div):
                     "font-size:10px; padding:1px 4px; border-radius:4px; background:var(--panel-header);"
                 ),
             ))
+        if mesh_status:
+            if mesh_status == "Meshed":
+                status_icon = QIcon(
+                    ui_name="mdi-grid",
+                    ui_size="14px",
+                    ui_color="positive",
+                )
+                status_icon._props["title"] = "Volume mesh ready"
+                children.append(status_icon)
+            else:
+                children.append(Div(
+                    mesh_status,
+                    ui_class="cb-muted",
+                    ui_style=(
+                        "max-width:58px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; "
+                        "font-size:10px; padding:1px 4px; border-radius:4px; "
+                        "background:var(--accent-subtle); color:var(--accent);"
+                    ),
+                ))
         children.append(_button("", "mdi-delete-outline", on_delete, tooltip="Remove from project"))
         row = Div(
             *children,
@@ -632,7 +716,11 @@ class ThreeDWorkspace(Div):
             self._tree_item(
                 geometry["name"], "geometry", geometry["id"], "mdi-cube-outline",
                 lambda *_a, asset=geometry["asset"]: self._remove_geometry(asset),
-                material=geometry.get("material"),
+                material=(
+                    geometry.get("material")
+                    if self._mesh_tree_label(geometry["id"]) is None else None
+                ),
+                mesh_status=self._mesh_tree_label(geometry["id"]),
             )
             for geometry in self.project.get("geometries", [])
         ]
@@ -651,6 +739,7 @@ class ThreeDWorkspace(Div):
         self._geometry_items.ui_children = geometry_rows
         self._trace_items.ui_children = trace_rows
         self._update_preview_selection()
+        self._refresh_mesh_controls()
 
     def _material_options(self, current):
         options = []
@@ -692,14 +781,43 @@ class ThreeDWorkspace(Div):
         widget.on_update_model_value(callback)
         return widget
 
+    def _mesh_property_message(self, item_id):
+        result = self._mesh_results.get(item_id, {})
+        state = result.get("status")
+        if state == "generating":
+            return "Netgen is generating a 3D volume mesh…"
+        if state == "error":
+            return f"Mesh failed: {result.get('error', 'Unknown meshing error')}"
+        if state == "ready":
+            message = (
+                f"Mesh ready · {result['volume_elements']:,} volume elements · "
+                f"{result['surface_faces']:,} surface triangles"
+            )
+            if not result.get("wireframe_available", True):
+                message += ". Mesh edges are hidden to keep the viewport responsive."
+            return message
+        return (
+            "No mesh generated. Mesh data stays in memory and is regenerated "
+            "when the project is reopened."
+        )
+
     def _rebuild_properties(self):
         kind, item_id = self._selection
         children = []
+        self._mesh_property_status = None
         if kind == "geometry":
             item = next((entry for entry in self.project["geometries"] if entry["id"] == item_id), None)
             if item is None:
                 self._selection = ("project", None)
                 return self._rebuild_properties()
+            mesh_size_input = _input(
+                "Maximum element size (mm)",
+                item.get("mesh_maxh_mm", 30.0),
+                lambda event, obj=item: self._set_mesh_maxh(obj, event),
+                number=True,
+                width="100%",
+            )
+            mesh_size_input.ui_disable = self._mesh_worker_active
             children.extend([
                 Div("Geometry model", ui_style="font-size:13px; font-weight:650;"),
                 _input("Name", item["name"], lambda event, obj=item: self._set_value(obj, "name", event), width="100%"),
@@ -714,8 +832,29 @@ class ThreeDWorkspace(Div):
                     lambda event, obj=item: self._set_geometry_units(obj, event),
                     _UNIT_OPTIONS,
                 ),
-                Div(Path(item["asset"]).name, ui_class="cb-muted", ui_style="font-size:11px; overflow-wrap:anywhere;"),
+                Div(
+                    Path(item["asset"]).name,
+                    ui_class="cb-muted",
+                    ui_style=(
+                        "font-size:11px; overflow:hidden; text-overflow:ellipsis; "
+                        "white-space:nowrap;"
+                    ),
+                ),
+                Div("3D mesh", ui_style="font-size:13px; font-weight:650; margin-top:8px;"),
+                mesh_size_input,
+                Div(
+                    self._mesh_property_message(item_id),
+                    ui_class="cb-muted",
+                    ui_style="font-size:11px; line-height:1.4; overflow-wrap:anywhere;",
+                ),
+                Div(
+                    "Netgen uses this as an upper bound. Mesh data is not saved; "
+                    "it is regenerated from these settings when reopened.",
+                    ui_class="cb-muted",
+                    ui_style="font-size:10px; line-height:1.4; overflow-wrap:anywhere;",
+                ),
             ])
+            self._mesh_property_status = children[-2]
         elif kind == "trace_set":
             item = next((entry for entry in self.project["wire_trace_sets"] if entry["id"] == item_id), None)
             if item is None:
@@ -753,8 +892,8 @@ class ThreeDWorkspace(Div):
                     ui_style="font-size:12px; margin-top:6px;",
                 ),
                 Div(
-                    "This workspace currently provides imported geometry and wire-trace previews. "
-                    "3D mesh generation and study execution are not available yet.",
+                    "This workspace provides imported geometry, wire-trace previews and "
+                    "Netgen volume meshing. 3D studies and solver execution are not available yet.",
                     ui_style=(
                         "font-size:12px; line-height:1.5; margin-top:10px; padding:10px; "
                         "border:1px solid var(--border); border-radius:6px; "
@@ -787,19 +926,10 @@ class ThreeDWorkspace(Div):
         if exists:
             self.select_item(kind, item_id)
 
-    def _update_preview_selection(self):
-        figures = getattr(self._preview, "_figures", ())
-        plots = getattr(self._preview, "_plots", ())
-        if not figures or not plots:
-            return
-        plot = plots[0]
-        plotly = getattr(type(plot), "_plotly", None)
-        target = getattr(plot, "_js_component", None)
-        if plotly is None or target is None:
-            return
-
+    def _style_preview_figure(self, figure):
         kind, item_id = self._selection
-        for index, trace in enumerate(figures[0].data):
+        trace_updates = []
+        for trace in figure.data:
             metadata = trace.meta or {}
             selected = (
                 metadata.get("mmfem_kind") == kind
@@ -812,16 +942,42 @@ class ThreeDWorkspace(Div):
                 trace.color = color
                 updates = {"color": color, "opacity": trace.opacity}
             else:
-                color = "#f59e0b" if selected else base_color
-                width = 8 if selected else 5
+                if metadata.get("mmfem_mesh_edges"):
+                    color = base_color
+                    width = 2.5 if selected else 1
+                else:
+                    color = "#f59e0b" if selected else base_color
+                    width = 8 if selected else 5
                 trace.line.color = color
                 trace.line.width = width
                 updates = {"line.color": color, "line.width": width}
+            trace_updates.append(updates)
+        return trace_updates
+
+    def _update_preview_selection(self):
+        figures = getattr(self._preview, "_figures", ())
+        plots = getattr(self._preview, "_plots", ())
+        if not figures or not plots:
+            return
+        plot = plots[0]
+        plotly = getattr(type(plot), "_plotly", None)
+        target = getattr(plot, "_js_component", None)
+        if plotly is None or target is None:
+            return
+
+        for index, updates in enumerate(self._style_preview_figure(figures[0])):
             try:
                 plotly._call_method_ignore_return("restyle", [target, updates, [index]])
             except Exception:
                 # The next figure draw will apply the updated trace properties.
                 pass
+
+    def _schedule_preview_selection_update(self):
+        loop = getattr(self.app, "loop", None)
+        if loop is not None and loop.is_running():
+            loop.call_later(0.75, self._update_preview_selection)
+        else:
+            self._update_preview_selection()
 
     def delete_selected(self):
         kind, item_id = self._selection
@@ -845,6 +1001,168 @@ class ThreeDWorkspace(Div):
         item["unit_source"] = "manual"
         self._mark_changed()
         self._rebuild_preview()
+
+    def _set_mesh_maxh(self, item, event):
+        if self._mesh_worker_active:
+            self._set_status("Wait for the current mesh generation to finish before changing its size.", error=True)
+            return
+        value = getattr(event, "value", event)
+        try:
+            maxh = float(value)
+        except (TypeError, ValueError, OverflowError):
+            self._set_status("Maximum element size must be a number in millimetres.", error=True)
+            return
+        if not math.isfinite(maxh) or not MIN_MESH_SIZE_MM <= maxh <= MAX_MESH_SIZE_MM:
+            self._set_status(
+                f"Maximum element size must be between {MIN_MESH_SIZE_MM:g} and {MAX_MESH_SIZE_MM:g} mm.",
+                error=True,
+            )
+            return
+        current = float(item.get("mesh_maxh_mm", 30.0))
+        if math.isclose(maxh, current, rel_tol=1e-12, abs_tol=1e-12):
+            return
+        item["mesh_maxh_mm"] = maxh
+        had_mesh = self._mesh_results.get(item["id"], {}).get("status") == "ready"
+        self._mesh_results.pop(item["id"], None)
+        self._mark_changed()
+        self._rebuild_items()
+        if had_mesh:
+            self._rebuild_preview()
+        if self._mesh_property_status is not None:
+            self._mesh_property_status.ui_children = [
+                self._mesh_property_message(item["id"])
+            ]
+        self._set_status("Mesh size updated. Generate a new mesh to apply it.")
+
+    def generate_mesh(self, *_args):
+        kind, item_id = self._selection
+        item = next(
+            (entry for entry in self.project.get("geometries", []) if entry.get("id") == item_id),
+            None,
+        ) if kind == "geometry" else None
+        if item is None:
+            self._set_status("Select a geometry model before generating a mesh.", error=True)
+            return False
+        if self._mesh_worker_active:
+            self._set_status("A 3D mesh is already being generated.", error=True)
+            return False
+        try:
+            maxh = float(item.get("mesh_maxh_mm", 30.0))
+            if not math.isfinite(maxh) or not MIN_MESH_SIZE_MM <= maxh <= MAX_MESH_SIZE_MM:
+                raise ValueError(
+                    f"Maximum element size must be between {MIN_MESH_SIZE_MM:g} "
+                    f"and {MAX_MESH_SIZE_MM:g} mm."
+                )
+            step_data = bytes(self.assets[item["asset"]])
+        except Exception as error:
+            self._set_status(f"Could not prepare the mesh job: {error}", error=True)
+            return False
+
+        had_mesh = self._mesh_results.get(item_id, {}).get("status") == "ready"
+        item["mesh_maxh_mm"] = maxh
+        self._mark_changed()
+        self._mesh_generation += 1
+        generation = self._mesh_generation
+        checksum = item.get("sha256")
+        self._mesh_job = {
+            "generation": generation,
+            "geometry_id": item_id,
+            "sha256": checksum,
+            "maxh_mm": maxh,
+        }
+        self._mesh_worker_active = True
+        self._mesh_results[item_id] = {"status": "generating", "maxh_mm": maxh}
+        self._refresh_mesh_controls()
+        self._rebuild_items()
+        self._rebuild_properties()
+        self._set_status(f"Generating a volume mesh for {item['name']} at max size {maxh:g} mm…")
+        if had_mesh:
+            self._rebuild_preview()
+        threading.Thread(
+            target=self._run_mesh_generation,
+            args=(generation, item_id, checksum, maxh, step_data),
+            name="MMFEM-3D-mesh-generation",
+            daemon=True,
+        ).start()
+        return True
+
+    def _run_mesh_generation(self, generation, item_id, checksum, maxh, step_data):
+        try:
+            mesh_result = generate_step_mesh(step_data, maxh_mm=maxh)
+            error = None
+        except Exception as exception:
+            mesh_result = None
+            error = str(exception).strip() or type(exception).__name__
+        self._dispatch_mesh_result(
+            generation, item_id, checksum, maxh, mesh_result, error
+        )
+
+    def _dispatch_mesh_result(
+        self, generation, item_id, checksum, maxh, mesh_result, error
+    ):
+        loop = getattr(self.app, "loop", None)
+        if loop is not None and loop.is_running():
+            try:
+                loop.call_soon_threadsafe(
+                    self._publish_mesh_result,
+                    generation,
+                    item_id,
+                    checksum,
+                    maxh,
+                    mesh_result,
+                    error,
+                )
+                return
+            except RuntimeError:
+                return
+        self._publish_mesh_result(
+            generation, item_id, checksum, maxh, mesh_result, error
+        )
+
+    def _publish_mesh_result(
+        self, generation, item_id, checksum, maxh, mesh_result, error
+    ):
+        job = self._mesh_job
+        if (
+            generation != self._mesh_generation
+            or job is None
+            or job.get("generation") != generation
+        ):
+            self._mesh_worker_active = False
+            self._refresh_mesh_controls()
+            return
+        item = next(
+            (entry for entry in self.project.get("geometries", []) if entry.get("id") == item_id),
+            None,
+        )
+        self._mesh_job = None
+        self._mesh_worker_active = False
+        if item is None or item.get("sha256") != checksum:
+            self._refresh_mesh_controls()
+            return
+        if error is not None:
+            self._mesh_results[item_id] = {
+                "status": "error",
+                "maxh_mm": maxh,
+                "error": error,
+            }
+            self._set_status(f"Could not generate the mesh for {item['name']}: {error}", error=True)
+        else:
+            self._mesh_results[item_id] = {
+                "status": "ready",
+                "maxh_mm": maxh,
+                "sha256": checksum,
+                **mesh_result,
+            }
+            self._set_status(
+                f"Mesh ready: {mesh_result['volume_elements']:,} volume elements and "
+                f"{mesh_result['surface_faces']:,} boundary facets."
+            )
+        self._rebuild_items()
+        self._rebuild_properties()
+        self._refresh_mesh_controls()
+        if error is None:
+            self._rebuild_preview()
 
     def _set_trace_material(self, item, event):
         value = getattr(event, "value", event)
@@ -1030,6 +1348,11 @@ class ThreeDWorkspace(Div):
     def _rebuild_preview(self):
         project = copy.deepcopy(self.project)
         assets = dict(self.assets)
+        meshes = {
+            item_id: result
+            for item_id, result in self._mesh_results.items()
+            if result.get("status") == "ready"
+        }
         if not project["geometries"] and not project["wire_trace_sets"]:
             with self._preview_lock:
                 self._preview_generation += 1
@@ -1046,7 +1369,7 @@ class ThreeDWorkspace(Div):
         with self._preview_lock:
             self._preview_generation += 1
             generation = self._preview_generation
-            self._preview_pending = (generation, project, assets)
+            self._preview_pending = (generation, project, assets, meshes)
             if self._preview_running:
                 return
             self._preview_running = True
@@ -1090,13 +1413,31 @@ class ThreeDWorkspace(Div):
         self._cache_preview_item(key, value)
         return value
 
-    def _build_preview_figure(self, project, assets):
+    def _build_preview_figure(self, project, assets, meshes=None):
         from .three_d_preview import _sample_trace_points, preview_figure, tessellate_step
         from .three_d_project import parse_wire_trace
 
+        meshes = meshes or {}
         geometry_payload = []
         for item in project.get("geometries", []):
             data = assets[item["asset"]]
+            generated_mesh = meshes.get(item["id"])
+            if generated_mesh and generated_mesh.get("sha256") == item.get("sha256"):
+                import numpy as np
+
+                vertices = generated_mesh["vertices_mm"] * step_unit_scale(
+                    data, units=item.get("units", "m")
+                )
+                geometry_payload.append({
+                    "id": item["id"],
+                    "name": item["name"],
+                    "material": item.get("material", "Shield"),
+                    "vertices": vertices.astype(np.float32, copy=False),
+                    "triangles": generated_mesh["triangles"],
+                    "edges": generated_mesh.get("edges"),
+                    "generated_mesh": True,
+                })
+                continue
             key = ("geometry", item.get("sha256"), item.get("units", "m"))
             mesh = self._get_preview_item(
                 key,
@@ -1149,9 +1490,9 @@ class ThreeDWorkspace(Div):
                 if job is None:
                     self._preview_running = False
                     return
-            generation, project, assets = job
+            generation, project, assets, meshes = job
             try:
-                figure = self._build_preview_figure(project, assets)
+                figure = self._build_preview_figure(project, assets, meshes)
                 self._dispatch_preview_result(generation, figure=figure)
             except Exception as error:
                 self._dispatch_preview_result(generation, error=error)
@@ -1184,11 +1525,20 @@ class ThreeDWorkspace(Div):
         for trace in figure.data:
             if trace.type == "mesh3d":
                 trace.opacity = 0.4 if self._transparent_shield else 1.0
+        self._style_preview_figure(figure)
         self._preview_empty_state.ui_hidden = True
         self._preview.ui_hidden = False
         self._preview.update_figure(figure)
-        self._update_preview_selection()
-        self._set_status("Preview ready. Original STEP and wire trace files remain in the project.")
+        self._schedule_preview_selection_update()
+        if self._mesh_job is not None or any(
+            result.get("status") == "error"
+            for result in self._mesh_results.values()
+        ):
+            return
+        if any(result.get("status") == "ready" for result in self._mesh_results.values()):
+            self._set_status("Volume mesh preview ready. Mesh data remains in memory for this session.")
+        else:
+            self._set_status("Preview ready. Original STEP and wire trace files remain in the project.")
 
 
 # Compatibility name retained for existing integrations importing the old class.
