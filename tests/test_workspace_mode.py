@@ -48,6 +48,7 @@ def test_workspace_mode_switch_changes_workspace_and_keeps_header_visible():
     app = SimpleNamespace(
         _post_process_workspace=post_process,
         _solve_workspace=solve,
+        navigator=SimpleNamespace(set_run_history_visible=lambda _visible: None),
         # These stand in for the fixed controls in the single app-bar row.
         _brand=brand,
         _file_group=files,
@@ -213,6 +214,66 @@ def test_workspace_mode_rejects_unknown_mode():
     app = SimpleNamespace()
     with pytest.raises(ValueError, match="Unknown workspace mode"):
         NGSolveGui._set_workspace_mode(app, "solver")
+
+
+@pytest.mark.parametrize("panel,visibility_attr", [
+    ("navigator", "_nav_visible"),
+    ("property", "_prop_visible"),
+])
+def test_3d_post_process_panel_shortcuts_use_shared_application_panels(
+    panel, visibility_attr
+):
+    calls = []
+    app = SimpleNamespace(
+        _active_project_type="3d",
+        _workspace_mode="post_process",
+        _nav_visible=True,
+        _prop_visible=True,
+        usersettings=SimpleNamespace(set=lambda key, value: calls.append((key, value))),
+        _three_d_workspace=SimpleNamespace(
+            toggle_tree=lambda: calls.append(("3d", "tree")),
+            toggle_properties=lambda: calls.append(("3d", "properties")),
+        ),
+        _apply_panel_visibility=lambda: calls.append(("apply", None)),
+    )
+
+    method = (
+        NGSolveGui._toggle_navigator
+        if panel == "navigator"
+        else NGSolveGui._toggle_property_panel
+    )
+    method(app)
+
+    assert getattr(app, visibility_attr) is False
+    assert calls == [
+        ("nav_visible" if panel == "navigator" else "prop_visible", False),
+        ("apply", None),
+    ]
+
+
+@pytest.mark.parametrize("panel,expected", [
+    ("navigator", ("3d", "tree")),
+    ("property", ("3d", "properties")),
+])
+def test_3d_solve_panel_shortcuts_use_workspace_panels(panel, expected):
+    calls = []
+    app = SimpleNamespace(
+        _active_project_type="3d",
+        _workspace_mode="solve",
+        _three_d_workspace=SimpleNamespace(
+            toggle_tree=lambda: calls.append(("3d", "tree")),
+            toggle_properties=lambda: calls.append(("3d", "properties")),
+        ),
+    )
+
+    method = (
+        NGSolveGui._toggle_navigator
+        if panel == "navigator"
+        else NGSolveGui._toggle_property_panel
+    )
+    method(app)
+
+    assert calls == [expected]
 
 
 def test_new_problem_prompts_when_model_has_unsaved_changes():

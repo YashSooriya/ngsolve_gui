@@ -601,6 +601,11 @@ def _draw_pickle_object(obj, name: str, field_path=None):
         "fieldlines_thickness": 0.0001,
     }
     _metadata, field_metadata = _pickle_metadata_for_path(field_path)
+    if field_path:
+        try:
+            draw_options["_ngsolve_gui_result_path"] = str(Path(field_path).resolve())
+        except (OSError, TypeError, ValueError):
+            draw_options["_ngsolve_gui_result_path"] = str(field_path)
     if isinstance(field_metadata, dict):
         draw_options["_ngsolve_gui_field_metadata"] = field_metadata
     field_choices = _result_field_choices(field_path, _metadata, field_metadata)

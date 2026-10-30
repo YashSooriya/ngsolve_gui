@@ -137,6 +137,7 @@ class FunctionComponent(WebgpuTab):
         self.name = name
         self.run_metadata = data.get("_ngsolve_gui_run_metadata")
         self.field_metadata = data.get("_ngsolve_gui_field_metadata")
+        self.result_path = data.get("_ngsolve_gui_result_path")
         self.available_result_fields = list(
             data.get("_ngsolve_gui_result_fields", [])
         )

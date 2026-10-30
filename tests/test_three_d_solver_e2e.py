@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import tempfile
 import time
 import json
@@ -112,7 +113,16 @@ def _exercise_3d_run_handoff(page, app, tmp_path):
     assert component.property_xref()["label"] == "Open as mesh"
     assert {str(name) for name in component.mesh.GetMaterials()} >= {"Copper", "Air"}
 
-    component._ngsolve_gui_open_result_field(alternate_field["path"])
+    run_tree_entry = next(
+        item for item in app.navigator._run_history
+        if Path(item["output_path"]) == output_dir
+    )
+    assert {item["kind"] for item in run_tree_entry["results"]} == {"field", "mesh"}
+    screenshot_dir = os.environ.get("MMFEM_UI_SCREENSHOT_DIR")
+
+    page.locator(".mmfem-run-result-entry").filter(
+        has_text=alternate_field["label"]
+    ).click()
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         loaded_component = app.tab_panel.comp
@@ -124,6 +134,34 @@ def _exercise_3d_run_handoff(page, app, tmp_path):
             break
         page.wait_for_timeout(100)
     assert app.tab_panel.comp.field_metadata["field_key"] == "gfBAC"
+    if screenshot_dir:
+        if not app._prop_visible:
+            app._toggle_property_panel()
+        page.get_by_text("Study information", exact=True).last.wait_for(
+            state="visible", timeout=5_000
+        )
+        property_panel = app.property_host._panels.get(app.tab_panel.comp)
+        assert property_panel is not None and property_panel.ui_hidden is False
+        assert app._inner_splitter.ui_model_value > 0
+        property_title_bounds = page.get_by_text(
+            "Study information", exact=True
+        ).last.bounding_box()
+        assert property_title_bounds and property_title_bounds["x"] > 700
+        page.wait_for_timeout(1000)
+        page.screenshot(
+            path=str(Path(screenshot_dir) / "06-3d-alternate-field.png"),
+            full_page=True,
+        )
+
+    page.get_by_role("button", name="Generated mesh", exact=True).click()
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        loaded_component = app.tab_panel.comp
+        if loaded_component is not None and type(loaded_component).__name__ == "MeshComponent":
+            break
+        page.wait_for_timeout(100)
+    assert type(app.tab_panel.comp).__name__ == "MeshComponent"
+    assert app.tab_panel.comp.mesh.ne > 0
 
     app._workspace_mode_toggle.select("solve")
     assert workspace.ui_hidden is False

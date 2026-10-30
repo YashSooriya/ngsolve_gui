@@ -691,7 +691,13 @@ class NGSolveGui(App):
         )
 
         # Three-column layout using flex
-        self.navigator = Navigator(self.app_data, self._click_tab, self._load_file)
+        self.navigator = Navigator(
+            self.app_data,
+            self._click_tab,
+            self._load_file,
+            on_open_run_result=self._open_run_result,
+            get_run_history=self._get_post_process_run_history,
+        )
         # The property panel is owned by each component; this host swaps in the
         # active component's own panel (built via comp.build_property_panel()).
         self.property_host = StackHost(ui_class=panel_full)
@@ -1851,6 +1857,11 @@ class NGSolveGui(App):
 
         solving = mode == "solve"
         self._workspace_mode = mode
+        navigator = getattr(self, "navigator", None)
+        if navigator is not None:
+            set_history_visible = getattr(navigator, "set_run_history_visible", None)
+            if callable(set_history_visible):
+                set_history_visible(not solving)
         if getattr(self, "_active_project_type", None) == "3d":
             self._three_d_workspace.ui_hidden = not solving
             self._post_process_workspace.ui_hidden = solving
@@ -2705,6 +2716,13 @@ class NGSolveGui(App):
         self._load_with_status(filename)
 
     @staticmethod
+    def _get_post_process_run_history():
+        """Use the same run discovery as the Solve workspace for the navigator."""
+        from .solve_workspace import _load_saved_run_history, default_run_history_root
+
+        return _load_saved_run_history(default_run_history_root())
+
+    @staticmethod
     def _find_solver_root():
         candidates = []
         configured = os.environ.get("COUPLED_SOLVER_ROOT")
@@ -2851,14 +2869,20 @@ class NGSolveGui(App):
         self.property_host.show(comp, comp.build_property_panel)
 
     def _toggle_navigator(self):
-        if self._active_project_type == "3d":
+        if (
+            self._active_project_type == "3d"
+            and self._workspace_mode == "solve"
+        ):
             return self._three_d_workspace.toggle_tree()
         self._nav_visible = not self._nav_visible
         self.usersettings.set("nav_visible", self._nav_visible)
         self._apply_panel_visibility()
 
     def _toggle_property_panel(self):
-        if self._active_project_type == "3d":
+        if (
+            self._active_project_type == "3d"
+            and self._workspace_mode == "solve"
+        ):
             return self._three_d_workspace.toggle_properties()
         self._prop_visible = not self._prop_visible
         self.usersettings.set("prop_visible", self._prop_visible)
