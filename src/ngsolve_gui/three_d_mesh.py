@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 from .three_d_project import MAX_MESH_SIZE_MM, MIN_MESH_SIZE_MM
@@ -12,6 +13,47 @@ MAX_ESTIMATED_VOLUME_ELEMENTS = 3_000_000
 MAX_VOLUME_ELEMENTS = 2_000_000
 MAX_BOUNDARY_FACETS = 300_000
 MAX_WIREFRAME_EDGES = 250_000
+LOW_TET_QUALITY_THRESHOLD = 0.1
+
+
+def _tetra_quality(vertices, connectivity):
+    """Return the normalized mean-ratio quality for tetrahedral elements."""
+    import numpy as np
+
+    if connectivity.ndim != 2 or connectivity.shape[1] != 4:
+        return None
+    points = vertices[connectivity]
+    edge_pairs = ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
+    edge_sum = sum(
+        np.einsum("ij,ij->i", points[:, left] - points[:, right], points[:, left] - points[:, right])
+        for left, right in edge_pairs
+    )
+    determinant = np.einsum(
+        "ij,ij->i",
+        points[:, 1] - points[:, 0],
+        np.cross(points[:, 2] - points[:, 0], points[:, 3] - points[:, 0]),
+    )
+    volume = np.abs(determinant) / 6.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        quality = 12.0 * np.power(3.0 * volume, 2.0 / 3.0) / edge_sum
+    return np.clip(np.nan_to_num(quality, nan=0.0, posinf=0.0), 0.0, 1.0)
+
+
+def _named_regions(ids, counts, names, fallback):
+    """Summarize region indices with unique display names and element counts."""
+    regions = []
+    used_names = set()
+    for region_id in sorted(set(ids)):
+        raw_name = str(names[region_id]).strip() if region_id < len(names) else ""
+        if not raw_name or raw_name.casefold() == "default" or raw_name.casefold() in used_names:
+            raw_name = f"{fallback} {region_id + 1}"
+        used_names.add(raw_name.casefold())
+        regions.append({
+            "id": int(region_id),
+            "name": raw_name,
+            "elements": int(counts.get(region_id, 0)),
+        })
+    return regions
 
 
 def generate_step_mesh(data, *, maxh_mm=30.0):
@@ -81,13 +123,41 @@ def generate_step_mesh(data, *, maxh_mm=30.0):
             [tuple(mesh[vertex].point)[:3] for vertex in mesh.vertices],
             dtype=np.float64,
         )
+        volume_connectivity = np.asarray(
+            [[int(vertex.nr) for vertex in element.vertices] for element in volume_elements],
+            dtype=np.int32,
+        )
+        domain_ids = [int(element.index) for element in volume_elements]
+        domain_regions = _named_regions(
+            domain_ids,
+            Counter(domain_ids),
+            list(mesh.GetMaterials()),
+            "Domain",
+        )
+        tetra_quality = _tetra_quality(vertices_mm, volume_connectivity)
+        quality = None
+        if tetra_quality is not None and len(tetra_quality):
+            quality = {
+                "metric": "tetrahedral mean ratio (0–1)",
+                "minimum": float(np.min(tetra_quality)),
+                "p05": float(np.percentile(tetra_quality, 5)),
+                "median": float(np.median(tetra_quality)),
+                "mean": float(np.mean(tetra_quality)),
+                "below_0_1": int(np.count_nonzero(tetra_quality < LOW_TET_QUALITY_THRESHOLD)),
+                "below_0_1_percent": float(
+                    100.0 * np.count_nonzero(tetra_quality < LOW_TET_QUALITY_THRESHOLD)
+                    / len(tetra_quality)
+                ),
+            }
         surface_triangles = []
+        surface_region_ids = []
         for element in mesh.Elements(ngs.BND):
             indices = [int(vertex.nr) for vertex in element.vertices]
             if len(indices) < 3:
                 continue
             for index in range(1, len(indices) - 1):
                 surface_triangles.append((indices[0], indices[index], indices[index + 1]))
+                surface_region_ids.append(int(element.index))
         if not surface_triangles:
             raise ValueError("The generated volume mesh has no displayable boundary facets.")
         if len(surface_triangles) > MAX_BOUNDARY_FACETS:
@@ -96,6 +166,12 @@ def generate_step_mesh(data, *, maxh_mm=30.0):
                 "too large to display interactively. Increase the maximum element size."
             )
         triangles = np.asarray(surface_triangles, dtype=np.int32)
+        boundary_regions = _named_regions(
+            surface_region_ids,
+            Counter(surface_region_ids),
+            list(mesh.GetBoundaries()),
+            "Boundary",
+        )
 
         edge_pairs = np.concatenate(
             (triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]),
@@ -111,8 +187,12 @@ def generate_step_mesh(data, *, maxh_mm=30.0):
             "mesh": mesh,
             "vertices_mm": vertices_mm.astype(np.float32),
             "triangles": triangles,
+            "boundary_region_ids": np.asarray(surface_region_ids, dtype=np.int32),
             "edges": edges,
             "volume_elements": len(volume_elements),
+            "domain_regions": domain_regions,
+            "boundary_regions": boundary_regions,
+            "tetra_quality": quality,
             "surface_faces": len(triangles),
             "wireframe_available": wireframe_available,
             "estimated_volume_elements": estimated_elements,
