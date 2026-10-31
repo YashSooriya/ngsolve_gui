@@ -8,7 +8,8 @@ RUN pip install --no-cache-dir --break-system-packages \
     "ngsolve_webgpu @ git+https://github.com/CERBSim/ngsolve_webgpu.git" \
     "ngapp[e2e] @ git+https://github.com/CERBSim/ngapp.git" \
     "cerbsim_ngapp_style @ git+https://github.com/CERBSim/cerbsim_ngapp_style.git" \
-    plotly
+    plotly \
+    psutil
 RUN pip install --no-cache-dir --break-system-packages --pre --upgrade ngsolve
 RUN pip install --no-cache-dir --break-system-packages --no-deps .
 CMD ["pytest", "tests/", "-vv", "-s"]
