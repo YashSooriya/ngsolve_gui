@@ -21,6 +21,7 @@ from .three_d_project import (
     MAX_MESH_SIZE_MM,
     MIN_MESH_SIZE_MM,
     PROJECT_SUFFIX,
+    UNASSIGNED_MATERIAL,
     add_step_geometry,
     add_wire_trace,
     detect_step_unit,
@@ -30,6 +31,7 @@ from .three_d_project import (
     step_unit_scale,
     unpack_3d_project,
     validate_3d_project,
+    domain_mesh_size_overrides,
 )
 from .workspace_components import panel_header, property_editor_body
 
@@ -121,7 +123,7 @@ class ThreeDWorkspace(Div):
         self._axes_visible = True
         self._saved = True
         self._status = Div(
-            "Import a STEP model or wire traces to start.",
+            "Ready",
             ui_class="cb-muted",
             ui_style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
         )
@@ -249,11 +251,7 @@ class ThreeDWorkspace(Div):
             "No 3D assets yet",
             ui_style="font-size:15px; font-weight:650; color:var(--fg);",
         )
-        self._preview_empty_detail = Div(
-            "Import a STEP model or wire traces to preview the project.",
-            ui_class="cb-muted",
-            ui_style="max-width:340px; text-align:center; line-height:1.5;",
-        )
+        self._preview_empty_detail = Div()
         self._preview_empty_state = Div(
             QIcon(ui_name="mdi-cube-scan", ui_size="30px", ui_color="grey-6"),
             self._preview_empty_title,
@@ -290,7 +288,9 @@ class ThreeDWorkspace(Div):
         self._run_study_button = _button(
             "Run study", "mdi-play", self.run_study,
             color="primary",
-            tooltip="Run the 3D time-harmonic electromagnetic study",
+            tooltip=(
+                "Assign materials and add a wire trace before running."
+            ),
         )
         self._cancel_study_button = _button(
             "Cancel", "mdi-stop", self.cancel_study,
@@ -503,9 +503,41 @@ class ThreeDWorkspace(Div):
                 running
                 or not self.project.get("geometries")
                 or not self.project.get("wire_trace_sets")
+                or not self._has_resolved_study_materials()
             )
         if hasattr(self, "_cancel_study_button"):
             self._cancel_study_button.ui_disable = not running
+
+    def _has_resolved_study_materials(self):
+        """Require each solver region to reference a known material record."""
+        records = self._material_records()
+
+        def is_resolved(name):
+            value = str(name or "").strip()
+            return (
+                bool(value)
+                and value.casefold() != UNASSIGNED_MATERIAL.casefold()
+                and value.casefold() in records
+            )
+
+        for geometry in self.project.get("geometries", []):
+            if not is_resolved(geometry.get("material")):
+                return False
+            if any(
+                selection.get("material")
+                and not is_resolved(selection["material"])
+                for selection in geometry.get("domain_selections", [])
+            ):
+                return False
+        for trace_set in self.project.get("wire_trace_sets", []):
+            if not is_resolved(trace_set.get("material", "Air")):
+                return False
+            if any(
+                not is_resolved(trace.get("material", trace_set.get("material", "Air")))
+                for trace in trace_set.get("traces", [])
+            ):
+                return False
+        return True
 
     def run_study(self, *_args):
         callback = getattr(self.app, "run_3d_study", None)
@@ -694,14 +726,16 @@ class ThreeDWorkspace(Div):
                 Path(path).name,
                 data,
                 units=units,
-                material="Shield",
+                material=UNASSIGNED_MATERIAL,
             )
             item["unit_source"] = unit_source
             self._mark_changed()
             self._selection = ("geometry", item["id"])
             self._rebuild_items()
             self._rebuild_properties()
-            self._set_status(f"Imported {item['name']}. Building the 3D preview…")
+            self._set_status(
+                f"Imported {item['name']}. Assign a material before running a study."
+            )
             self._rebuild_preview()
         except Exception as error:
             self._set_status(f"Could not import STEP geometry: {error}", error=True)
@@ -926,6 +960,9 @@ class ThreeDWorkspace(Div):
         return row
 
     def _remove_named_selection(self, geometry, kind, selection):
+        if self._mesh_worker_active:
+            self._set_status("Wait for mesh generation to finish before editing selections.", error=True)
+            return
         collection = geometry.get(f"{kind}_selections", [])
         if selection in collection:
             collection.remove(selection)
@@ -942,7 +979,7 @@ class ThreeDWorkspace(Div):
             self._mark_changed()
             self._rebuild_items()
             self._rebuild_properties()
-            self._rebuild_preview()
+            self._update_boundary_overlay()
 
     def _rebuild_items(self):
         selected_project = self._selection == ("project", None)
@@ -1007,10 +1044,6 @@ class ThreeDWorkspace(Div):
             )
             for trace_set in self.project.get("wire_trace_sets", [])
         ]
-        if not geometry_rows:
-            geometry_rows = [Div("No geometry models", ui_class="cb-muted", ui_style="padding:5px 18px; font-size:12px;")]
-        if not trace_rows:
-            trace_rows = [Div("No wire traces", ui_class="cb-muted", ui_style="padding:5px 18px; font-size:12px;")]
         self._geometry_items.ui_children = geometry_rows
         self._trace_items.ui_children = trace_rows
         self._update_study_controls()
@@ -1018,7 +1051,10 @@ class ThreeDWorkspace(Div):
         self._refresh_mesh_controls()
 
     def _material_options(self, current):
-        options = []
+        options = [{
+            "label": "Unassigned (choose before running)",
+            "value": UNASSIGNED_MATERIAL,
+        }]
         names = set()
         material_records = [
             *self.project.get("materials", []),
@@ -1031,15 +1067,19 @@ class ThreeDWorkspace(Div):
                 continue
             names.add(name.casefold())
             options.append({"label": name, "value": name})
-        current = str(current or "").strip()
-        if current and current.casefold() not in names:
+        current = str(current or UNASSIGNED_MATERIAL).strip()
+        if (
+            current
+            and current.casefold() != UNASSIGNED_MATERIAL.casefold()
+            and current.casefold() not in names
+        ):
             options.append({"label": f"{current} (current project value)", "value": current})
         return options
 
     @staticmethod
     def _material_note():
         return Div(
-            "Material properties are copied into the project when assigned.",
+            "Material data is embedded in the project.",
             ui_class="cb-muted",
             ui_style="font-size:11px; line-height:1.4; margin-top:-7px;",
         )
@@ -1110,7 +1150,7 @@ class ThreeDWorkspace(Div):
         })
         self._selection = ("geometry", geometry["id"])
         self._rebuild_properties()
-        self._rebuild_preview()
+        self._update_boundary_overlay()
 
     def _set_selection_draft_regions(self, geometry, event):
         draft = self._ensure_selection_draft(geometry)
@@ -1128,7 +1168,7 @@ class ThreeDWorkspace(Div):
             if region_id >= 0 and region_id not in region_ids:
                 region_ids.append(region_id)
         draft["region_ids"] = sorted(region_ids)
-        self._rebuild_preview()
+        self._update_boundary_overlay()
 
     def _set_selection_draft_name(self, event):
         value = getattr(event, "value", event)
@@ -1157,9 +1197,12 @@ class ThreeDWorkspace(Div):
         self._selection = ("geometry", geometry["id"])
         self._rebuild_items()
         self._rebuild_properties()
-        self._rebuild_preview()
+        self._update_boundary_overlay()
 
     def _save_named_selection(self, geometry):
+        if self._mesh_worker_active:
+            self._set_status("Wait for mesh generation to finish before editing selections.", error=True)
+            return False
         draft = self._ensure_selection_draft(geometry)
         kind = draft["kind"]
         name = str(draft.get("name", "")).strip()
@@ -1215,7 +1258,7 @@ class ThreeDWorkspace(Div):
         validate_3d_project(self.project, self.assets)
         self._rebuild_items()
         self._rebuild_properties()
-        self._rebuild_preview()
+        self._update_boundary_overlay()
         self._set_status(f"Saved {kind} selection {name!r}.")
         return True
 
@@ -1281,11 +1324,6 @@ class ThreeDWorkspace(Div):
             ])
         children.extend([
             Div("Named selections", ui_style="font-size:13px; font-weight:650; margin-top:8px;"),
-            Div(
-                "Choose volume domains to create material assignments, or select boundaries for named groups.",
-                ui_class="cb-muted",
-                ui_style="font-size:10px; line-height:1.35;",
-            ),
         ])
         if kind == "domain":
             region_material = draft.get("material")
@@ -1340,13 +1378,7 @@ class ThreeDWorkspace(Div):
                 ui_style="display:flex; flex-wrap:wrap; gap:6px;",
             ),
         ])
-        if not ready:
-            children.append(Div(
-                "Generate a volume mesh to identify domains and boundaries.",
-                ui_class="cb-muted",
-                ui_style="font-size:10px; line-height:1.35;",
-            ))
-        elif not region_options:
+        if ready and not region_options:
             children.append(Div(
                 "The generated mesh did not expose any named regions for this selection type.",
                 ui_class="cb-muted",
@@ -1369,10 +1401,7 @@ class ThreeDWorkspace(Div):
             if not result.get("wireframe_available", True):
                 message += ". Mesh edges are hidden to keep the viewport responsive."
             return message
-        return (
-            "No mesh generated. Mesh data stays in memory and is regenerated "
-            "when the project is reopened."
-        )
+        return "Mesh not generated."
 
     def _rebuild_properties(self):
         kind, item_id = self._selection
@@ -1447,7 +1476,17 @@ class ThreeDWorkspace(Div):
                     ui_style="font-size:11px;",
                 ))
                 if selection_kind == "domain":
-                    geometry_material = geometry.get("material", "Shield")
+                    geometry_material = geometry.get("material", UNASSIGNED_MATERIAL)
+                    local_mesh_size = _input(
+                        "Local max element size (mm)",
+                        selection.get("mesh_maxh_mm", ""),
+                        lambda event, geom=geometry, obj=selection: self._set_named_selection_mesh_maxh(
+                            geom, obj, event
+                        ),
+                        number=True,
+                        width="100%",
+                    )
+                    local_mesh_size.ui_disable = self._mesh_worker_active
                     children.extend([
                         self._select_options(
                             "Region material",
@@ -1464,17 +1503,32 @@ class ThreeDWorkspace(Div):
                             ],
                         ),
                         self._material_note(),
+                        local_mesh_size,
+                        Div(
+                            "Blank uses the geometry size.",
+                            ui_class="cb-muted",
+                            ui_style="font-size:10px;",
+                        ),
                     ])
                 self._mesh_property_status = None
             else:
                 children.extend([
                     self._select_options(
                         "Default material",
-                        item.get("material", "Shield"),
+                        item.get("material", UNASSIGNED_MATERIAL),
                         lambda event, obj=item: self._set_material_reference(obj, event),
-                        self._material_options(item.get("material", "Shield")),
+                        self._material_options(item.get("material", UNASSIGNED_MATERIAL)),
                     ),
-                    self._material_note(),
+                    (
+                        Div(
+                            "No physical material is assumed. Choose one from the library before running.",
+                            ui_class="mmfem-3d-status-error",
+                            ui_style="font-size:11px; line-height:1.4;",
+                        )
+                        if str(item.get("material", UNASSIGNED_MATERIAL)).casefold()
+                        == UNASSIGNED_MATERIAL.casefold()
+                        else self._material_note()
+                    ),
                     self._select_options(
                         "Length units", item.get("units", "m"),
                         lambda event, obj=item: self._set_geometry_units(obj, event),
@@ -1496,8 +1550,7 @@ class ThreeDWorkspace(Div):
                         ui_style="font-size:11px; line-height:1.4; overflow-wrap:anywhere;",
                     ),
                     Div(
-                        "Netgen uses this as an upper bound. Mesh data is not saved; "
-                        "it is regenerated from these settings when reopened.",
+                        "Upper bound; regenerated when reopened.",
                         ui_class="cb-muted",
                         ui_style="font-size:10px; line-height:1.4; overflow-wrap:anywhere;",
                     ),
@@ -1534,11 +1587,6 @@ class ThreeDWorkspace(Div):
             study = self.project.setdefault("study", {})
             children.extend([
                 Div("Time-harmonic electromagnetic study", ui_style="font-size:13px; font-weight:650;"),
-                Div(
-                    "Solves magnetic vector potential and flux density at one frequency using the existing 3D EM solver.",
-                    ui_class="cb-muted",
-                    ui_style="font-size:11px; line-height:1.45;",
-                ),
                 _input(
                     "Frequency (Hz)", study.get("frequency_hz", 500.0),
                     lambda event: self._set_study_value("frequency_hz", event, number=True),
@@ -1556,7 +1604,7 @@ class ThreeDWorkspace(Div):
                     number=True, width="100%",
                 ),
                 Div(
-                    "The study creates a surrounding Air volume and applies the magnetic boundary condition to its exterior. Mechanical and DC solves are not enabled in this workflow.",
+                    "Creates an Air region with an exterior magnetic boundary. Mechanical and DC solves are unavailable.",
                     ui_class="cb-muted",
                     ui_style="font-size:10px; line-height:1.45; padding:8px; background:var(--panel-header); border-radius:5px;",
                 ),
@@ -1566,19 +1614,6 @@ class ThreeDWorkspace(Div):
                 Div("3D project", ui_style="font-size:13px; font-weight:650;"),
                 Div(f"{len(self.project['geometries'])} geometry models", ui_class="cb-muted"),
                 Div(f"{len(self.project['wire_trace_sets'])} wire trace sets", ui_class="cb-muted"),
-                Div(
-                    "Select Geometry or Wire traces in the model tree to add files.",
-                    ui_class="cb-muted",
-                    ui_style="font-size:12px; margin-top:6px;",
-                ),
-                Div(
-                    "Assign material properties to the imported solids, add wire traces, then select the time-harmonic EM study to configure and run it.",
-                    ui_style=(
-                        "font-size:12px; line-height:1.5; margin-top:10px; padding:10px; "
-                        "border:1px solid var(--border); border-radius:6px; "
-                        "background:var(--panel-header); color:var(--fg-muted);"
-                    ),
-                ),
             ])
         self._properties.ui_children = children
 
@@ -1607,8 +1642,7 @@ class ThreeDWorkspace(Div):
         self._selection = (kind, item_id)
         self._rebuild_items()
         self._rebuild_properties()
-        if kind == "named_selection":
-            self._rebuild_preview()
+        self._update_boundary_overlay()
 
     def _on_preview_plotly_click(self, figure_index, curve_number, point_number=None):
         if figure_index != 0 or not self._preview._figures:
@@ -1651,8 +1685,8 @@ class ThreeDWorkspace(Div):
                         "name": "",
                         "region_ids": [],
                         "material": next(
-                            (item.get("material", "Shield") for item in self.project.get("geometries", []) if item.get("id") == item_id),
-                            "Shield",
+                            (item.get("material", UNASSIGNED_MATERIAL) for item in self.project.get("geometries", []) if item.get("id") == item_id),
+                            UNASSIGNED_MATERIAL,
                         ),
                     }
                 region_id = int(region_ids[point_number])
@@ -1668,7 +1702,7 @@ class ThreeDWorkspace(Div):
                 )
                 self._rebuild_items()
                 self._rebuild_properties()
-                self._rebuild_preview()
+                self._update_boundary_overlay()
                 return
         exists = any(
             item.get("id") == item_id
@@ -1742,6 +1776,71 @@ class ThreeDWorkspace(Div):
         else:
             self._update_preview_selection()
 
+    def _update_boundary_overlay(self):
+        """Update selected mesh boundaries without resending the full 3D scene."""
+        figures = getattr(self._preview, "_figures", ())
+        if not figures:
+            self._rebuild_preview()
+            return
+
+        figure = figures[0]
+        plot = next(iter(getattr(self._preview, "_plots", ())), None)
+        plotly = getattr(type(plot), "_plotly", None) if plot is not None else None
+        target = getattr(plot, "_js_component", None) if plot is not None else None
+        overlays = {
+            (trace.meta or {}).get("mmfem_item_id"): index
+            for index, trace in enumerate(figure.data)
+            if (trace.meta or {}).get("mmfem_boundary_overlay")
+        }
+        geometries = {
+            item.get("id"): item for item in self.project.get("geometries", [])
+        }
+        for geometry_id, mesh_result in self._mesh_results.items():
+            geometry = geometries.get(geometry_id)
+            if geometry is None or mesh_result.get("status") != "ready":
+                continue
+            overlay_index = overlays.get(geometry_id)
+            if overlay_index is None:
+                # The first mesh draw is still being assembled. Queue one
+                # preview with the current selection; subsequent edits update
+                # only this small outline trace in place.
+                self._rebuild_preview()
+                return
+            from .three_d_preview import boundary_overlay_trace
+            from .three_d_project import step_unit_scale
+
+            asset = self.assets[geometry["asset"]]
+            vertices = mesh_result["vertices_mm"] * step_unit_scale(
+                asset, units=geometry.get("units", "m")
+            )
+            overlay = boundary_overlay_trace(
+                vertices,
+                mesh_result["triangles"],
+                mesh_result["boundary_region_ids"],
+                self._active_boundary_region_ids(geometry_id),
+                geometry_id=geometry_id,
+                name=geometry.get("name", "Geometry"),
+            )
+            trace = figure.data[overlay_index]
+            trace.x, trace.y, trace.z = overlay.x, overlay.y, overlay.z
+            trace.visible = overlay.visible
+            if plotly is not None and target is not None:
+                updates = {
+                    "x": [list(overlay.x)],
+                    "y": [list(overlay.y)],
+                    "z": [list(overlay.z)],
+                    "visible": [overlay.visible],
+                }
+                try:
+                    plotly._call_method_ignore_return(
+                        "restyle", [target, updates, [overlay_index]]
+                    )
+                except Exception:
+                    # The current Python figure remains authoritative; a later
+                    # Plotly render will include this updated trace.
+                    pass
+        self._schedule_preview_selection_update()
+
     def delete_selected(self):
         kind, item_id = self._selection
         if kind == "geometry":
@@ -1797,6 +1896,48 @@ class ThreeDWorkspace(Div):
             ]
         self._set_status("Mesh size updated. Generate a new mesh to apply it.")
 
+    def _set_named_selection_mesh_maxh(self, geometry, selection, event):
+        if self._mesh_worker_active:
+            self._set_status("Wait for mesh generation to finish before changing its size.", error=True)
+            return False
+        raw = getattr(event, "value", event)
+        text = str(raw if raw is not None else "").strip()
+        previous = selection.get("mesh_maxh_mm")
+        if not text:
+            if previous is None:
+                return True
+            selection.pop("mesh_maxh_mm", None)
+        else:
+            try:
+                maxh = float(text)
+            except (TypeError, ValueError, OverflowError):
+                self._set_status("Local maximum element size must be a number in millimetres.", error=True)
+                return False
+            if not math.isfinite(maxh) or not MIN_MESH_SIZE_MM <= maxh <= MAX_MESH_SIZE_MM:
+                self._set_status(
+                    f"Local maximum element size must be between {MIN_MESH_SIZE_MM:g} "
+                    f"and {MAX_MESH_SIZE_MM:g} mm.",
+                    error=True,
+                )
+                return False
+            selection["mesh_maxh_mm"] = maxh
+        try:
+            domain_mesh_size_overrides(geometry)
+        except ValueError as error:
+            if previous is None:
+                selection.pop("mesh_maxh_mm", None)
+            else:
+                selection["mesh_maxh_mm"] = previous
+            self._set_status(str(error), error=True)
+            return False
+        self._mesh_results.pop(geometry["id"], None)
+        self._mark_changed()
+        self._rebuild_items()
+        self._rebuild_properties()
+        self._rebuild_preview()
+        self._set_status("Local mesh size updated. Generate a new mesh to apply it.")
+        return True
+
     def generate_mesh(self, *_args):
         item = self._selected_geometry()
         item_id = item.get("id") if item else None
@@ -1813,6 +1954,7 @@ class ThreeDWorkspace(Div):
                     f"Maximum element size must be between {MIN_MESH_SIZE_MM:g} "
                     f"and {MAX_MESH_SIZE_MM:g} mm."
                 )
+            local_maxh = domain_mesh_size_overrides(item)
             step_data = bytes(self.assets[item["asset"]])
         except Exception as error:
             self._set_status(f"Could not prepare the mesh job: {error}", error=True)
@@ -1829,6 +1971,7 @@ class ThreeDWorkspace(Div):
             "geometry_id": item_id,
             "sha256": checksum,
             "maxh_mm": maxh,
+            "domain_maxh_mm": local_maxh,
         }
         self._mesh_worker_active = True
         self._mesh_results[item_id] = {"status": "generating", "maxh_mm": maxh}
@@ -1840,15 +1983,17 @@ class ThreeDWorkspace(Div):
             self._rebuild_preview()
         threading.Thread(
             target=self._run_mesh_generation,
-            args=(generation, item_id, checksum, maxh, step_data),
+            args=(generation, item_id, checksum, maxh, local_maxh, step_data),
             name="MMFEM-3D-mesh-generation",
             daemon=True,
         ).start()
         return True
 
-    def _run_mesh_generation(self, generation, item_id, checksum, maxh, step_data):
+    def _run_mesh_generation(self, generation, item_id, checksum, maxh, local_maxh, step_data):
         try:
-            mesh_result = generate_step_mesh(step_data, maxh_mm=maxh)
+            mesh_result = generate_step_mesh(
+                step_data, maxh_mm=maxh, domain_maxh_mm=local_maxh
+            )
             error = None
         except Exception as exception:
             mesh_result = None
@@ -1949,9 +2094,11 @@ class ThreeDWorkspace(Div):
             self._set_status("Choose a material from the available library references.", error=True)
             return
         item["material"] = value
-        self._snapshot_material_reference(value)
+        if value.casefold() != UNASSIGNED_MATERIAL.casefold():
+            self._snapshot_material_reference(value)
         self._mark_changed()
         self._rebuild_items()
+        self._rebuild_properties()
 
     def _set_named_selection_material(self, selection, event):
         value = str(getattr(event, "value", event) or "").strip()
@@ -2133,9 +2280,7 @@ class ThreeDWorkspace(Div):
         self._preview.ui_hidden = True
         self._preview_empty_state.ui_hidden = False
         self._preview_empty_title.ui_children = ["No 3D assets yet"]
-        self._preview_empty_detail.ui_children = [
-            "Import a STEP model or wire traces to preview the project."
-        ]
+        self._preview_empty_detail.ui_children = []
 
     def _rebuild_preview(self):
         project = copy.deepcopy(self.project)
@@ -2210,7 +2355,11 @@ class ThreeDWorkspace(Div):
         return value
 
     def _build_preview_figure(self, project, assets, meshes=None, highlighted_regions=None):
-        from .three_d_preview import _sample_trace_points, preview_figure, tessellate_step
+        from .three_d_preview import (
+            _sample_trace_points,
+            preview_figure,
+            tessellate_step,
+        )
         from .three_d_project import parse_wire_trace
 
         meshes = meshes or {}
@@ -2228,7 +2377,7 @@ class ThreeDWorkspace(Div):
                 geometry_payload.append({
                     "id": item["id"],
                     "name": item["name"],
-                    "material": item.get("material", "Shield"),
+                    "material": item.get("material", UNASSIGNED_MATERIAL),
                     "vertices": vertices.astype(np.float32, copy=False),
                     "triangles": generated_mesh["triangles"],
                     "edges": generated_mesh.get("edges"),
@@ -2245,7 +2394,7 @@ class ThreeDWorkspace(Div):
             geometry_payload.append({
                 "id": item["id"],
                 "name": item["name"],
-                "material": item.get("material", "Shield"),
+                "material": item.get("material", UNASSIGNED_MATERIAL),
                 **mesh,
             })
         trace_payload = []

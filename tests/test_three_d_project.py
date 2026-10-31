@@ -12,6 +12,7 @@ from ngsolve_gui.three_d_project import (
     detect_step_unit,
     materialize_3d_assets,
     new_3d_project,
+    UNASSIGNED_MATERIAL,
     package_3d_project,
     parse_wire_trace,
     unpack_3d_project,
@@ -24,6 +25,15 @@ STEP = (
     b"#1=(LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.));\n"
     b"ENDSEC;\nEND-ISO-10303-21;\n"
 )
+
+
+def test_step_import_does_not_assume_a_physical_material():
+    project = new_3d_project()
+    assets = {}
+
+    geometry = add_step_geometry(project, assets, "part.step", STEP, units="mm")
+
+    assert geometry["material"] == UNASSIGNED_MATERIAL
 
 
 def test_wire_trace_parser_converts_csv_and_whitespace_units_to_metres():
@@ -83,7 +93,12 @@ def test_project_round_trip_keeps_step_trace_metadata_and_solver_filenames(tmp_p
     assets = {}
     geometry = add_step_geometry(project, assets, "shield.stp", STEP, units="mm")
     geometry["mesh_maxh_mm"] = 30.0
-    geometry["domain_selections"] = [{"id": "domain-selection-1", "name": "Shield volume", "domain_ids": [0]}]
+    geometry["domain_selections"] = [{
+        "id": "domain-selection-1",
+        "name": "Shield volume",
+        "domain_ids": [0],
+        "mesh_maxh_mm": 2.5,
+    }]
     geometry["boundary_selections"] = [{"id": "boundary-selection-1", "name": "Cryostat ends", "boundary_ids": [0, 2]}]
     trace_set = add_wire_trace(
         project, assets, "x_gradient.csv", b"0,0,0\n0,0.1,0\n", units="cm"
@@ -124,6 +139,35 @@ def test_project_rejects_invalid_persisted_mesh_size(maxh):
     geometry["mesh_maxh_mm"] = maxh
 
     with pytest.raises(ValueError, match="Invalid maximum mesh size"):
+        package_3d_project(project, assets)
+
+
+@pytest.mark.parametrize("maxh", [0, -1, float("nan"), float("inf"), "invalid"])
+def test_project_rejects_invalid_domain_mesh_size(maxh):
+    project = new_3d_project()
+    assets = {}
+    geometry = add_step_geometry(project, assets, "shield.step", STEP)
+    geometry["domain_selections"] = [{
+        "id": "domain-1",
+        "name": "Shield volume",
+        "domain_ids": [0],
+        "mesh_maxh_mm": maxh,
+    }]
+
+    with pytest.raises(ValueError, match="Invalid local mesh size|Local maximum element size"):
+        package_3d_project(project, assets)
+
+
+def test_project_rejects_conflicting_local_mesh_sizes_on_overlapping_selections():
+    project = new_3d_project()
+    assets = {}
+    geometry = add_step_geometry(project, assets, "shield.step", STEP)
+    geometry["domain_selections"] = [
+        {"id": "domain-1", "name": "Core", "domain_ids": [0], "mesh_maxh_mm": 2.0},
+        {"id": "domain-2", "name": "Refined core", "domain_ids": [0], "mesh_maxh_mm": 1.0},
+    ]
+
+    with pytest.raises(ValueError, match="conflicting local mesh sizes"):
         package_3d_project(project, assets)
 
 

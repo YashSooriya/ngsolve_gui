@@ -16,6 +16,7 @@ from ngsolve_gui.axisymmetric_model import (
     unpack_model,
     validate_model,
     validate_studies,
+    _contains_or_touches,
 )
 
 
@@ -496,6 +497,15 @@ def test_tangent_nested_region_may_touch_its_container():
     _rebuild_test_edges(model)
 
     assert validate_model(model) == []
+
+
+def test_containment_rejects_child_edges_that_cross_a_concave_notch():
+    concave_container = [
+        [0, 0], [4, 0], [4, 4], [3, 4], [3, 1], [1, 1], [1, 4], [0, 4]
+    ]
+    child = [[0.5, 2], [3.5, 2], [3.5, 3], [0.5, 3]]
+
+    assert not _contains_or_touches(concave_container, child)
 
 def test_legacy_region_sources_migrate_to_named_regional_loads():
     model = _nested_model()

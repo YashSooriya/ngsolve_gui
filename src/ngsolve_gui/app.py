@@ -40,6 +40,52 @@ from .result_files import (
 )
 
 
+def _solver_process_failure_detail(return_code):
+    """Describe an exited solver process without hiding native status codes."""
+    status = int(return_code)
+    return (
+        f"Solver process exited with status {status} "
+        f"(0x{status & 0xFFFFFFFF:08X}). See solver.log for details."
+    )
+
+
+def _reap_solver_process(process):
+    """Boundedly stop and reap a solver child left alive by an error path."""
+    if process is None:
+        return True
+    try:
+        running = process.poll() is None
+    except OSError:
+        return False
+    if running:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                return False
+            except OSError:
+                return False
+    else:
+        try:
+            process.wait()
+        except OSError:
+            return False
+    try:
+        return process.poll() is not None
+    except OSError:
+        return False
+
+
 def _request_guest_vm_shutdown():
     # Only the packaged VM sets this flag; standalone launches quit normally.
     if os.environ.get("MMFEM_VM_GUEST") != "1":
@@ -874,8 +920,7 @@ class NGSolveGui(App):
         self._startup_card = QCard(
             QCardSection(
                 Div("MM-FEM", ui_style="font-size:26px; font-weight:700; color:var(--fg);"),
-                Div("Choose what you want to work on.", ui_style="font-size:14px; color:var(--fg-muted); margin-top:4px;"),
-                ui_style="padding:28px 28px 18px;",
+                ui_style="padding:24px 28px 16px;",
             ),
             QCardSection(
                 Div("New project", ui_style="font-size:13px; font-weight:650; margin-bottom:10px;"),
@@ -2252,6 +2297,11 @@ class NGSolveGui(App):
                 "physics": "time-harmonic electromagnetics",
                 "frequency_hz": setup["frequency_hz"],
                 "polynomial_order": setup["polynomial_order"],
+                "air_padding": setup["air_padding"],
+                "diagnostics": {
+                    "process_context": "solver_process.json",
+                    "native_crash_log": "native_crash.log",
+                },
             }
             self._write_run_manifest(output_dir, manifest)
         except Exception as error:
@@ -2329,7 +2379,7 @@ class NGSolveGui(App):
                         f"Study cancelled. Partial files are in {output_dir}",
                     )
                 elif return_code != 0:
-                    detail = manifest.get("error") or "See solver.log for details."
+                    detail = manifest.get("error") or _solver_process_failure_detail(return_code)
                     manifest.update({
                         "status": "failed",
                         "error": detail,
@@ -2370,15 +2420,40 @@ class NGSolveGui(App):
                     "solver_log": "solver.log",
                 })
                 self._write_run_manifest(output_dir, manifest)
-                self._dispatch_to_ui(lambda: workspace._set_status(
-                    f"Study failed: {error}", error=True
+                status_detail = f"Study failed: {error}"
+                notification_detail = f"3D study failed: {error}"
+                self._dispatch_to_ui(lambda detail=status_detail: workspace._set_status(
+                    detail, error=True
                 ))
-                self._dispatch_to_ui(lambda: self._notify(
-                    f"3D study failed: {error}", type="negative", timeout=9000
+                self._dispatch_to_ui(lambda detail=notification_detail: self._notify(
+                    detail, type="negative", timeout=9000
                 ))
             finally:
+                if not _reap_solver_process(process):
+                    try:
+                        manifest = self._read_run_manifest(output_dir)
+                        manifest.update({
+                            "status": "failed",
+                            "error": "Solver child process remained alive after terminate and kill.",
+                            "process_cleanup_error": "Child process could not be reaped.",
+                            "finished_utc": _datetime.now(_timezone.utc).isoformat(),
+                        })
+                        self._write_run_manifest(output_dir, manifest)
+                    except Exception as cleanup_error:
+                        print(f"Could not record solver cleanup failure: {cleanup_error}")
+                    try:
+                        self._dispatch_to_ui(
+                            workspace._set_status,
+                            "Study failed because the solver process could not be stopped.",
+                            error=True,
+                        )
+                    except Exception as cleanup_error:
+                        print(f"Could not update 3D cleanup status: {cleanup_error}")
                 if process is not None and process.stdout is not None:
-                    process.stdout.close()
+                    try:
+                        process.stdout.close()
+                    except OSError:
+                        pass
                 self._dispatch_to_ui(lambda: self._finish_3d_study_controls(workspace))
                 with self._solver_job_lock:
                     self._solver_process = None
@@ -2503,6 +2578,10 @@ class NGSolveGui(App):
                 "mesh_settings": copy.deepcopy(model.get("mesh", {})),
                 "solver_settings": copy.deepcopy(model.get("solver", {})),
                 "studies": copy.deepcopy(studies.get("studies", [])),
+                "diagnostics": {
+                    "process_context": "solver_process.json",
+                    "native_crash_log": "native_crash.log",
+                },
             }
             self._write_run_manifest(output_dir, manifest)
         except Exception as error:
@@ -2529,6 +2608,7 @@ class NGSolveGui(App):
             try:
                 command = [
                     sys.executable,
+                    "-u",
                     str(runner),
                     "--model",
                     str(model_path),
@@ -2590,7 +2670,7 @@ class NGSolveGui(App):
                     )
                     return
                 if return_code != 0:
-                    detail = manifest.get("error") or "See solver.log for details."
+                    detail = manifest.get("error") or _solver_process_failure_detail(return_code)
                     manifest.update({
                         "status": "failed",
                         "run_name": run_name,
@@ -2656,8 +2736,33 @@ class NGSolveGui(App):
                     f"Solver failed: {error}", type="negative", timeout=9000
                 )
             finally:
+                if not _reap_solver_process(process):
+                    try:
+                        manifest = self._read_run_manifest(output_dir)
+                        manifest.update({
+                            "status": "failed",
+                            "error": "Solver child process remained alive after terminate and kill.",
+                            "process_cleanup_error": "Child process could not be reaped.",
+                            "finished_utc": _datetime.now(_timezone.utc).isoformat(),
+                        })
+                        self._write_run_manifest(output_dir, manifest)
+                    except Exception as cleanup_error:
+                        print(f"Could not record solver cleanup failure: {cleanup_error}")
+                    try:
+                        workspace.finish_solver_job(
+                            "Solver failed because the process could not be stopped.",
+                            error=True,
+                            run_kind=run_kind,
+                            run_name=run_name,
+                            output_path=output_dir,
+                        )
+                    except Exception as cleanup_error:
+                        print(f"Could not update solver cleanup status: {cleanup_error}")
                 if process is not None and process.stdout is not None:
-                    process.stdout.close()
+                    try:
+                        process.stdout.close()
+                    except OSError:
+                        pass
                 with self._solver_job_lock:
                     self._solver_process = None
                     self._solver_run_context = None

@@ -102,6 +102,57 @@ def _sample_trace_points(points, limit):
     return sampled
 
 
+def boundary_overlay_trace(
+    vertices, triangles, boundary_region_ids, selected_region_ids, *, geometry_id, name
+):
+    """Return a lightweight line trace outlining the selected mesh boundaries."""
+    import numpy as np
+    import plotly.graph_objects as go
+
+    vertices = np.asarray(vertices, dtype=np.float64)
+    triangles = np.asarray(triangles, dtype=np.int32)
+    region_ids = np.asarray(boundary_region_ids, dtype=np.int32)
+    selected_ids = {int(region_id) for region_id in selected_region_ids}
+    edge_x, edge_y, edge_z = [], [], []
+    if selected_ids and len(region_ids) == len(triangles):
+        selected_triangles = triangles[np.isin(region_ids, list(selected_ids))]
+        if len(selected_triangles):
+            selected_edges = np.concatenate((
+                selected_triangles[:, [0, 1]],
+                selected_triangles[:, [1, 2]],
+                selected_triangles[:, [2, 0]],
+            ), axis=0)
+            selected_edges.sort(axis=1)
+            unique_edges, edge_counts = np.unique(
+                selected_edges, axis=0, return_counts=True
+            )
+            outline = unique_edges[edge_counts == 1]
+            if len(outline):
+                edge_coordinates = vertices[outline]
+                for start, end in edge_coordinates:
+                    edge_x.extend((float(start[0]), float(end[0]), None))
+                    edge_y.extend((float(start[1]), float(end[1]), None))
+                    edge_z.extend((float(start[2]), float(end[2]), None))
+
+    return go.Scatter3d(
+        x=edge_x,
+        y=edge_y,
+        z=edge_z,
+        mode="lines",
+        name=f"{name} selected boundary",
+        line={"color": "#f59e0b", "width": 4},
+        hoverinfo="skip",
+        showlegend=False,
+        visible=bool(edge_x),
+        meta={
+            "mmfem_kind": "boundary_overlay",
+            "mmfem_item_id": geometry_id,
+            "mmfem_base_color": "#f59e0b",
+            "mmfem_boundary_overlay": True,
+        },
+    )
+
+
 def preview_figure(payload):
     """Create a combined Plotly scene from display mesh and sampled wire paths."""
     try:
@@ -171,51 +222,15 @@ def preview_figure(payload):
                 },
             ))
         boundary_region_ids = item.get("boundary_region_ids")
-        selected_region_ids = set(item.get("highlighted_boundary_ids", []))
-        if (
-            item.get("generated_mesh")
-            and boundary_region_ids is not None
-            and selected_region_ids
-        ):
-            region_ids = np.asarray(boundary_region_ids, dtype=np.int32)
-            if len(region_ids) == len(triangles):
-                selected_triangles = triangles[np.isin(region_ids, list(selected_region_ids))]
-                if len(selected_triangles):
-                    selected_edges = np.concatenate((
-                        selected_triangles[:, [0, 1]],
-                        selected_triangles[:, [1, 2]],
-                        selected_triangles[:, [2, 0]],
-                    ), axis=0)
-                    selected_edges.sort(axis=1)
-                    unique_edges, edge_counts = np.unique(
-                        selected_edges, axis=0, return_counts=True
-                    )
-                    outline = unique_edges[edge_counts == 1]
-                    if len(outline):
-                        edge_coordinates = vertices[outline]
-                        edge_x = []
-                        edge_y = []
-                        edge_z = []
-                        for start, end in edge_coordinates:
-                            edge_x.extend((float(start[0]), float(end[0]), None))
-                            edge_y.extend((float(start[1]), float(end[1]), None))
-                            edge_z.extend((float(start[2]), float(end[2]), None))
-                        figure.add_trace(go.Scatter3d(
-                            x=edge_x,
-                            y=edge_y,
-                            z=edge_z,
-                            mode="lines",
-                            name=f"{item.get('name', 'Geometry')} selected boundary",
-                            line={"color": "#f59e0b", "width": 4},
-                            hoverinfo="skip",
-                            showlegend=False,
-                            meta={
-                                "mmfem_kind": "boundary_overlay",
-                                "mmfem_item_id": item.get("id"),
-                                "mmfem_base_color": "#f59e0b",
-                                "mmfem_boundary_overlay": True,
-                            },
-                        ))
+        if item.get("generated_mesh") and boundary_region_ids is not None:
+            figure.add_trace(boundary_overlay_trace(
+                vertices,
+                triangles,
+                boundary_region_ids,
+                item.get("highlighted_boundary_ids", []),
+                geometry_id=item.get("id"),
+                name=item.get("name", "Geometry"),
+            ))
     for index, item in enumerate(payload.get("traces", [])):
         points = item["points"]
         figure.add_trace(go.Scatter3d(

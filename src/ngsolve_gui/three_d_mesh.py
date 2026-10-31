@@ -56,7 +56,7 @@ def _named_regions(ids, counts, names, fallback):
     return regions
 
 
-def generate_step_mesh(data, *, maxh_mm=30.0):
+def generate_step_mesh(data, *, maxh_mm=30.0, domain_maxh_mm=None):
     """Generate a 3D volume mesh and return it with a displayable boundary.
 
     Netgen's OCC STEP reader uses millimetres for model coordinates. The
@@ -76,7 +76,7 @@ def generate_step_mesh(data, *, maxh_mm=30.0):
     try:
         import numpy as np
         import ngsolve as ngs
-        from netgen.occ import OCCGeometry
+        from netgen.occ import Glue, OCCGeometry
     except ImportError as error:
         raise RuntimeError("3D mesh generation requires the Netgen/NGSolve runtime.") from error
 
@@ -92,14 +92,38 @@ def generate_step_mesh(data, *, maxh_mm=30.0):
                     "A volume mesh needs a closed 3D body."
                 )
             volume = sum(float(solid.mass) for solid in solids)
-            estimated_elements = math.ceil(12.0 * volume / maxh**3)
+            domain_sizes = {}
+            for region_id, value in (domain_maxh_mm or {}).items():
+                if type(region_id) is not int or not 0 <= region_id < len(solids):
+                    raise ValueError(
+                        "A local mesh size refers to a domain that is not in this STEP model."
+                    )
+                try:
+                    local_maxh = float(value)
+                except (TypeError, ValueError, OverflowError) as error:
+                    raise ValueError(
+                        "Local maximum element sizes must be finite numbers in millimetres."
+                    ) from error
+                if not math.isfinite(local_maxh) or not MIN_MESH_SIZE_MM <= local_maxh <= MAX_MESH_SIZE_MM:
+                    raise ValueError(
+                        f"Local maximum element size must be between {MIN_MESH_SIZE_MM:g} "
+                        f"and {MAX_MESH_SIZE_MM:g} mm."
+                    )
+                domain_sizes[region_id] = local_maxh
+
+            estimated_elements = 0
+            for region_id, solid in enumerate(solids):
+                local_maxh = domain_sizes.get(region_id, maxh)
+                solid.maxh = local_maxh
+                estimated_elements += 12.0 * float(solid.mass) / local_maxh**3
+            estimated_elements = math.ceil(estimated_elements)
             if estimated_elements > MAX_ESTIMATED_VOLUME_ELEMENTS:
                 suggested = (12.0 * volume / MAX_ESTIMATED_VOLUME_ELEMENTS) ** (1 / 3)
                 raise ValueError(
-                    "The requested size is estimated to create an impractically "
+                    "The requested sizes are estimated to create an impractically "
                     f"large mesh. Increase it to about {suggested:.3g} mm or larger."
                 )
-            netgen_mesh = geometry.GenerateMesh(maxh=maxh)
+            netgen_mesh = OCCGeometry(Glue(solids)).GenerateMesh()
         except ValueError:
             raise
         except Exception as error:
@@ -197,6 +221,7 @@ def generate_step_mesh(data, *, maxh_mm=30.0):
             "wireframe_available": wireframe_available,
             "estimated_volume_elements": estimated_elements,
             "maxh_mm": maxh,
+            "domain_maxh_mm": domain_sizes,
         }
     except ValueError:
         raise

@@ -413,7 +413,7 @@ class SolveWorkspace(Div):
         self.selected_region_ids = []
         self.selected_edge_id = None
         self.selected_edge_ids = []
-        self.message = "Choose a sketch tool in the viewport toolbar to begin. Dimensions use SI metres (m)."
+        self.message = "Ready"
         self.message_is_error = False
         self._log_visible = False
         self._log_messages = ["Axisymmetric model editor ready."]
@@ -830,21 +830,21 @@ class SolveWorkspace(Div):
         line_button = _button(
             "Line", "mdi-vector-line",
             lambda *a: self.set_sketch_tool("line"),
-            tooltip="Draw a straight sketch edge. Nearby endpoints and line midpoints snap automatically; the icon shows the target. Press L for Line.",
+            tooltip="Line (L). Endpoints and midpoints snap automatically.",
             style="flex:0 0 auto; white-space:nowrap;",
         )
         arc_button, arc_group = sketch_tool_group(
             "Arc", "mdi-vector-curve", "arc",
             (("three-point", "3-point arc"), ("centerpoint", "Centerpoint arc"), ("tangent", "Tangent arc"), ("spline3", "Spline")),
-            "Choose a 3-point, centerpoint, tangent, or spline arc. Nearby endpoints, line midpoints and curve centres snap automatically; the icon shows the target. Press A for a 3-point arc.",
+            "Arc (A): 3-point, centerpoint, tangent or spline. Endpoint, midpoint and curve-centre snapping is automatic.",
         )
         trim_button = _button(
             "Trim", "mdi-content-cut",
             lambda *a: self.set_sketch_tool("trim"),
-            tooltip="Trim an open line at its intersections with other sketch curves. Press T to activate Trim.",
+            tooltip="Trim an open line at a curve intersection (T).",
             style="flex:0 0 auto; white-space:nowrap;",
         )
-        snap_button = _button("Snap", "mdi-magnet", self.toggle_snap_to_grid, tooltip="Grid snapping to visible intersections. While drawing Line or Arc, endpoint, midpoint, centre and edge snapping is automatic.", style="flex:0 0 auto; white-space:nowrap;")
+        snap_button = _button("Snap", "mdi-magnet", self.toggle_snap_to_grid, tooltip="Toggle grid snapping; geometry snapping stays active.", style="flex:0 0 auto; white-space:nowrap;")
         sketch_toolbar_separator = QSeparator(ui_vertical=True)
         fit_view_button = _button(
             "Fit view", "mdi-fit-to-screen-outline",
@@ -867,12 +867,10 @@ class SolveWorkspace(Div):
         self._mesh_preview_button = _button(
             "Mesh preview", "mdi-vector-polygon", self.toggle_mesh_preview,
             disable=True,
-            tooltip="Generate a mesh before previewing it.",
             style="flex:0 0 auto; white-space:nowrap;",
         )
         self._preview_3d_button = _button(
             "Preview in 3D", "mdi-cube-scan", self.toggle_3d_preview,
-            tooltip="Preview the axisymmetric regions revolved into 3D.",
             style="flex:0 0 auto; white-space:nowrap;",
         )
         self._preview_3d_tooltip = self._preview_3d_button.ui_slots["default"][0]
@@ -10214,7 +10212,7 @@ class SolveWorkspace(Div):
             detail = f"Active condition: {condition.get('name', 'Boundary condition')} - {selected_count} unique edge(s) selected."
         summary.ui_children = [
             Div("Geometry selection", ui_style="font-size:10px; font-weight:700; letter-spacing:.06em; color:var(--fg-muted);"),
-            Div("Click a region to toggle all its boundaries. Click an edge to toggle only that edge. The active condition is assigned on each new selection.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+            Div("Regions assign all boundaries; edges assign individually.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
             Div(detail, ui_style="font-size:12px; font-weight:600; line-height:1.4; padding-top:4px;"),
         ]
 
@@ -10516,9 +10514,8 @@ class SolveWorkspace(Div):
 
     def _build_geometry_inspector(self):
         self._geometry_empty_panel = Div(
-            _section_title("Geometry", "Click a region or edge to edit it."),
-            Div("Choose Rectangle, Circle, Line or Arc in the viewport toolbar. Select a region to edit its dimensions. Assign materials and mechanics under Materials.", ui_style="font-size:12px; line-height:1.5; color:var(--fg-muted);"),
-            Div("r ≥ 0 is enforced for axisymmetric geometry. Nested regions must be strictly contained or disjoint.", ui_style="font-size:11px; color:var(--fg-muted); line-height:1.45;"),
+            _section_title("Geometry"),
+            Div("r ≥ 0. Nested regions must be contained or disjoint.", ui_style="font-size:11px; color:var(--fg-muted); line-height:1.45;"),
         )
 
         self._region_subtitle = Div("", ui_style="font-size:11px; color:var(--fg-muted); margin-top:3px;")
@@ -10542,7 +10539,6 @@ class SolveWorkspace(Div):
                     "",
                     lambda event, dimension=key: self._set_selected_region_dimension(dimension, event.value),
                     suffix="m",
-                    hint="Enter lengths in SI metres.",
                 ))
                 self._region_dimension_groups.setdefault(shape_type, {})[key] = inputs[-1]
             self._region_dimension_groups[shape_type]["group"] = Div(
@@ -10557,10 +10553,9 @@ class SolveWorkspace(Div):
             Div("GEOMETRY", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted);"),
             self._region_name_input,
             Div("Driving dimensions", ui_style="font-size:11px; font-weight:700; letter-spacing:.05em; padding-top:4px;"),
-            Div("Dimensions are in SI metres (m). Sketch contours can be moved or resized here; select an edge to edit its curve endpoints or Spline3 control point.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
             *[group["group"] for group in self._region_dimension_groups.values()],
             Div("SKETCH CONSTRAINTS", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:6px;"),
-            Div("These are built-in relationships for the rectangle and circle tools. This version does not solve general user-defined sketch constraints.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+            Div("Rectangle and circle constraints are automatic; user-defined constraints are unsupported.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
             self._region_constraints,
             _button("Delete region", "mdi-delete-outline", lambda *a: self.delete_region(self.selected_region_id) if self.selected_region_id else None, color="negative"),
             ui_hidden=True,
@@ -10589,7 +10584,7 @@ class SolveWorkspace(Div):
                 imported_edge_fields.append(field)
         self._imported_edge_geometry = Div(
             Div("EDIT SKETCH CURVE", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted);"),
-            Div("Change a curve endpoint or its Spline3 control point. Connected curves follow shared sketch points.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+            Div("Connected curves follow shared endpoints.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
             *imported_edge_fields,
             ui_hidden=True,
             ui_style="display:flex; flex-direction:column; gap:7px; padding:8px 0;",
@@ -10914,7 +10909,7 @@ class SolveWorkspace(Div):
             ), None)
             title = f"{group.get('name')} selected" if group else "Geometry selection"
             return [
-                _section_title(title, "Multiple regions selected in the viewport."),
+                _section_title(title),
                 Div(f"{len(selected_ids)} regions are selected.", ui_style="font-size:12px; line-height:1.5; color:var(--fg-muted);"),
                 Div("Ctrl-click or Shift-click regions to add or remove them. Right-click a region to group, ungroup, or delete the selection.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
                 _button("Assign material to selection", "mdi-cube-outline", lambda *args: self.select_section("materials"), color="primary"),
@@ -10993,12 +10988,12 @@ class SolveWorkspace(Div):
                 expressions = shape.get("dimension_expressions", {})
                 for key, label in (("r_min", "Inner radius"), ("z_min", "Bottom"), ("width", "Radial width"), ("height", "Axial height")):
                     value = expressions.get(key, str(float(shape[key])))
-                    shape_fields.append(_input(label, value, lambda event, rid=region["id"], k=key: self._set_region_dimension(rid, k, event.value), suffix="m", hint="Enter lengths in SI metres."))
+                    shape_fields.append(_input(label, value, lambda event, rid=region["id"], k=key: self._set_region_dimension(rid, k, event.value), suffix="m"))
             elif shape.get("type") == "circle":
                 expressions = shape.get("dimension_expressions", {})
                 for key, label in (("r_center", "Centre radius"), ("z_center", "Centre height"), ("radius", "Radius")):
                     value = expressions.get(key, str(float(shape[key])))
-                    shape_fields.append(_input(label, value, lambda event, rid=region["id"], k=key: self._set_region_dimension(rid, k, event.value), suffix="m", hint="Enter lengths in SI metres."))
+                    shape_fields.append(_input(label, value, lambda event, rid=region["id"], k=key: self._set_region_dimension(rid, k, event.value), suffix="m"))
             delete_button = _button("Delete region", "mdi-delete-outline", lambda *a, rid=region["id"]: self.delete_region(rid), color="negative")
             constraints = [Div(f"{constraint['type'].replace('_', ' ').title()}  ·  {'driving' if constraint.get('driving') else 'reference'}", ui_style="font-size:11px; padding:3px 0; color:var(--fg-muted);") for constraint in region.get("constraints", [])]
             parent = next((item["name"] for item in self.model["geometry"]["regions"] if item["id"] == region.get("parent_id")), "Exterior")
@@ -11007,27 +11002,20 @@ class SolveWorkspace(Div):
                 Div("GEOMETRY", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted);"),
                 name,
                 Div("Driving dimensions", ui_style="font-size:11px; font-weight:700; letter-spacing:.05em; padding-top:4px;"),
-                Div("Dimensions are in SI metres (m). Imported legacy contours can be moved and resized here; select one of their edges to edit its endpoints or spline control point.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
                 *shape_fields,
                 Div("SKETCH CONSTRAINTS", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:6px;"),
-                Div("These are built-in relationships for the rectangle and circle tools. This version does not solve general user-defined sketch constraints.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
+                Div("Rectangle and circle constraints are automatic; user-defined constraints are unsupported.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
                 *constraints,
                 delete_button,
             ]
         return [
-            _section_title("Geometry", "Click a region or edge to edit it."),
-            Div("Choose Rectangle, Circle, Line or Arc in the viewport toolbar. Select a region to edit its dimensions. Assign materials and mechanics under Materials.", ui_style="font-size:12px; line-height:1.5; color:var(--fg-muted);"),
-            Div("r ≥ 0 is enforced for axisymmetric geometry. Nested regions must be strictly contained or disjoint.", ui_style="font-size:11px; color:var(--fg-muted); line-height:1.45;"),
+            _section_title("Geometry"),
+            Div("r ≥ 0. Nested regions must be contained or disjoint.", ui_style="font-size:11px; color:var(--fg-muted); line-height:1.45;"),
         ]
 
     def _parameter_properties(self):
-        children = [_section_title("Parameters", "Named values you can reuse throughout this model.")]
+        children = [_section_title("Parameters")]
         parameter_map = {item["name"]: item for item in self.model.get("parameters", [])}
-        if not parameter_map:
-            children.append(Div(
-                "No parameters yet. Add a named value such as coil_radius, then reuse it in dimensions, material properties, sources, or study frequencies.",
-                ui_style="font-size:12px; line-height:1.5; color:var(--fg-muted); padding:4px 0 8px;",
-            ))
         for parameter in self.model.get("parameters", []):
             try:
                 value = f"{evaluate_expression(parameter['expression'], parameter_map):.6g}"
@@ -11078,7 +11066,7 @@ class SolveWorkspace(Div):
         children.extend([
             _button("Add parameter", "mdi-plus", self.add_parameter, color="primary"),
             Div(
-                "Choose the parameter's physical dimension. Compatible expressions can reuse it; Check setup rejects using it in a field with a different SI unit. Bare numbers are interpreted in the destination field's unit.",
+                "Bare numbers use the destination field unit; named parameters retain their selected SI dimension.",
                 ui_style="font-size:11px; line-height:1.45; color:var(--fg-muted);",
             ),
         ])
@@ -11240,7 +11228,6 @@ class SolveWorkspace(Div):
                 select,
                 _button("Select region in viewport", "mdi-cursor-default-click-outline", self._toggle_editor_region_pick, color="primary" if draft.get("select_region_in_viewport") else None),
                 _input("Target element size", draft.get("value", ""), lambda event: self._set_editor_draft("value", event), suffix="m"),
-                Div("Choose a region from the list or use the viewport selection button. Regions without an entry use the global target size.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
             ])
         cancel = _button("Cancel", "mdi-close", self._cancel_editor)
         if kind == "region_material":
@@ -11673,7 +11660,6 @@ class SolveWorkspace(Div):
             ])
         if not regions:
             return children + [
-                Div("Create geometry before assigning materials.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
                 _button("Open Geometry", "mdi-vector-square-outline", lambda *a: self.select_section("geometry")),
             ]
         known = {item.get("id"): item for item in [*builtin_materials(), *self._user_materials, *self.model.get("materials", [])]}
@@ -11741,14 +11727,14 @@ class SolveWorkspace(Div):
         return True
 
     def _boundary_properties(self):
-        children = [_section_title("Boundary conditions", "Click a condition to make it active, then assign it directly in the viewport.")]
+        children = [_section_title("Boundary conditions")]
         self._boundary_selection_summary = Div(ui_style="display:flex; flex-direction:column; gap:4px; padding:9px 10px; border:1px solid var(--border); border-radius:6px; background:var(--surface-subtle, #f7f9fb);")
         children.append(_button("Add boundary condition", "mdi-plus", self.add_boundary, color="primary"))
         children.append(self._boundary_selection_summary)
         self._sync_boundary_selection_controls()
         conditions = self.model.get("boundary_conditions", [])
         if not conditions:
-            children.append(Div("No boundary conditions yet. Add one, then activate it and click regions or edges in the viewport.", ui_style="font-size:12px; color:var(--fg-muted); line-height:1.45;"))
+            children.append(Div("None defined.", ui_style="font-size:12px; color:var(--fg-muted); line-height:1.45;"))
         for condition in conditions:
             assigned = sum(condition["id"] in _edge_condition_ids(edge) for edge in self.model.get("geometry", {}).get("edges", []))
             select = _button(
@@ -11770,17 +11756,17 @@ class SolveWorkspace(Div):
 
     def _physics_properties(self):
         physics = self.model["physics"]
-        children = [_section_title("Physics & coupling", "Choose which equations the study will solve.")]
+        children = [_section_title("Physics & coupling")]
         options = [
-            ("dc_magnetic", "Static magnetic field", "DC magnetic solution"),
-            ("harmonic_electromagnetic", "Time-harmonic EM", "Complex-valued EM field"),
-            ("mechanics", "Time-harmonic mechanics", "Elastic displacement response"),
-            ("coupling", "EM-mechanical coupling", "Coupled electromagnetic and mechanical solve"),
+            ("dc_magnetic", "Static magnetic field"),
+            ("harmonic_electromagnetic", "Time-harmonic EM"),
+            ("mechanics", "Time-harmonic mechanics"),
+            ("coupling", "EM-mechanical coupling"),
         ]
-        for key, label, hint in options:
+        for key, label in options:
             toggle = QCheckbox(ui_model_value=bool(physics[key].get("enabled")), ui_label=label, ui_dense=True)
             toggle.on_update_model_value(lambda event, selected=key: self._set_physics(selected, "enabled", bool(event.value)))
-            children.append(Div(toggle, Div(hint, ui_style="font-size:11px; color:var(--fg-muted); margin-left:30px; margin-top:-5px;"), ui_style="padding:7px 0; border-bottom:1px solid var(--border);"))
+            children.append(Div(toggle, ui_style="padding:7px 0; border-bottom:1px solid var(--border);"))
         mechanics = physics.get("mechanics", {})
         if isinstance(mechanics, dict) and ("rayleigh_alpha" in mechanics or "rayleigh_beta" in mechanics):
             children.extend([
@@ -11789,22 +11775,18 @@ class SolveWorkspace(Div):
                 _input("Stiffness coefficient (beta)", mechanics.get("rayleigh_beta", "0"), lambda event: self._set_physics("mechanics", "rayleigh_beta", event.value), suffix="s"),
             ])
         if physics.get("harmonic_electromagnetic", {}).get("enabled", False):
-            children.extend([
-                Div("Set frequency points and sweep values in Study.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted); padding-top:8px;"),
-                _button("Configure study frequencies", "mdi-play-box-outline", lambda *a: self.select_section("studies")),
-            ])
+            children.append(_button("Configure study frequencies", "mdi-play-box-outline", lambda *a: self.select_section("studies")))
         else:
-            children.append(Div("Static electromagnetic studies do not require a frequency.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted); padding-top:8px;"))
-        children.append(Div("Regional current densities and mechanical body forces are configured separately under Sources & loads.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"))
-        children.append(Div("Coupling requires DC magnetic, time-harmonic EM and mechanics to be enabled.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted); padding-top:5px;"))
+            children.append(Div("Frequency is unused by static studies.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted); padding-top:8px;"))
+        children.append(Div("Coupling needs DC magnetic, time-harmonic EM and mechanics.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted); padding-top:5px;"))
         return children
 
     def _sources_properties(self):
         loads = self.model.get("regional_loads", [])
-        children = [_section_title("Sources & loads", "Define named loads, select one, then click regions in the viewport to assign it.")]
+        children = [_section_title("Sources & loads")]
         children.append(_button("Add source/load", "mdi-plus", self._open_sources_editor, color="primary"))
         if not loads:
-            children.append(Div("No regional loads defined yet.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"))
+            children.append(Div("None defined.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"))
             return children
         for load in loads:
             selected = load.get("id") == self.selected_source_id
@@ -11820,7 +11802,7 @@ class SolveWorkspace(Div):
             assigned = self._assigned_regions_for_load(self.selected_source_id)
             names = [region.get("name", "Region") for region in self.model.get("geometry", {}).get("regions", []) if region.get("id") in assigned]
             children.append(Div(
-                "Click a region in the viewport to add or remove it from this load. Assigned: " + (", ".join(names) if names else "none"),
+                "Assigned: " + (", ".join(names) if names else "none"),
                 ui_style="font-size:11px; line-height:1.45; color:var(--fg-muted); padding-top:4px;",
             ))
         return children
@@ -11839,16 +11821,15 @@ class SolveWorkspace(Div):
             lambda event: self._set_mesh("curve_order", int(event.value))
         )
         children = [
-            _section_title("Mesh", "Control global density, local overrides, and geometric hp layers."),
+            _section_title("Mesh"),
             _input("Target element size", mesh["element_size"], lambda event: self._set_mesh("element_size", event.value), suffix="m"),
             order,
             curve_order,
             Div(
-                "1 keeps mesh edges straight. Higher orders follow the sketch curves more closely; this is separate from polynomial order.",
+                "Curve order controls geometric approximation independently of polynomial order.",
                 ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);",
             ),
             Div("REGION-WISE ELEMENT SIZING", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:7px;"),
-            Div("Only regions with a local override are listed. Other regions use the global target.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
             _button("Add region-wise element sizing", "mdi-plus", lambda *args: self._open_region_mesh_size_editor(), color="primary"),
         ]
         regions = self.model.get("geometry", {}).get("regions", [])
@@ -11866,15 +11847,12 @@ class SolveWorkspace(Div):
             ))
         children.extend([
             Div("GEOMETRIC HP LAYERS", ui_style="font-size:10px; font-weight:700; letter-spacing:.07em; color:var(--fg-muted); padding-top:12px;"),
-            Div("Choose a layer count and grading, then select targets directly in the viewport.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted);"),
         ])
         layer_count = QSelect(ui_label="Number of hp layers", ui_options=list(range(0, 9)), ui_model_value=mesh.get("hp_layers", 0), ui_dense=True, ui_filled=True)
         layer_count.on_update_model_value(lambda event: self._set_mesh("hp_layers", int(event.value)))
         grading = _input("Layer grading factor", mesh.get("hp_grading_factor", 0.3), lambda event: self._set_mesh("hp_grading_factor", event.value), number=True, hint="Between 0 and 1; smaller values make tighter layers")
         children.extend([layer_count, grading])
         targets = list(mesh.get("hp_region_ids", [])) + list(mesh.get("hp_edge_ids", []))
-        if self.hp_target_selection_active:
-            children.append(Div("Selection mode is active. Click a region or edge, or drag a marquee across targets.", ui_style="font-size:11px; line-height:1.4; color:var(--primary); padding:5px 0;"))
         children.append(_button(
             "Finish selection" if self.hp_target_selection_active else "Select regions and edges",
             "mdi-cursor-default-click-outline",
@@ -11911,9 +11889,6 @@ class SolveWorkspace(Div):
                     ui_style="display:flex; align-items:center; gap:7px; padding:3px 4px 3px 6px; background:var(--surface-subtle,#f7f9fb); border-radius:5px;",
                 ))
             children.append(_button("Clear all targets", "mdi-eraser", self._clear_hp_layer_targets))
-        else:
-            children.append(Div("No hp layer targets selected.", ui_style="font-size:11px; color:var(--fg-muted);"))
-        children.append(Div("The sketch must contain valid, non-overlapping regions before mesh generation.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted); padding-top:5px;"))
         return children
 
     def _remove_region_mesh_size(self, region_id):

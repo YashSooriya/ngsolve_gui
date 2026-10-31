@@ -285,7 +285,13 @@ class PlotComponent(PropertyPanelMixin, Div):
             plot.ui_style = (
                 f"width:100%; min-width:0; height:{plot_height};"
             )  # height is computed per figure
-            plot.on_mounted(lambda _=None, plot=plot, fig=pfig: plot.draw(fig))
+            # Keep the latest figure on the plot component before it mounts.
+            # A project can change while this child is being attached (for
+            # example, a STEP preview finishing before a wire-trace import).
+            # Capturing ``pfig`` in the mount callback would then redraw the
+            # stale first figure over the newer one.
+            plot.draw(pfig)
+            plot.on_mounted(lambda _=None, plot=plot: plot.redraw())
             self._plots.append(plot)
 
         if not self._plots:

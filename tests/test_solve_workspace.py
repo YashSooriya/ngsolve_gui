@@ -3801,10 +3801,7 @@ def test_region_properties_explain_the_current_sketch_constraint_scope(standalon
     workspace._add_primitive("rectangle")
     workspace.selected_region_id = workspace.model["geometry"]["regions"][0]["id"]
 
-    note = (
-        "These are built-in relationships for the rectangle and circle tools. "
-        "This version does not solve general user-defined sketch constraints."
-    )
+    note = "Rectangle and circle constraints are automatic; user-defined constraints are unsupported."
     properties = workspace._geometry_properties()
 
     assert any(getattr(component, "ui_children", None) == [note] for component in properties)

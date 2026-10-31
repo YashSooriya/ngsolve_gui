@@ -6,7 +6,14 @@ import plotly.graph_objects as go
 import numpy as np
 
 from ngsolve_gui.three_d_workspace import ThreeDWorkspace
-from ngsolve_gui.three_d_project import add_step_geometry, new_3d_project, package_3d_project, unpack_3d_project
+from ngsolve_gui.three_d_project import (
+    UNASSIGNED_MATERIAL,
+    add_step_geometry,
+    add_wire_trace,
+    new_3d_project,
+    package_3d_project,
+    unpack_3d_project,
+)
 
 
 def test_three_d_workspace_is_persistent_and_keeps_unsaved_imports(monkeypatch):
@@ -42,6 +49,42 @@ def test_three_d_workspace_is_persistent_and_keeps_unsaved_imports(monkeypatch):
     assert workspace.dirty is True
 
 
+def test_3d_study_waits_for_a_real_material_assignment(monkeypatch):
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+    workspace = ThreeDWorkspace(SimpleNamespace())
+    project = new_3d_project("Material assignment")
+    project["materials"] = [{
+        "id": "test-unassigned-material",
+        "name": UNASSIGNED_MATERIAL,
+        "properties": {"relative_permeability": 1.0, "electrical_conductivity": 0.0},
+    }]
+    assets = {}
+    geometry = add_step_geometry(
+        project,
+        assets,
+        "part.step",
+        b"ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n",
+        units="mm",
+    )
+    add_wire_trace(project, assets, "coil.txt", b"0 0 0\n0 0 1\n")
+    workspace.project = project
+    workspace.assets = assets
+    workspace._rebuild_items()
+
+    assert geometry["material"] == UNASSIGNED_MATERIAL
+    assert workspace._run_study_button.ui_disable is True
+
+    workspace._set_material_reference(geometry, SimpleNamespace(value="Copper"))
+
+    assert geometry["material"] == "Copper"
+    assert workspace._run_study_button.ui_disable is False
+
+    geometry["material"] = UNASSIGNED_MATERIAL
+    workspace._update_study_controls()
+    assert workspace._has_resolved_study_materials() is False
+    assert workspace._run_study_button.ui_disable is True
+
+
 def test_3d_side_panels_collapse_and_reopen_without_losing_width(monkeypatch):
     monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
     workspace = ThreeDWorkspace(SimpleNamespace())
@@ -64,6 +107,7 @@ def test_3d_side_panels_collapse_and_reopen_without_losing_width(monkeypatch):
 def test_three_d_tree_selection_updates_the_properties_panel(monkeypatch):
     monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
     workspace = ThreeDWorkspace(SimpleNamespace())
+    workspace._rebuild_preview = lambda: None
     workspace.project["geometries"] = [{
         "id": "geometry-1",
         "name": "shield.step",
@@ -82,6 +126,57 @@ def test_three_d_tree_selection_updates_the_properties_panel(monkeypatch):
     assert {"Default material", "Length units", "Maximum element size (mm)"} <= labels
 
 
+def test_named_domain_mesh_size_invalidates_preview_mesh_and_persists(monkeypatch):
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+    workspace = ThreeDWorkspace(SimpleNamespace())
+    geometry = {
+        "id": "geometry-1",
+        "name": "shield.step",
+        "material": "Copper",
+        "units": "mm",
+        "asset": "assets/geometry/shield.step",
+        "domain_selections": [{
+            "id": "selection-1",
+            "name": "Inner shield",
+            "domain_ids": [0],
+        }],
+    }
+    workspace.project["geometries"] = [geometry]
+    selection = geometry["domain_selections"][0]
+    workspace._mesh_results[geometry["id"]] = {"status": "ready"}
+    workspace._rebuild_preview = lambda: None
+
+    workspace.select_item("named_selection", selection["id"])
+    labels = {getattr(child, "ui_label", None) for child in workspace._properties.ui_children}
+    assert "Local max element size (mm)" in labels
+
+    assert workspace._set_named_selection_mesh_maxh(
+        geometry, selection, SimpleNamespace(value="2.5")
+    ) is True
+    assert selection["mesh_maxh_mm"] == 2.5
+    assert geometry["id"] not in workspace._mesh_results
+    assert workspace.dirty is True
+
+
+def test_named_domain_mesh_size_rejects_conflicting_overlapping_selections(monkeypatch):
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+    workspace = ThreeDWorkspace(SimpleNamespace())
+    workspace._rebuild_preview = lambda: None
+    geometry = {
+        "id": "geometry-1",
+        "name": "shield.step",
+        "domain_selections": [
+            {"id": "selection-1", "name": "Inner shield", "domain_ids": [0], "mesh_maxh_mm": 2.0},
+            {"id": "selection-2", "name": "Refined shield", "domain_ids": [0], "mesh_maxh_mm": 1.0},
+        ],
+    }
+
+    assert workspace._set_named_selection_mesh_maxh(
+        geometry, geometry["domain_selections"][1], SimpleNamespace(value="3")
+    ) is False
+    assert geometry["domain_selections"][1]["mesh_maxh_mm"] == 1.0
+
+
 def test_viewport_selection_syncs_to_tree_properties_and_preview(monkeypatch):
     monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
     workspace = ThreeDWorkspace(SimpleNamespace())
@@ -98,6 +193,7 @@ def test_viewport_selection_syncs_to_tree_properties_and_preview(monkeypatch):
         "material": "Air",
         "traces": [{"name": "golay_x_trace.txt", "filename": "assets/traces/golay.txt"}],
     }]
+    workspace._rebuild_preview = lambda: None
     figure = go.Figure([
         go.Mesh3d(
             x=[0, 1, 0], y=[0, 0, 1], z=[0, 0, 0], i=[0], j=[1], k=[2],
@@ -161,6 +257,7 @@ def test_material_reference_options_include_existing_libraries_and_preserve_unkn
 def test_material_reference_selection_updates_project_and_tree_badge(monkeypatch):
     monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
     workspace = ThreeDWorkspace(SimpleNamespace())
+    workspace._rebuild_preview = lambda: None
     item = {
         "id": "geometry-1",
         "name": "shield.step",
@@ -176,7 +273,7 @@ def test_material_reference_selection_updates_project_and_tree_badge(monkeypatch
     assert item["material"] == "Copper"
     assert workspace.dirty is True
     assert workspace._geometry_items.ui_children[0].ui_children[2].ui_children == ["Copper"]
-    assert "Material properties are copied into the project" in workspace._properties.ui_children[3].ui_children[0]
+    assert "Material data is embedded in the project." in workspace._properties.ui_children[3].ui_children[0]
 
 
 def test_preview_worker_dispatches_ui_updates_to_the_application_loop(monkeypatch):
@@ -279,7 +376,7 @@ def test_mesh_size_changes_are_persisted_and_invalidate_the_display_mesh(monkeyp
     assert workspace.dirty is True
     assert item["id"] not in workspace._mesh_results
     assert previews == [True]
-    assert "No mesh generated" in workspace._mesh_property_status.ui_children[0]
+    assert "Mesh not generated." in workspace._mesh_property_status.ui_children[0]
     assert workspace._generate_mesh_button.ui_disable is False
 
 
@@ -354,6 +451,77 @@ def test_selected_mesh_figure_is_styled_before_asynchronous_plotly_render(monkey
     assert figure.data[1].line.width == 2.5
     assert updates[0]["color"] == "#f59e0b"
     assert updates[1]["line.color"] == "#33475b"
+
+
+def test_boundary_selection_updates_only_the_mesh_overlay_trace(monkeypatch):
+    from ngsolve_gui.three_d_preview import preview_figure
+
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+    workspace = ThreeDWorkspace(SimpleNamespace())
+    geometry = {
+        "id": "geometry-1",
+        "name": "shield.step",
+        "material": "Copper",
+        "units": "mm",
+        "asset": "assets/geometry/shield.step",
+    }
+    workspace.project["geometries"] = [geometry]
+    workspace.assets[geometry["asset"]] = b"STEP"
+    workspace._selection = ("geometry", geometry["id"])
+    workspace._selection_draft.update({
+        "geometry_id": geometry["id"],
+        "kind": "boundary",
+        "region_ids": [],
+    })
+    workspace._mesh_results[geometry["id"]] = {
+        "status": "ready",
+        "vertices_mm": np.asarray([
+            [0, 0, 0], [1000, 0, 0], [0, 1000, 0], [1000, 1000, 0],
+        ], dtype=np.float32),
+        "triangles": np.asarray([[0, 1, 2], [1, 3, 2]], dtype=np.int32),
+        "boundary_region_ids": np.asarray([4, 4], dtype=np.int32),
+    }
+    figure = preview_figure({
+        "geometry": [{
+            "id": geometry["id"],
+            "name": geometry["name"],
+            "vertices": workspace._mesh_results[geometry["id"]]["vertices_mm"] * 0.001,
+            "triangles": workspace._mesh_results[geometry["id"]]["triangles"],
+            "edges": np.empty((0, 2), dtype=np.int32),
+            "generated_mesh": True,
+            "boundary_region_ids": [4, 4],
+            "highlighted_boundary_ids": [],
+        }],
+        "traces": [],
+    })
+    calls = []
+
+    class FakePlotly:
+        def _call_method_ignore_return(self, method, args):
+            calls.append((method, args))
+
+    class FakePlot:
+        _plotly = FakePlotly()
+        _js_component = object()
+
+    workspace._preview._figures = [figure]
+    workspace._preview._plots = [FakePlot()]
+    workspace._rebuild_preview = lambda: (_ for _ in ()).throw(
+        AssertionError("Boundary selection rebuilt the complete 3D scene")
+    )
+    workspace._schedule_preview_selection_update = lambda: None
+
+    workspace._set_selection_draft_regions(
+        geometry, SimpleNamespace(value=[4])
+    )
+
+    overlay = figure.data[1]
+    assert overlay.visible is True
+    assert len(overlay.x) == 12
+    assert len(calls) == 1
+    assert calls[0][0] == "restyle"
+    assert calls[0][1][2] == [1]
+    assert calls[0][1][1]["x"][0] == list(overlay.x)
 
 
 def _workspace_with_test_mesh(monkeypatch):

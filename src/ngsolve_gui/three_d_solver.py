@@ -6,7 +6,12 @@ import math
 from pathlib import Path
 
 from .axisymmetric_model import builtin_materials
-from .three_d_project import build_3d_solver_inputs, build_wire_trace_sets
+from .three_d_project import (
+    UNASSIGNED_MATERIAL,
+    build_3d_solver_inputs,
+    build_wire_trace_sets,
+    domain_mesh_size_overrides,
+)
 
 
 def _finite_material_property(material, key, *, default=None):
@@ -79,6 +84,10 @@ def validate_time_harmonic_em_setup(project):
         default_material = str(geometry.get("material", "")).strip()
         if not default_material:
             raise ValueError(f"Assign a material to {geometry.get('name', 'Geometry')!r} before running.")
+        if default_material.casefold() == UNASSIGNED_MATERIAL.casefold():
+            raise ValueError(
+                f"Assign a physical material to {geometry.get('name', 'Geometry')!r} before running."
+            )
         names = [default_material]
         names.extend(
             selection.get("material", "")
@@ -88,6 +97,7 @@ def validate_time_harmonic_em_setup(project):
         mesh_size = float(geometry.get("mesh_maxh_mm", 30.0))
         if not math.isfinite(mesh_size) or mesh_size <= 0:
             raise ValueError(f"{geometry.get('name', 'Geometry')!r} needs a positive mesh size.")
+        domain_mesh_size_overrides(geometry)
         material_names.update(str(name).strip() for name in names if str(name).strip())
     for trace_set in project.get("wire_trace_sets", []):
         for trace in trace_set.get("traces", []):
@@ -97,6 +107,10 @@ def validate_time_harmonic_em_setup(project):
     for name in material_names | {"Air"}:
         record = records.get(name.casefold())
         if record is None:
+            if name.casefold() == UNASSIGNED_MATERIAL.casefold():
+                raise ValueError(
+                    "Assign a physical material from the library to every solid and region before running."
+                )
             raise ValueError(
                 f"Material {name!r} is not embedded in this project. Choose it from the material library."
             )
@@ -171,9 +185,10 @@ def build_time_harmonic_em_problem(project, asset_paths):
         }
 
     geometry_inputs = build_3d_solver_inputs(project, asset_paths)["geometries"]
-    material_groups = {}
-    material_maxh = {}
+    objects = {}
+    domain_maxh = {}
     all_solids = []
+    object_index = 0
     bounds_min = [math.inf, math.inf, math.inf]
     bounds_max = [-math.inf, -math.inf, -math.inf]
     used_materials = {}
@@ -193,6 +208,7 @@ def build_time_harmonic_em_problem(project, asset_paths):
             raise ValueError(f"{geometry['name']!r} does not contain a closed STEP solid.")
 
         overrides = {}
+        local_mesh_overrides = domain_mesh_size_overrides(geometry)
         for selection in geometry.get("domain_selections", []):
             selected_material = selection.get("material")
             if not selected_material:
@@ -212,17 +228,19 @@ def build_time_harmonic_em_problem(project, asset_paths):
                 "Regenerate the mesh and update the domain selections."
             )
 
-        mesh_size_m = float(geometry.get("mesh_maxh_mm", 30.0)) * 0.001
-        if not math.isfinite(mesh_size_m) or mesh_size_m <= 0:
+        default_mesh_size_mm = float(geometry.get("mesh_maxh_mm", 30.0))
+        if not math.isfinite(default_mesh_size_mm) or default_mesh_size_mm <= 0:
             raise ValueError(f"{geometry['name']!r} needs a positive maximum element size.")
         for region_id, solid in enumerate(solids):
             material_name = overrides.get(region_id, default_material)
             material = resolve_material(material_name)
             solid.mat(material["name"])
             solid.bc("Transmission_Interface")
-            material_groups.setdefault(material["name"], []).append(solid)
-            material_maxh[material["name"]] = min(
-                mesh_size_m, material_maxh.get(material["name"], math.inf)
+            object_key = f"_mmfem_solid_{object_index}"
+            object_index += 1
+            objects[object_key] = solid
+            domain_maxh[object_key] = (
+                local_mesh_overrides.get(region_id, default_mesh_size_mm) * 0.001
             )
             used_materials[material["name"]] = material
             all_solids.append(solid)
@@ -242,18 +260,11 @@ def build_time_harmonic_em_problem(project, asset_paths):
     inner_union = Glue(all_solids)
     air_shape = (air_box - inner_union).mat(air_record["name"])
 
-    objects = {
-        material_name: Glue(solids)
-        for material_name, solids in material_groups.items()
-    }
-    objects[air_record["name"]] = (
-        Glue([objects[air_record["name"]], air_shape])
-        if air_record["name"] in objects
-        else air_shape
-    )
-    solid_maxh = max(material_maxh.values())
+    solid_maxh = max(domain_maxh.values())
     air_maxh = max(solid_maxh, span / 12.0)
-    domain_maxh = {**material_maxh, air_record["name"]: air_maxh}
+    air_key = "_mmfem_air"
+    objects[air_key] = air_shape
+    domain_maxh[air_key] = air_maxh
     used_materials[air_record["name"]] = resolve_material(air_record["name"])
     material_names = list(used_materials)
     all_material_names = set(material_names)
@@ -341,6 +352,7 @@ def build_time_harmonic_em_problem(project, asset_paths):
         "problem": problem,
         "frequency_hz": frequency_hz,
         "polynomial_order": polynomial_order,
+        "air_padding": air_padding,
         "h_global": max(domain_maxh.values()),
         "mesh_curve_order": max(1, min(polynomial_order, 3)),
         "domain_maxh": domain_maxh,

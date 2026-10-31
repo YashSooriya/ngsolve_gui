@@ -118,3 +118,29 @@ def test_selected_mesh_boundary_draws_an_outline_overlay_without_changing_the_su
     assert figure.data[1].meta["mmfem_boundary_overlay"] is True
     assert figure.data[1].line.color == "#f59e0b"
     assert len(figure.data[1].x) == 12
+    assert figure.data[1].visible is True
+
+
+def test_generated_mesh_keeps_an_empty_boundary_overlay_trace():
+    import numpy as np
+
+    figure = preview_figure({
+        "geometry": [{
+            "id": "geometry-1",
+            "name": "box.step",
+            "vertices": np.asarray([
+                [0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],
+            ]),
+            "triangles": np.asarray([[0, 1, 2], [1, 3, 2]]),
+            "edges": np.empty((0, 2), dtype=np.int32),
+            "generated_mesh": True,
+            "boundary_region_ids": [4, 4],
+            "highlighted_boundary_ids": [],
+        }],
+        "traces": [],
+    })
+
+    overlay = figure.data[1]
+    assert overlay.meta["mmfem_boundary_overlay"] is True
+    assert list(overlay.x) == []
+    assert overlay.visible is False

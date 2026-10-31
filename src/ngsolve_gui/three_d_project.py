@@ -19,6 +19,7 @@ PROJECT_SUFFIX = ".mmfem3d"
 PROJECT_SCHEMA = "mm-fem.3d-project"
 PROJECT_VERSION = 1
 PROJECT_ENTRY = "project.json"
+UNASSIGNED_MATERIAL = "Unassigned"
 MAX_PROJECT_BYTES = 512_000_000
 MAX_ASSET_BYTES = 256_000_000
 MAX_PROJECT_ITEMS = 500
@@ -203,7 +204,9 @@ def wire_trace_text(points):
     ) + "\n"
 
 
-def add_step_geometry(project, assets, filename, data, *, units="m", material="Shield"):
+def add_step_geometry(
+    project, assets, filename, data, *, units="m", material=UNASSIGNED_MATERIAL
+):
     if units not in LENGTH_UNITS:
         raise ValueError(f"Unsupported STEP length unit: {units!r}.")
     payload = validate_step_file(filename, data)
@@ -213,7 +216,7 @@ def add_step_geometry(project, assets, filename, data, *, units="m", material="S
     item = {
         "id": asset_id,
         "name": str(filename),
-        "material": _safe_name(material, "Shield"),
+        "material": _safe_name(material, UNASSIGNED_MATERIAL),
         "units": units,
         "asset": asset,
         "sha256": hashlib.sha256(payload).hexdigest(),
@@ -322,6 +325,39 @@ def _validate_named_selections(geometry, key, region_key, label):
         used_names.add(normalized_name)
 
 
+def domain_mesh_size_overrides(geometry):
+    """Return validated per-domain mesh sizes, rejecting ambiguous overlaps."""
+    overrides = {}
+    for selection in geometry.get("domain_selections", []):
+        value = selection.get("mesh_maxh_mm")
+        if value is None or value == "":
+            continue
+        try:
+            maxh = float(value)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                f"Invalid local mesh size for {selection.get('name', 'domain selection')!r}."
+            ) from error
+        if not math.isfinite(maxh) or not MIN_MESH_SIZE_MM <= maxh <= MAX_MESH_SIZE_MM:
+            raise ValueError(
+                f"Local maximum element size must be between {MIN_MESH_SIZE_MM:g} "
+                f"and {MAX_MESH_SIZE_MM:g} mm."
+            )
+        for region_id in selection.get("domain_ids", []):
+            region_id = int(region_id)
+            existing = overrides.get(region_id)
+            if existing is not None and not math.isclose(
+                existing, maxh, rel_tol=1e-12, abs_tol=1e-12
+            ):
+                raise ValueError(
+                    f"Domain {region_id} has conflicting local mesh sizes. "
+                    "Use one size for every overlapping selection."
+                )
+            overrides[region_id] = maxh
+        selection["mesh_maxh_mm"] = maxh
+    return overrides
+
+
 def validate_3d_project(project, assets):
     if not isinstance(project, dict) or project.get("schema") != PROJECT_SCHEMA:
         raise ValueError("This is not an MM-FEM 3D project.")
@@ -410,6 +446,7 @@ def validate_3d_project(project, assets):
                 not isinstance(assigned_material, str) or not assigned_material.strip()
             ):
                 raise ValueError("A domain material assignment must be a material name.")
+        domain_mesh_size_overrides(geometry)
         _validate_named_selections(
             geometry, "boundary_selections", "boundary_ids", "boundary"
         )

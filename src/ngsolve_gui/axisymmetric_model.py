@@ -1839,7 +1839,7 @@ def validate_model(model: dict, *, scope="solve") -> list[str]:
             if outer.get("id") != region.get("id")
             and abs(_signed_area(outer_points))
                 > child_area + _area_tolerance(outer_points, points)
-            and _strictly_contains(outer_points, points)
+            and _contains_or_touches(outer_points, points)
         ]
         expected_parent = min(containers)[1] if containers else None
         if region.get("parent_id") != expected_parent:
@@ -2607,17 +2607,6 @@ def _segments_intersect(a, b, c, d, tolerance=1e-12):
     )
 
 
-def _strictly_contains(outer, inner):
-    if len(outer) < 3 or len(inner) < 3 or not all(_point_in_polygon(point, outer) for point in inner):
-        return False
-    return not any(
-        _segments_intersect(outer[i], outer[(i + 1) % len(outer)], inner[j], inner[(j + 1) % len(inner)])
-        for i in range(len(outer))
-        for j in range(len(inner))
-    )
-
-
-
 def _area_tolerance(first, second):
     first_width = max(p[0] for p in first) - min(p[0] for p in first)
     first_height = max(p[1] for p in first) - min(p[1] for p in first)
@@ -2630,18 +2619,70 @@ def _area_tolerance(first, second):
 def _contains_or_touches(outer, inner):
     if len(outer) < 3 or len(inner) < 3:
         return False
-    return all(
-        _point_in_polygon(point, outer)
-        or any(
-            _point_on_segment(
-                point,
-                outer[index],
-                outer[(index + 1) % len(outer)],
-            )
+
+    def inside_or_on(point):
+        return _point_in_polygon(point, outer) or any(
+            _point_on_segment(point, outer[index], outer[(index + 1) % len(outer)])
             for index in range(len(outer))
         )
-        for point in inner
+
+    if not all(inside_or_on(point) for point in inner):
+        return False
+
+    scale = max(
+        max(point[0] for point in outer) - min(point[0] for point in outer),
+        max(point[1] for point in outer) - min(point[1] for point in outer),
+        max(point[0] for point in inner) - min(point[0] for point in inner),
+        max(point[1] for point in inner) - min(point[1] for point in inner),
+        1e-12,
     )
+    cross_tolerance = scale * scale * 1e-12
+    parameter_tolerance = 1e-12
+
+    # Checking vertices alone accepts an edge that crosses outside a concave
+    # container. Split each child edge at every container intersection and
+    # test a point in each resulting interval; boundary overlap remains valid.
+    for index, start in enumerate(inner):
+        end = inner[(index + 1) % len(inner)]
+        rx, ry = end[0] - start[0], end[1] - start[1]
+        length_squared = rx * rx + ry * ry
+        if length_squared <= cross_tolerance:
+            continue
+        parameters = [0.0, 1.0]
+
+        for boundary_index, boundary_start in enumerate(outer):
+            boundary_end = outer[(boundary_index + 1) % len(outer)]
+            sx = boundary_end[0] - boundary_start[0]
+            sy = boundary_end[1] - boundary_start[1]
+            qx, qy = boundary_start[0] - start[0], boundary_start[1] - start[1]
+            denominator = rx * sy - ry * sx
+            if abs(denominator) > cross_tolerance:
+                parameter = (qx * sy - qy * sx) / denominator
+                boundary_parameter = (qx * ry - qy * rx) / denominator
+                if (
+                    -parameter_tolerance <= parameter <= 1 + parameter_tolerance
+                    and -parameter_tolerance <= boundary_parameter <= 1 + parameter_tolerance
+                ):
+                    parameters.append(min(1.0, max(0.0, parameter)))
+            elif abs(qx * ry - qy * rx) <= cross_tolerance:
+                # Collinear boundary overlap contributes its endpoints to the
+                # partition so the uncovered portions are still checked.
+                for point in (boundary_start, boundary_end):
+                    parameter = (
+                        (point[0] - start[0]) * rx + (point[1] - start[1]) * ry
+                    ) / length_squared
+                    if -parameter_tolerance <= parameter <= 1 + parameter_tolerance:
+                        parameters.append(min(1.0, max(0.0, parameter)))
+
+        parameters.sort()
+        for low, high in zip(parameters, parameters[1:]):
+            if high - low <= parameter_tolerance:
+                continue
+            parameter = (low + high) * 0.5
+            midpoint = (start[0] + parameter * rx, start[1] + parameter * ry)
+            if not inside_or_on(midpoint):
+                return False
+    return True
 
 
 def _polygons_overlap_interior(first, second):

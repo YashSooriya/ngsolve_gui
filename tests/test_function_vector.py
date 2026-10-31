@@ -29,7 +29,7 @@ def test_function_vector_2d(page: Page, app) -> None:
     """2D vector CF: default → surface vectors."""
     mesh = make_mesh_2d()
     cf = ngs.CF((ngs.x, ngs.y))
-    _draw(app, cf, mesh=mesh, name="Vec2D")
+    _draw(app, cf, page=page, mesh=mesh, name="Vec2D")
     comp = app.tab_panel.comp
 
     assert_matches_baseline(page, comp.wgpu, "func_vector_2d_default.png")
@@ -43,7 +43,7 @@ def test_function_vector_3d(page: Page, app) -> None:
     """3D vector CF: enable clipping → clipping vectors → surface vectors."""
     mesh = make_mesh_3d()
     cf = ngs.CF((ngs.x, ngs.y, ngs.z))
-    _draw(app, cf, mesh=mesh, name="Vec3D")
+    _draw(app, cf, page=page, mesh=mesh, name="Vec3D")
     comp = app.tab_panel.comp
 
     assert_matches_baseline(page, comp.wgpu, "func_vector_3d_default.png")
@@ -67,8 +67,13 @@ def test_function_streamline_defaults(page: Page, app) -> None:
     """Interactive streamlines use the requested light default settings."""
     mesh = make_mesh_3d()
     cf = ngs.CF((ngs.x, ngs.y, ngs.z))
-    _draw(app, cf, mesh=mesh, name="StreamlineDefaults")
+    _draw(app, cf, page=page, mesh=mesh, name="StreamlineDefaults")
     comp = app.tab_panel.comp
+
+    from ngapp.e2e_webgpu import _ensure_scene_ready
+
+    _ensure_scene_ready(page, comp.wgpu)
+    comp.field_lines_visible.value = True
 
     assert comp.fieldlines_num_lines.value == 20
     assert comp.fieldlines_thickness.value == 0.0001
@@ -85,6 +90,7 @@ def test_streamline_seed_material_is_temporarily_hidden(page: Page, app) -> None
     _draw(
         app,
         cf,
+        page=page,
         mesh=mesh,
         name="StreamlineSeedVisibility",
         _ngsolve_gui_fast_fieldlines=True,
@@ -110,31 +116,16 @@ def test_streamline_seed_material_is_temporarily_hidden(page: Page, app) -> None
 @app_test("ngsolve_gui.appconfig")
 def test_streamline_seed_region_selector_supports_all_regions(page: Page, app) -> None:
     """The seed selector scopes starts to a material or to the whole mesh."""
-    import ngsolve_gui.function as function_module
-
-    class _RegionVisibility:
-        def set_alphas(self, **_alphas):
-            pass
-
     mesh = make_mesh_3d()
     cf = ngs.CF((ngs.x, ngs.y, ngs.z))
-    missing = object()
-    previous = getattr(function_module, "RegionVisibility", missing)
-    function_module.RegionVisibility = _RegionVisibility
-    try:
-        _draw(
-            app,
-            cf,
-            mesh=mesh,
-            name="StreamlineAllSeedRegions",
-            _ngsolve_gui_fast_fieldlines=True,
-        )
-    finally:
-        if previous is missing:
-            del function_module.RegionVisibility
-        else:
-            function_module.RegionVisibility = previous
+    _draw(app, cf, page=page, mesh=mesh, name="StreamlineAllSeedRegions",
+          _ngsolve_gui_fast_fieldlines=True)
     comp = app.tab_panel.comp
+    # Wait for the initial WebGPU scene before changing renderers. Rebuilding
+    # the scene while its first engine is still attaching invalidates proxies.
+    from ngapp.e2e_webgpu import _ensure_scene_ready
+
+    _ensure_scene_ready(page, comp.wgpu)
     material_names = [str(material) for material in mesh.GetMaterials()]
     section = VectorsFlowSection(comp)
 
@@ -145,12 +136,15 @@ def test_streamline_seed_region_selector_supports_all_regions(page: Page, app) -
     material = material_names[0]
     section._update_seed_region(SimpleNamespace(value=material))
     assert comp.fieldline_seed_region.value == material
+    # Fieldline rendering is lazy while hidden. Enabling it should construct
+    # the renderer from the selected seed region before inspecting its mask.
+    comp.field_lines_visible.value = True
+    assert comp.fieldlines is not None
     assert comp.fieldlines._ngsolve_gui_start_region_name == material
     assert list(comp.fieldlines.start_region.Mask()) == list(
         mesh.Materials(material).Mask()
     )
 
-    comp.field_lines_visible.value = True
     assert comp.region_state.auto_hidden == {material}
     section._update_seed_region(SimpleNamespace(value=ALL_REGIONS))
     assert comp.fieldlines._ngsolve_gui_start_region_name == ALL_REGIONS
@@ -168,12 +162,17 @@ def test_imported_result_installs_fast_streamline_update(page: Page, app) -> Non
     _draw(
         app,
         cf,
+        page=page,
         mesh=mesh,
         name="ImportedFastFieldlines",
         _ngsolve_gui_fast_fieldlines=True,
     )
 
     comp = app.tab_panel.comp
+    from ngapp.e2e_webgpu import _ensure_scene_ready
+
+    _ensure_scene_ready(page, comp.wgpu)
+    comp.field_lines_visible.value = True
     assert comp.fieldlines.update.__func__.__module__ == "ngsolve_gui.fast_fieldlines"
 
 
@@ -182,7 +181,7 @@ def test_function_fieldlines_2d(page: Page, app) -> None:
     """2D vector CF with field lines."""
     mesh = make_mesh_2d()
     cf = ngs.CF((ngs.y, -ngs.x))
-    _draw(app, cf, mesh=mesh, name="FieldLines2D")
+    _draw(app, cf, page=page, mesh=mesh, name="FieldLines2D")
     comp = app.tab_panel.comp
 
     np.random.seed(42)
@@ -197,7 +196,7 @@ def test_complex_field_defaults_to_absolute_and_allows_component_selection(
     mesh = make_mesh_2d()
     field = ngs.GridFunction(ngs.H1(mesh, order=1, complex=True), name="Complex field")
     field.Set(ngs.CF(ngs.x + 1j * ngs.y))
-    _draw(app, field, name="ComplexField")
+    _draw(app, field, page=page, name="ComplexField")
 
     component = app.tab_panel.comp
     assert component.cf.is_complex
@@ -275,7 +274,7 @@ def test_3d_vector_result_can_deform_geometry(page: Page, app) -> None:
         ngs.VectorH1(mesh, order=1, dim=3), name="Displacement"
     )
     displacement.Set(ngs.CF((ngs.x, ngs.y, ngs.z)))
-    _draw(app, displacement, name="3D displacement")
+    _draw(app, displacement, page=page, name="3D displacement")
 
     component = app.tab_panel.comp
     assert component.deformation is not None
@@ -284,13 +283,16 @@ def test_3d_vector_result_can_deform_geometry(page: Page, app) -> None:
 
     app._workspace_mode_toggle.select("post_process")
     app._update()
-    section = page.locator(".cb-psec").filter(has_text="Deformation").first
+    page.get_by_role("button", name="Display & view").click()
+    menu = page.locator(".q-menu:visible").filter(has_text="Display & view").last
+    section = menu.locator(".cb-psec").filter(has_text="Deformation").first
     section.wait_for(state="attached", timeout=5000)
     assert section.count() == 1
     section.locator(".cb-psec-head-main").click()
     multiplier = section.locator('input[type="number"]').first
     multiplier.fill("250")
-    multiplier.press("Enter")
+    multiplier.press("Tab")
+    page.wait_for_timeout(300)
     assert component.deformation_scale.value == 250.0
 
     component.deformation_enabled.value = True

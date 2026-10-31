@@ -195,152 +195,118 @@ def test_radial_axial_vector_is_rotated_into_cartesian_components():
 def test_axisymmetric_revolution_control_switches_viewport_dimension(
     page: Page, app
 ) -> None:
-    # This local test environment currently has ngsolve_webgpu 0.4.0 installed,
-    # while the app requires >=0.5.6 (which supplies RegionVisibility).
-    import ngsolve_gui.function as function_module
+    meridian = _meridian_mesh()
+    source = ngs.GridFunction(ngs.H1(meridian, order=1), name="Axisymmetric scalar")
+    source.Set(ngs.x + ngs.y)
+    _draw(app, source, name="Axisymmetric result", _ngsolve_gui_axisymmetric=True)
+    app._set_workspace_mode("post_process")
+    app._update()
+    component = app.tab_panel.comp
 
-    class _RegionVisibility:
-        def set_alphas(self, **_alphas):
-            pass
-
-    missing_region_visibility = object()
-    previous_region_visibility = getattr(
-        function_module, "RegionVisibility", missing_region_visibility
+    assert component.axisymmetric_revolution_available
+    assert component.mesh.dim == 2
+    assert not component.slice_available
+    assert not component.slice_feature_available
+    assert any(
+        section.__name__ == "AxisymmetricRevolutionSection"
+        for section in component.property_sections
     )
-    function_module.RegionVisibility = _RegionVisibility
-    try:
-        meridian = _meridian_mesh()
-        source = ngs.GridFunction(ngs.H1(meridian, order=1), name="Axisymmetric scalar")
-        source.Set(ngs.x + ngs.y)
-        _draw(app, source, name="Axisymmetric result", _ngsolve_gui_axisymmetric=True)
-        app._set_workspace_mode("post_process")
-        app._update()
-        component = app.tab_panel.comp
-
-        assert component.axisymmetric_revolution_available
-        assert component.mesh.dim == 2
-        assert not component.slice_available
-        assert not component.slice_feature_available
-        assert any(
-            section.__name__ == "AxisymmetricRevolutionSection"
-            for section in component.property_sections
-        )
-        assert all(section.__name__ != "SliceViewSection" for section in component.property_sections)
-        section_names = [section.__name__ for section in component.property_sections]
-        assert section_names.index("RegionsSection") < section_names.index("AxisymmetricRevolutionSection")
-        assert component._camera_view_group.ui_hidden is False
-        assert component._clip_tool_group.ui_hidden is False
-        section_ui = AxisymmetricRevolutionSection(component)
-        assert section_ui._caret in section_ui._head_main.ui_children
-        assert section_ui._head_main.ui_children[2].ui_children == [
-            "Revolved 3D View"
-        ]
-        original_tool_dock = component._tool_dock
-        component.axisymmetric_revolved.value = True
-        assert component.mesh.dim == 3
-        deadline = time.monotonic() + 5
-        while (
-            component._tool_dock not in app._post_process_toolbar.ui_children
-            and time.monotonic() < deadline
-        ):
-            page.wait_for_timeout(20)
-        assert component._tool_dock is not original_tool_dock
-        assert component._tool_dock in app._post_process_toolbar.ui_children
-        assert component._camera_view_group.ui_hidden is False
-        assert component._clip_tool_group.ui_hidden is False
-        assert component.cf.dim == 1
-        assert not component.slice_available
-        assert not component.slice_feature_available
-        assert component._camera_view_group.ui_hidden is False
-        assert component._clip_tool_group.ui_hidden is False
-        assert component._clip_toolbar is not None
-        component.axisymmetric_revolved.value = False
-        assert component.mesh.dim == 2
-        deadline = time.monotonic() + 5
-        while (
-            component._tool_dock not in app._post_process_toolbar.ui_children
-            and time.monotonic() < deadline
-        ):
-            page.wait_for_timeout(20)
-        assert not component.slice_available
-        assert not component.slice_feature_available
-        assert component._camera_view_group.ui_hidden is False
-        assert component._clip_tool_group.ui_hidden is False
-        assert component._clip_toolbar.ui_hidden is True
-        assert component._tool_dock in app._post_process_toolbar.ui_children
-    finally:
-        if previous_region_visibility is missing_region_visibility:
-            del function_module.RegionVisibility
-        else:
-            function_module.RegionVisibility = previous_region_visibility
+    assert all(section.__name__ != "SliceViewSection" for section in component.property_sections)
+    section_names = [section.__name__ for section in component.property_sections]
+    assert section_names.index("RegionsSection") < section_names.index("AxisymmetricRevolutionSection")
+    assert component._camera_view_group.ui_hidden is False
+    assert component._clip_tool_group.ui_hidden is False
+    section_ui = AxisymmetricRevolutionSection(component)
+    assert section_ui._caret in section_ui._head_main.ui_children
+    assert section_ui._head_main.ui_children[2].ui_children == [
+        "Revolved 3D View"
+    ]
+    original_tool_dock = component._tool_dock
+    component.axisymmetric_revolved.value = True
+    assert component.mesh.dim == 3
+    deadline = time.monotonic() + 5
+    while (
+        component._tool_dock not in app._post_process_toolbar.ui_children
+        and time.monotonic() < deadline
+    ):
+        page.wait_for_timeout(20)
+    assert component._tool_dock is not original_tool_dock
+    assert component._tool_dock in app._post_process_toolbar.ui_children
+    assert component._camera_view_group.ui_hidden is False
+    assert component._clip_tool_group.ui_hidden is False
+    assert component.cf.dim == 1
+    assert not component.slice_available
+    assert not component.slice_feature_available
+    assert component._camera_view_group.ui_hidden is False
+    assert component._clip_tool_group.ui_hidden is False
+    assert component._clip_toolbar is not None
+    component.axisymmetric_revolved.value = False
+    assert component.mesh.dim == 2
+    deadline = time.monotonic() + 5
+    while (
+        component._tool_dock not in app._post_process_toolbar.ui_children
+        and time.monotonic() < deadline
+    ):
+        page.wait_for_timeout(20)
+    assert not component.slice_available
+    assert not component.slice_feature_available
+    assert component._camera_view_group.ui_hidden is False
+    assert component._clip_tool_group.ui_hidden is False
+    assert component._clip_toolbar.ui_hidden is True
+    assert component._tool_dock in app._post_process_toolbar.ui_children
 
 @app_test("ngsolve_gui.appconfig")
 def test_vector_displacement_deforms_axisymmetric_revolution(page: Page, app) -> None:
     """A meridional (radial, axial) displacement becomes Cartesian in 3D."""
-    import ngsolve_gui.function as function_module
+    meridian = _meridian_mesh()
+    displacement = ngs.GridFunction(
+        ngs.VectorH1(meridian, order=1, dim=2), name="Displacement"
+    )
+    displacement.Set(ngs.CF((ngs.x, ngs.y)))
+    _draw(
+        app,
+        displacement,
+        name="Axisymmetric displacement",
+        _ngsolve_gui_axisymmetric=True,
+    )
+    component = app.tab_panel.comp
 
-    class _RegionVisibility:
-        def set_alphas(self, **_alphas):
-            pass
+    assert component.deformation is not None
+    assert component.deformation.dim == 3
+    assert not component.deformation_enabled.value
 
-    missing = object()
-    previous = getattr(function_module, "RegionVisibility", missing)
-    function_module.RegionVisibility = _RegionVisibility
-    try:
-        meridian = _meridian_mesh()
-        displacement = ngs.GridFunction(
-            ngs.VectorH1(meridian, order=1, dim=2), name="Displacement"
+    component.axisymmetric_revolved.value = True
+    assert component.mesh.dim == 3
+    assert component.deformation is not None
+    assert component.deformation.dim == 3
+    for vertex in component.mesh.vertices:
+        x_coord, y_coord, axial = map(float, component.mesh[vertex].point)
+        radius = math.hypot(x_coord, y_coord)
+        angle = math.atan2(y_coord, x_coord)
+        radial, axial_component = displacement(
+            meridian(radius, axial)
         )
-        displacement.Set(ngs.CF((ngs.x, ngs.y)))
-        _draw(
-            app,
-            displacement,
-            name="Axisymmetric displacement",
-            _ngsolve_gui_axisymmetric=True,
-        )
-        component = app.tab_panel.comp
-
-        assert component.deformation is not None
-        assert component.deformation.dim == 3
-        assert not component.deformation_enabled.value
-
-        component.axisymmetric_revolved.value = True
-        assert component.mesh.dim == 3
-        assert component.deformation is not None
-        assert component.deformation.dim == 3
-        for vertex in component.mesh.vertices:
-            x_coord, y_coord, axial = map(float, component.mesh[vertex].point)
-            radius = math.hypot(x_coord, y_coord)
-            angle = math.atan2(y_coord, x_coord)
-            radial, axial_component = displacement(
-                meridian(radius, axial)
-            )
-            if radius < 1e-12:
-                expected = (0.0, 0.0, axial_component)
-            else:
-                expected = (
-                    radial * math.cos(angle),
-                    radial * math.sin(angle),
-                    axial_component,
-                )
-            actual = component.deformation(
-                component.mesh(x_coord, y_coord, axial)
-            )
-            assert tuple(map(float, actual)) == pytest.approx(
-                expected, abs=1e-8
-            )
-
-        component.deformation_enabled.value = True
-        component.deformation_scale.value = 1000.0
-        component.deformation_scale2.value = 0.5
-        assert component.mdata.deformation_scale == pytest.approx(500.0)
-        component.deformation_scale.value = 100000.0
-        assert component.mdata.deformation_scale == pytest.approx(50000.0)
-    finally:
-        if previous is missing:
-            del function_module.RegionVisibility
+        if radius < 1e-12:
+            expected = (0.0, 0.0, axial_component)
         else:
-            function_module.RegionVisibility = previous
+            expected = (
+                radial * math.cos(angle),
+                radial * math.sin(angle),
+                axial_component,
+            )
+        actual = component.deformation(
+            component.mesh(x_coord, y_coord, axial)
+        )
+        assert tuple(map(float, actual)) == pytest.approx(
+            expected, abs=1e-8
+        )
+
+    component.deformation_enabled.value = True
+    component.deformation_scale.value = 1000.0
+    component.deformation_scale2.value = 0.5
+    assert component.mdata.deformation_scale == pytest.approx(500.0)
+    component.deformation_scale.value = 100000.0
+    assert component.mdata.deformation_scale == pytest.approx(50000.0)
 
 def test_meridian_fieldline_segments_revolve_into_uniform_planes():
     from ngsolve_gui.revolved_fieldlines import revolve_meridian_fieldline_arrays

@@ -945,7 +945,15 @@ class WebgpuTab(PropertyPanelMixin, Div):
                     continue
                 try:
                     sections.append(section_class(self))
-                except ValueError:
+                except ValueError as error:
+                    if str(error) not in {
+                        "Not a complex function",
+                        "Clipping not applicable for 2D",
+                        "no regions to manage",
+                        "Deformation not applicable",
+                        "Not applicable for scalar functions",
+                    }:
+                        raise
                     continue
             if not sections:
                 continue

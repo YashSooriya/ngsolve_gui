@@ -141,86 +141,54 @@ def test_scalar_result_is_repeated_unchanged_across_both_planes():
 
 @app_test("ngsolve_gui.appconfig")
 def test_full_model_symmetry_keeps_solution_deformation(page: Page, app) -> None:
-    import ngsolve_gui.function as function_module
+    mesh = _quarter_box()
+    displacement = ngs.GridFunction(
+        ngs.VectorH1(mesh, order=1, dim=3), name="Displacement"
+    )
+    displacement.Set(ngs.CF((x, y, ngs.z)))
+    _draw(app, displacement, name="Quarter displacement")
+    app._set_workspace_mode("post_process")
+    app._update()
+    component = app.tab_panel.comp
 
-    class _RegionVisibility:
-        def set_alphas(self, **_alphas):
-            pass
+    assert component._deformation_uses_solution
+    component.symmetry_expanded.value = True
+    assert component.deformation is not None
+    assert component.deformation.dim == 3
+    point = (-0.4, 0.4, 0.3)
+    displayed = tuple(component.cf(component.mesh(*point)))
+    deformed = tuple(component.deformation(component.mesh(*point)))
+    assert deformed == pytest.approx(
+        displayed, abs=1e-8
+    )
 
-    missing = object()
-    previous = getattr(function_module, "RegionVisibility", missing)
-    function_module.RegionVisibility = _RegionVisibility
-    try:
-        mesh = _quarter_box()
-        displacement = ngs.GridFunction(
-            ngs.VectorH1(mesh, order=1, dim=3), name="Displacement"
-        )
-        displacement.Set(ngs.CF((x, y, ngs.z)))
-        _draw(app, displacement, name="Quarter displacement")
-        app._set_workspace_mode("post_process")
-        app._update()
-        component = app.tab_panel.comp
-
-        assert component._deformation_uses_solution
-        component.symmetry_expanded.value = True
-        assert component.deformation is not None
-        assert component.deformation.dim == 3
-        point = (-0.4, 0.4, 0.3)
-        displayed = tuple(component.cf(component.mesh(*point)))
-        deformed = tuple(component.deformation(component.mesh(*point)))
-        assert deformed == pytest.approx(
-            displayed, abs=1e-8
-        )
-
-        component.symmetry_expanded.value = False
-        assert component.deformation is not None
-        assert component.mesh is mesh
-    finally:
-        if previous is missing:
-            del function_module.RegionVisibility
-        else:
-            function_module.RegionVisibility = previous
+    component.symmetry_expanded.value = False
+    assert component.deformation is not None
+    assert component.mesh is mesh
 
 
 @app_test("ngsolve_gui.appconfig")
 def test_full_model_symmetry_switch_is_available_for_tagged_quarter_results(
     page: Page, app
 ) -> None:
-    import ngsolve_gui.function as function_module
+    mesh = _quarter_box()
+    source = ngs.GridFunction(ngs.H1(mesh, order=1), name="quarter_scalar")
+    source.Set(1 + x + y)
+    _draw(app, source, name="Quarter result")
+    app._set_workspace_mode("post_process")
+    app._update()
+    component = app.tab_panel.comp
 
-    class _RegionVisibility:
-        def set_alphas(self, **_alphas):
-            pass
-
-    missing_region_visibility = object()
-    previous_region_visibility = getattr(
-        function_module, "RegionVisibility", missing_region_visibility
+    assert component.quarter_symmetry_expansion_available
+    assert any(
+        section.__name__ == "QuarterSymmetrySection"
+        for section in component.property_sections
     )
-    function_module.RegionVisibility = _RegionVisibility
-    try:
-        mesh = _quarter_box()
-        source = ngs.GridFunction(ngs.H1(mesh, order=1), name="quarter_scalar")
-        source.Set(1 + x + y)
-        _draw(app, source, name="Quarter result")
-        app._set_workspace_mode("post_process")
-        app._update()
-        component = app.tab_panel.comp
+    quarter_element_count = len(list(mesh.Elements(ngs.VOL)))
+    component.symmetry_expanded.value = True
+    assert component.mesh.dim == 3
+    assert len(list(component.mesh.Elements(ngs.VOL))) == 4 * quarter_element_count
+    assert component.cf.dim == 1
 
-        assert component.quarter_symmetry_expansion_available
-        assert any(
-            section.__name__ == "QuarterSymmetrySection"
-            for section in component.property_sections
-        )
-        quarter_element_count = len(list(mesh.Elements(ngs.VOL)))
-        component.symmetry_expanded.value = True
-        assert component.mesh.dim == 3
-        assert len(list(component.mesh.Elements(ngs.VOL))) == 4 * quarter_element_count
-        assert component.cf.dim == 1
-
-        component.symmetry_expanded.value = False
-        assert component.mesh is mesh
-    finally:
-        if previous_region_visibility is missing_region_visibility:
-            del function_module.RegionVisibility
-        else:
-            function_module.RegionVisibility = previous_region_visibility
+    component.symmetry_expanded.value = False
+    assert component.mesh is mesh

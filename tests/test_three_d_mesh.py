@@ -13,6 +13,17 @@ def _box_step(tmp_path: Path):
     return path.read_bytes()
 
 
+def _two_domain_step(tmp_path: Path):
+    from netgen.occ import Box, Glue, Pnt
+
+    path = tmp_path / "two_domains.step"
+    Glue([
+        Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).mat("Fine"),
+        Box(Pnt(20, 0, 0), Pnt(30, 10, 10)).mat("Coarse"),
+    ]).WriteStep(str(path))
+    return path.read_bytes()
+
+
 def test_generates_a_volume_mesh_and_exterior_triangles_for_step_solid(tmp_path):
     result = generate_step_mesh(_box_step(tmp_path), maxh_mm=2.5)
 
@@ -30,6 +41,21 @@ def test_generates_a_volume_mesh_and_exterior_triangles_for_step_solid(tmp_path)
     assert sum(region["elements"] for region in result["boundary_regions"]) == result["surface_faces"]
     assert 0 <= result["tetra_quality"]["minimum"] <= result["tetra_quality"]["median"] <= 1
     assert result["tetra_quality"]["below_0_1"] <= result["volume_elements"]
+
+
+def test_local_domain_size_refines_only_the_selected_volume(tmp_path):
+    result = generate_step_mesh(
+        _two_domain_step(tmp_path),
+        maxh_mm=2.5,
+        domain_maxh_mm={0: 1.0},
+    )
+
+    elements_by_domain = {
+        region["id"]: region["elements"] for region in result["domain_regions"]
+    }
+    assert set(elements_by_domain) == {0, 1}
+    assert elements_by_domain[0] > elements_by_domain[1]
+    assert result["domain_maxh_mm"] == {0: 1.0}
 
 
 def test_tetrahedral_mean_ratio_quality_is_one_for_a_regular_tetrahedron():

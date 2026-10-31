@@ -94,33 +94,19 @@ def test_region_scoped_field_data_matches_slice_mesh_elements():
 
 @app_test("ngsolve_gui.appconfig")
 def test_slice_feature_is_not_available_in_postprocess_ui(page: Page, app) -> None:
-    import ngsolve_gui.function as function_module
     from ngsolve import x, y, z
 
-    class _RegionVisibility:
-        def set_alphas(self, **_alphas):
-            pass
-
-    missing = object()
-    previous = getattr(function_module, "RegionVisibility", missing)
-    function_module.RegionVisibility = _RegionVisibility
-    try:
-        mesh = _quarter_box()
-        source = ngs.GridFunction(ngs.H1(mesh, order=1), name="quarter_scalar")
-        source.Set(x + y + z)
-        _draw(app, source, name="Quarter result")
-        app._set_workspace_mode("post_process")
-        app._update()
-        component = app.tab_panel.comp
-        assert not component.slice_available
-        assert not component.slice_feature_available
-        assert all(section.__name__ != "SliceViewSection" for section in component.property_sections)
-        assert all(all(section is None or section.__name__ != "SliceViewSection" for section in sections) for _, _, sections in component._postprocess_toolbar_groups)
-    finally:
-        if previous is missing:
-            del function_module.RegionVisibility
-        else:
-            function_module.RegionVisibility = previous
+    mesh = _quarter_box()
+    source = ngs.GridFunction(ngs.H1(mesh, order=1), name="quarter_scalar")
+    source.Set(x + y + z)
+    _draw(app, source, name="Quarter result")
+    app._set_workspace_mode("post_process")
+    app._update()
+    component = app.tab_panel.comp
+    assert not component.slice_available
+    assert not component.slice_feature_available
+    assert all(section.__name__ != "SliceViewSection" for section in component.property_sections)
+    assert all(all(section is None or section.__name__ != "SliceViewSection" for section in sections) for _, _, sections in component._postprocess_toolbar_groups)
 
 def test_slice_section_header_uses_standard_switch_handler():
     from types import SimpleNamespace
