@@ -14,6 +14,7 @@ from pathlib import Path
 
 from ngapp.app import App
 from ngapp.components import *
+from ngapp.utils import UserSettings
 
 from .app_data import AppData
 from .controls import ControlBar
@@ -29,6 +30,8 @@ from .footer import StatusFooter
 from .mesh_geometry import axisymmetric_mesh_edge_polylines
 from .axisymmetric_model import new_model, new_studies, unpack_model, package_model, serialize_model_json
 from .three_d_project import PROJECT_SUFFIX, package_3d_project, unpack_3d_project
+from . import __version__
+from .branding import DOCUMENTATION_URL, PRODUCT_DESCRIPTION, PRODUCT_NAME
 from .result_files import (
     MESH_SUFFIX,
     SOLUTION_SUFFIX,
@@ -198,11 +201,11 @@ def _inject_solve_status_styles(js):
 
 def _set_window_title(js):
     """Give the standalone browser window the product name."""
-    js.document.title = "MM-FEM"
+    js.document.title = PRODUCT_NAME
 
 
 def _set_window_icon(js, icon_data_uri):
-    """Replace ngapp's default favicon with the MM-FEM application icon."""
+    """Replace ngapp's default favicon with the MagMechSim application icon."""
     document = js.document
     old_icons = document.querySelectorAll(
         'link[rel="icon"], link[rel="shortcut icon"]'
@@ -521,12 +524,20 @@ class Settings(Div):
 
 
 
-def _app_menu_item(label, callback=None, icon=None, shortcut=None, close_menu=None):
+def _app_menu_item(
+    label, callback=None, icon=None, shortcut=None, close_menu=None, href=None
+):
     leading = []
     if icon:
         leading.append(QItemSection(QIcon(ui_name=icon, ui_size="xs"), ui_avatar=True))
     text = label + (f"   {shortcut}" if shortcut else "")
-    item = QItem(*leading, QItemSection(text), ui_clickable=callback is not None, ui_dense=True)
+    item = QItem(
+        *leading,
+        QItemSection(text),
+        ui_clickable=callback is not None or href is not None,
+        ui_dense=True,
+        **({"ui_href": href, "ui_target": "_blank"} if href else {}),
+    )
     if callback is not None:
         def run_action(event=None, action=callback, close=close_menu):
             try:
@@ -554,7 +565,10 @@ def _app_menu_button(label, entries):
         if entry is None:
             items.append(QSeparator())
             continue
-        item = _app_menu_item(entry[0], entry[1], entry[2], entry[3], close_menu)
+        item = _app_menu_item(
+            entry[0], entry[1], entry[2], entry[3], close_menu,
+            href=entry[4] if len(entry) > 4 else None,
+        )
         items.append(item)
         menu_items[entry[0]] = item
     menu = QMenu(
@@ -579,6 +593,13 @@ def _app_menu_button(label, entries):
 
 
 class NGSolveGui(App):
+    @property
+    def usersettings(self):
+        """Keep the pre-rebrand settings key so existing preferences survive."""
+        if self._usersettings is None:
+            self._usersettings = UserSettings(app_id="NGSolve GUI")
+        return self._usersettings
+
     @property
     def solve_workspace(self):
         if self._solve_workspace_instance is None:
@@ -702,14 +723,19 @@ class NGSolveGui(App):
 
         # Preferences and application exit are available from the menus.
 
-        ngs_logo = Div(
+        app_brand = Div(
             QImg(
-                ui_src=self.load_asset("mm-fem-logo.png"),
-                ui_height="42px",
-                ui_width="158px",
+                ui_src=self.load_asset("magmechsim_icon_128x128.png"),
+                ui_height="30px",
+                ui_width="30px",
                 ui_fit="contain",
             ),
+            Div(
+                PRODUCT_NAME,
+                ui_style="font-size:15px; font-weight:700; letter-spacing:.01em; color:var(--fg);",
+            ),
             ui_class=cb.brand,
+            ui_style="display:flex; align-items:center; gap:7px; white-space:nowrap;",
         )
         self._workspace_mode_toggle = WorkspaceModeToggle(
             "solve", self._set_workspace_mode
@@ -727,7 +753,7 @@ class NGSolveGui(App):
         # Keep the fixed app header compact: brand, workspace switch, common
         # actions, and system status.
         bar = QBar(
-            ngs_logo,
+            app_brand,
             self._workspace_mode_toggle,
             quick_actions,
             QSpace(),
@@ -859,18 +885,20 @@ class NGSolveGui(App):
             QCard(
                 QCardSection(
                     QImg(
-                        ui_src=self.load_asset("mm-fem-logo.png"),
-                        ui_height="40px", ui_width="152px", ui_fit="contain",
+                        ui_src=self.load_asset("magmechsim_about_page_banner.png"),
+                        ui_height="198px", ui_width="352px", ui_fit="contain",
                     ),
-                    ui_style="display:flex; justify-content:center; padding:22px 22px 8px;",
+                    ui_style="display:flex; justify-content:center; padding:18px 20px 4px;",
                 ),
                 QCardSection(
-                    "MM-FEM",
-                    Div("Magneto-mechanical finite-element modelling", ui_class=cb.hint),
-                    ui_style="text-align:center;",
+                    Div(PRODUCT_NAME, ui_style="font-size:18px; font-weight:700; color:var(--fg);"),
+                    Div(f"Version {__version__}", ui_style="font-size:12px; color:var(--fg-muted); margin-top:4px;"),
+                    Div(PRODUCT_DESCRIPTION, ui_class=cb.hint),
+                    Div("Powered by NGSolve and Netgen", ui_style="font-size:11px; color:var(--fg-muted); margin-top:8px;"),
+                    ui_style="text-align:center; padding:8px 20px 16px;",
                 ),
                 QCardActions(about_close, ui_align="center"),
-                ui_style="width:min(380px, 92vw);",
+                ui_style="width:min(440px, 92vw);",
             ),
             ui_model_value=False,
         )
@@ -919,8 +947,11 @@ class NGSolveGui(App):
         open_project_choice.on_click(self.open_project_file)
         self._startup_card = QCard(
             QCardSection(
-                Div("MM-FEM", ui_style="font-size:26px; font-weight:700; color:var(--fg);"),
-                ui_style="padding:24px 28px 16px;",
+                QImg(
+                    ui_src=self.load_asset("magmechsim_full_logo_light.png"),
+                    ui_height="150px", ui_width="200px", ui_fit="contain",
+                ),
+                ui_style="display:flex; justify-content:center; padding:18px 28px 8px;",
             ),
             QCardSection(
                 Div("New project", ui_style="font-size:13px; font-weight:650; margin-bottom:10px;"),
@@ -976,7 +1007,7 @@ class NGSolveGui(App):
         keybinding_styles.inject(self)
         self.call_js(_inject_solve_status_styles)
         self.call_js(_set_window_title)
-        self.call_js(_set_window_icon, self.load_asset("mm-fem-app-icon.png"))
+        self.call_js(_set_window_icon, self.load_asset("magmechsim_icon_128x128.png"))
         self.on_load(self.__on_load)
 
         # Start in Solve while retaining the mounted Post Process workspace so
@@ -1174,7 +1205,7 @@ class NGSolveGui(App):
             return "axisymmetric", (model, studies, layout), None
         except Exception as axis_error:
             raise ValueError(
-                "This file is not a supported MM-FEM project. "
+                "This file is not a supported MagMechSim project. "
                 f"3D check: {three_d_error}. Axisymmetric check: {axis_error}"
             ) from axis_error
 
@@ -1247,8 +1278,8 @@ class NGSolveGui(App):
         )
         try:
             path, data = self._pick_artifact(
-                title="Open MM-FEM project",
-                description="MM-FEM projects",
+                title="Open MagMechSim project",
+                description="MagMechSim projects",
                 extension=".json",
                 additional_extensions=(".ngsmodel", PROJECT_SUFFIX),
                 force_native=True,
@@ -1400,7 +1431,8 @@ class NGSolveGui(App):
             ]),
             ("Help", [
                 ("Keyboard shortcuts", self.kb.toggle_help, "mdi-keyboard-outline", "H"),
-                ("About MM-FEM", self._open_about, "mdi-information-outline", None),
+                ("Documentation", None, "mdi-book-open-page-variant-outline", None, DOCUMENTATION_URL),
+                (f"About {PRODUCT_NAME}", self._open_about, "mdi-information-outline", None),
             ]),
         ]
         self._application_menu_buttons = {}
@@ -1934,10 +1966,10 @@ class NGSolveGui(App):
             )
             suffix = Path(filename).suffix or "*"
             path = save_file_dialog(
-                title="Save MM-FEM file",
+                title=f"Save {PRODUCT_NAME} file",
                 initialdir=initialdir,
                 filename=filename,
-                filters=[("MM-FEM file", f"*{suffix}"), ("All Files", "*")],
+                filters=[(f"{PRODUCT_NAME} file", f"*{suffix}"), ("All Files", "*")],
             )
             if not path:
                 return False
@@ -2162,7 +2194,7 @@ class NGSolveGui(App):
         try:
             path, data = self._pick_artifact(
                 title="Load mesh for the current problem",
-                description="MM-FEM mesh bundle",
+                description=f"{PRODUCT_NAME} mesh bundle",
                 extension=MESH_SUFFIX,
             )
             if not path:
@@ -2206,10 +2238,10 @@ class NGSolveGui(App):
                         or os.path.expanduser("~")
                     )
                     path = save_file_dialog(
-                        title="Save MM-FEM solution bundle",
+                        title=f"Save {PRODUCT_NAME} solution bundle",
                         initialdir=initialdir,
                         filename=filename,
-                        filters=[("MM-FEM solution bundle", f"*{SOLUTION_SUFFIX}"), ("All Files", "*")],
+                        filters=[(f"{PRODUCT_NAME} solution bundle", f"*{SOLUTION_SUFFIX}"), ("All Files", "*")],
                     )
                     if not path:
                         return
@@ -2232,8 +2264,8 @@ class NGSolveGui(App):
         """Open a saved solution bundle in Post Process."""
         try:
             path, _data = self._pick_artifact(
-                title="Open MM-FEM solution bundle",
-                description="MM-FEM solution bundle or field pickle",
+                title=f"Open {PRODUCT_NAME} solution bundle",
+                description=f"{PRODUCT_NAME} solution bundle or field pickle",
                 extension=SOLUTION_SUFFIX,
                 additional_extensions=(".pkl",),
                 read_bytes=False,
@@ -2358,11 +2390,13 @@ class NGSolveGui(App):
                         log_file.flush()
                         text = line.strip()
                         if text and (
-                            text.startswith("MM-FEM")
+                            text.startswith((PRODUCT_NAME, "MM-FEM"))
                             or text.startswith("The mesh has")
                             or text.startswith("Frequency=")
                             or "degrees of freedom" in text
                         ):
+                            if text.startswith("MM-FEM"):
+                                text = PRODUCT_NAME + text[len("MM-FEM"):]
                             self._dispatch_to_ui(workspace._set_status, text[:240])
                 return_code = process.wait()
                 manifest = self._read_run_manifest(output_dir)

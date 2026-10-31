@@ -1,4 +1,4 @@
-"""Import data-only legacy axisymmetric problems into MM-FEM documents.
+"""Import data-only legacy axisymmetric problems into MagMechSim documents.
 
 The selected Python file is executed to capture its SplineGeometry definitions.
 Lines and rational quadratic ``spline3`` curves, domain-side labels, constant
@@ -297,7 +297,7 @@ def _make_boundary_condition(tag, by_type, conditions, *, active_em_tags, active
 
 
 def legacy_problem_to_model(problem, *, name="Imported legacy problem", element_size=0.01, polynomial_order=3):
-    """Convert captured legacy curves, domains, and constant data to an MM-FEM model."""
+    """Convert captured legacy curves, domains, and constant data to a MagMechSim model."""
     if not isinstance(problem, dict):
         raise ValueError("The selected Python file did not return a legacy problem dictionary.")
     geometry = problem.get("geometry")
@@ -633,7 +633,7 @@ def legacy_problem_to_model(problem, *, name="Imported legacy problem", element_
     model = convert_imported_contours_to_sketch(model)
     errors = validate_model(model)
     if errors:
-        raise ValueError("Imported problem is not a valid MM-FEM model: " + " ".join(errors))
+        raise ValueError("Imported problem is not a valid MagMechSim model: " + " ".join(errors))
     study_errors = validate_studies(studies)
     if study_errors:
         raise ValueError("Imported study is not valid: " + " ".join(study_errors))
@@ -641,7 +641,7 @@ def legacy_problem_to_model(problem, *, name="Imported legacy problem", element_
 
 
 def import_legacy_problem_file(path, *, element_size=1.0, polynomial_order=3, legacy_h_local=0.1):
-    """Execute a trusted legacy ``.py`` problem and convert its data to MM-FEM."""
+    """Execute a trusted legacy ``.py`` problem and convert its data to MagMechSim."""
     source = Path(path).expanduser().resolve()
     if not source.is_file() or source.suffix.lower() != ".py":
         raise ValueError("Select an existing legacy Python problem file (.py).")

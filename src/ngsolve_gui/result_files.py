@@ -1,4 +1,4 @@
-"""Portable mesh and solution bundles used by the MM-FEM desktop UI."""
+"""Portable mesh and solution bundles used by the MagMechSim desktop UI."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def _read_archive(data: bytes) -> zipfile.ZipFile:
     try:
         archive = zipfile.ZipFile(io.BytesIO(data), "r")
     except (OSError, zipfile.BadZipFile) as error:
-        raise ValueError("The selected file is not a valid MM-FEM bundle.") from error
+        raise ValueError("The selected file is not a valid MagMechSim bundle.") from error
     return _validate_archive(archive)
 
 
@@ -96,14 +96,14 @@ def read_mesh_bundle(data: bytes, expected_model: dict) -> bytes:
     with _read_archive(data) as archive:
         names = set(archive.namelist())
         if names != {"manifest.json", "problem.json", "mesh.vol"}:
-            raise ValueError("The MM-FEM mesh bundle is missing required files or contains unsupported files.")
+            raise ValueError("The MagMechSim mesh bundle is missing required files or contains unsupported files.")
         try:
             manifest = json.loads(archive.read("manifest.json"))
             bundled_model = json.loads(archive.read("problem.json"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError("The mesh bundle metadata is invalid.") from error
         if manifest.get("schema") != MESH_SCHEMA or manifest.get("schema_version") != 1:
-            raise ValueError("This MM-FEM mesh bundle version is not supported.")
+            raise ValueError("This MagMechSim mesh bundle version is not supported.")
         recorded_hash = manifest.get("problem_sha256")
         if recorded_hash != problem_fingerprint(bundled_model):
             raise ValueError("The mesh bundle problem data failed its integrity check.")
@@ -256,7 +256,7 @@ def extract_solution_bundle_from_path(path: str | Path) -> tuple[str, list[str]]
     try:
         archive = _validate_archive(zipfile.ZipFile(path, "r"))
     except (OSError, zipfile.BadZipFile) as error:
-        raise ValueError("The selected file is not a valid MM-FEM bundle.") from error
+        raise ValueError("The selected file is not a valid MagMechSim bundle.") from error
     with archive:
         return _extract_solution_archive(archive)
 
@@ -264,14 +264,14 @@ def extract_solution_bundle_from_path(path: str | Path) -> tuple[str, list[str]]
 def _extract_solution_archive(archive: zipfile.ZipFile) -> tuple[str, list[str]]:
     names = set(archive.namelist())
     if "solution_manifest.json" not in names or "problem.json" not in names:
-        raise ValueError("This file is not a complete MM-FEM solution bundle.")
+        raise ValueError("This file is not a complete MagMechSim solution bundle.")
     try:
         manifest = json.loads(archive.read("solution_manifest.json"))
         model = json.loads(archive.read("problem.json"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("The solution bundle metadata is invalid.") from error
     if manifest.get("schema") != SOLUTION_SCHEMA or manifest.get("schema_version") != 1:
-        raise ValueError("This MM-FEM solution bundle version is not supported.")
+        raise ValueError("This MagMechSim solution bundle version is not supported.")
     if problem_fingerprint(model) != manifest.get("problem_sha256"):
         raise ValueError("The solution bundle problem data failed its integrity check.")
     fields = manifest.get("fields")

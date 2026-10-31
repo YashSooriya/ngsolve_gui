@@ -26,7 +26,7 @@ def test_invalid_file_is_rejected_as_an_unsupported_project():
     try:
         NGSolveGui._decode_project_file(b"not a project")
     except ValueError as error:
-        assert "not a supported MM-FEM project" in str(error)
+        assert "not a supported MagMechSim project" in str(error)
     else:
         raise AssertionError("Invalid project data was accepted.")
 

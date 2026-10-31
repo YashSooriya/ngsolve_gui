@@ -6291,7 +6291,7 @@ class SolveWorkspace(Div):
 
             # A free-standing entity has no trim boundary. SolidWorks Power
             # Trim leaves it untouched; whole-entity deletion is a separate
-            # operation in MM-FEM as well. Region boundary endpoints count as
+            # operation in MagMechSim as well. Region boundary endpoints count as
             # real trim boundaries even when a source curve intersection is
             # only approximate.
             if not intersections and not topology_parameters:
