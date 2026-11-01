@@ -139,6 +139,7 @@ def test_named_domain_mesh_size_invalidates_preview_mesh_and_persists(monkeypatc
             "id": "selection-1",
             "name": "Inner shield",
             "domain_ids": [0],
+            "domain_tags": ["MMFEM_SOLID_000000000000000000000001"],
         }],
     }
     workspace.project["geometries"] = [geometry]
@@ -166,8 +167,8 @@ def test_named_domain_mesh_size_rejects_conflicting_overlapping_selections(monke
         "id": "geometry-1",
         "name": "shield.step",
         "domain_selections": [
-            {"id": "selection-1", "name": "Inner shield", "domain_ids": [0], "mesh_maxh_mm": 2.0},
-            {"id": "selection-2", "name": "Refined shield", "domain_ids": [0], "mesh_maxh_mm": 1.0},
+            {"id": "selection-1", "name": "Inner shield", "domain_ids": [0], "domain_tags": ["MMFEM_SOLID_000000000000000000000001"], "mesh_maxh_mm": 2.0},
+            {"id": "selection-2", "name": "Refined shield", "domain_ids": [0], "domain_tags": ["MMFEM_SOLID_000000000000000000000001"], "mesh_maxh_mm": 1.0},
         ],
     }
 
@@ -545,22 +546,27 @@ def _workspace_with_test_mesh(monkeypatch):
                 "id": 0,
                 "name": "Boundary 1",
                 "elements": 1,
-                "boundary_tag": "MMFEM_FACE_0_0",
+                "boundary_tag": "MMFEM_FACE_000000000000000000000000",
             },
             {
                 "id": 1,
                 "name": "Boundary 2",
                 "elements": 1,
-                "boundary_tag": "MMFEM_FACE_0_1",
+                "boundary_tag": "MMFEM_FACE_000000000000000000000001",
             },
             {
                 "id": 2,
                 "name": "Boundary 3",
                 "elements": 1,
-                "boundary_tag": "MMFEM_FACE_0_2",
+                "boundary_tag": "MMFEM_FACE_000000000000000000000002",
             },
         ],
-        "domain_regions": [{"id": 0, "name": "Shield", "elements": 4}],
+        "domain_regions": [{
+            "id": 0,
+            "name": "Shield",
+            "elements": 4,
+            "domain_tag": "MMFEM_SOLID_000000000000000000000001",
+        }],
         "tetra_quality": {
             "minimum": 0.3,
             "p05": 0.4,
@@ -586,7 +592,10 @@ def test_mesh_quality_and_named_domain_boundary_selections_persist(monkeypatch):
     selection = geometry["boundary_selections"][0]
     assert selection["name"] == "Symmetry surfaces"
     assert selection["boundary_ids"] == [0, 2]
-    assert selection["boundary_tags"] == ["MMFEM_FACE_0_0", "MMFEM_FACE_0_2"]
+    assert selection["boundary_tags"] == [
+        "MMFEM_FACE_000000000000000000000000",
+        "MMFEM_FACE_000000000000000000000002",
+    ]
     assert "median 0.700" in workspace._mesh_quality_message(geometry["id"])
     assert workspace._selection == ("named_selection", selection["id"])
     assert workspace._active_boundary_region_ids(geometry["id"]) == [0, 2]
@@ -646,7 +655,7 @@ def test_explicit_boundary_condition_rejects_regions_without_step_face_tags(monk
     assert geometry["boundary_selections"] == []
 
 
-def test_existing_boundary_selection_can_be_upgraded_to_supported_condition(monkeypatch):
+def test_legacy_boundary_selection_requires_recreation_before_condition(monkeypatch):
     workspace, geometry = _workspace_with_test_mesh(monkeypatch)
     selection = {
         "id": "existing-face",
@@ -659,9 +668,27 @@ def test_existing_boundary_selection_can_be_upgraded_to_supported_condition(monk
         geometry,
         selection,
         SimpleNamespace(value="magnetic_potential_zero"),
+    ) is False
+    assert "boundary_condition" not in selection
+
+
+def test_current_boundary_selection_can_change_supported_condition(monkeypatch):
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    selection = {
+        "id": "current-face",
+        "name": "Current STEP boundary",
+        "boundary_ids": [1],
+        "boundary_tags": ["MMFEM_FACE_000000000000000000000001"],
+    }
+    geometry["boundary_selections"].append(selection)
+    workspace.select_item("named_selection", selection["id"])
+
+    assert workspace._set_named_selection_boundary_condition(
+        geometry,
+        selection,
+        SimpleNamespace(value="magnetic_potential_zero"),
     ) is True
     assert selection["boundary_condition"] == "magnetic_potential_zero"
-    assert selection["boundary_tags"] == ["MMFEM_FACE_0_1"]
 
 
 def test_named_boundary_selection_assigns_only_supported_time_harmonic_condition(monkeypatch):
@@ -676,7 +703,7 @@ def test_named_boundary_selection_assigns_only_supported_time_harmonic_condition
 
     selection = geometry["boundary_selections"][0]
     assert selection["boundary_condition"] == "magnetic_potential_zero"
-    assert selection["boundary_tags"] == ["MMFEM_FACE_0_1"]
+    assert selection["boundary_tags"] == ["MMFEM_FACE_000000000000000000000001"]
     workspace.select_item("named_selection", selection["id"])
     controls = {
         getattr(child, "ui_label", None): child
@@ -686,13 +713,53 @@ def test_named_boundary_selection_assigns_only_supported_time_harmonic_condition
     assert {option["value"] for option in controls["Boundary condition"].ui_options} == {
         "default",
         "magnetic_potential_zero",
+        "mechanical_fixed",
     }
 
     assert workspace._set_named_selection_boundary_condition(
         geometry, selection, SimpleNamespace(value="default")
     ) is True
     assert "boundary_condition" not in selection
-    assert selection["boundary_tags"] == ["MMFEM_FACE_0_1"]
+    assert selection["boundary_tags"] == ["MMFEM_FACE_000000000000000000000001"]
+
+
+def test_mechanical_study_property_editor_exposes_only_relevant_configuration(monkeypatch):
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    workspace.select_item("study")
+    geometry["material"] = "Stainless steel (4 K / OVC)"
+
+    assert workspace._set_study_physics(SimpleNamespace(value="harmonic_mechanical")) is True
+    assert workspace._study_node.ui_children[1].ui_children == ["Time-harmonic mechanics"]
+    workspace._rebuild_properties()
+    controls = {
+        getattr(child, "ui_label", None): child
+        for child in workspace._properties.ui_children
+    }
+
+    assert controls["Physics"].ui_model_value == "harmonic_mechanical"
+    assert {option["value"] for option in controls["Physics"].ui_options} == {
+        "harmonic_em",
+        "harmonic_mechanical",
+    }
+    assert {"Body force X (N/m³)", "Body force Y (N/m³)", "Body force Z (N/m³)"} <= set(controls)
+    assert "Air-region padding (model spans)" not in controls
+    assert workspace._set_mechanical_body_force(0, SimpleNamespace(value="1000")) is True
+    assert workspace.project["study"]["mechanical_body_force_n_m3"] == [1000.0, 0.0, 0.0]
+    assert workspace._run_study_button.ui_disable is True
+
+    geometry["boundary_selections"].append({
+        "id": "fixed-face",
+        "name": "Fixed support",
+        "boundary_ids": [0],
+        "boundary_tags": ["MMFEM_FACE_000000000000000000000000"],
+        "boundary_condition": "mechanical_fixed",
+    })
+    workspace._update_study_controls()
+    assert workspace._run_study_button.ui_disable is False
+
+    geometry["boundary_selections"][0]["boundary_condition"] = "magnetic_potential_zero"
+    workspace._update_study_controls()
+    assert workspace._run_study_button.ui_disable is True
 
 
 def test_named_volume_domain_selection_is_saved_with_region_indices(monkeypatch):
@@ -706,6 +773,7 @@ def test_named_volume_domain_selection_is_saved_with_region_indices(monkeypatch)
         "id": workspace._selection[1],
         "name": "Shield volume",
         "domain_ids": [0],
+        "domain_tags": ["MMFEM_SOLID_000000000000000000000001"],
     }]
 
 
@@ -719,6 +787,7 @@ def test_named_volume_domain_selection_can_assign_a_project_material(monkeypatch
     assert workspace._save_named_selection(geometry) is True
     selection = geometry["domain_selections"][0]
     assert selection["material"] == "Copper"
+    assert selection["domain_tags"] == ["MMFEM_SOLID_000000000000000000000001"]
     assert any(material["name"] == "Copper" for material in workspace.project["materials"])
 
     workspace.select_item("named_selection", selection["id"])

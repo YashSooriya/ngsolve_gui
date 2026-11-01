@@ -120,7 +120,17 @@ class StudyInfoSection(Section):
                 materials = list(mesh.GetMaterials())
             except (AttributeError, TypeError):
                 materials = []
-        names = [str(name) for name in materials if str(name).strip()]
+        display_names = run.get("material_display_names")
+        if not isinstance(display_names, dict):
+            display_names = {}
+        names = []
+        for value in materials:
+            solver_name = str(value).strip()
+            if not solver_name:
+                continue
+            display_name = str(display_names.get(solver_name, solver_name)).strip()
+            if display_name and display_name not in names:
+                names.append(display_name)
         return ", ".join(names) if names else None
 
     @staticmethod

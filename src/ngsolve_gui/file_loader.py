@@ -476,6 +476,21 @@ def _run_manifest_for_path(filename):
     return None
 
 
+def _apply_run_material_display_names(mesh, run_metadata):
+    """Replace internal solver region tags with saved display names in memory."""
+    display_names = (
+        run_metadata.get("material_display_names")
+        if isinstance(run_metadata, dict) else None
+    )
+    if mesh.dim != 3 or not isinstance(display_names, dict):
+        return
+
+    for domain_id, solver_name in enumerate(mesh.GetMaterials(), start=1):
+        display_name = display_names.get(str(solver_name))
+        if display_name and str(display_name) != str(solver_name):
+            mesh.ngmesh.SetMaterial(domain_id, str(display_name))
+
+
 def _result_field_choices(filename, metadata, field_metadata):
     """Resolve sibling GUI field pickles for the study information panel."""
     if not filename or not isinstance(metadata, dict):
@@ -587,6 +602,9 @@ def _draw_pickle_object(obj, name: str, field_path=None):
     is_mechanical_field = any(
         key in field_name for key in ("displacement", "velocity")
     )
+    run_metadata = _run_manifest_for_path(field_path)
+    if run_metadata is not None:
+        _apply_run_material_display_names(mesh, run_metadata)
     material_names = {str(material) for material in mesh.GetMaterials()}
     seed_material = (
         "Air"
@@ -611,7 +629,6 @@ def _draw_pickle_object(obj, name: str, field_path=None):
     field_choices = _result_field_choices(field_path, _metadata, field_metadata)
     if field_choices:
         draw_options["_ngsolve_gui_result_fields"] = field_choices
-    run_metadata = _run_manifest_for_path(field_path)
     if run_metadata is not None:
         draw_options["_ngsolve_gui_run_metadata"] = run_metadata
     if mesh.dim == 3:

@@ -37,6 +37,86 @@ def test_step_import_does_not_assume_a_physical_material():
     assert geometry["material"] == UNASSIGNED_MATERIAL
 
 
+def test_step_region_tags_follow_geometry_not_import_order_or_assembly_scale():
+    from netgen.occ import Box, Pnt
+
+    from ngsolve_gui.three_d_project import step_geometry_tags
+
+    first = Box(Pnt(0, 0, 0), Pnt(10, 10, 10))
+    second = Box(Pnt(25, 0, 0), Pnt(45, 10, 5))
+    unrelated_large = Box(Pnt(-200, 0, 0), Pnt(-20, 25, 30))
+
+    tags, face_refs = step_geometry_tags([first, second])
+    reversed_tags, reversed_faces = step_geometry_tags([second, first])
+    expanded_tags, _ = step_geometry_tags([first, second, unrelated_large])
+
+    assert tags[0] == reversed_tags[1] == expanded_tags[0]
+    assert tags[1] == reversed_tags[0] == expanded_tags[1]
+    assert {tag for tag, _solid, _face in face_refs} == {
+        tag for tag, _solid, _face in reversed_faces
+    }
+
+
+def test_step_region_tags_change_when_solid_geometry_changes():
+    from netgen.occ import Box, Pnt
+
+    from ngsolve_gui.three_d_project import step_geometry_tags
+
+    original = Box(Pnt(0, 0, 0), Pnt(10, 10, 10))
+    edited = Box(Pnt(0, 0, 0), Pnt(11, 10, 10))
+
+    assert step_geometry_tags([original])[0] != step_geometry_tags([edited])[0]
+
+
+def test_step_region_tags_survive_solver_unit_scaling():
+    from netgen.occ import Box, Pnt
+
+    from ngsolve_gui.three_d_project import step_geometry_tags
+
+    source = Box(Pnt(0, 0, 0), Pnt(10, 10, 10))
+    scaled = source.Scale(Pnt(0, 0, 0), 0.001)
+
+    assert step_geometry_tags([source])[0] == step_geometry_tags([scaled])[0]
+
+
+def test_indistinguishable_duplicate_solids_fail_closed():
+    from netgen.occ import Box, Pnt
+
+    from ngsolve_gui.three_d_project import step_geometry_tags
+
+    duplicate_a = Box(Pnt(0, 0, 0), Pnt(10, 10, 10))
+    duplicate_b = Box(Pnt(0, 0, 0), Pnt(10, 10, 10))
+
+    with pytest.raises(ValueError, match="indistinguishable overlapping solids"):
+        step_geometry_tags([duplicate_a, duplicate_b])
+
+
+def test_project_round_trip_preserves_stable_solid_and_face_assignments():
+    project = new_3d_project("Stable selections")
+    assets = {}
+    geometry = add_step_geometry(project, assets, "shield.step", STEP)
+    geometry["domain_selections"] = [{
+        "id": "core",
+        "name": "Core",
+        "domain_ids": [0],
+        "domain_tags": ["MMFEM_SOLID_000000000000000000000001"],
+        "material": "Copper",
+        "mesh_maxh_mm": 2.0,
+    }]
+    geometry["boundary_selections"] = [{
+        "id": "support",
+        "name": "Support",
+        "boundary_ids": [0],
+        "boundary_tags": ["MMFEM_FACE_000000000000000000000002"],
+        "boundary_condition": "magnetic_potential_zero",
+    }]
+
+    restored, _assets = unpack_3d_project(package_3d_project(project, assets))
+
+    assert restored["geometries"][0]["domain_selections"] == geometry["domain_selections"]
+    assert restored["geometries"][0]["boundary_selections"] == geometry["boundary_selections"]
+
+
 def test_wire_trace_parser_converts_csv_and_whitespace_units_to_metres():
     assert parse_wire_trace("0, 0, 0\n10, 20, 30\n", "mm") == [
         (0.0, 0.0, 0.0),

@@ -38,6 +38,7 @@ def _study_project():
             "id": "domain-1",
             "name": "Inner shield",
             "domain_ids": [0],
+            "domain_tags": ["MMFEM_SOLID_000000000000000000000001"],
             "material": "Stainless steel (4 K / OVC)",
         }],
     }]
@@ -64,6 +65,89 @@ def test_study_setup_uses_project_material_snapshots_and_single_frequency():
     assert "Air" in validated["materials"]
 
 
+def test_mechanical_setup_accepts_body_force_without_electromagnetic_trace():
+    project = _study_project()
+    project["wire_trace_sets"] = []
+    project["study"].update(
+        physics="harmonic_mechanical",
+        mechanical_body_force_n_m3=[1e6, 0.0, -2e6],
+    )
+
+    validated = validate_time_harmonic_em_setup(project)
+
+    assert validated["physics"] == "harmonic_mechanical"
+    assert validated["mechanical_body_force_n_m3"] == [1e6, 0.0, -2e6]
+    assert "Air" not in validated["materials"]
+
+
+@pytest.mark.parametrize(
+    ("body_force", "material_change", "message"),
+    [
+        ([0, 0, 0], None, "non-zero body force"),
+        ([1, 0], None, "X, Y and Z"),
+        ([1, 0, 0], ("youngs_modulus", 0), "positive Young's modulus"),
+        ([1, 0, 0], ("density", -1), "physical range"),
+    ],
+)
+def test_mechanical_setup_rejects_missing_or_invalid_inputs(body_force, material_change, message):
+    project = _study_project()
+    project["wire_trace_sets"] = []
+    project["study"].update(physics="harmonic_mechanical", mechanical_body_force_n_m3=body_force)
+    if material_change:
+        key, value = material_change
+        project["materials"][0]["properties"][key] = value
+
+    with pytest.raises(ValueError, match=message):
+        validate_time_harmonic_em_setup(project)
+
+
+def test_mechanical_builder_sets_structural_sources_supports_and_no_air_domain(tmp_path):
+    from netgen.occ import Box, Pnt
+
+    from ngsolve_gui.three_d_mesh import generate_step_mesh
+
+    step_path = tmp_path / "mechanics_block.step"
+    Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).WriteStep(str(step_path))
+    mesh_result = generate_step_mesh(step_path.read_bytes(), maxh_mm=10.0)
+    support_face = mesh_result["boundary_regions"][0]
+    materials = builtin_materials()
+    project = new_3d_project("Mechanical block")
+    project["study"].update(
+        physics="harmonic_mechanical",
+        frequency_hz=50.0,
+        polynomial_order=1,
+        mechanical_body_force_n_m3=[1e8, 0.0, 0.0],
+    )
+    project["materials"] = [materials[4]]
+    assets = {}
+    geometry = add_step_geometry(
+        project, assets, step_path.name, step_path.read_bytes(), units="mm",
+        material=materials[4]["name"],
+    )
+    geometry["material"] = materials[4]["name"]
+    geometry["mesh_maxh_mm"] = 10.0
+    geometry["boundary_selections"] = [{
+        "id": "fixed-face",
+        "name": "Fixed support",
+        "boundary_ids": [support_face["id"]],
+        "boundary_tags": [support_face["boundary_tag"]],
+        "boundary_condition": "mechanical_fixed",
+    }]
+
+    inputs = build_time_harmonic_em_problem(project, {geometry["asset"]: step_path})
+    problem = inputs["problem"]
+
+    assert inputs["physics"] == "harmonic_mechanical"
+    assert len(problem["objects"]) == 1
+    assert "_mmfem_air" not in problem["objects"]
+    assert problem["cACCoef"] == problem["kACCoef"] == 0
+    assert problem["mMechCoef"] == problem["kMechCoef"] == 1
+    assert problem["electromagnetic_only"] is False
+    assert problem["dirkeysMech"].startswith("DirMech_G0_MMFEM_FACE_")
+    assert set(problem["dirconditionMech"]) == set(problem["dirkeysMech"].split("|"))
+    assert inputs["mechanical_body_force_n_m3"] == [1e8, 0.0, 0.0]
+
+
 @pytest.mark.parametrize(
     ("change", "message"),
     [
@@ -80,6 +164,14 @@ def test_study_setup_rejects_invalid_or_incomplete_inputs(change, message):
     change(project)
 
     with pytest.raises(ValueError, match=message):
+        validate_time_harmonic_em_setup(project)
+
+
+def test_study_setup_rejects_legacy_order_based_active_domain_assignment():
+    project = _study_project()
+    project["geometries"][0]["domain_selections"][0].pop("domain_tags")
+
+    with pytest.raises(ValueError, match="order-based geometry ids"):
         validate_time_harmonic_em_setup(project)
 
 
@@ -123,6 +215,12 @@ def test_solver_problem_preserves_local_domain_sizes_and_physical_materials(tmp_
         "material": materials[5]["name"],
         "mesh_maxh_mm": 2.0,
     }]
+    from ngsolve_gui.three_d_project import step_geometry_tags
+    from netgen.occ import OCCGeometry
+
+    geometry["domain_selections"][0]["domain_tags"] = step_geometry_tags(
+        list(OCCGeometry(str(step_path)).solids)
+    )[0][:1]
     trace_set = add_wire_trace(project, assets, "coil.txt", trace_path.read_bytes())
 
     inputs = build_time_harmonic_em_problem(
@@ -134,19 +232,21 @@ def test_solver_problem_preserves_local_domain_sizes_and_physical_materials(tmp_
     )
 
     problem = inputs["problem"]
-    assert set(problem["objects"]) == {
-        "_mmfem_solid_0",
-        "_mmfem_solid_1",
-        "_mmfem_air",
-    }
-    assert inputs["domain_maxh"]["_mmfem_solid_0"] == pytest.approx(0.002)
-    assert inputs["domain_maxh"]["_mmfem_solid_1"] == pytest.approx(0.01)
-    assert problem["murdict"][materials[5]["name"]] == pytest.approx(
+    assert len(problem["objects"]) == 3
+    solid_objects = [name for name in problem["objects"] if name.startswith("_mmfem_g0_")]
+    assert len(solid_objects) == 2
+    assert "_mmfem_air" in problem["objects"]
+    refined_object = next(name for name in solid_objects if inputs["domain_maxh"][name] == pytest.approx(0.002))
+    coarse_object = next(name for name in solid_objects if inputs["domain_maxh"][name] == pytest.approx(0.01))
+    assert refined_object != coarse_object
+    assert problem["murdict"][refined_object] == pytest.approx(
         float(materials[5]["properties"]["relative_permeability"])
     )
-    assert problem["murdict"][materials[4]["name"]] == pytest.approx(
+    assert problem["murdict"][coarse_object] == pytest.approx(
         float(materials[4]["properties"]["relative_permeability"])
     )
+    assert inputs["material_display_names"][refined_object] == materials[5]["name"]
+    assert inputs["material_display_names"][coarse_object] == materials[4]["name"]
 
 
 def test_named_surface_condition_reaches_solver_mesh_and_dirichlet_boundaries(tmp_path):
@@ -347,6 +447,114 @@ def test_small_3d_solver_run_completes_with_scoped_surface_condition(tmp_path):
     )
 
 
+@pytest.mark.skipif(
+    not solver_checkout_available(),
+    reason=SOLVER_UNAVAILABLE_REASON,
+)
+def test_small_3d_mechanical_solver_run_exports_nonzero_displacement(tmp_path):
+    from netgen.occ import Box, Pnt
+
+    from ngsolve_gui.three_d_mesh import generate_step_mesh
+
+    solver_roots = []
+    configured_root = os.environ.get("COUPLED_SOLVER_ROOT")
+    if configured_root:
+        solver_roots.append(Path(configured_root).expanduser())
+    gui_root = Path(__file__).resolve().parents[1]
+    solver_roots.extend([
+        gui_root / "coupled_solver",
+        gui_root.parent / "ngsolve-ui" / "coupled_solver",
+        Path.cwd() / "coupled_solver",
+    ])
+    solver_root = next(
+        root.resolve()
+        for root in solver_roots
+        if (root / "main.py").is_file()
+        and (root / "scripts" / "run_gui_3d_model.py").is_file()
+    )
+
+    step_path = tmp_path / "small_mechanical_block.step"
+    Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).WriteStep(str(step_path))
+    mesh_setup = generate_step_mesh(step_path.read_bytes(), maxh_mm=10.0)
+    assert 0 < mesh_setup["volume_elements"] < 50_000
+    support_face = mesh_setup["boundary_regions"][0]
+
+    materials = builtin_materials()
+    project = new_3d_project("Small mechanical support check")
+    project["study"].update(
+        physics="harmonic_mechanical",
+        frequency_hz=50.0,
+        polynomial_order=1,
+        mechanical_body_force_n_m3=[1e8, 0.0, 0.0],
+    )
+    project["materials"] = [materials[4]]
+    assets = {}
+    geometry = add_step_geometry(
+        project, assets, step_path.name, step_path.read_bytes(),
+        units="mm", material=materials[4]["name"],
+    )
+    geometry["material"] = materials[4]["name"]
+    geometry["mesh_maxh_mm"] = 10.0
+    geometry["boundary_selections"] = [{
+        "id": "fixed-face",
+        "name": "Fixed support",
+        "boundary_ids": [support_face["id"]],
+        "boundary_tags": [support_face["boundary_tag"]],
+        "boundary_condition": "mechanical_fixed",
+    }]
+
+    model_path = tmp_path / "small_mechanics.mmfem3d"
+    model_path.write_bytes(package_3d_project(project, assets))
+    output_dir = tmp_path / "mechanical-solver-output"
+    environment = os.environ.copy()
+    environment.pop("COUPLED_SOLVER_OUTPUT_DIR", None)
+    environment.pop("COUPLED_SOLVER_SHARED_FILES_DIR", None)
+    python_paths = [str(gui_root / "src")]
+    if environment.get("PYTHONPATH"):
+        python_paths.append(environment["PYTHONPATH"])
+    environment["PYTHONPATH"] = os.pathsep.join(python_paths)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(solver_root / "scripts" / "run_gui_3d_model.py"),
+            "--model", str(model_path),
+            "--output-dir", str(output_dir),
+        ],
+        cwd=solver_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=90,
+        env=environment,
+        check=False,
+    )
+    solver_output = re.sub(
+        re.escape(str(tmp_path)), "<temporary-run>",
+        f"{completed.stdout}\n{completed.stderr}", flags=re.IGNORECASE,
+    )
+    assert completed.returncode == 0, solver_output[-5000:]
+    manifest = json.loads((output_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "complete"
+    assert manifest["physics"] == "Time-harmonic mechanics"
+    assert manifest["mechanical_body_force_n_m3"] == [1e8, 0.0, 0.0]
+    assert "air_padding" not in manifest
+    displacement_file = next(
+        field for field in manifest["fields"] if "gfuAC" in field
+    )
+    with (output_dir / displacement_file).open("rb") as stream:
+        displacement = pickle.load(stream)
+    displacement_values = displacement.vec.FV().NumPy()
+    assert displacement_values.size > 0
+    assert all(math.isfinite(float(value.real)) for value in displacement_values)
+    assert float(abs(displacement_values).max()) > 0
+    print(
+        f"Bounded mechanical run: {manifest['mesh']['elements']} elements, "
+        f"max |u|={float(abs(displacement_values).max()):.6g} m"
+    )
+
+
 def test_solver_rejects_boundary_tags_that_do_not_match_step_topology(tmp_path):
     from netgen.occ import Box, Pnt
 
@@ -371,12 +579,47 @@ def test_solver_rejects_boundary_tags_that_do_not_match_step_topology(tmp_path):
         "id": "stale-face",
         "name": "Stale face",
         "boundary_ids": [0],
-        "boundary_tags": ["MMFEM_FACE_99_99"],
+        "boundary_tags": ["MMFEM_FACE_000000000000000000000099"],
         "boundary_condition": "magnetic_potential_zero",
     }]
     trace_set = add_wire_trace(project, assets, trace_path.name, trace_path.read_bytes())
 
-    with pytest.raises(ValueError, match="no longer match its STEP faces"):
+    with pytest.raises(ValueError, match="no longer match unique STEP faces"):
+        build_time_harmonic_em_problem(
+            project,
+            {
+                geometry["asset"]: step_path,
+                trace_set["traces"][0]["filename"]: trace_path,
+            },
+        )
+
+
+def test_solver_rejects_active_order_based_boundary_references(tmp_path):
+    from netgen.occ import Box, Pnt
+
+    step_path = tmp_path / "legacy_boundary.step"
+    Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).WriteStep(str(step_path))
+    trace_path = tmp_path / "coil.txt"
+    trace_path.write_text("0 0 0\n0 0.1 0\n", encoding="utf-8")
+    materials = builtin_materials()
+    project = new_3d_project("Legacy boundary mapping")
+    project["materials"] = [materials[4]]
+    assets = {}
+    geometry = add_step_geometry(
+        project, assets, step_path.name, step_path.read_bytes(),
+        units="mm", material=materials[4]["name"],
+    )
+    geometry["material"] = materials[4]["name"]
+    geometry["boundary_selections"] = [{
+        "id": "old-face",
+        "name": "Old boundary reference",
+        "boundary_ids": [0],
+        "boundary_tags": ["MMFEM_FACE_0_0"],
+        "boundary_condition": "magnetic_potential_zero",
+    }]
+    trace_set = add_wire_trace(project, assets, trace_path.name, trace_path.read_bytes())
+
+    with pytest.raises(ValueError, match="order-based STEP references"):
         build_time_harmonic_em_problem(
             project,
             {

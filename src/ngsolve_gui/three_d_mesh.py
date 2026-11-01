@@ -7,7 +7,11 @@ import tempfile
 from collections import Counter
 from pathlib import Path
 
-from .three_d_project import MAX_MESH_SIZE_MM, MIN_MESH_SIZE_MM, step_face_tags
+from .three_d_project import (
+    MAX_MESH_SIZE_MM,
+    MIN_MESH_SIZE_MM,
+    step_geometry_tags,
+)
 
 MAX_ESTIMATED_VOLUME_ELEMENTS = 3_000_000
 MAX_VOLUME_ELEMENTS = 2_000_000
@@ -39,18 +43,18 @@ def _tetra_quality(vertices, connectivity):
     return np.clip(np.nan_to_num(quality, nan=0.0, posinf=0.0), 0.0, 1.0)
 
 
-def _named_regions(ids, counts, names, fallback, *, include_boundary_tags=False):
+def _named_regions(
+    ids, counts, names, fallback, *, include_boundary_tags=False,
+    include_domain_tags=False,
+):
     """Summarize region indices with unique display names and element counts."""
     regions = []
     used_names = set()
     for region_id in sorted(set(ids)):
         raw_name = str(names[region_id]).strip() if region_id < len(names) else ""
-        boundary_tag = (
-            raw_name
-            if include_boundary_tags and raw_name.startswith("MMFEM_FACE_")
-            else None
-        )
-        if boundary_tag:
+        boundary_tag = raw_name if include_boundary_tags and raw_name.startswith("MMFEM_FACE_") else None
+        domain_tag = raw_name if include_domain_tags and raw_name.startswith("MMFEM_SOLID_") else None
+        if boundary_tag or domain_tag:
             raw_name = f"{fallback} {region_id + 1}"
         if not raw_name or raw_name.casefold() == "default" or raw_name.casefold() in used_names:
             raw_name = f"{fallback} {region_id + 1}"
@@ -62,6 +66,8 @@ def _named_regions(ids, counts, names, fallback, *, include_boundary_tags=False)
         }
         if include_boundary_tags:
             region["boundary_tag"] = boundary_tag
+        if include_domain_tags:
+            region["domain_tag"] = domain_tag
         regions.append(region)
     return regions
 
@@ -102,9 +108,20 @@ def generate_step_mesh(data, *, maxh_mm=30.0, domain_maxh_mm=None):
                     "A volume mesh needs a closed 3D body."
                 )
             volume = sum(float(solid.mass) for solid in solids)
+            solid_tags, face_refs = step_geometry_tags(solids)
+            for solid_tag, solid in zip(solid_tags, solids):
+                solid.mat(solid_tag)
+
             domain_sizes = {}
-            for region_id, value in (domain_maxh_mm or {}).items():
-                if type(region_id) is not int or not 0 <= region_id < len(solids):
+            solid_indices = {tag: index for index, tag in enumerate(solid_tags)}
+            for region_ref, value in (domain_maxh_mm or {}).items():
+                if type(region_ref) is int:
+                    region_id = region_ref
+                elif isinstance(region_ref, str) and region_ref in solid_indices:
+                    region_id = solid_indices[region_ref]
+                else:
+                    region_id = -1
+                if not 0 <= region_id < len(solids):
                     raise ValueError(
                         "A local mesh size refers to a domain that is not in this STEP model."
                     )
@@ -133,8 +150,9 @@ def generate_step_mesh(data, *, maxh_mm=30.0, domain_maxh_mm=None):
                     "The requested sizes are estimated to create an impractically "
                     f"large mesh. Increase it to about {suggested:.3g} mm or larger."
                 )
-            for tag, face in step_face_tags(solids):
-                face.bc(tag)
+            for tag, _solid_tag, face in face_refs:
+                if tag is not None:
+                    face.bc(tag)
             netgen_mesh = OCCGeometry(Glue(solids)).GenerateMesh()
         except ValueError:
             raise
@@ -169,6 +187,7 @@ def generate_step_mesh(data, *, maxh_mm=30.0, domain_maxh_mm=None):
             Counter(domain_ids),
             list(mesh.GetMaterials()),
             "Domain",
+            include_domain_tags=True,
         )
         tetra_quality = _tetra_quality(vertices_mm, volume_connectivity)
         quality = None

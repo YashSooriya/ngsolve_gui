@@ -13,8 +13,9 @@ PowerShell in the repository root:
 ```powershell
 $env:PYTHONPATH = 'src'
 python -m pytest -q `
-  tests/test_three_d_solver_setup.py::test_named_surface_condition_reaches_solver_mesh_and_dirichlet_boundaries `
-  tests/test_three_d_workspace.py::test_named_boundary_selection_assigns_only_supported_time_harmonic_condition
+  tests/test_three_d_project.py::test_step_region_tags_follow_geometry_not_import_order_or_assembly_scale `
+  tests/test_three_d_solver_setup.py::test_mechanical_builder_sets_structural_sources_supports_and_no_air_domain `
+  tests/test_three_d_workspace.py::test_mechanical_study_property_editor_exposes_only_relevant_configuration
 ```
 
 When using the bundled Windows runtime, add the companion release package's
@@ -36,7 +37,11 @@ The finite-element integration case constructs a single 10 mm block and checks
 the constrained NGSolve space without solving. A separate smoke case launches
 the real solver process for the same small geometry, caps the mesh below
 50,000 elements and checks a finite non-zero magnetic flux density. The observed
-run used 79 volume elements.
+run used 79 volume elements. Stage 8B adds a second bounded process run on a
+single 10 mm block. It checks that fixed support and body force reach the
+existing solver and requires finite non-zero displacement output. The
+companion UI workflow also switches the rendered project from the EM
+configuration to the mechanics configuration.
 
 The core job is the routine blocking pull-request check. WebGPU and Playwright
 tests stay sequential within their job because they share browser and renderer

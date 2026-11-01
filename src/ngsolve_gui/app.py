@@ -52,6 +52,27 @@ def _solver_process_failure_detail(return_code):
     )
 
 
+def _solver_subprocess_environment():
+    """Keep the GUI package and configured modules importable after cwd changes."""
+    environment = os.environ.copy()
+    package_root = Path(__file__).resolve().parent.parent
+    configured_paths = environment.get("PYTHONPATH", "").split(os.pathsep)
+    paths = [package_root]
+    paths.extend(Path(value) if value else Path.cwd() for value in configured_paths)
+
+    normalized = []
+    seen = set()
+    for value in paths:
+        path = value if value.is_absolute() else Path.cwd() / value
+        absolute = os.path.abspath(path)
+        key = os.path.normcase(absolute)
+        if key not in seen:
+            seen.add(key)
+            normalized.append(absolute)
+    environment["PYTHONPATH"] = os.pathsep.join(normalized)
+    return environment
+
+
 def _reap_solver_process(process):
     """Boundedly stop and reap a solver child left alive by an error path."""
     if process is None:
@@ -2279,7 +2300,7 @@ class NGSolveGui(App):
             self._notify(f"Could not load solutions: {error}", type="negative", timeout=7000)
 
     def run_3d_study(self, workspace):
-        """Run the supported 3D harmonic EM study in a cancellable child process."""
+        """Run a supported 3D harmonic study in a cancellable child process."""
         run_kind = "Study"
         project_name = str(workspace.project.get("name", "3D project"))
         run_name = f"{run_kind}: {project_name}"
@@ -2296,11 +2317,12 @@ class NGSolveGui(App):
             workspace._snapshot_referenced_materials()
             project = copy.deepcopy(workspace.project)
             assets = dict(workspace.assets)
-            from .three_d_project import validate_3d_project
+            from .three_d_project import SUPPORTED_3D_STUDIES, validate_3d_project
             from .three_d_solver import validate_time_harmonic_em_setup
 
             validate_3d_project(project, assets)
             setup = validate_time_harmonic_em_setup(project)
+            study_label = SUPPORTED_3D_STUDIES[setup["physics"]]
             solver_root = self._find_solver_root()
             runner = solver_root / "scripts" / "run_gui_3d_model.py"
             if not runner.is_file():
@@ -2326,15 +2348,20 @@ class NGSolveGui(App):
                 "output_path": str(output_dir),
                 "model_name": project_name,
                 "problem_sha256": hashlib.sha256(model_bytes).hexdigest(),
-                "physics": "time-harmonic electromagnetics",
+                "physics": study_label,
                 "frequency_hz": setup["frequency_hz"],
                 "polynomial_order": setup["polynomial_order"],
-                "air_padding": setup["air_padding"],
                 "diagnostics": {
                     "process_context": "solver_process.json",
                     "native_crash_log": "native_crash.log",
                 },
             }
+            if setup["physics"] == "harmonic_em":
+                manifest["air_padding"] = setup["air_padding"]
+            else:
+                manifest["mechanical_body_force_n_m3"] = setup[
+                    "mechanical_body_force_n_m3"
+                ]
             self._write_run_manifest(output_dir, manifest)
         except Exception as error:
             with self._solver_job_lock:
@@ -2346,7 +2373,7 @@ class NGSolveGui(App):
         workspace._study_running = True
         workspace._update_study_controls()
         workspace._set_status(
-            f"Running {setup['frequency_hz']:g} Hz harmonic EM study in {output_dir}…"
+            f"Running {setup['frequency_hz']:g} Hz {study_label} in {output_dir}…"
         )
 
         def run_job():
@@ -2364,6 +2391,7 @@ class NGSolveGui(App):
                 ]
                 popen_options = {
                     "cwd": str(solver_root),
+                    "env": _solver_subprocess_environment(),
                     "stdin": subprocess.DEVNULL,
                     "stdout": subprocess.PIPE,
                     "stderr": subprocess.STDOUT,
@@ -2437,7 +2465,7 @@ class NGSolveGui(App):
                         f"Study complete · results saved to {output_dir}",
                     )
                     self._dispatch_to_ui(lambda: self._notify(
-                        f"3D harmonic EM study complete · {output_dir}",
+                        f"3D {study_label} complete · {output_dir}",
                         type="positive",
                         timeout=7000,
                     ))
@@ -2655,6 +2683,7 @@ class NGSolveGui(App):
                     command.extend(["--mesh", loaded_mesh_path])
                 popen_options = {
                     "cwd": str(solver_root),
+                    "env": _solver_subprocess_environment(),
                     "stdin": subprocess.DEVNULL,
                     "stdout": subprocess.PIPE,
                     "stderr": subprocess.STDOUT,

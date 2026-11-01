@@ -53,6 +53,30 @@ def test_study_info_section_falls_back_to_mesh_material_names():
     assert dict(StudyInfoSection._collect_rows(component))["Materials"] == "Steel, Air"
 
 
+def test_study_info_section_displays_material_names_for_stable_solver_regions():
+    internal_solid = "_mmfem_g0_MMFEM_SOLID_a1b2c3"
+    internal_air = "_mmfem_air"
+    component = SimpleNamespace(
+        mesh=SimpleNamespace(
+            ne=8,
+            nv=5,
+            GetMaterials=lambda: [internal_solid, internal_air],
+        ),
+        run_metadata={
+            "schema": "mm-fem.run",
+            "status": "complete",
+            "materials": [internal_air, internal_solid, "Air"],
+            "material_display_names": {
+                internal_solid: "Copper",
+                internal_air: "Air",
+            },
+        },
+        field_metadata=None,
+    )
+
+    assert dict(StudyInfoSection._collect_rows(component))["Materials"] == "Air, Copper"
+
+
 def test_other_result_field_action_opens_the_selected_export():
     opened = []
     component = SimpleNamespace(

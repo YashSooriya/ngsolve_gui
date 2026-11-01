@@ -41,9 +41,11 @@ def test_generates_a_volume_mesh_and_exterior_triangles_for_step_solid(tmp_path)
     assert sum(region["elements"] for region in result["boundary_regions"]) == result["surface_faces"]
     assert len({region["boundary_tag"] for region in result["boundary_regions"]}) == 6
     assert all(
-        region["boundary_tag"].startswith("MMFEM_FACE_0_")
+        region["boundary_tag"].startswith("MMFEM_FACE_")
+        and len(region["boundary_tag"]) == len("MMFEM_FACE_") + 24
         for region in result["boundary_regions"]
     )
+    assert result["domain_regions"][0]["domain_tag"].startswith("MMFEM_SOLID_")
     assert 0 <= result["tetra_quality"]["minimum"] <= result["tetra_quality"]["median"] <= 1
     assert result["tetra_quality"]["below_0_1"] <= result["volume_elements"]
 
@@ -61,6 +63,25 @@ def test_local_domain_size_refines_only_the_selected_volume(tmp_path):
     assert set(elements_by_domain) == {0, 1}
     assert elements_by_domain[0] > elements_by_domain[1]
     assert result["domain_maxh_mm"] == {0: 1.0}
+    assert len({region["domain_tag"] for region in result["domain_regions"]}) == 2
+    assert len({region["boundary_tag"] for region in result["boundary_regions"]}) == 12
+
+
+def test_step_region_tags_are_repeatable_across_remesh(tmp_path):
+    step_data = _two_domain_step(tmp_path)
+    first = generate_step_mesh(step_data, maxh_mm=4.0)
+    second = generate_step_mesh(step_data, maxh_mm=2.5)
+
+    assert {
+        region["domain_tag"] for region in first["domain_regions"]
+    } == {
+        region["domain_tag"] for region in second["domain_regions"]
+    }
+    assert {
+        region["boundary_tag"] for region in first["boundary_regions"]
+    } == {
+        region["boundary_tag"] for region in second["boundary_regions"]
+    }
 
 
 def test_tetrahedral_mean_ratio_quality_is_one_for_a_regular_tetrahedron():

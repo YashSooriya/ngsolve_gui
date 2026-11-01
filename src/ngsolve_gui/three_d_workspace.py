@@ -22,6 +22,7 @@ from .three_d_project import (
     MIN_MESH_SIZE_MM,
     PROJECT_SUFFIX,
     SUPPORTED_3D_BOUNDARY_CONDITIONS,
+    SUPPORTED_3D_STUDIES,
     UNASSIGNED_MATERIAL,
     add_step_geometry,
     add_wire_trace,
@@ -30,6 +31,7 @@ from .three_d_project import (
     package_3d_project,
     snapshot_material,
     step_unit_scale,
+    _LEGACY_DOMAIN_SELECTION_ERROR,
     unpack_3d_project,
     validate_3d_project,
     domain_mesh_size_overrides,
@@ -507,12 +509,54 @@ class ThreeDWorkspace(Div):
 
     def _update_study_controls(self):
         running = bool(self._study_running)
+        physics = self.project.get("study", {}).get("physics", "harmonic_em")
+        compatible_condition = (
+            "mechanical_fixed" if physics == "harmonic_mechanical"
+            else "magnetic_potential_zero"
+        )
+        boundary_ready = all(
+            all(
+                selection.get("boundary_condition") in (None, compatible_condition)
+                for selection in geometry.get("boundary_selections", [])
+            )
+            and (
+                physics != "harmonic_mechanical"
+                or any(
+                    selection.get("boundary_condition") == "mechanical_fixed"
+                    and selection.get("boundary_tags")
+                    and all(
+                        isinstance(tag, str)
+                        and tag.startswith("MMFEM_FACE_")
+                        and len(tag.rsplit("_", 1)[-1]) == 24
+                        for tag in selection["boundary_tags"]
+                    )
+                    for selection in geometry.get("boundary_selections", [])
+                )
+            )
+            for geometry in self.project.get("geometries", [])
+        )
+        body_force = self.project.get("study", {}).get(
+            "mechanical_body_force_n_m3", [0, 0, 0]
+        )
+        try:
+            mechanical_load_ready = physics != "harmonic_mechanical" or (
+                len(body_force) == 3
+                and all(math.isfinite(float(component)) for component in body_force)
+                and any(float(component) != 0 for component in body_force)
+            )
+        except (TypeError, ValueError, OverflowError):
+            mechanical_load_ready = False
         if hasattr(self, "_run_study_button"):
             self._run_study_button.ui_disable = (
                 running
                 or not self.project.get("geometries")
-                or not self.project.get("wire_trace_sets")
+                or (
+                    physics == "harmonic_em"
+                    and not self.project.get("wire_trace_sets")
+                )
                 or not self._has_resolved_study_materials()
+                or not boundary_ready
+                or not mechanical_load_ready
             )
         if hasattr(self, "_cancel_study_button"):
             self._cancel_study_button.ui_disable = not running
@@ -520,14 +564,29 @@ class ThreeDWorkspace(Div):
     def _has_resolved_study_materials(self):
         """Require each solver region to reference a known material record."""
         records = self._material_records()
+        physics = self.project.get("study", {}).get("physics", "harmonic_em")
+        mechanical = physics == "harmonic_mechanical"
 
         def is_resolved(name):
             value = str(name or "").strip()
-            return (
-                bool(value)
-                and value.casefold() != UNASSIGNED_MATERIAL.casefold()
-                and value.casefold() in records
-            )
+            if (
+                not value
+                or value.casefold() == UNASSIGNED_MATERIAL.casefold()
+                or value.casefold() not in records
+            ):
+                return False
+            if mechanical and value.casefold() != "air":
+                properties = records[value.casefold()].get("properties", {})
+                try:
+                    youngs = float(properties.get("youngs_modulus", 0))
+                    density = float(properties.get("density", 0))
+                except (TypeError, ValueError, OverflowError):
+                    return False
+                if not math.isfinite(youngs) or not math.isfinite(density):
+                    return False
+                if youngs <= 0 or density <= 0:
+                    return False
+            return True
 
         for geometry in self.project.get("geometries", []):
             if not is_resolved(geometry.get("material")):
@@ -538,14 +597,15 @@ class ThreeDWorkspace(Div):
                 for selection in geometry.get("domain_selections", [])
             ):
                 return False
-        for trace_set in self.project.get("wire_trace_sets", []):
-            if not is_resolved(trace_set.get("material", "Air")):
-                return False
-            if any(
-                not is_resolved(trace.get("material", trace_set.get("material", "Air")))
-                for trace in trace_set.get("traces", [])
-            ):
-                return False
+        if not mechanical:
+            for trace_set in self.project.get("wire_trace_sets", []):
+                if not is_resolved(trace_set.get("material", "Air")):
+                    return False
+                if any(
+                    not is_resolved(trace.get("material", trace_set.get("material", "Air")))
+                    for trace in trace_set.get("traces", [])
+                ):
+                    return False
         return True
 
     def run_study(self, *_args):
@@ -614,6 +674,51 @@ class ThreeDWorkspace(Div):
             return False
         self._mark_changed()
         self._set_status("3D study settings updated.")
+        return True
+
+    def _set_study_physics(self, event):
+        value = str(getattr(event, "value", event) or "")
+        if value not in SUPPORTED_3D_STUDIES:
+            self._set_status("Choose a supported 3D harmonic study.", error=True)
+            return False
+        study = self.project.setdefault("study", {})
+        old_value = study.get("physics", "harmonic_em")
+        study["physics"] = value
+        try:
+            validate_3d_project(self.project, self.assets)
+        except (TypeError, ValueError) as error:
+            study["physics"] = old_value
+            self._set_status(str(error), error=True)
+            self._rebuild_properties()
+            return False
+        self._mark_changed()
+        self._update_study_controls()
+        self._rebuild_items()
+        self._rebuild_properties()
+        self._set_status(f"Study physics set to {SUPPORTED_3D_STUDIES[value]}.")
+        return True
+
+    def _set_mechanical_body_force(self, component, event):
+        if component not in range(3):
+            return False
+        study = self.project.setdefault("study", {})
+        old_values = list(study.get("mechanical_body_force_n_m3", [0.0, 0.0, 0.0]))
+        value = getattr(event, "value", event)
+        try:
+            value = float(value)
+            if not math.isfinite(value) or abs(value) > 1e15:
+                raise ValueError("Body-force components must be finite and no larger than 1e15 N/m³.")
+            values = list(old_values)
+            values[component] = value
+            study["mechanical_body_force_n_m3"] = values
+            validate_3d_project(self.project, self.assets)
+        except (TypeError, ValueError, OverflowError, IndexError) as error:
+            study["mechanical_body_force_n_m3"] = old_values
+            self._set_status(str(error), error=True)
+            self._rebuild_properties()
+            return False
+        self._mark_changed()
+        self._set_status("Mechanical body force updated.")
         return True
 
     def _mark_changed(self):
@@ -1019,7 +1124,11 @@ class ThreeDWorkspace(Div):
                 ui_color="primary" if selected_study else "grey-7",
             ),
             Div(
-                "Time-harmonic EM",
+                (
+                    "Time-harmonic EM"
+                    if self.project.get("study", {}).get("physics", "harmonic_em") == "harmonic_em"
+                    else "Time-harmonic mechanics"
+                ),
                 ui_style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px;",
             ),
         ]
@@ -1152,6 +1261,28 @@ class ThreeDWorkspace(Div):
             }
         return self._selection_draft
 
+    def _current_selection_region_ids(self, selection, kind, result=None):
+        """Resolve stored selections by stable tags; never fall back to mesh order."""
+        result = result or self._mesh_results.get(
+            self._selection_draft.get("geometry_id"), {}
+        )
+        if result.get("status") != "ready":
+            return []
+        regions_key = "domain_regions" if kind == "domain" else "boundary_regions"
+        tag_key = "domain_tag" if kind == "domain" else "boundary_tag"
+        selection_tag_key = "domain_tags" if kind == "domain" else "boundary_tags"
+        tags = selection.get(selection_tag_key)
+        if not tags:
+            return []
+        regions_by_tag = {
+            region.get(tag_key): int(region["id"])
+            for region in result.get(regions_key, [])
+            if isinstance(region.get(tag_key), str)
+        }
+        if any(tag not in regions_by_tag for tag in tags):
+            return []
+        return sorted(regions_by_tag[tag] for tag in tags)
+
     def _set_selection_draft_kind(self, geometry, event):
         kind = str(getattr(event, "value", event) or "boundary")
         if kind not in {"domain", "boundary"}:
@@ -1221,7 +1352,7 @@ class ThreeDWorkspace(Div):
 
         old_condition = selection.get("boundary_condition")
         old_tags = selection.get("boundary_tags")
-        if value != "default" and not old_tags:
+        if value != "default":
             result = self._mesh_results.get(geometry["id"], {})
             if result.get("status") != "ready":
                 self._set_status(
@@ -1233,7 +1364,7 @@ class ThreeDWorkspace(Div):
                 int(region["id"]): region.get("boundary_tag")
                 for region in result.get("boundary_regions", [])
             }
-            region_ids = selection.get("boundary_ids", [])
+            region_ids = list(self._selection_draft.get("region_ids", []))
             if any(
                 not isinstance(tags_by_id.get(int(region_id)), str)
                 for region_id in region_ids
@@ -1245,6 +1376,7 @@ class ThreeDWorkspace(Div):
                 )
                 return False
             selection["boundary_tags"] = [tags_by_id[int(region_id)] for region_id in region_ids]
+            selection["boundary_ids"] = sorted(region_ids)
 
         if value == "default":
             selection.pop("boundary_condition", None)
@@ -1307,9 +1439,23 @@ class ThreeDWorkspace(Div):
         if not set(region_ids).issubset(valid_ids):
             self._set_status("One or more selected regions are not in the current mesh.", error=True)
             return False
+        domain_tags = []
         boundary_tags = []
         boundary_condition = draft.get("boundary_condition", "default")
-        if kind == "boundary":
+        if kind == "domain":
+            domain_regions = {
+                int(region["id"]): region
+                for region in result.get("domain_regions", [])
+            }
+            domain_tags = [domain_regions[region_id].get("domain_tag") for region_id in region_ids]
+            if any(not isinstance(tag, str) for tag in domain_tags):
+                self._set_status(
+                    "The selected solid has no unique geometric identity. "
+                    "Resolve overlapping or duplicate solids before assigning material or mesh controls.",
+                    error=True,
+                )
+                return False
+        else:
             if (
                 boundary_condition != "default"
                 and boundary_condition not in SUPPORTED_3D_BOUNDARY_CONDITIONS
@@ -1357,6 +1503,7 @@ class ThreeDWorkspace(Div):
         existing["name"] = name
         existing["domain_ids" if kind == "domain" else "boundary_ids"] = region_ids
         if kind == "domain":
+            existing["domain_tags"] = domain_tags
             assigned_material = str(draft.get("material") or "").strip()
             if assigned_material:
                 existing["material"] = assigned_material
@@ -1469,7 +1616,7 @@ class ThreeDWorkspace(Div):
                     _BOUNDARY_CONDITION_OPTIONS,
                 ),
                 Div(
-                    "Leave the faces unconstrained to use the solver's existing time-harmonic EM behavior.",
+                    "A = 0 applies to electromagnetics. Fixed support sets displacement to zero in a mechanics study.",
                     ui_class="cb-muted",
                     ui_style="font-size:10px; line-height:1.4;",
                 ),
@@ -1566,9 +1713,9 @@ class ThreeDWorkspace(Div):
                     "kind": selection_kind,
                     "selection_id": selection["id"],
                     "name": selection["name"],
-                    "region_ids": list(selection.get(
-                        "domain_ids" if selection_kind == "domain" else "boundary_ids", []
-                    )),
+                    "region_ids": self._current_selection_region_ids(
+                        selection, selection_kind, self._mesh_results.get(geometry["id"], {})
+                    ),
                     "material": selection.get("material"),
                     "boundary_condition": selection.get("boundary_condition") or "default",
                 })
@@ -1601,6 +1748,10 @@ class ThreeDWorkspace(Div):
             ])
             if named_context:
                 geometry, selection_kind, selection = named_context
+                active_physics = self.project.get("study", {}).get(
+                    "physics", "harmonic_em"
+                )
+                selection_condition = selection.get("boundary_condition")
                 region_ids = selection.get(
                     "domain_ids" if selection_kind == "domain" else "boundary_ids", []
                 )
@@ -1611,6 +1762,30 @@ class ThreeDWorkspace(Div):
                     ui_class="cb-muted",
                     ui_style="font-size:11px;",
                 ))
+                if (
+                    selection_kind == "domain"
+                    and (selection.get("material") or selection.get("mesh_maxh_mm") is not None)
+                    and not selection.get("domain_tags")
+                ):
+                    children.append(Div(
+                        f"{_LEGACY_DOMAIN_SELECTION_ERROR} Recreate this selection from the current mesh.",
+                        ui_class="mmfem-3d-status-error",
+                        ui_style="font-size:10px; line-height:1.4;",
+                    ))
+                if (
+                    selection_kind == "boundary"
+                    and selection.get("boundary_condition")
+                    and any(
+                        isinstance(tag, str)
+                        and len(tag.rsplit("_", 1)[-1]) != 24
+                        for tag in selection.get("boundary_tags", [])
+                    )
+                ):
+                    children.append(Div(
+                        "This boundary assignment uses old order-based references. Recreate the selection from the current mesh before solving.",
+                        ui_class="mmfem-3d-status-error",
+                        ui_style="font-size:10px; line-height:1.4;",
+                    ))
                 if selection_kind == "domain":
                     geometry_material = geometry.get("material", UNASSIGNED_MATERIAL)
                     local_mesh_size = _input(
@@ -1659,8 +1834,19 @@ class ThreeDWorkspace(Div):
                     children.extend([
                         boundary_condition,
                         Div(
-                            "Imposes A = 0 (Dirichlet) on these faces in the time-harmonic EM study. "
-                            "Other 3D physics conditions are not available yet.",
+                            (
+                                "This condition belongs to another physics study. Switch study physics or choose the default condition."
+                                if selection_condition
+                                and (
+                                    (active_physics == "harmonic_em" and selection_condition != "magnetic_potential_zero")
+                                    or (active_physics == "harmonic_mechanical" and selection_condition != "mechanical_fixed")
+                                )
+                                else "Sets magnetic vector potential A = 0 on these faces."
+                                if selection_condition == "magnetic_potential_zero"
+                                else "Constrains all displacement components to zero on these faces."
+                                if selection_condition == "mechanical_fixed"
+                                else "Leave unconstrained unless this boundary needs a supported study condition."
+                            ),
                             ui_class="cb-muted",
                             ui_style="font-size:10px; line-height:1.4;",
                         ),
@@ -1740,8 +1926,18 @@ class ThreeDWorkspace(Div):
             ])
         elif kind == "study":
             study = self.project.setdefault("study", {})
+            physics = study.get("physics", "harmonic_em")
             children.extend([
-                Div("Time-harmonic electromagnetic study", ui_style="font-size:13px; font-weight:650;"),
+                Div("Harmonic study", ui_style="font-size:13px; font-weight:650;"),
+                self._select_options(
+                    "Physics",
+                    physics,
+                    self._set_study_physics,
+                    [
+                        {"label": label, "value": value}
+                        for value, label in SUPPORTED_3D_STUDIES.items()
+                    ],
+                ),
                 _input(
                     "Frequency (Hz)", study.get("frequency_hz", 500.0),
                     lambda event: self._set_study_value("frequency_hz", event, number=True),
@@ -1753,17 +1949,35 @@ class ThreeDWorkspace(Div):
                     [{"label": f"{order} · {'linear' if order == 1 else 'quadratic' if order == 2 else 'order ' + str(order)}", "value": order}
                      for order in (1, 2, 3, 4)],
                 ),
-                _input(
-                    "Air-region padding (model spans)", study.get("air_padding", 2.0),
-                    lambda event: self._set_study_value("air_padding", event, number=True),
-                    number=True, width="100%",
-                ),
-                Div(
-                    "Creates an Air region with an exterior magnetic boundary. Mechanical and DC solves are unavailable.",
+            ])
+            if physics == "harmonic_em":
+                children.extend([
+                    _input(
+                        "Air-region padding (model spans)", study.get("air_padding", 2.0),
+                        lambda event: self._set_study_value("air_padding", event, number=True),
+                        number=True, width="100%",
+                    ),
+                    Div(
+                        "Imports AC excitation from the project wire traces and solves the magnetic vector potential.",
+                        ui_class="cb-muted",
+                        ui_style="font-size:10px; line-height:1.45; padding:8px; background:var(--panel-header); border-radius:5px;",
+                    ),
+                ])
+            else:
+                body_force = study.get("mechanical_body_force_n_m3", [0.0, 0.0, 0.0])
+                for index, axis in enumerate("xyz"):
+                    children.append(_input(
+                        f"Body force {axis.upper()} (N/m³)",
+                        body_force[index],
+                        lambda event, i=index: self._set_mechanical_body_force(i, event),
+                        number=True,
+                        width="100%",
+                    ))
+                children.append(Div(
+                    "Solves linear time-harmonic elasticity on all solid domains. Apply a fixed support to each body and a non-zero body force; materials need Young’s modulus, Poisson ratio and density.",
                     ui_class="cb-muted",
                     ui_style="font-size:10px; line-height:1.45; padding:8px; background:var(--panel-header); border-radius:5px;",
-                ),
-            ])
+                ))
         else:
             children.extend([
                 Div("3D project", ui_style="font-size:13px; font-weight:650;"),
@@ -1789,9 +2003,9 @@ class ThreeDWorkspace(Div):
                     "kind": selection_kind,
                     "selection_id": selection["id"],
                     "name": selection["name"],
-                    "region_ids": list(selection.get(
-                        "domain_ids" if selection_kind == "domain" else "boundary_ids", []
-                    )),
+                "region_ids": self._current_selection_region_ids(
+                    selection, selection_kind, self._mesh_results.get(geometry["id"], {})
+                ),
                     "material": selection.get("material"),
                     "boundary_condition": selection.get("boundary_condition") or "default",
                 }
@@ -2083,7 +2297,7 @@ class ThreeDWorkspace(Div):
                 return False
             selection["mesh_maxh_mm"] = maxh
         try:
-            domain_mesh_size_overrides(geometry)
+            domain_mesh_size_overrides(geometry, require_stable_tags=True)
         except ValueError as error:
             if previous is None:
                 selection.pop("mesh_maxh_mm", None)
@@ -2115,7 +2329,7 @@ class ThreeDWorkspace(Div):
                     f"Maximum element size must be between {MIN_MESH_SIZE_MM:g} "
                     f"and {MAX_MESH_SIZE_MM:g} mm."
                 )
-            local_maxh = domain_mesh_size_overrides(item)
+            local_maxh = domain_mesh_size_overrides(item, require_stable_tags=True)
             step_data = bytes(self.assets[item["asset"]])
         except Exception as error:
             self._set_status(f"Could not prepare the mesh job: {error}", error=True)
@@ -2262,6 +2476,12 @@ class ThreeDWorkspace(Div):
         self._rebuild_properties()
 
     def _set_named_selection_material(self, selection, event):
+        if not selection.get("domain_tags"):
+            self._set_status(
+                f"{_LEGACY_DOMAIN_SELECTION_ERROR} Recreate this selection from the current mesh first.",
+                error=True,
+            )
+            return False
         value = str(getattr(event, "value", event) or "").strip()
         options = {option["value"] for option in self._material_options(value)}
         options.add("__inherit__")

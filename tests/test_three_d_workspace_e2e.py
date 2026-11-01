@@ -18,6 +18,7 @@ from ngsolve_gui.three_d_project import (
 def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     page_errors = []
     page.on("pageerror", lambda error: page_errors.append(str(error)))
+    initial_viewport = page.viewport_size
     fixtures = Path(__file__).parent / "fixtures"
     step_path = fixtures / "magnet_shield_4k.step"
     trace_path = fixtures / "golay_x_trace.txt"
@@ -174,9 +175,14 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     assert graph.locator("canvas").count() > 0
     bounds = graph.bounding_box()
     assert bounds is not None and bounds["width"] > 400 and bounds["height"] > 300
+    geometry_selection_started = time.perf_counter()
     graph.evaluate("element => element.emit('plotly_click', {points: [{curveNumber: 0}]})")
     page.get_by_text("Geometry model", exact=True).wait_for(timeout=10_000)
+    geometry_selection_ms = (
+        time.perf_counter() - geometry_selection_started
+    ) * 1000
     assert workspace._selection == ("geometry", geometry["id"])
+    mesh_generation_started = time.perf_counter()
     page.get_by_role("button", name="Generate mesh", exact=True).click()
     deadline = time.monotonic() + 70
     while workspace._mesh_worker_active and time.monotonic() < deadline:
@@ -190,11 +196,15 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
         }""",
         timeout=90_000,
     )
+    mesh_generation_seconds = time.perf_counter() - mesh_generation_started
     browser_traces = graph.evaluate(
         "element => element.data.map(trace => ({type: trace.type, name: trace.name, meta: trace.meta, color: trace.color, lineColor: trace.line && trace.line.color}))"
     )
     assert workspace._mesh_results[geometry["id"]]["status"] == "ready"
     assert workspace._mesh_results[geometry["id"]]["volume_elements"] > 0
+    mesh_volume_elements = workspace._mesh_results[geometry["id"]][
+        "volume_elements"
+    ]
     assert workspace._preview._figures[0].data[0].color == "#f59e0b"
     assert browser_traces[0]["color"] == "#f59e0b"
     assert browser_traces[1]["lineColor"] == "#33475b"
@@ -207,9 +217,14 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
             full_page=True,
         )
     selected_boundary = int(workspace._mesh_results[geometry["id"]]["boundary_region_ids"][0])
+    boundary_selection_started = time.perf_counter()
     graph.evaluate(
         "element => element.emit('plotly_click', {points: [{curveNumber: 0, pointNumber: 0}]})"
     )
+    page.get_by_label("Selection name").wait_for(timeout=10_000)
+    boundary_selection_ms = (
+        time.perf_counter() - boundary_selection_started
+    ) * 1000
     deadline = time.monotonic() + 10
     while (
         selected_boundary not in workspace._selection_draft.get("region_ids", [])
@@ -388,6 +403,93 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
         full_page=True,
     )
 
+    # Configure the mechanics-only study while the freshly generated mesh is
+    # still available for mapping a selected face to its stable STEP tag.
+    tree.get_by_text("Selected STEP boundary", exact=True).click()
+    page.get_by_label("Boundary condition").click()
+    page.locator(".q-menu:visible .q-item").filter(
+        has_text="Default solver behavior"
+    ).click()
+    deadline = time.monotonic() + 5
+    while "boundary_condition" in selection and time.monotonic() < deadline:
+        page.wait_for_timeout(100)
+    assert "boundary_condition" not in selection
+    workspace.select_item("study")
+    app._update()
+    page.get_by_label("Physics").click()
+    page.locator(".q-menu:visible .q-item").filter(
+        has_text="Time-harmonic mechanics"
+    ).click()
+    deadline = time.monotonic() + 5
+    while (
+        workspace.project["study"].get("physics") != "harmonic_mechanical"
+        and time.monotonic() < deadline
+    ):
+        page.wait_for_timeout(100)
+    assert workspace.project["study"]["physics"] == "harmonic_mechanical"
+    tree.get_by_text("Time-harmonic mechanics", exact=True).wait_for(timeout=10_000)
+    force_x = page.get_by_label("Body force X (N/m³)")
+    force_x.fill("1000")
+    force_x.press("Tab")
+    deadline = time.monotonic() + 5
+    while (
+        workspace.project["study"]["mechanical_body_force_n_m3"][0] != 1000.0
+        and time.monotonic() < deadline
+    ):
+        page.wait_for_timeout(100)
+    assert workspace.project["study"]["mechanical_body_force_n_m3"] == [
+        1000.0, 0.0, 0.0
+    ]
+    page.get_by_text(
+        "Solves linear time-harmonic elasticity on all solid domains.", exact=False
+    ).wait_for(timeout=10_000)
+    assert page.get_by_role("button", name="Run study").is_disabled()
+    page.evaluate("document.activeElement && document.activeElement.blur()")
+    if screenshot_dir:
+        page.screenshot(
+            path=str(Path(screenshot_dir) / "07-3d-harmonic-mechanics-settings.png"),
+            full_page=True,
+        )
+    tree.get_by_text("Selected STEP boundary", exact=True).click()
+    page.get_by_label("Boundary condition").click()
+    page.locator(".q-menu:visible .q-item").filter(
+        has_text="Fixed support (u = 0)"
+    ).click()
+    deadline = time.monotonic() + 5
+    while (
+        selection.get("boundary_condition") != "mechanical_fixed"
+        and time.monotonic() < deadline
+    ):
+        page.wait_for_timeout(100)
+    assert selection["boundary_condition"] == "mechanical_fixed"
+    assert not page.get_by_role("button", name="Run study").is_disabled()
+    page.evaluate("document.activeElement && document.activeElement.blur()")
+    if screenshot_dir:
+        page.screenshot(
+            path=str(Path(screenshot_dir) / "08-3d-mechanical-fixed-support.png"),
+            full_page=True,
+        )
+    # Return to EM with the saved condition cleared; the same named faces and
+    # domain selection continue to persist in the project.
+    tree.get_by_text("Selected STEP boundary", exact=True).click()
+    page.get_by_label("Boundary condition").click()
+    page.locator(".q-menu:visible .q-item").filter(
+        has_text="Default solver behavior"
+    ).click()
+    deadline = time.monotonic() + 5
+    while "boundary_condition" in selection and time.monotonic() < deadline:
+        page.wait_for_timeout(100)
+    workspace.select_item("study")
+    app._update()
+    page.get_by_label("Physics").click()
+    page.locator(".q-menu:visible .q-item").filter(
+        has_text="Time-harmonic electromagnetics"
+    ).click()
+    deadline = time.monotonic() + 5
+    while workspace.project["study"].get("physics") != "harmonic_em" and time.monotonic() < deadline:
+        page.wait_for_timeout(100)
+    assert workspace.project["study"]["physics"] == "harmonic_em"
+
     # Expose the actual per-domain control in a rendered property editor. The
     # selection is backed by the generated Netgen domain region; the size itself
     # is entered through the same input an engineer uses in the application.
@@ -421,13 +523,54 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
             full_page=True,
         )
 
+    graph_width_before_resize = graph.bounding_box()["width"]
+    viewport_resize_started = time.perf_counter()
     page.set_viewport_size({"width": 1440, "height": 900})
+    page.wait_for_function(
+        """previousWidth => {
+            const graph = document.querySelector(
+                '.mmfem-3d-viewport .js-plotly-plot'
+            );
+            return graph
+                && graph.getBoundingClientRect().width > previousWidth + 50;
+        }""",
+        arg=graph_width_before_resize,
+        timeout=10_000,
+    )
+    viewport_resize_ms = (time.perf_counter() - viewport_resize_started) * 1000
     workspace.select_item("study")
     app._update()
-    page.get_by_text("Time-harmonic electromagnetic study", exact=True).wait_for(timeout=10_000)
+    page.get_by_text("Harmonic study", exact=True).wait_for(timeout=10_000)
     page.get_by_label("Frequency (Hz)").wait_for(timeout=10_000)
     if screenshot_dir:
         page.screenshot(
             path=str(Path(screenshot_dir) / "06-3d-harmonic-study-settings.png"),
             full_page=True,
+        )
+    evidence_dir = os.environ.get("MMFEM_STAGE8A_EVIDENCE_DIR")
+    if evidence_dir:
+        Path(evidence_dir).mkdir(parents=True, exist_ok=True)
+        (Path(evidence_dir) / "ui-3d-interaction-performance.json").write_text(
+            json.dumps({
+                "representative_step": step_path.name,
+                    "mesh_volume_elements": mesh_volume_elements,
+                "viewport_initial_px": initial_viewport,
+                "viewport_after_resize_px": {"width": 1440, "height": 900},
+                "measurements_ms": {
+                    "geometry_selection_to_property_editor": round(
+                        geometry_selection_ms, 2
+                    ),
+                    "face_selection_to_boundary_property_editor": round(
+                        boundary_selection_ms, 2
+                    ),
+                    "viewport_resize_to_plot_width_update": round(
+                        viewport_resize_ms, 2
+                    ),
+                    "mesh_generation_to_visible_mesh": round(
+                        mesh_generation_seconds * 1000, 2
+                    ),
+                },
+                "notes": "Local Playwright development environment; timings include browser event dispatch and are diagnostic, not release benchmarks.",
+            }, indent=2),
+            encoding="utf-8",
         )

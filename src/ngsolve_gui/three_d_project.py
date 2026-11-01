@@ -29,8 +29,19 @@ MIN_MESH_SIZE_MM = 0.01
 MAX_MESH_SIZE_MM = 100_000.0
 SUPPORTED_3D_BOUNDARY_CONDITIONS = {
     "magnetic_potential_zero": "Vector potential A = 0",
+    "mechanical_fixed": "Fixed support (u = 0)",
 }
-_STEP_FACE_TAG_PATTERN = re.compile(r"MMFEM_FACE_\d+_\d+\Z")
+SUPPORTED_3D_STUDIES = {
+    "harmonic_em": "Time-harmonic electromagnetics",
+    "harmonic_mechanical": "Time-harmonic mechanics",
+}
+_STEP_FACE_TAG_PATTERN = re.compile(r"MMFEM_FACE_[0-9a-f]{24}\Z")
+_STEP_SOLID_TAG_PATTERN = re.compile(r"MMFEM_SOLID_[0-9a-f]{24}\Z")
+_LEGACY_STEP_FACE_TAG_PATTERN = re.compile(r"MMFEM_FACE_\d+_\d+\Z")
+_LEGACY_DOMAIN_SELECTION_ERROR = (
+    "This saved domain assignment uses order-based geometry ids. Recreate the named "
+    "selection from the current mesh before applying a material or local mesh size."
+)
 
 LENGTH_UNITS = {
     "m": 1.0,
@@ -70,6 +81,7 @@ def new_3d_project(name="Untitled 3D project"):
             "frequency_hz": 500.0,
             "polynomial_order": 1,
             "air_padding": 2.0,
+            "mechanical_body_force_n_m3": [0.0, 0.0, 0.0],
         },
     }
 
@@ -323,6 +335,37 @@ def _validate_named_selections(geometry, key, region_key, label):
             raise ValueError(f"Named {label} selection region ids must be non-negative integers.")
         if len(set(region_ids)) != len(region_ids):
             raise ValueError(f"Named {label} selection region ids must be unique.")
+        tag_key = "domain_tags" if label == "domain" else "boundary_tags"
+        tags = selection.get(tag_key)
+        if tags is not None:
+            pattern = _STEP_SOLID_TAG_PATTERN if label == "domain" else _STEP_FACE_TAG_PATTERN
+            accepted = (pattern,)
+            if label == "boundary":
+                accepted += (_LEGACY_STEP_FACE_TAG_PATTERN,)
+            if (
+                not isinstance(tags, list)
+                or not tags
+                or len(tags) > MAX_SELECTION_REGIONS
+                or any(
+                    not isinstance(tag, str)
+                    or not any(tag_pattern.fullmatch(tag) for tag_pattern in accepted)
+                    for tag in tags
+                )
+            ):
+                if label == "boundary":
+                    raise ValueError(
+                        "Named boundary selection face tags must be valid STEP face identifiers."
+                    )
+                raise ValueError("Named domain selection solid tags are invalid.")
+            if len(set(tags)) != len(tags):
+                raise ValueError(f"Named {label} selection tags must be unique.")
+            if len(tags) != len(region_ids):
+                raise ValueError(
+                    f"Named {label} selection tags must map one-to-one to its region ids."
+                )
+            pairs = sorted(zip(region_ids, tags), key=lambda pair: pair[0])
+            region_ids[:] = [region_id for region_id, _tag in pairs]
+            tags[:] = [tag for _region_id, tag in pairs]
         if label == "boundary":
             condition = selection.get("boundary_condition")
             if condition is not None and (
@@ -333,27 +376,6 @@ def _validate_named_selections(geometry, key, region_key, label):
                     f"Unsupported 3D boundary condition {condition!r}. "
                     "Only magnetic potential = 0 is currently available."
                 )
-            tags = selection.get("boundary_tags")
-            if tags is not None:
-                if (
-                    not isinstance(tags, list)
-                    or not tags
-                    or len(tags) > MAX_SELECTION_REGIONS
-                    or any(
-                        not isinstance(tag, str)
-                        or not _STEP_FACE_TAG_PATTERN.fullmatch(tag)
-                        for tag in tags
-                    )
-                ):
-                    raise ValueError(
-                        "Named boundary selection face tags must be valid STEP face identifiers."
-                    )
-                if len(set(tags)) != len(tags):
-                    raise ValueError("Named boundary selection face tags must be unique.")
-                if len(tags) != len(region_ids):
-                    raise ValueError(
-                        "Named boundary selection face tags must map one-to-one to its region ids."
-                    )
             if condition is not None and not tags:
                 raise ValueError(
                     "A 3D boundary condition needs saved STEP face identifiers. "
@@ -365,14 +387,126 @@ def _validate_named_selections(geometry, key, region_key, label):
         used_names.add(normalized_name)
 
 
+def _normalized_shape_descriptor(shape, scale, dimension):
+    """Describe a STEP subshape using geometric properties, not OCC enumeration."""
+    def number(value):
+        # OCC bounding-box tolerances scale imperfectly after unit conversion;
+        # quantize relative to the solid size so mm and m imports stay identical.
+        return round(float(value) / scale, 4)
+
+    def point(value):
+        return tuple(number(coordinate) for coordinate in value)
+
+    lower, upper = shape.bounding_box
+    measure, centre = shape.Properties()
+    edges = []
+    for edge in shape.edges:
+        edge_measure, edge_centre = edge.Properties()
+        edge_lower, edge_upper = edge.bounding_box
+        edge_vertices = sorted(point(vertex.center) for vertex in edge.vertices)
+        edges.append((
+            number(edge_measure),
+            point(edge_centre),
+            point(edge_lower),
+            point(edge_upper),
+            edge_vertices,
+        ))
+    edges.sort()
+    vertices = sorted(point(vertex.center) for vertex in shape.vertices)
+    return (
+        number(measure ** (1.0 / dimension)),
+        point(centre),
+        point(lower),
+        point(upper),
+        tuple(edges),
+        tuple(vertices),
+    )
+
+
+def step_geometry_tags(solids):
+    """Return order-independent tags for distinguishable STEP solids and faces.
+
+    Tags are based on normalized OCC geometric properties. A solid signature
+    includes every face signature, so an edit to its topology invalidates its
+    domain identity and all face identities. Duplicate face signatures are
+    deliberately omitted: a saved assignment to one of those faces would be
+    ambiguous and must be recreated after the geometry is inspected.
+    """
+    solids = list(solids)
+    if not solids:
+        return [], []
+
+    descriptions = []
+    for solid in solids:
+        lower, upper = solid.bounding_box
+        scale = max(float(upper[axis] - lower[axis]) for axis in range(3))
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError("STEP solids have invalid dimensions and cannot be assigned safely.")
+        face_descriptors = [
+            _normalized_shape_descriptor(face, scale, 2) for face in solid.faces
+        ]
+        solid_descriptor = (
+            _normalized_shape_descriptor(solid, scale, 3),
+            tuple(sorted(face_descriptors)),
+        )
+        solid_signature = hashlib.sha256(
+            json.dumps(solid_descriptor, separators=(",", ":")).encode("ascii")
+        ).hexdigest()[:24]
+        descriptions.append((solid_signature, face_descriptors))
+
+    solid_signatures = [signature for signature, _faces in descriptions]
+    if len(set(solid_signatures)) != len(solid_signatures):
+        raise ValueError(
+            "This STEP file contains indistinguishable overlapping solids. "
+            "Separate or repair them before creating material or mesh assignments."
+        )
+    solid_tags = [f"MMFEM_SOLID_{signature}" for signature in solid_signatures]
+
+    face_signatures = []
+    for solid_tag, (_solid_signature, face_descriptors) in zip(solid_tags, descriptions):
+        face_signatures.extend(
+            (
+                solid_tag,
+                hashlib.sha256(
+                    json.dumps(descriptor, separators=(",", ":")).encode("ascii")
+                ).hexdigest()[:24],
+            )
+            for descriptor in face_descriptors
+        )
+    counts = {}
+    for signature in face_signatures:
+        counts[signature] = counts.get(signature, 0) + 1
+
+    face_refs = []
+    for solid_tag, solid, (_solid_signature, face_descriptors) in zip(
+        solid_tags, solids, descriptions
+    ):
+        for face, descriptor in zip(solid.faces, face_descriptors):
+            face_signature = hashlib.sha256(
+                json.dumps(descriptor, separators=(",", ":")).encode("ascii")
+            ).hexdigest()[:24]
+            signature = (solid_tag, face_signature)
+            tag = (
+                f"MMFEM_FACE_{hashlib.sha256('|'.join(signature).encode('ascii')).hexdigest()[:24]}"
+                if counts[signature] == 1 else None
+            )
+            face_refs.append((tag, solid_tag, face))
+    return solid_tags, face_refs
+
+
+def step_solid_tags(solids):
+    """Return stable solid tags in the current import order."""
+    return step_geometry_tags(solids)[0]
+
+
 def step_face_tags(solids):
-    """Yield stable per-solid face tags shared by meshing and solver builds."""
-    for solid_index, solid in enumerate(solids):
-        for face_index, face in enumerate(solid.faces):
-            yield f"MMFEM_FACE_{solid_index}_{face_index}", face
+    """Yield only unambiguous, order-independent STEP face tags."""
+    for tag, _solid_tag, face in step_geometry_tags(solids)[1]:
+        if tag is not None:
+            yield tag, face
 
 
-def domain_mesh_size_overrides(geometry):
+def domain_mesh_size_overrides(geometry, *, require_stable_tags=False):
     """Return validated per-domain mesh sizes, rejecting ambiguous overlaps."""
     overrides = {}
     for selection in geometry.get("domain_selections", []):
@@ -390,17 +524,23 @@ def domain_mesh_size_overrides(geometry):
                 f"Local maximum element size must be between {MIN_MESH_SIZE_MM:g} "
                 f"and {MAX_MESH_SIZE_MM:g} mm."
             )
-        for region_id in selection.get("domain_ids", []):
-            region_id = int(region_id)
-            existing = overrides.get(region_id)
+        domain_tags = selection.get("domain_tags")
+        if require_stable_tags and not domain_tags:
+            raise ValueError(
+                f"{_LEGACY_DOMAIN_SELECTION_ERROR} Selection {selection.get('name', '')!r}."
+            )
+        refs = domain_tags if domain_tags else selection.get("domain_ids", [])
+        for region_ref in refs:
+            region_ref = str(region_ref) if domain_tags else int(region_ref)
+            existing = overrides.get(region_ref)
             if existing is not None and not math.isclose(
                 existing, maxh, rel_tol=1e-12, abs_tol=1e-12
             ):
                 raise ValueError(
-                    f"Domain {region_id} has conflicting local mesh sizes. "
+                    f"Domain {region_ref} has conflicting local mesh sizes. "
                     "Use one size for every overlapping selection."
                 )
-            overrides[region_id] = maxh
+            overrides[region_ref] = maxh
         selection["mesh_maxh_mm"] = maxh
     return overrides
 
@@ -421,18 +561,24 @@ def validate_3d_project(project, assets):
     if not isinstance(study, dict):
         raise ValueError("The 3D study settings must be an object.")
     physics = study.get("physics", "harmonic_em")
-    if physics != "harmonic_em":
-        raise ValueError("The first 3D study supports time-harmonic electromagnetics only.")
+    if physics not in SUPPORTED_3D_STUDIES:
+        raise ValueError("Choose a supported 3D harmonic study.")
     try:
         frequency_hz = float(study.get("frequency_hz", 500.0))
         polynomial_order = int(study.get("polynomial_order", 1))
         air_padding = float(study.get("air_padding", 2.0))
+        body_force = study.get("mechanical_body_force_n_m3", [0.0, 0.0, 0.0])
         if not math.isfinite(frequency_hz) or not 0 < frequency_hz <= 1e9:
             raise ValueError("Frequency must be greater than 0 and no more than 1e9 Hz.")
         if polynomial_order not in {1, 2, 3, 4}:
             raise ValueError("Polynomial order must be between 1 and 4.")
         if not math.isfinite(air_padding) or not 0.25 <= air_padding <= 20:
             raise ValueError("Air-domain padding must be between 0.25 and 20 model spans.")
+        if not isinstance(body_force, (list, tuple)) or len(body_force) != 3:
+            raise ValueError("Mechanical body force must have finite X, Y and Z components.")
+        body_force = [float(value) for value in body_force]
+        if not all(math.isfinite(value) and abs(value) <= 1e15 for value in body_force):
+            raise ValueError("Mechanical body-force components must be finite and no larger than 1e15 N/m³.")
     except (TypeError, ValueError, OverflowError) as error:
         raise ValueError(f"Invalid 3D study settings: {error}") from error
     study.update({
@@ -440,6 +586,7 @@ def validate_3d_project(project, assets):
         "frequency_hz": frequency_hz,
         "polynomial_order": polynomial_order,
         "air_padding": air_padding,
+        "mechanical_body_force_n_m3": body_force,
     })
 
     materials = project.setdefault("materials", [])

@@ -157,6 +157,20 @@ def test_run_manifest_lookup_finds_the_result_run_directory(tmp_path):
     assert manifest["model_name"] == "Copper coil"
 
 
+def test_run_material_display_names_are_applied_to_the_loaded_mesh():
+    from netgen.occ import Box, Pnt
+
+    solver_region = "_mmfem_g0_MMFEM_SOLID_a1b2c3"
+    mesh = Box(Pnt(0, 0, 0), Pnt(1, 1, 1)).mat(solver_region).GenerateMesh(maxh=0.8)
+
+    file_loader._apply_run_material_display_names(
+        mesh,
+        {"material_display_names": {solver_region: "Copper"}},
+    )
+
+    assert list(map(str, mesh.GetMaterials())) == ["Copper"]
+
+
 def test_result_field_choices_resolve_siblings_and_exclude_current_field(tmp_path):
     gui_directory = tmp_path / "ngsolve_gui"
     fields_directory = gui_directory / "fields"

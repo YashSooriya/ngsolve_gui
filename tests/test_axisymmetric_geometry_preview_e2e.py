@@ -70,6 +70,16 @@ def test_axisymmetric_geometry_creation_renders_3d_preview(page: Page, app):
     )
     app._update()
 
+    page.wait_for_function(
+        """() => {
+            const canvas = document.querySelector('svg.solve-sketch-canvas');
+            return canvas && canvas.querySelector(
+                '[data-sketch-region-id="preview-shield"]'
+            );
+        }""",
+        timeout=10_000,
+    )
+
     screenshot_dir = os.environ.get("MMFEM_UI_SCREENSHOT_DIR")
     if screenshot_dir:
         Path(screenshot_dir).mkdir(parents=True, exist_ok=True)

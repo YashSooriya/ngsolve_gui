@@ -28,6 +28,21 @@ def _wait_for_result_load(page: Page, app, generation_before: int) -> None:
     done_event = None
     while footer._generation <= generation_before and time.monotonic() < deadline:
         page.wait_for_timeout(50)
+    if footer._generation <= generation_before:
+        diagnostics = {
+            "workspace_mode": getattr(app, "_workspace_mode", None),
+            "tab_component": type(getattr(app.tab_panel, "comp", None)).__name__,
+            "footer_generation": footer._generation,
+            "footer_idle_hidden": footer._idle.ui_hidden,
+            "body_text": page.locator("body").inner_text()[:1800],
+        }
+        print("RESULT_LOAD_TIMEOUT " + json.dumps(diagnostics, default=str))
+        evidence_dir = os.environ.get("MMFEM_UI_SCREENSHOT_DIR")
+        if evidence_dir:
+            page.screenshot(
+                path=str(Path(evidence_dir) / "3d-run-postprocess-load-timeout.png"),
+                full_page=True,
+            )
     assert footer._generation > generation_before, "The run result did not start loading."
     while footer._idle.ui_hidden and time.monotonic() < deadline:
         load_thread = load_thread or footer._thread
@@ -65,6 +80,8 @@ def test_3d_run_button_completes_and_opens_post_process(page: Page, app):
 
 
 def _exercise_3d_run_handoff(page, app, tmp_path):
+    page_errors = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
     cube_path = tmp_path / "em_cube.step"
     Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).WriteStep(str(cube_path))
     trace_path = tmp_path / "coil_trace.txt"
@@ -109,8 +126,10 @@ def _exercise_3d_run_handoff(page, app, tmp_path):
     app._update()
 
     geometry = workspace.project["geometries"][0]
-    workspace.select_item("geometry", geometry["id"])
-    app._update()
+    page.locator(".mmfem-3d-model-tree").get_by_text(
+        geometry["name"], exact=True
+    ).click()
+    page.get_by_label("Default material").wait_for(timeout=10_000)
     assert geometry["units"] == "mm"
     assert geometry["material"] == "Unassigned"
     run_button = page.get_by_role("button", name="Run study")
@@ -132,8 +151,9 @@ def _exercise_3d_run_handoff(page, app, tmp_path):
     while run_button.is_disabled() and time.monotonic() < deadline:
         page.wait_for_timeout(100)
     assert not run_button.is_disabled()
-    workspace.select_item("geometry", geometry["id"])
-    app._update()
+    page.locator(".mmfem-3d-model-tree").get_by_text(
+        geometry["name"], exact=True
+    ).click()
     page.get_by_label("Maximum element size (mm)").wait_for(timeout=10_000)
     page.wait_for_timeout(250)
 
@@ -186,7 +206,7 @@ def _exercise_3d_run_handoff(page, app, tmp_path):
         page.wait_for_timeout(100)
     assert workspace.project["study"]["air_padding"] == 1.5
     page.keyboard.press("Escape")
-    page.get_by_text("Time-harmonic electromagnetic study", exact=True).click()
+    page.get_by_text("Harmonic study", exact=True).click()
     page.wait_for_timeout(500)
     screenshot_dir = os.environ.get("MMFEM_UI_SCREENSHOT_DIR")
     if screenshot_dir:
@@ -212,10 +232,25 @@ def _exercise_3d_run_handoff(page, app, tmp_path):
     while app._solver_job_active and time.monotonic() < deadline:
         page.wait_for_timeout(100)
     assert app._solver_job_active is False
+    completed_manifest = json.loads(
+        (output_dir / "run_manifest.json").read_text(encoding="utf-8")
+    )
+    print("3D_RUN_COMPLETED " + json.dumps({
+        "status": completed_manifest.get("status"),
+        "physics": completed_manifest.get("physics"),
+        "solution_exists": (output_dir / "ngsolve_gui" / "solution.pkl").is_file(),
+        "fields": completed_manifest.get("fields"),
+        "workspace_mode": app._workspace_mode,
+        "page_errors": page_errors,
+    }, default=str))
+    assert completed_manifest["status"] == "complete", (
+        f"The 3D UI run failed: {(output_dir / 'solver.log').read_text(encoding='utf-8')[-2400:]}"
+    )
     _wait_for_result_load(page, app, first_load_generation)
 
     manifest = json.loads((output_dir / "run_manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "complete"
+    assert manifest["physics"] == "Time-harmonic electromagnetics"
     assert manifest["frequency_hz"] == 63.0
     assert manifest["polynomial_order"] == 2
     assert manifest["air_padding"] == 1.5
