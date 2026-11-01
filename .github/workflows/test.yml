@@ -6,6 +6,37 @@ on:
   pull_request:
 
 jobs:
+  core-preprocessing:
+    name: Core preprocessing and branding
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build test image
+        run: docker build -t ngsolve-gui-tests .
+
+      - name: Run core preprocessing checks
+        run: |
+          docker run --rm ngsolve-gui-tests pytest -q \
+            tests/test_branding.py \
+            tests/test_axisymmetric_model.py \
+            tests/test_axisymmetric_geometry_preview_e2e.py \
+            tests/test_file_loader.py \
+            tests/test_geometry.py \
+            tests/test_mesh.py \
+            tests/test_project_startup.py \
+            tests/test_run_history.py \
+            tests/test_three_d_mesh.py \
+            tests/test_three_d_preview.py \
+            tests/test_three_d_project.py \
+            tests/test_three_d_solver_setup.py \
+            tests/test_three_d_workspace.py \
+            tests/test_three_d_workspace_e2e.py
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -13,6 +44,7 @@ jobs:
         with:
           lfs: true
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Build test image
         run: docker build -t ngsolve-gui-tests .
