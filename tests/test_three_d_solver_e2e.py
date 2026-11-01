@@ -10,12 +10,14 @@ from unittest.mock import patch
 from ngapp.e2e import app_test
 from netgen.occ import Box, Pnt
 from playwright.sync_api import Page
+import pytest
 
 from ngsolve_gui.axisymmetric_model import builtin_materials
 from ngsolve_gui.sections.regions import RegionsSection
 from ngsolve_gui.sections.study_info import StudyInfoSection
 from ngsolve_gui.three_d_project import add_step_geometry, add_wire_trace, new_3d_project
 import ngsolve_gui.solve_workspace as solve_workspace
+from .solver_test_support import SOLVER_UNAVAILABLE_REASON, solver_checkout_available
 
 
 def _wait_for_result_load(page: Page, app, generation_before: int) -> None:
@@ -42,6 +44,10 @@ def _wait_for_result_load(page: Page, app, generation_before: int) -> None:
 
 
 @app_test("ngsolve_gui.appconfig")
+@pytest.mark.skipif(
+    not solver_checkout_available(),
+    reason=SOLVER_UNAVAILABLE_REASON,
+)
 def test_3d_run_button_completes_and_opens_post_process(page: Page, app):
     with tempfile.TemporaryDirectory(prefix="mmfem_3d_run_e2e_") as temporary:
         evidence_dir = os.environ.get("MMFEM_STAGE8A_EVIDENCE_DIR")

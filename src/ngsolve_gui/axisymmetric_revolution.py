@@ -263,7 +263,7 @@ def revolve_gridfunction(
             x_coord = radius * math.cos(angle)
             y_coord = radius * math.sin(angle)
             point_id = target_ngmesh.Add(
-                ngm.MeshPoint(ngm.Point3d(x_coord, y_coord, axial))
+                ngm.MeshPoint(ngm.Pnt(x_coord, y_coord, axial))
             )
             ring.append(point_id)
             point_coordinates[point_id.nr] = (x_coord, y_coord, axial)

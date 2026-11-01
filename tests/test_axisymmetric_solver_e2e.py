@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from ngapp.e2e import app_test
 from playwright.sync_api import Page
+import pytest
 
 from ngsolve_gui.axisymmetric_model import (
     builtin_materials,
@@ -20,6 +21,7 @@ from ngsolve_gui.axisymmetric_model import (
     validate_model,
 )
 import ngsolve_gui.solve_workspace as solve_workspace
+from .solver_test_support import SOLVER_UNAVAILABLE_REASON, solver_checkout_available
 
 
 def _harmonic_coil_project():
@@ -128,6 +130,10 @@ def _harmonic_coil_project():
 
 
 @app_test("ngsolve_gui.appconfig")
+@pytest.mark.skipif(
+    not solver_checkout_available(),
+    reason=SOLVER_UNAVAILABLE_REASON,
+)
 def test_axisymmetric_run_button_executes_harmonic_project(page: Page, app):
     with tempfile.TemporaryDirectory(prefix="mmfem_axisym_run_e2e_") as temporary:
         root = Path(temporary)

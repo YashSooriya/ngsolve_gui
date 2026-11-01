@@ -133,7 +133,7 @@ def mirror_quarter_gridfunction(
             point[axis] = float(plane["coordinate"])
             normal[axis] = 1.0
             mirrored_ngmesh = mirrored_ngmesh.Mirror(
-                ngm.Point3d(*point), ngm.Vec3d(*normal)
+                ngm.Pnt(*point), ngm.Vec3d(*normal)
             )
 
         target_mesh = ngs.Mesh(mirrored_ngmesh)

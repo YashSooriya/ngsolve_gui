@@ -30,6 +30,23 @@ PLOTLY_TEST_BUNDLE = TESTS_DIR / "vendor" / "plotly-2.35.2.min.js"
 PLOTLY_CDN_URL = "https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"
 
 
+def _children_with_procfs_retry():
+    """Retry a transient psutil parse race while a child exits on Linux.
+
+    psutil can raise IndexError when a process disappears between reading
+    /proc/<pid>/stat and parsing its fields. Retrying lets the next snapshot
+    reflect the process tree after that exit; persistent inspection errors
+    still fail the test cleanup check.
+    """
+    for attempt in range(4):
+        try:
+            return psutil.Process().children(recursive=True)
+        except IndexError:
+            if attempt == 3:
+                raise
+            time.sleep(0.025)
+
+
 def pytest_configure(config):
     import ngapp.e2e_webgpu as e2e_webgpu
 
@@ -74,9 +91,10 @@ def page(browser):
         _initialised_scenes,
     )
 
-    # Use the desktop-sized viewport used when the WebGPU baselines were
-    # captured. Some expanded workspaces reduce the canvas height further.
-    current_page = browser.new_page(viewport={"width": 1441, "height": 864})
+    # Keep the viewport at the width used by the checked-in visual baselines.
+    # A wider browser changes the canvas dimensions and creates false image
+    # differences even when the rendered content is otherwise unchanged.
+    current_page = browser.new_page(viewport={"width": 1280, "height": 864})
     current_page.add_init_script(_OFFSCREEN_CANVAS_JS)
     current_page.add_init_script(_READBACK_JS)
     current_page.route(
@@ -237,6 +255,12 @@ def _isolate_ngapp_test_lifecycle(monkeypatch):
                     with resize_state._lock:
                         resize_timer = resize_state._timer
                         resize_state._pending = None
+                        # A debounced resize can already be queued in a
+                        # Timer thread when the component unmounts. Once the
+                        # browser canvas is gone, make any in-flight callback
+                        # a no-op before the host clears platform.js; otherwise
+                        # canvas.resize can dereference a closed JS window.
+                        resize_state._fn = lambda *_args, **_kwargs: None
                         if resize_timer is not None:
                             resize_timer.cancel()
                             resize_state._timer = None
@@ -344,7 +368,7 @@ def _isolate_ngapp_test_lifecycle(monkeypatch):
 
     baseline_pids = {
         process.pid
-        for process in psutil.Process().children(recursive=True)
+        for process in _children_with_procfs_retry()
     }
     yield
 
@@ -359,7 +383,7 @@ def _isolate_ngapp_test_lifecycle(monkeypatch):
 
     def owned_test_workers():
         workers = []
-        for process in psutil.Process().children(recursive=True):
+        for process in _children_with_procfs_retry():
             if process.pid in baseline_pids:
                 continue
             try:
