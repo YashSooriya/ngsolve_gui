@@ -39,6 +39,11 @@ def test_generates_a_volume_mesh_and_exterior_triangles_for_step_solid(tmp_path)
     assert result["domain_regions"][0]["elements"] == result["volume_elements"]
     assert len(result["boundary_regions"]) == 6
     assert sum(region["elements"] for region in result["boundary_regions"]) == result["surface_faces"]
+    assert len({region["boundary_tag"] for region in result["boundary_regions"]}) == 6
+    assert all(
+        region["boundary_tag"].startswith("MMFEM_FACE_0_")
+        for region in result["boundary_regions"]
+    )
     assert 0 <= result["tetra_quality"]["minimum"] <= result["tetra_quality"]["median"] <= 1
     assert result["tetra_quality"]["below_0_1"] <= result["volume_elements"]
 

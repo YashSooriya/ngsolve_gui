@@ -48,12 +48,14 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     ).click()
     mesh_size = page.get_by_label("Maximum element size (mm)")
     mesh_size.wait_for(timeout=10_000)
-    mesh_size.fill("40")
+    # Keep this end-to-end UI check bounded on developer machines while still
+    # generating a real volume mesh for CAD selection and viewport verification.
+    mesh_size.fill("100")
     mesh_size.press("Tab")
     deadline = time.monotonic() + 5
-    while geometry.get("mesh_maxh_mm") != 40.0 and time.monotonic() < deadline:
+    while geometry.get("mesh_maxh_mm") != 100.0 and time.monotonic() < deadline:
         page.wait_for_timeout(100)
-    assert geometry["mesh_maxh_mm"] == 40.0
+    assert geometry["mesh_maxh_mm"] == 100.0
     assert geometry["material"] == UNASSIGNED_MATERIAL
     assert workspace._run_study_button.ui_disable is True
     assert page.get_by_role("button", name="Run study").is_disabled()
@@ -223,6 +225,17 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     ):
         page.wait_for_timeout(100)
     assert workspace._selection_draft["name"] == "Selected STEP boundary"
+    page.get_by_label("Boundary condition").click()
+    page.locator(".q-menu:visible .q-item").filter(
+        has_text="Vector potential A = 0"
+    ).click()
+    deadline = time.monotonic() + 10
+    while (
+        workspace._selection_draft.get("boundary_condition") != "magnetic_potential_zero"
+        and time.monotonic() < deadline
+    ):
+        page.wait_for_timeout(100)
+    assert workspace._selection_draft["boundary_condition"] == "magnetic_potential_zero"
     page.get_by_role("button", name="Save selection").click()
     deadline = time.monotonic() + 10
     while not live_geometry.get("boundary_selections") and time.monotonic() < deadline:
@@ -230,6 +243,8 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     assert live_geometry.get("boundary_selections")
     assert live_geometry["boundary_selections"][0]["boundary_ids"] == [selected_boundary]
     selection = live_geometry["boundary_selections"][0]
+    assert selection["boundary_condition"] == "magnetic_potential_zero"
+    assert len(selection["boundary_tags"]) == 1
     assert workspace._selection == ("named_selection", selection["id"])
     try:
         page.wait_for_function(
@@ -313,6 +328,13 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
         }""",
         timeout=10_000,
     )
+    tree.get_by_text("Time-harmonic EM", exact=True).click()
+    page.get_by_label("Frequency (Hz)").wait_for(timeout=10_000)
+    if screenshot_dir:
+        page.screenshot(
+            path=str(Path(screenshot_dir) / "05-3d-study-configuration.png"),
+            full_page=True,
+        )
     page.wait_for_timeout(2500)
     properties = page.locator(".mmfem-property-editor-body")
     properties.evaluate("element => { element.scrollTop = 0; }")

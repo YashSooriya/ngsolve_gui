@@ -7,7 +7,7 @@ import tempfile
 from collections import Counter
 from pathlib import Path
 
-from .three_d_project import MAX_MESH_SIZE_MM, MIN_MESH_SIZE_MM
+from .three_d_project import MAX_MESH_SIZE_MM, MIN_MESH_SIZE_MM, step_face_tags
 
 MAX_ESTIMATED_VOLUME_ELEMENTS = 3_000_000
 MAX_VOLUME_ELEMENTS = 2_000_000
@@ -39,20 +39,30 @@ def _tetra_quality(vertices, connectivity):
     return np.clip(np.nan_to_num(quality, nan=0.0, posinf=0.0), 0.0, 1.0)
 
 
-def _named_regions(ids, counts, names, fallback):
+def _named_regions(ids, counts, names, fallback, *, include_boundary_tags=False):
     """Summarize region indices with unique display names and element counts."""
     regions = []
     used_names = set()
     for region_id in sorted(set(ids)):
         raw_name = str(names[region_id]).strip() if region_id < len(names) else ""
+        boundary_tag = (
+            raw_name
+            if include_boundary_tags and raw_name.startswith("MMFEM_FACE_")
+            else None
+        )
+        if boundary_tag:
+            raw_name = f"{fallback} {region_id + 1}"
         if not raw_name or raw_name.casefold() == "default" or raw_name.casefold() in used_names:
             raw_name = f"{fallback} {region_id + 1}"
         used_names.add(raw_name.casefold())
-        regions.append({
+        region = {
             "id": int(region_id),
             "name": raw_name,
             "elements": int(counts.get(region_id, 0)),
-        })
+        }
+        if include_boundary_tags:
+            region["boundary_tag"] = boundary_tag
+        regions.append(region)
     return regions
 
 
@@ -123,6 +133,8 @@ def generate_step_mesh(data, *, maxh_mm=30.0, domain_maxh_mm=None):
                     "The requested sizes are estimated to create an impractically "
                     f"large mesh. Increase it to about {suggested:.3g} mm or larger."
                 )
+            for tag, face in step_face_tags(solids):
+                face.bc(tag)
             netgen_mesh = OCCGeometry(Glue(solids)).GenerateMesh()
         except ValueError:
             raise
@@ -195,6 +207,7 @@ def generate_step_mesh(data, *, maxh_mm=30.0, domain_maxh_mm=None):
             Counter(surface_region_ids),
             list(mesh.GetBoundaries()),
             "Boundary",
+            include_boundary_tags=True,
         )
 
         edge_pairs = np.concatenate(

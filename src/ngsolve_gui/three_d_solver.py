@@ -11,6 +11,7 @@ from .three_d_project import (
     build_3d_solver_inputs,
     build_wire_trace_sets,
     domain_mesh_size_overrides,
+    step_face_tags,
 )
 
 
@@ -192,8 +193,12 @@ def build_time_harmonic_em_problem(project, asset_paths):
     bounds_min = [math.inf, math.inf, math.inf]
     bounds_max = [-math.inf, -math.inf, -math.inf]
     used_materials = {}
+    dirichlet_boundary_names = []
+    seen_dirichlet_boundary_names = set()
 
-    for geometry_input, geometry in zip(geometry_inputs, project["geometries"]):
+    for geometry_index, (geometry_input, geometry) in enumerate(
+        zip(geometry_inputs, project["geometries"])
+    ):
         default_material = str(geometry.get("material", "")).strip()
         if not default_material:
             raise ValueError(f"Assign a material to {geometry['name']!r} before running.")
@@ -206,6 +211,41 @@ def build_time_harmonic_em_problem(project, asset_paths):
         solids = list(shape.solids)
         if not solids:
             raise ValueError(f"{geometry['name']!r} does not contain a closed STEP solid.")
+
+        selected_boundary_conditions = {}
+        for selection in geometry.get("boundary_selections", []):
+            condition = selection.get("boundary_condition")
+            if condition is None:
+                continue
+            if condition != "magnetic_potential_zero":
+                raise ValueError(
+                    f"Boundary selection {selection.get('name', '')!r} uses an unsupported condition."
+                )
+            tags = selection.get("boundary_tags")
+            if not tags:
+                raise ValueError(
+                    f"Boundary selection {selection.get('name', '')!r} has no saved STEP face mapping. "
+                    "Regenerate the mesh and save the selection again."
+                )
+            for tag in tags:
+                selected_boundary_conditions[tag] = condition
+
+        faces_by_tag = dict(step_face_tags(solids))
+        stale_tags = sorted(set(selected_boundary_conditions) - set(faces_by_tag))
+        if stale_tags:
+            raise ValueError(
+                f"Boundary selections for {geometry['name']!r} no longer match its STEP faces. "
+                "Regenerate the mesh and update the selections."
+            )
+        for tag, face in faces_by_tag.items():
+            if tag in selected_boundary_conditions:
+                boundary_name = f"DirEM_G{geometry_index}_{tag}"
+                face.bc(boundary_name)
+                if boundary_name not in seen_dirichlet_boundary_names:
+                    dirichlet_boundary_names.append(boundary_name)
+                    seen_dirichlet_boundary_names.add(boundary_name)
+            else:
+                face.bc("Transmission_Interface")
 
         overrides = {}
         local_mesh_overrides = domain_mesh_size_overrides(geometry)
@@ -235,7 +275,6 @@ def build_time_harmonic_em_problem(project, asset_paths):
             material_name = overrides.get(region_id, default_material)
             material = resolve_material(material_name)
             solid.mat(material["name"])
-            solid.bc("Transmission_Interface")
             object_key = f"_mmfem_solid_{object_index}"
             object_index += 1
             objects[object_key] = solid
@@ -320,8 +359,10 @@ def build_time_harmonic_em_problem(project, asset_paths):
         "mechSubdom": "|".join(name for name in material_names if name != air_record["name"]),
         "Neudict": {"Neu_0": 0},
         "Neukeys": ["Neu_0", "Transmission_Interface"],
-        "dirconditionAAC": {"DirEM": zero_vector},
-        "dirkeysAAC": "DirEM",
+        "dirconditionAAC": {
+            name: zero_vector for name in ["DirEM", *dirichlet_boundary_names]
+        },
+        "dirkeysAAC": "|".join(["DirEM", *dirichlet_boundary_names]),
         "dirconditionADC": {},
         "dirkeysADC": "",
         "dirconditionMech": {},

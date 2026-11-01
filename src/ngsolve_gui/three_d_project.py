@@ -27,6 +27,10 @@ MAX_NAMED_SELECTIONS = 500
 MAX_SELECTION_REGIONS = 100_000
 MIN_MESH_SIZE_MM = 0.01
 MAX_MESH_SIZE_MM = 100_000.0
+SUPPORTED_3D_BOUNDARY_CONDITIONS = {
+    "magnetic_potential_zero": "Vector potential A = 0",
+}
+_STEP_FACE_TAG_PATTERN = re.compile(r"MMFEM_FACE_\d+_\d+\Z")
 
 LENGTH_UNITS = {
     "m": 1.0,
@@ -319,10 +323,53 @@ def _validate_named_selections(geometry, key, region_key, label):
             raise ValueError(f"Named {label} selection region ids must be non-negative integers.")
         if len(set(region_ids)) != len(region_ids):
             raise ValueError(f"Named {label} selection region ids must be unique.")
+        if label == "boundary":
+            condition = selection.get("boundary_condition")
+            if condition is not None and (
+                not isinstance(condition, str)
+                or condition not in SUPPORTED_3D_BOUNDARY_CONDITIONS
+            ):
+                raise ValueError(
+                    f"Unsupported 3D boundary condition {condition!r}. "
+                    "Only magnetic potential = 0 is currently available."
+                )
+            tags = selection.get("boundary_tags")
+            if tags is not None:
+                if (
+                    not isinstance(tags, list)
+                    or not tags
+                    or len(tags) > MAX_SELECTION_REGIONS
+                    or any(
+                        not isinstance(tag, str)
+                        or not _STEP_FACE_TAG_PATTERN.fullmatch(tag)
+                        for tag in tags
+                    )
+                ):
+                    raise ValueError(
+                        "Named boundary selection face tags must be valid STEP face identifiers."
+                    )
+                if len(set(tags)) != len(tags):
+                    raise ValueError("Named boundary selection face tags must be unique.")
+                if len(tags) != len(region_ids):
+                    raise ValueError(
+                        "Named boundary selection face tags must map one-to-one to its region ids."
+                    )
+            if condition is not None and not tags:
+                raise ValueError(
+                    "A 3D boundary condition needs saved STEP face identifiers. "
+                    "Regenerate the mesh and save the boundary selection again."
+                )
         selection["name"] = name.strip()
         selection[region_key] = sorted(region_ids)
         used_ids.add(selection_id)
         used_names.add(normalized_name)
+
+
+def step_face_tags(solids):
+    """Yield stable per-solid face tags shared by meshing and solver builds."""
+    for solid_index, solid in enumerate(solids):
+        for face_index, face in enumerate(solid.faces):
+            yield f"MMFEM_FACE_{solid_index}_{face_index}", face
 
 
 def domain_mesh_size_overrides(geometry):

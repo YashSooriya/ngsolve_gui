@@ -21,6 +21,7 @@ from .three_d_project import (
     MAX_MESH_SIZE_MM,
     MIN_MESH_SIZE_MM,
     PROJECT_SUFFIX,
+    SUPPORTED_3D_BOUNDARY_CONDITIONS,
     UNASSIGNED_MATERIAL,
     add_step_geometry,
     add_wire_trace,
@@ -54,6 +55,13 @@ _VIEW_OPTIONS = [
     {"label": "Back", "value": "back"},
     {"label": "Top", "value": "top"},
     {"label": "Bottom", "value": "bottom"},
+]
+_BOUNDARY_CONDITION_OPTIONS = [
+    {"label": "Default solver behavior", "value": "default"},
+    *[
+        {"label": label, "value": key}
+        for key, label in SUPPORTED_3D_BOUNDARY_CONDITIONS.items()
+    ],
 ]
 
 
@@ -108,6 +116,7 @@ class ThreeDWorkspace(Div):
             "name": "",
             "region_ids": [],
             "material": None,
+            "boundary_condition": "default",
         }
         self._study_running = False
         self._preview_lock = threading.Lock()
@@ -623,6 +632,7 @@ class ThreeDWorkspace(Div):
             "name": "",
             "region_ids": [],
             "material": None,
+            "boundary_condition": "default",
         }
         self._update_study_controls()
         self._refresh_mesh_controls()
@@ -935,7 +945,13 @@ class ThreeDWorkspace(Div):
             ),
             label,
             Div(
-                "Domain" if kind == "domain" else "Boundary",
+                "Domain"
+                if kind == "domain"
+                else (
+                    "A = 0"
+                    if selection.get("boundary_condition") == "magnetic_potential_zero"
+                    else "Boundary"
+                ),
                 ui_class="cb-muted",
                 ui_style="font-size:9px; padding:1px 4px; border-radius:4px; background:var(--panel-header);",
             ),
@@ -975,6 +991,7 @@ class ThreeDWorkspace(Div):
                     "name": "",
                     "region_ids": [],
                     "material": None,
+                    "boundary_condition": "default",
                 }
             self._mark_changed()
             self._rebuild_items()
@@ -1131,6 +1148,7 @@ class ThreeDWorkspace(Div):
                 "name": "",
                 "region_ids": [],
                 "material": None,
+                "boundary_condition": "default",
             }
         return self._selection_draft
 
@@ -1147,6 +1165,7 @@ class ThreeDWorkspace(Div):
             "name": "",
             "region_ids": [],
             "material": None,
+            "boundary_condition": "default",
         })
         self._selection = ("geometry", geometry["id"])
         self._rebuild_properties()
@@ -1186,6 +1205,71 @@ class ThreeDWorkspace(Div):
         if value and self._snapshot_material_reference(value):
             self._mark_changed()
 
+    def _set_selection_draft_boundary_condition(self, event):
+        value = str(getattr(event, "value", event) or "default")
+        if value != "default" and value not in SUPPORTED_3D_BOUNDARY_CONDITIONS:
+            self._set_status("Choose a supported 3D time-harmonic boundary condition.", error=True)
+            return False
+        self._selection_draft["boundary_condition"] = value
+        return True
+
+    def _set_named_selection_boundary_condition(self, geometry, selection, event):
+        value = str(getattr(event, "value", event) or "default")
+        if value != "default" and value not in SUPPORTED_3D_BOUNDARY_CONDITIONS:
+            self._set_status("Choose a supported 3D time-harmonic boundary condition.", error=True)
+            return False
+
+        old_condition = selection.get("boundary_condition")
+        old_tags = selection.get("boundary_tags")
+        if value != "default" and not old_tags:
+            result = self._mesh_results.get(geometry["id"], {})
+            if result.get("status") != "ready":
+                self._set_status(
+                    "Generate a volume mesh before assigning a condition to this boundary selection.",
+                    error=True,
+                )
+                return False
+            tags_by_id = {
+                int(region["id"]): region.get("boundary_tag")
+                for region in result.get("boundary_regions", [])
+            }
+            region_ids = selection.get("boundary_ids", [])
+            if any(
+                not isinstance(tags_by_id.get(int(region_id)), str)
+                for region_id in region_ids
+            ):
+                self._set_status(
+                    "The current mesh cannot map this selection to STEP faces. "
+                    "Recreate the selection from the current mesh.",
+                    error=True,
+                )
+                return False
+            selection["boundary_tags"] = [tags_by_id[int(region_id)] for region_id in region_ids]
+
+        if value == "default":
+            selection.pop("boundary_condition", None)
+        else:
+            selection["boundary_condition"] = value
+        try:
+            validate_3d_project(self.project, self.assets)
+        except (TypeError, ValueError) as error:
+            if old_condition is None:
+                selection.pop("boundary_condition", None)
+            else:
+                selection["boundary_condition"] = old_condition
+            if old_tags is None:
+                selection.pop("boundary_tags", None)
+            else:
+                selection["boundary_tags"] = old_tags
+            self._set_status(str(error), error=True)
+            return False
+        self._selection_draft["boundary_condition"] = value
+        self._mark_changed()
+        self._rebuild_items()
+        self._rebuild_properties()
+        self._set_status("3D boundary condition updated.")
+        return True
+
     def _new_named_selection(self, geometry):
         draft = self._ensure_selection_draft(geometry)
         draft.update({
@@ -1193,6 +1277,7 @@ class ThreeDWorkspace(Div):
             "name": "",
             "region_ids": [],
             "material": None,
+            "boundary_condition": "default",
         })
         self._selection = ("geometry", geometry["id"])
         self._rebuild_items()
@@ -1222,6 +1307,34 @@ class ThreeDWorkspace(Div):
         if not set(region_ids).issubset(valid_ids):
             self._set_status("One or more selected regions are not in the current mesh.", error=True)
             return False
+        boundary_tags = []
+        boundary_condition = draft.get("boundary_condition", "default")
+        if kind == "boundary":
+            if (
+                boundary_condition != "default"
+                and boundary_condition not in SUPPORTED_3D_BOUNDARY_CONDITIONS
+            ):
+                self._set_status("Choose a supported 3D time-harmonic boundary condition.", error=True)
+                return False
+            boundary_regions = {
+                int(region["id"]): region
+                for region in result.get("boundary_regions", [])
+            }
+            selected_boundary_tags = [
+                boundary_regions[region_id].get("boundary_tag")
+                for region_id in region_ids
+            ]
+            if boundary_condition != "default" and any(
+                not isinstance(tag, str) for tag in selected_boundary_tags
+            ):
+                self._set_status(
+                    "The selected boundary condition can only be assigned to mapped STEP faces. "
+                    "Regenerate the mesh before saving the selection.",
+                    error=True,
+                )
+                return False
+            if all(isinstance(tag, str) for tag in selected_boundary_tags):
+                boundary_tags = selected_boundary_tags
 
         collection_key = f"{kind}_selections"
         collection = geometry.setdefault(collection_key, [])
@@ -1252,6 +1365,14 @@ class ThreeDWorkspace(Div):
                 existing.pop("material", None)
         else:
             existing.pop("material", None)
+            if boundary_tags:
+                existing["boundary_tags"] = boundary_tags
+            else:
+                existing.pop("boundary_tags", None)
+            if boundary_condition == "default":
+                existing.pop("boundary_condition", None)
+            else:
+                existing["boundary_condition"] = boundary_condition
         draft.update({"selection_id": selection_id, "region_ids": region_ids})
         self._selection = ("named_selection", selection_id)
         self._mark_changed()
@@ -1338,6 +1459,20 @@ class ThreeDWorkspace(Div):
                     ],
                 ),
                 self._material_note(),
+            ])
+        else:
+            children.extend([
+                self._select_options(
+                    "Boundary condition",
+                    draft.get("boundary_condition", "default"),
+                    self._set_selection_draft_boundary_condition,
+                    _BOUNDARY_CONDITION_OPTIONS,
+                ),
+                Div(
+                    "Leave the faces unconstrained to use the solver's existing time-harmonic EM behavior.",
+                    ui_class="cb-muted",
+                    ui_style="font-size:10px; line-height:1.4;",
+                ),
             ])
         children.extend([
             self._select_options(
@@ -1435,6 +1570,7 @@ class ThreeDWorkspace(Div):
                         "domain_ids" if selection_kind == "domain" else "boundary_ids", []
                     )),
                     "material": selection.get("material"),
+                    "boundary_condition": selection.get("boundary_condition") or "default",
                 })
             name_target = named_context[2] if named_context else item
             name_label = "Selection name" if named_context else "Name"
@@ -1508,6 +1644,25 @@ class ThreeDWorkspace(Div):
                             "Blank uses the geometry size.",
                             ui_class="cb-muted",
                             ui_style="font-size:10px;",
+                        ),
+                    ])
+                else:
+                    boundary_condition = self._select_options(
+                        "Boundary condition",
+                        selection.get("boundary_condition") or "default",
+                        lambda event, geom=geometry, obj=selection: self._set_named_selection_boundary_condition(
+                            geom, obj, event
+                        ),
+                        _BOUNDARY_CONDITION_OPTIONS,
+                    )
+                    boundary_condition.ui_disable = self._mesh_worker_active
+                    children.extend([
+                        boundary_condition,
+                        Div(
+                            "Imposes A = 0 (Dirichlet) on these faces in the time-harmonic EM study. "
+                            "Other 3D physics conditions are not available yet.",
+                            ui_class="cb-muted",
+                            ui_style="font-size:10px; line-height:1.4;",
                         ),
                     ])
                 self._mesh_property_status = None
@@ -1638,6 +1793,7 @@ class ThreeDWorkspace(Div):
                         "domain_ids" if selection_kind == "domain" else "boundary_ids", []
                     )),
                     "material": selection.get("material"),
+                    "boundary_condition": selection.get("boundary_condition") or "default",
                 }
         self._selection = (kind, item_id)
         self._rebuild_items()
@@ -1685,9 +1841,14 @@ class ThreeDWorkspace(Div):
                         "name": "",
                         "region_ids": [],
                         "material": next(
-                            (item.get("material", UNASSIGNED_MATERIAL) for item in self.project.get("geometries", []) if item.get("id") == item_id),
+                            (
+                                item.get("material", UNASSIGNED_MATERIAL)
+                                for item in self.project.get("geometries", [])
+                                if item.get("id") == item_id
+                            ),
                             UNASSIGNED_MATERIAL,
                         ),
+                        "boundary_condition": "default",
                     }
                 region_id = int(region_ids[point_number])
                 draft_ids = self._selection_draft["region_ids"]

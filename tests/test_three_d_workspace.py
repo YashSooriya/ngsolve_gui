@@ -541,9 +541,24 @@ def _workspace_with_test_mesh(monkeypatch):
         "surface_faces": 3,
         "boundary_region_ids": np.asarray([0, 1, 2], dtype=np.int32),
         "boundary_regions": [
-            {"id": 0, "name": "Boundary 1", "elements": 1},
-            {"id": 1, "name": "Boundary 2", "elements": 1},
-            {"id": 2, "name": "Boundary 3", "elements": 1},
+            {
+                "id": 0,
+                "name": "Boundary 1",
+                "elements": 1,
+                "boundary_tag": "MMFEM_FACE_0_0",
+            },
+            {
+                "id": 1,
+                "name": "Boundary 2",
+                "elements": 1,
+                "boundary_tag": "MMFEM_FACE_0_1",
+            },
+            {
+                "id": 2,
+                "name": "Boundary 3",
+                "elements": 1,
+                "boundary_tag": "MMFEM_FACE_0_2",
+            },
         ],
         "domain_regions": [{"id": 0, "name": "Shield", "elements": 4}],
         "tetra_quality": {
@@ -571,6 +586,7 @@ def test_mesh_quality_and_named_domain_boundary_selections_persist(monkeypatch):
     selection = geometry["boundary_selections"][0]
     assert selection["name"] == "Symmetry surfaces"
     assert selection["boundary_ids"] == [0, 2]
+    assert selection["boundary_tags"] == ["MMFEM_FACE_0_0", "MMFEM_FACE_0_2"]
     assert "median 0.700" in workspace._mesh_quality_message(geometry["id"])
     assert workspace._selection == ("named_selection", selection["id"])
     assert workspace._active_boundary_region_ids(geometry["id"]) == [0, 2]
@@ -601,6 +617,82 @@ def test_named_boundary_inspector_only_shows_boundary_properties(monkeypatch):
     assert "Default material" not in labels
     assert "Length units" not in labels
     assert "Maximum element size (mm)" not in labels
+    assert "Boundary condition" in labels
+
+
+def test_default_boundary_selection_can_include_regions_without_step_face_tags(monkeypatch):
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    workspace._mesh_results[geometry["id"]]["boundary_regions"][0]["boundary_tag"] = None
+    workspace._set_selection_draft_regions(geometry, SimpleNamespace(value=[0]))
+    workspace._set_selection_draft_name(SimpleNamespace(value="Outer air boundary"))
+
+    assert workspace._save_named_selection(geometry) is True
+
+    selection = geometry["boundary_selections"][0]
+    assert selection["boundary_ids"] == [0]
+    assert "boundary_tags" not in selection
+
+
+def test_explicit_boundary_condition_rejects_regions_without_step_face_tags(monkeypatch):
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    workspace._mesh_results[geometry["id"]]["boundary_regions"][0]["boundary_tag"] = None
+    workspace._set_selection_draft_regions(geometry, SimpleNamespace(value=[0]))
+    workspace._set_selection_draft_name(SimpleNamespace(value="Unmapped face"))
+    workspace._set_selection_draft_boundary_condition(
+        SimpleNamespace(value="magnetic_potential_zero")
+    )
+
+    assert workspace._save_named_selection(geometry) is False
+    assert geometry["boundary_selections"] == []
+
+
+def test_existing_boundary_selection_can_be_upgraded_to_supported_condition(monkeypatch):
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    selection = {
+        "id": "existing-face",
+        "name": "Existing STEP boundary",
+        "boundary_ids": [1],
+    }
+    geometry["boundary_selections"].append(selection)
+
+    assert workspace._set_named_selection_boundary_condition(
+        geometry,
+        selection,
+        SimpleNamespace(value="magnetic_potential_zero"),
+    ) is True
+    assert selection["boundary_condition"] == "magnetic_potential_zero"
+    assert selection["boundary_tags"] == ["MMFEM_FACE_0_1"]
+
+
+def test_named_boundary_selection_assigns_only_supported_time_harmonic_condition(monkeypatch):
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    workspace._set_selection_draft_regions(geometry, SimpleNamespace(value=[1]))
+    workspace._set_selection_draft_name(SimpleNamespace(value="Fixed magnetic boundary"))
+    workspace._set_selection_draft_boundary_condition(
+        SimpleNamespace(value="magnetic_potential_zero")
+    )
+
+    assert workspace._save_named_selection(geometry) is True
+
+    selection = geometry["boundary_selections"][0]
+    assert selection["boundary_condition"] == "magnetic_potential_zero"
+    assert selection["boundary_tags"] == ["MMFEM_FACE_0_1"]
+    workspace.select_item("named_selection", selection["id"])
+    controls = {
+        getattr(child, "ui_label", None): child
+        for child in workspace._properties.ui_children
+    }
+    assert controls["Boundary condition"].ui_model_value == "magnetic_potential_zero"
+    assert {option["value"] for option in controls["Boundary condition"].ui_options} == {
+        "default",
+        "magnetic_potential_zero",
+    }
+
+    assert workspace._set_named_selection_boundary_condition(
+        geometry, selection, SimpleNamespace(value="default")
+    ) is True
+    assert "boundary_condition" not in selection
+    assert selection["boundary_tags"] == ["MMFEM_FACE_0_1"]
 
 
 def test_named_volume_domain_selection_is_saved_with_region_indices(monkeypatch):

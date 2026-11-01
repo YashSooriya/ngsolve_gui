@@ -17,6 +17,7 @@ from ngsolve_gui.three_d_project import (
     parse_wire_trace,
     unpack_3d_project,
     step_unit_scale,
+    validate_3d_project,
 )
 
 
@@ -201,6 +202,37 @@ def test_project_rejects_invalid_named_region_selections(key, selection, error):
 
     with pytest.raises(ValueError, match=error):
         package_3d_project(project, assets)
+
+
+@pytest.mark.parametrize(
+    "condition,tags,error",
+    [
+        ("unsupported_surface_load", ["MMFEM_FACE_0_0"], "Unsupported 3D boundary condition"),
+        ("magnetic_potential_zero", None, "needs saved STEP face identifiers"),
+        ("magnetic_potential_zero", ["missing-face-id"], "valid STEP face identifiers"),
+        (
+            "magnetic_potential_zero",
+            ["MMFEM_FACE_0_0", "MMFEM_FACE_0_1"],
+            "one-to-one",
+        ),
+    ],
+)
+def test_project_rejects_unsupported_or_unmapped_3d_boundary_conditions(condition, tags, error):
+    project = new_3d_project()
+    assets = {}
+    geometry = add_step_geometry(project, assets, "shield.step", STEP)
+    selection = {
+        "id": "fixed-face",
+        "name": "Fixed magnetic boundary",
+        "boundary_ids": [0],
+        "boundary_condition": condition,
+    }
+    if tags is not None:
+        selection["boundary_tags"] = tags
+    geometry["boundary_selections"] = [selection]
+
+    with pytest.raises(ValueError, match=error):
+        validate_3d_project(project, assets)
 
 
 def test_project_archive_rejects_corrupt_asset_checksum():
