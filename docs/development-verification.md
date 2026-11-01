@@ -81,13 +81,18 @@ responsive-layout tests, but must not be used as the primary review screenshots.
 
 ## Launching the reviewed version
 
-Every work-package handoff must state how to launch the exact reviewed revision.
-Include the source branch and commit, working directory, and copyable launch
-command. State explicitly whether the standalone Windows package or shortcut
-was rebuilt. If it was not rebuilt, identify the source-checkout launcher and
-make clear that an existing packaged installation may still run an older build.
-When a portable package is produced, include its exact path and version alongside
-the source-checkout command.
+Every completed work package must leave a Windows executable that launches the
+reviewed application source. Rebuild the standalone package after the final
+source changes. If an older packaged app is running, build the new executable
+side-by-side rather than replacing files beneath the running process, and give
+the user the new executable path.
+
+Launch the new executable and verify that its GUI reaches a ready state and
+loads the reviewed GUI source. Include the GUI and solver source revisions, app
+version, executable path and SHA-256, and launch verification evidence in the
+review ZIP. Include a copyable launch instruction. The source-checkout launcher
+may be documented as a development alternative, but does not count as updating
+the Windows executable.
 
 ## Known comprehensive-suite baseline
 
