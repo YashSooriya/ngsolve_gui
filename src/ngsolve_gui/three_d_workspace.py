@@ -291,13 +291,6 @@ class ThreeDWorkspace(Div):
             ui_style="position:relative; display:flex; flex:1 1 0%; width:100%; height:100%; min-width:0; min-height:0; overflow:hidden; background:var(--canvas-bg, #f4f6f8);",
         )
 
-        self._open_project_button = _button(
-            "Open project", "mdi-folder-open-outline", self.open_project
-        )
-        self._save_project_button = _button(
-            "Save project", "mdi-content-save-outline", self.save_project,
-            color="primary",
-        )
         self._run_study_button = _button(
             "Run study", "mdi-play", self.run_study,
             color="primary",
@@ -353,8 +346,6 @@ class ThreeDWorkspace(Div):
             Div(
                 self._run_study_button,
                 self._cancel_study_button,
-                self._open_project_button,
-                self._save_project_button,
                 ui_style="display:flex; align-items:center; gap:6px; margin-left:auto;",
             ),
             ui_style=(
@@ -942,7 +933,7 @@ class ThreeDWorkspace(Div):
         self._show_empty_preview()
         self.ui_hidden = True
 
-    def save_project(self, *_args):
+    def save_project(self, *_args, save_as=False):
         try:
             self.project["name"] = str(self.project.get("name", "")).strip() or "3D project"
             self._snapshot_referenced_materials()
@@ -951,7 +942,12 @@ class ThreeDWorkspace(Div):
                 for character in self.project["name"]
             ).strip() or "3D project"
             archive = package_3d_project(self.project, self.assets)
-            if self.app._save_artifact(archive, safe_name + PROJECT_SUFFIX):
+            if self.app._save_project_artifact(
+                archive,
+                safe_name + PROJECT_SUFFIX,
+                kind="3d",
+                save_as=save_as,
+            ):
                 self._saved = True
                 self._set_status("3D project saved with geometry, material data and study settings.")
                 remember = getattr(self.app, "_remember_recent_project", None)

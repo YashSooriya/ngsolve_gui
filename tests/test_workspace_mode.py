@@ -12,13 +12,11 @@ def test_workspace_mode_toggle_updates_selection_and_notifies(monkeypatch):
         monkeypatch.setattr(button, "_update_frontend", lambda payload: None)
 
     assert toggle.value == "post_process"
-    assert [button.ui_children[0] for button in toggle.ui_children] == [
-        "Solve", "Post Process"
-    ]
+    assert [button.ui_label for button in toggle.ui_children] == ["Model", "Results"]
     assert all(
-        "font-size:15px" in button.ui_style for button in toggle._buttons.values()
+        "font-size:13px" in button.ui_style for button in toggle._buttons.values()
     )
-    assert "width:174px" in toggle.ui_style
+    assert "width:190px" in toggle.ui_style
     assert "background:var(--accent-subtle)" in toggle._buttons["post_process"].ui_style
     assert "background:var(--surface)" in toggle._buttons["solve"].ui_style
 
@@ -55,6 +53,7 @@ def test_workspace_mode_switch_changes_workspace_and_keeps_header_visible():
         _view_group=actions,
         system_monitor=monitor,
         _system_monitor_separator=separator,
+        _set_application_menu_context=lambda _three_d=None: None,
     )
 
     NGSolveGui._set_workspace_mode(app, "solve")
@@ -86,10 +85,10 @@ def test_three_d_workspace_replaces_axisymmetric_views_and_restores_active_mode(
 
     NGSolveGui._set_3d_workspace_active(app, True)
 
-    assert three_d.ui_hidden is False
-    assert toggle.ui_hidden is True
+    assert three_d.ui_hidden is True
+    assert toggle.ui_hidden is False
     assert solve.ui_hidden is True
-    assert post_process.ui_hidden is True
+    assert post_process.ui_hidden is False
 
     NGSolveGui._set_3d_workspace_active(app, False)
 
@@ -108,33 +107,91 @@ def test_3d_context_hides_axisymmetric_commands_and_restores_them():
         "File": {
             "Open project...": SimpleNamespace(ui_hidden=False),
             "Load mesh...": SimpleNamespace(ui_hidden=False),
+            "Save project": SimpleNamespace(ui_hidden=False),
         },
         "Edit": {"Undo": SimpleNamespace(ui_hidden=False)},
         "View": {
             "Isometric": SimpleNamespace(ui_hidden=False),
             "Toggle navigation cube": SimpleNamespace(ui_hidden=False),
         },
+        "Model": {
+            "Import STEP model...": SimpleNamespace(ui_hidden=False),
+            "Import wire traces...": SimpleNamespace(ui_hidden=False),
+            "Sources & loads": SimpleNamespace(ui_hidden=False),
+        },
+        "Study": {
+            "Check setup": SimpleNamespace(ui_hidden=False),
+            "Run study": SimpleNamespace(ui_hidden=False),
+        },
     }
     app = SimpleNamespace(
         _application_menu_buttons=buttons,
         _application_menu_items=items,
+        _workspace_mode="solve",
+        _active_project_type="3d",
     )
 
     NGSolveGui._set_application_menu_context(app, True)
 
-    assert buttons["Model"].ui_hidden is True
-    assert buttons["Study"].ui_hidden is True
-    assert buttons["Results"].ui_hidden is True
+    assert buttons["Model"].ui_hidden is False
+    assert buttons["Study"].ui_hidden is False
+    assert buttons["Results"].ui_hidden is False
     assert items["File"]["Open project..."].ui_hidden is False
     assert items["File"]["Load mesh..."].ui_hidden is True
     assert items["Edit"]["Undo"].ui_hidden is True
     assert items["View"]["Isometric"].ui_hidden is False
-    assert items["View"]["Toggle navigation cube"].ui_hidden is True
+    assert items["View"]["Toggle navigation cube"].ui_hidden is False
+    assert items["Model"]["Import STEP model..."].ui_hidden is False
+    assert items["Model"]["Sources & loads"].ui_hidden is True
+
+    app._active_project_type = "axisymmetric"
+    NGSolveGui._set_application_menu_context(app, False)
+
+    assert buttons["Model"].ui_hidden is False
+    assert buttons["Study"].ui_hidden is False
+    assert items["File"]["Load mesh..."].ui_hidden is False
+    assert items["View"]["Isometric"].ui_hidden is True
+    assert items["Model"]["Import STEP model..."].ui_hidden is True
+
+    app._active_project_type = None
+    NGSolveGui._set_application_menu_context(app, False)
+    assert buttons["Model"].ui_hidden is True
+    assert buttons["Study"].ui_hidden is True
+    assert buttons["Results"].ui_hidden is True
+
+
+def test_cpu_field_viewer_is_only_visible_for_packaged_axisymmetric_results(monkeypatch):
+    viewer = SimpleNamespace(ui_hidden=False)
+    app = SimpleNamespace(
+        _application_menu_buttons={},
+        _application_menu_items={"Results": {"Open CPU 2D field viewer...": viewer}},
+        _workspace_mode="post_process",
+        _active_project_type="axisymmetric",
+        tab_panel=SimpleNamespace(comp=object()),
+    )
+    monkeypatch.setenv("MMFEM_DESKTOP_SCRIPT", "desktop.py")
+
+    NGSolveGui._set_application_menu_context(app, False)
+    assert viewer.ui_hidden is False
+
+    app._active_project_type = "3d"
+    NGSolveGui._set_application_menu_context(app, True)
+    assert viewer.ui_hidden is True
+
+
+def test_results_menu_remains_available_when_a_solution_is_open_without_a_project():
+    results = SimpleNamespace(ui_hidden=True)
+    app = SimpleNamespace(
+        _application_menu_buttons={"Results": results},
+        _application_menu_items={},
+        _workspace_mode="post_process",
+        _active_project_type=None,
+        tab_panel=SimpleNamespace(comp=object()),
+    )
 
     NGSolveGui._set_application_menu_context(app, False)
 
-    assert all(button.ui_hidden is False for button in buttons.values())
-    assert all(item.ui_hidden is False for menu in items.values() for item in menu.values())
+    assert results.ui_hidden is False
 
 
 def test_new_problem_uses_the_active_3d_project_type():
@@ -189,6 +246,7 @@ def test_opening_a_run_result_keeps_the_mode_toggle_in_sync(monkeypatch):
         _post_process_workspace=SimpleNamespace(ui_hidden=True),
         _solve_workspace=SimpleNamespace(ui_hidden=False),
         _load_with_status=loaded.append,
+        _set_application_menu_context=lambda _three_d=None: None,
     )
     toggle = WorkspaceModeToggle(
         "solve", on_change=lambda mode: NGSolveGui._set_workspace_mode(app, mode)
@@ -300,6 +358,22 @@ def test_new_problem_starts_immediately_when_model_is_clean():
     assert started == [True]
 
 
+def test_dismissing_dirty_project_prompt_cancels_pending_replacement():
+    called = []
+    app = SimpleNamespace(
+        _pending_problem_replacement=lambda: called.append("replaced"),
+        _pending_project_type="axisymmetric",
+    )
+
+    NGSolveGui._on_new_problem_dialog_model_value(
+        app, SimpleNamespace(value=False)
+    )
+
+    assert app._pending_problem_replacement is None
+    assert app._pending_project_type is None
+    assert called == []
+
+
 def test_cancelled_problem_save_keeps_current_problem_and_reopens_prompt():
     dialog = SimpleNamespace(ui_model_value=True)
     reset = []
@@ -361,6 +435,7 @@ def test_problem_save_reports_success_and_marks_only_written_state(monkeypatch, 
     app = SimpleNamespace(
         solve_workspace=workspace,
         _save_artifact=lambda data, filename: save_succeeds,
+        _save_project_artifact=lambda data, filename, *, kind, save_as=False: save_succeeds,
         _notify=lambda *args, **kwargs: None,
     )
     monkeypatch.setattr("ngsolve_gui.app.serialize_model_json", lambda *args: b"problem")

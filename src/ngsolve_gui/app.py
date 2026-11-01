@@ -9,6 +9,7 @@ import json
 import mimetypes
 import re
 import subprocess
+import tempfile
 from datetime import datetime as _datetime, timezone as _timezone
 from pathlib import Path
 
@@ -31,7 +32,8 @@ from .mesh_geometry import axisymmetric_mesh_edge_polylines
 from .axisymmetric_model import new_model, new_studies, unpack_model, package_model, serialize_model_json
 from .three_d_project import PROJECT_SUFFIX, package_3d_project, unpack_3d_project
 from . import __version__
-from .branding import DOCUMENTATION_URL, PRODUCT_DESCRIPTION, PRODUCT_NAME
+from .branding import AXISYMMETRIC_ICON, PRODUCT_DESCRIPTION, PRODUCT_NAME
+from .documentation import find_documentation_index
 from .result_files import (
     MESH_SUFFIX,
     SOLUTION_SUFFIX,
@@ -315,7 +317,7 @@ class StackHost(Div):
 
 
 class WorkspaceModeToggle(Div):
-    """Prominent switch between the Solve and Post Process workspaces."""
+    """Keyboard-accessible switch between the Model and Results workspaces."""
 
     _MODES = ("solve", "post_process")
 
@@ -326,15 +328,26 @@ class WorkspaceModeToggle(Div):
         self._on_change = on_change
         self._buttons = {}
 
-        for mode, label in (("solve", "Solve"), ("post_process", "Post Process")):
-            button = Div(label, ui_style=self._button_style(mode))
+        for mode, label, icon in (
+            ("solve", "Model", "mdi-cube-outline"),
+            ("post_process", "Results", "mdi-chart-bell-curve"),
+        ):
+            button = QBtn(
+                ui_label=label,
+                ui_icon=icon,
+                ui_flat=True,
+                ui_dense=True,
+                ui_no_caps=True,
+                ui_style=self._button_style(mode),
+                ui_class="mmfem-workspace-tab",
+            )
             button.on("click", lambda event=None, selected=mode: self.select(selected))
             self._buttons[mode] = button
 
         super().__init__(
             self._buttons["solve"], self._buttons["post_process"],
             ui_style=(
-                "display:flex; width:174px; height:34px; flex:none; "
+                "display:flex; width:190px; height:34px; flex:none; "
                 "overflow:hidden; border:1px solid var(--border-strong); "
                 "border-radius:var(--r-sm); background:var(--surface);"
             ),
@@ -344,8 +357,8 @@ class WorkspaceModeToggle(Div):
         active = mode == self._value
         style = (
             "display:flex; flex:1; align-items:center; justify-content:center; "
-            "height:34px; padding:0 5px; white-space:nowrap; cursor:pointer; "
-            "user-select:none; font-size:15px; transition:background-color 100ms ease, color 100ms ease;"
+            "height:32px; min-height:32px; padding:0 5px; white-space:nowrap; "
+            "font-size:13px; transition:background-color 100ms ease, color 100ms ease;"
         )
         if mode == "post_process":
             style += " border-left:1px solid var(--border);"
@@ -657,6 +670,8 @@ class NGSolveGui(App):
     def __init__(self, filename=None, local_path=None, script_args=None):
         self._local_path = local_path
         self._last_saved_path = None
+        self._current_project_path = None
+        self._current_project_kind = None
         self._active_project_type = None
         self._pending_project_type = None
         self.script_args = list(script_args or [])
@@ -691,6 +706,8 @@ class NGSolveGui(App):
         save_problem_btn = _tbtn(
             "mdi-content-save-outline", "Save project (Ctrl+S)", self.save_problem_file
         )
+        self._save_project_button = save_problem_btn
+        self._save_project_button.ui_disable = True
         self._undo_button = _tbtn(
             "mdi-undo", "Undo model change (Ctrl+Z)", self._undo_solve_action
         )
@@ -736,7 +753,10 @@ class NGSolveGui(App):
                 ui_style="width:min(460px, 92vw);",
             ),
             ui_model_value=False,
-            ui_persistent=True,
+            ui_persistent=False,
+        )
+        self._new_problem_dialog.on_update_model_value(
+            self._on_new_problem_dialog_model_value
         )
         cancel_new_problem.on_click(self._close_new_problem_dialog)
         discard_new_problem.on_click(self._discard_and_continue_problem_replacement)
@@ -780,7 +800,7 @@ class NGSolveGui(App):
             QSpace(),
             *([self.system_monitor, Div(ui_class=cb.tb_sep)] if self.system_monitor is not None else []),
             ui_class=str(cb.app_bar) + " mmfem-compact-app-bar",
-            ui_style="height:60px; min-height:60px;",
+            ui_style="height:54px; min-height:54px;",
         )
 
         # Three-column layout using flex
@@ -945,7 +965,7 @@ class NGSolveGui(App):
         )
         axisymmetric_choice = QBtn(
             ui_label="Axisymmetric",
-            ui_icon="mdi-axis-arrow",
+            ui_icon=AXISYMMETRIC_ICON,
             ui_color="primary",
             ui_no_caps=True,
             ui_class="full-width",
@@ -1031,9 +1051,10 @@ class NGSolveGui(App):
         self.call_js(_set_window_icon, self.load_asset("magmechsim_icon_128x128.png"))
         self.on_load(self.__on_load)
 
-        # Start in Solve while retaining the mounted Post Process workspace so
-        # its viewport and loaded data survive mode switches.
+        # Start in Model while retaining the mounted Results workspace so its
+        # viewport and previously opened data survive mode switches.
         self._workspace_mode = "solve"
+        self._set_application_menu_context()
 
         # -- Global keybindings (always active) --
         kb = self.kb
@@ -1041,6 +1062,7 @@ class NGSolveGui(App):
         kb.add("ctrl+n", lambda *a: self._run_menu_shortcut(self.new_problem), "New problem", "File")
         kb.add("ctrl+o", lambda *a: self._run_menu_shortcut(self.open_project_file), "Open project", "File")
         kb.add("ctrl+s", lambda *a: self._run_menu_shortcut(self.save_problem_file), "Save problem", "File")
+        kb.add("ctrl+shift+s", lambda *a: self._run_menu_shortcut(self._save_as_project_file), "Save project as", "File")
         kb.add("delete", self._delete_selected_region_shortcut, "Delete selected geometry", "Solve")
         for key, tool, description in (
             ("l", "line", "Line tool"),
@@ -1264,6 +1286,12 @@ class NGSolveGui(App):
                         self._active_project_type = "3d"
                         self._set_3d_workspace_active(True)
                         self._hide_startup_chooser()
+                    if os.name == "nt" and Path(actual_path).is_file():
+                        self._current_project_path = actual_path
+                        self._current_project_kind = kind
+                    else:
+                        self._current_project_path = None
+                        self._current_project_kind = None
                     self._remember_recent_project(
                         actual_path, kind=kind, name=project_name
                     )
@@ -1342,6 +1370,12 @@ class NGSolveGui(App):
                         self._active_project_type = "3d"
                         self._set_3d_workspace_active(True)
                         self._hide_startup_chooser()
+                    if os.name == "nt" and Path(actual_path).is_file():
+                        self._current_project_path = actual_path
+                        self._current_project_kind = kind
+                    else:
+                        self._current_project_path = None
+                        self._current_project_kind = None
                     self._remember_recent_project(actual_path, kind=kind, name=project_name)
                     self._set_startup_status("")
                     return True
@@ -1373,6 +1407,7 @@ class NGSolveGui(App):
                 ("New axisymmetric problem...", self._new_axisymmetric_project, "mdi-axis-arrow", None),
                 ("Open project...", self.open_project_file, "mdi-folder-open-outline", "Ctrl+O"),
                 ("Save project", self.save_problem_file, "mdi-content-save-outline", "Ctrl+S"),
+                ("Save project as...", self._save_as_project_file, "mdi-content-save-edit-outline", "Ctrl+Shift+S"),
                 None,
                 ("New 3D project...", self._new_3d_project, "mdi-cube-scan", None),
                 None,
@@ -1417,14 +1452,14 @@ class NGSolveGui(App):
                 ("Solver log", self._menu_toggle_log, "mdi-console", None),
             ]),
             ("Model", [
-                ("Geometry", lambda: self._open_solve_section("geometry"), "mdi-vector-square", None),
-                ("Materials", lambda: self._open_solve_section("materials"), "mdi-cube-scan", None),
-                ("Physics & coupling", lambda: self._open_solve_section("physics"), "mdi-magnet", None),
-                ("Boundary conditions", lambda: self._open_solve_section("boundaries"), "mdi-vector-link", None),
-                ("Sources & loads", lambda: self._open_solve_section("sources"), "mdi-flash-outline", None),
-                ("Mesh settings", lambda: self._open_solve_section("mesh"), "mdi-vector-triangle", None),
-                ("Solver settings", lambda: self._open_solve_section("solver"), "mdi-tune-variant", None),
-                ("Study settings", lambda: self._open_solve_section("studies"), "mdi-play-box-multiple-outline", None),
+                ("Geometry", lambda: self._menu_model_section("geometry"), "mdi-vector-square", None),
+                ("Materials", lambda: self._menu_model_section("materials"), "mdi-cube-scan", None),
+                ("Physics", lambda: self._menu_model_section("physics"), "mdi-magnet", None),
+                ("Boundary conditions", lambda: self._menu_model_section("boundaries"), "mdi-vector-link", None),
+                ("Sources & loads", lambda: self._menu_model_section("sources"), "mdi-flash-outline", None),
+                ("Mesh settings", lambda: self._menu_model_section("mesh"), "mdi-vector-triangle", None),
+                ("Solver settings", lambda: self._menu_model_section("solver"), "mdi-tune-variant", None),
+                ("Study settings", lambda: self._menu_model_section("studies"), "mdi-play-box-multiple-outline", None),
                 ("Run history", lambda: self._open_solve_section("runs"), "mdi-history", None),
                 None,
                 ("Toggle snap to grid", self._menu_toggle_snap, "mdi-magnet", None),
@@ -1441,6 +1476,7 @@ class NGSolveGui(App):
             ]),
             ("Results", [
                 ("Open solutions...", self.load_solutions_file, "mdi-folder-open-outline", None),
+                ("Open CPU 2D field viewer...", self._open_2d_field_viewer, "mdi-chart-areaspline", None),
                 None,
                 ("Field & colour options", lambda: self._open_postprocess_controls("Field"), "mdi-palette", None),
                 ("Display & view options", lambda: self._open_postprocess_controls("Display & view"), "mdi-cube-scan", None),
@@ -1452,7 +1488,7 @@ class NGSolveGui(App):
             ]),
             ("Help", [
                 ("Keyboard shortcuts", self.kb.toggle_help, "mdi-keyboard-outline", "H"),
-                ("Documentation", None, "mdi-book-open-page-variant-outline", None, DOCUMENTATION_URL),
+                ("Documentation", self._open_documentation, "mdi-book-open-page-variant-outline", None),
                 (f"About {PRODUCT_NAME}", self._open_about, "mdi-information-outline", None),
             ]),
         ]
@@ -1472,41 +1508,88 @@ class NGSolveGui(App):
             ),
         )
 
-    def _set_application_menu_context(self, three_d):
-        """Hide commands that are specific to the inactive project workflow."""
+    def _set_application_menu_context(self, three_d=None):
+        """Expose shared commands only where the active workspace can use them."""
+        active_type = getattr(self, "_active_project_type", None)
+        if three_d is None:
+            three_d = active_type == "3d"
+        else:
+            three_d = bool(three_d)
+        solving = getattr(self, "_workspace_mode", "solve") == "solve"
+        has_project = active_type in {"axisymmetric", "3d"} or three_d
+        has_result = (
+            not solving
+            and getattr(getattr(self, "tab_panel", None), "comp", None) is not None
+        )
+
         menu_buttons = getattr(self, "_application_menu_buttons", {})
-        for label in ("Model", "Study", "Results"):
+        for label in ("Model", "Study"):
             button = menu_buttons.get(label)
             if button is not None:
-                button.ui_hidden = bool(three_d)
+                button.ui_hidden = not has_project or not solving
+        results_button = menu_buttons.get("Results")
+        if results_button is not None:
+            results_button.ui_hidden = not (has_project or has_result)
 
-        hidden_in_3d = {
-            "File": (
-                "Import legacy Python problem...",
-                "Open external file...",
-                "Load mesh...",
-                "Save mesh",
-                "Load solutions...",
-                "Save solutions",
-            ),
-            "Edit": ("Undo", "Redo"),
-            "View": (
-                "Toggle parallel projection",
-                "Toggle navigation cube",
-                "Link or detach camera",
-                "Saved camera views",
-                "Fullscreen viewport",
-                "Messages",
-                "Solver log",
-            ),
-        }
         menu_items = getattr(self, "_application_menu_items", {})
-        for menu, labels in hidden_in_3d.items():
+
+        def hide(menu, labels, hidden):
             items = menu_items.get(menu, {})
             for label in labels:
                 item = items.get(label)
                 if item is not None:
-                    item.ui_hidden = bool(three_d)
+                    item.ui_hidden = bool(hidden)
+
+        if hasattr(self, "_save_project_button"):
+            self._save_project_button.ui_disable = not has_project
+        hide("File", ("Save project", "Save project as..."), not has_project)
+        hide("File", ("Import legacy Python problem...",), three_d)
+        hide("File", ("Load mesh...", "Save mesh"), three_d or not solving)
+        hide("File", ("Save solutions",), three_d or solving)
+        hide("Edit", ("Undo", "Redo"), three_d or not solving)
+        hide("Edit", ("Delete selected geometry",), not has_project or not solving)
+
+        camera_commands = (
+            "Isometric", "View from +X", "View from -X", "View from +Y",
+            "View from -Y", "View from +Z", "View from -Z",
+            "Toggle parallel projection", "Toggle navigation cube",
+            "Link or detach camera", "Saved camera views", "Fullscreen viewport",
+        )
+        hide("View", camera_commands, not three_d)
+        hide("View", ("Toggle axes",), not (three_d or has_result))
+        hide("View", ("Messages", "Solver log"), three_d or not solving)
+
+        hide("Model", ("Sources & loads", "Toggle snap to grid", "Rename model...", "Preview geometry in 3D"), three_d or not solving)
+        hide("Model", ("Solver settings", "Run history"), three_d)
+        hide("Model", ("Import STEP model...", "Import wire traces..."), not three_d or not solving)
+
+        hide("Study", ("Check setup", "Generate mesh", "Run study"), not solving or not has_project)
+        job_active = bool(getattr(self, "_solver_job_active", False))
+        axisymmetric_job = active_type == "axisymmetric" and (
+            job_active or getattr(
+                getattr(self, "_solve_workspace_instance", None), "_job_active", False
+            )
+        )
+        three_d_job = active_type == "3d" and (
+            job_active or getattr(
+                getattr(self, "_three_d_workspace_instance", None), "_study_running", False
+            )
+        )
+        hide("Study", ("Cancel current run",), not (axisymmetric_job or three_d_job))
+        result_commands = (
+            "Field & colour options", "Display & view options", "Vectors & flow options",
+            "Toggle wireframe", "Toggle clipping", "Toggle probe",
+        )
+        hide("Results", result_commands, not has_result)
+        hide(
+            "Results",
+            ("Open CPU 2D field viewer...",),
+            not (
+                active_type == "axisymmetric"
+                and has_result
+                and bool(os.environ.get("MMFEM_DESKTOP_SCRIPT"))
+            ),
+        )
 
     def _quit_application(self, *args):
         return self._request_problem_replacement(self._close_application_now)
@@ -1531,6 +1614,39 @@ class NGSolveGui(App):
             lambda: self._start_3d_and_import(self._three_d_workspace.import_wire_trace)
         )
 
+    def _menu_model_section(self, section):
+        if self._active_project_type != "3d":
+            return self._open_solve_section(section)
+        workspace = self._three_d_workspace
+        geometries = workspace.project.get("geometries", [])
+        if section == "geometry":
+            workspace.select_item("project", None)
+        elif section in {"materials", "mesh"}:
+            if geometries:
+                workspace.select_item("geometry", geometries[0]["id"])
+            else:
+                workspace.select_item("project", None)
+                workspace._set_status("Import STEP geometry before editing material or mesh settings.")
+        elif section == "boundaries":
+            selection = next((
+                item
+                for geometry in geometries
+                for item in geometry.get("boundary_selections", [])
+            ), None)
+            if selection is not None:
+                workspace.select_item("named_selection", selection["id"])
+            elif geometries:
+                workspace.select_item("geometry", geometries[0]["id"])
+            else:
+                workspace.select_item("project", None)
+                workspace._set_status("Import and mesh geometry before defining named boundary selections.")
+        elif section in {"physics", "studies"}:
+            workspace.select_item("study", None)
+        else:
+            workspace._set_status(f"{section.replace('_', ' ').title()} is not available in the 3D workspace.")
+            return False
+        return True
+
     def _start_3d_and_import(self, importer):
         if not self._start_3d_project_from_menu():
             return False
@@ -1542,6 +1658,8 @@ class NGSolveGui(App):
     def _start_3d_project_from_menu(self):
         if not self._three_d_workspace.show_new():
             return False
+        self._current_project_path = None
+        self._current_project_kind = None
         self._active_project_type = "3d"
         self._hide_startup_chooser()
         self._set_3d_workspace_active(True)
@@ -1563,10 +1681,12 @@ class NGSolveGui(App):
                 container.ui_hidden = True
         if workspace is not None:
             workspace.ui_hidden = not active
-        self._workspace_mode_toggle.ui_hidden = active
+        self._workspace_mode_toggle.ui_hidden = False
         if active:
+            solving = getattr(self, "_workspace_mode", "solve") == "solve"
+            workspace.ui_hidden = not solving
             self._solve_workspace.ui_hidden = True
-            self._post_process_workspace.ui_hidden = True
+            self._post_process_workspace.ui_hidden = solving
         else:
             self._solve_workspace.ui_hidden = self._workspace_mode != "solve"
             self._post_process_workspace.ui_hidden = self._workspace_mode == "solve"
@@ -1592,6 +1712,59 @@ class NGSolveGui(App):
 
     def _open_about(self, *args):
         self._about_dialog.ui_model_value = True
+
+    def _open_documentation(self, *args):
+        try:
+            solver_root = self._find_solver_root()
+        except Exception:
+            solver_root = None
+        index = find_documentation_index(solver_root)
+        if index is None:
+            self._notify(
+                "Local MagMechSim documentation is not installed. Build the Sphinx HTML site from the solver docs or reinstall the packaged application.",
+                type="warning",
+                timeout=8000,
+            )
+            return False
+        try:
+            import webbrowser
+
+            if not webbrowser.open(index.as_uri(), new=2):
+                raise RuntimeError("The default browser did not accept the local documentation URL.")
+            return True
+        except Exception as error:
+            self._notify(
+                f"Could not open local documentation: {error}",
+                type="negative",
+                timeout=8000,
+            )
+            return False
+
+    def _open_2d_field_viewer(self, filename=None, *args):
+        script = os.environ.get("MMFEM_DESKTOP_SCRIPT")
+        if not script:
+            self._notify(
+                "The CPU 2D field viewer is available in the packaged desktop application.",
+                type="info",
+                timeout=5000,
+            )
+            return False
+        command = [sys.executable, script, "--viewer"]
+        if isinstance(filename, (str, os.PathLike)):
+            command.extend(["--field", str(filename)])
+        try:
+            subprocess.Popen(
+                command,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return True
+        except Exception as error:
+            self._notify(
+                f"Could not open the CPU 2D field viewer: {error}",
+                type="negative",
+                timeout=7000,
+            )
+            return False
 
     def _global_shortcut_context_active(self):
         try:
@@ -1669,22 +1842,19 @@ class NGSolveGui(App):
         return False
 
     def _open_postprocess_controls(self, label):
-        if self._active_project_type == "3d":
-            self._notify("Post Process controls apply to solved result files.", type="info", timeout=3000)
-            return False
         if self._workspace_mode != "post_process":
             self._workspace_mode_toggle.select("post_process")
         return self._active_view_action("open_postprocess_controls", label)
 
     def _menu_toggle_tree(self, *args):
-        if self._active_project_type == "3d":
+        if self._active_project_type == "3d" and self._workspace_mode == "solve":
             return self._three_d_workspace.toggle_tree()
         if self._workspace_mode == "solve":
             return self.solve_workspace._toggle_tree_panel()
         return self._toggle_navigator()
 
     def _menu_toggle_properties(self, *args):
-        if self._active_project_type == "3d":
+        if self._active_project_type == "3d" and self._workspace_mode == "solve":
             return self._three_d_workspace.toggle_properties()
         if self._workspace_mode == "solve":
             return self.solve_workspace._toggle_properties_panel()
@@ -1709,14 +1879,38 @@ class NGSolveGui(App):
         return self.solve_workspace.toggle_3d_preview()
 
     def _menu_check_setup(self, *args):
+        if self._active_project_type == "3d":
+            workspace = self._three_d_workspace
+            try:
+                from .three_d_project import validate_3d_project
+                from .three_d_solver import validate_time_harmonic_em_setup
+
+                validate_3d_project(workspace.project, workspace.assets)
+                setup = validate_time_harmonic_em_setup(workspace.project)
+            except Exception as error:
+                workspace._set_status(f"Study setup needs attention: {error}", error=True)
+                return False
+            label = "time-harmonic electromagnetic" if setup["physics"] == "harmonic_em" else "time-harmonic mechanics"
+            workspace._set_status(
+                f"3D {label} setup is valid at {setup['frequency_hz']:g} Hz."
+            )
+            return True
         self._open_solve_section("studies")
         return self.solve_workspace.validate_action()
 
     def _menu_generate_mesh(self, *args):
+        if self._active_project_type == "3d":
+            workspace = self._three_d_workspace
+            geometries = workspace.project.get("geometries", [])
+            if geometries and workspace._selected_geometry() is None:
+                workspace.select_item("geometry", geometries[0]["id"])
+            return workspace.generate_mesh()
         self._open_solve_section("mesh")
         return self.solve_workspace.run_mesh_action()
 
     def _menu_run_study(self, *args):
+        if self._active_project_type == "3d":
+            return self._three_d_workspace.run_study()
         self._open_solve_section("studies")
         return self.solve_workspace.run_study_action()
 
@@ -1858,6 +2052,13 @@ class NGSolveGui(App):
         self._pending_problem_replacement = None
         self._pending_project_type = None
 
+    def _on_new_problem_dialog_model_value(self, event):
+        if not bool(getattr(event, "value", event)):
+            # Backdrop and Escape dismissal are equivalent to Cancel. A pending
+            # replacement must never run later because the dialog was closed.
+            self._pending_problem_replacement = None
+            self._pending_project_type = None
+
     def _continue_problem_replacement(self, save_changes):
         action = self._pending_problem_replacement
         project_type = self._pending_project_type
@@ -1908,6 +2109,9 @@ class NGSolveGui(App):
             return False
         return self._start_new_problem()
 
+    def _save_as_project_file(self, *args):
+        return self.save_problem_file(save_as=True)
+
     def _start_new_problem(self):
         if self._solver_job_active or getattr(self.solve_workspace, "_job_active", False):
             self._notify(
@@ -1917,6 +2121,8 @@ class NGSolveGui(App):
             )
             return False
         self._close_new_problem_dialog()
+        self._current_project_path = None
+        self._current_project_kind = None
         self.solve_workspace.set_model(
             new_model(),
             new_studies(),
@@ -1964,12 +2170,62 @@ class NGSolveGui(App):
             self._three_d_workspace.ui_hidden = not solving
             self._post_process_workspace.ui_hidden = solving
             self._solve_workspace.ui_hidden = True
+            self._set_application_menu_context(True)
             return
         self._post_process_workspace.ui_hidden = solving
         self._solve_workspace.ui_hidden = not solving
         refresh_history_controls = getattr(self, "_refresh_solve_history_controls", None)
         if refresh_history_controls:
             refresh_history_controls()
+        self._set_application_menu_context(False)
+
+    def _save_project_artifact(self, data, filename, *, kind, save_as=False):
+        """Save to the current project path or request a new path."""
+        current_path = getattr(self, "_current_project_path", None)
+        current_kind = getattr(self, "_current_project_kind", None)
+        target = Path(current_path) if current_path else None
+        expected_suffix = Path(filename).suffix.casefold()
+        if (
+            os.name == "nt"
+            and not save_as
+            and target is not None
+            and current_kind == kind
+            and target.suffix.casefold() == expected_suffix
+            and target.is_file()
+        ):
+            payload = data.encode("utf-8") if isinstance(data, str) else bytes(data)
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    dir=target.parent,
+                    prefix=f".{target.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as stream:
+                    temporary = Path(stream.name)
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, target)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+            self._last_saved_path = str(target)
+            return True
+
+        if not self._save_artifact(data, filename):
+            return False
+        saved_path = getattr(self, "_last_saved_path", None)
+        if saved_path and os.name == "nt":
+            self._current_project_path = saved_path
+            self._current_project_kind = kind
+        elif save_as:
+            # The browser File System Access API does not expose the saved
+            # destination to Python, so it cannot be safely reused by Ctrl+S.
+            self._current_project_path = None
+            self._current_project_kind = None
+        return True
 
     def _save_artifact(self, data, filename):
         self._last_saved_path = None
@@ -2120,9 +2376,11 @@ class NGSolveGui(App):
             self._notify(f"Could not import legacy problem: {error}", type="negative", timeout=9000)
             self.solve_workspace._message(f"Legacy import failed: {error}", error=True)
 
-    def save_problem_file(self):
+    def save_problem_file(self, *_args, save_as=False):
         """Save the problem definition and its study settings."""
         if getattr(self, "_active_project_type", None) == "3d":
+            if save_as:
+                return self._three_d_workspace.save_project(save_as=True)
             return self._three_d_workspace.save_project()
         if getattr(self.solve_workspace, "_editor_drawer", None) is not None:
             self.solve_workspace._commit_editor()
@@ -2136,7 +2394,9 @@ class NGSolveGui(App):
             data = serialize_model_json(model, self.solve_workspace.studies, self.solve_workspace.layout)
             title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in model.get("name", "axisymmetric-model")).strip()
             filename = (title or "axisymmetric-model") + ".json"
-            if not self._save_artifact(data, filename):
+            if not self._save_project_artifact(
+                data, filename, kind="axisymmetric", save_as=save_as
+            ):
                 return False
             self.solve_workspace.mark_saved()
             remember = getattr(self, "_remember_recent_project", None)
@@ -2146,7 +2406,11 @@ class NGSolveGui(App):
                     kind="axisymmetric",
                     name=model.get("name", "Axisymmetric project"),
                 )
-            self._notify("Problem file saved.", type="positive", timeout=2500)
+            self._notify(
+                "Project saved." if save_as else "Project saved.",
+                type="positive",
+                timeout=2500,
+            )
             self.solve_workspace._message(f"Saved {filename}.")
             if errors:
                 self._notify("Model saved as a draft. Review Geometry and Physics before running.", type="warning", timeout=5000)
@@ -2311,6 +2575,7 @@ class NGSolveGui(App):
             self._solver_job_active = True
             self._solver_cancel_requested = False
             self._solver_process = None
+        self._set_application_menu_context(True)
 
         output_dir = None
         try:
@@ -2366,11 +2631,15 @@ class NGSolveGui(App):
         except Exception as error:
             with self._solver_job_lock:
                 self._solver_job_active = False
+                self._set_application_menu_context(
+                    getattr(self, "_active_project_type", None) == "3d"
+                )
             workspace._set_status(f"Could not prepare study: {error}", error=True)
             self._notify(f"Could not prepare 3D study: {error}", type="negative", timeout=8000)
             return False
 
         workspace._study_running = True
+        self._set_application_menu_context(True)
         workspace._update_study_controls()
         workspace._set_status(
             f"Running {setup['frequency_hz']:g} Hz {study_label} in {output_dir}…"
@@ -2522,6 +2791,11 @@ class NGSolveGui(App):
                     self._solver_run_context = None
                     self._solver_job_active = False
                     self._solver_cancel_requested = False
+                self._dispatch_to_ui(
+                    lambda: self._set_application_menu_context(
+                        getattr(self, "_active_project_type", None) == "3d"
+                    )
+                )
 
         self._solver_run_context = {
             "kind": run_kind,
@@ -2572,9 +2846,11 @@ class NGSolveGui(App):
         callback(*args)
         return True
 
-    @staticmethod
-    def _finish_3d_study_controls(workspace):
+    def _finish_3d_study_controls(self, workspace):
         workspace._study_running = False
+        self._set_application_menu_context(
+            getattr(self, "_active_project_type", None) == "3d"
+        )
         workspace._update_study_controls()
 
     def _run_axisymmetric_solver(self, *, mesh_only=False):
@@ -2589,6 +2865,7 @@ class NGSolveGui(App):
             self._solver_job_active = True
             self._solver_cancel_requested = False
             self._solver_process = None
+        self._set_application_menu_context(False)
 
         model = copy.deepcopy(workspace.model)
         studies = copy.deepcopy(workspace.studies)
@@ -2649,6 +2926,7 @@ class NGSolveGui(App):
         except Exception as error:
             with self._solver_job_lock:
                 self._solver_job_active = False
+            self._set_application_menu_context(False)
             workspace.finish_solver_job(
                 f"Could not prepare solver input: {error}",
                 error=True,
@@ -2831,6 +3109,9 @@ class NGSolveGui(App):
                     self._solver_run_context = None
                     self._solver_job_active = False
                     self._solver_cancel_requested = False
+                self._dispatch_to_ui(
+                    lambda: self._set_application_menu_context(False)
+                )
 
         self._solver_run_context = {
             "kind": run_kind,

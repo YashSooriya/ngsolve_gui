@@ -975,7 +975,7 @@ class SolveWorkspace(Div):
         self._preview_3d_dialog = QDialog(
             preview_card,
             ui_model_value=False,
-            ui_persistent=True,
+            ui_persistent=False,
             ui_maximized=True,
             ui_transition_duration=160,
             ui_class="mmfem-3d-preview-dialog",
@@ -4750,79 +4750,134 @@ class SolveWorkspace(Div):
         return True
 
     def _tangent_at_sketch_endpoint(self, point, tolerance_px=12.0, preferred_edge_id=None):
-        """Return the exact outward tangent at the nearest eligible curve endpoint."""
+        """Return the tangent at a loose endpoint of a straight sketch segment."""
         project, _ = self._canvas_projection()
         target = project(point)
         geometry = self.model.get("geometry", {})
         edges = geometry.get("edges", []) if isinstance(geometry, dict) else []
         entities = geometry.get("sketch_entities", []) if isinstance(geometry, dict) else []
         edges_by_entity = {}
-        represented = set()
         for edge in edges:
             entity_id = edge.get("sketch_entity_id")
             if entity_id:
-                represented.add(entity_id)
                 edges_by_entity.setdefault(entity_id, []).append(edge)
 
-        sources = []
+        topology_sources = []
+        represented = set()
+        coordinate_values = []
         for entity in entities:
             entity_id = entity.get("id")
-            linked_edges = edges_by_entity.get(entity_id, [])
-            if preferred_edge_id:
-                linked_edges = [edge for edge in linked_edges if edge.get("id") == preferred_edge_id]
-                if not linked_edges:
-                    continue
-            if linked_edges:
-                for edge in linked_edges:
-                    curve = edge.get("curve") if isinstance(edge.get("curve"), dict) else entity
-                    samples = curve.get("sampled_points") or edge.get("vertices", [])
-                    if len(samples) >= 2:
-                        sources.append((samples, curve, edge.get("id")))
-            elif not preferred_edge_id:
-                samples = entity.get("sampled_points") or entity.get("points") or []
-                if len(samples) >= 2:
-                    sources.append((samples, entity, None))
-
+            if entity_id:
+                represented.add(entity_id)
+            samples = entity.get("sampled_points") or entity.get("points") or []
+            if len(samples) >= 2:
+                topology_sources.append((samples, entity.get("type"), entity_id))
+                coordinate_values.extend(samples)
         for edge in edges:
             if edge.get("sketch_entity_id") in represented:
-                continue
-            if preferred_edge_id and edge.get("id") != preferred_edge_id:
                 continue
             curve = edge.get("curve") if isinstance(edge.get("curve"), dict) else {}
             samples = curve.get("sampled_points") or edge.get("vertices", [])
             if len(samples) >= 2:
-                sources.append((samples, curve, edge.get("id")))
+                curve_type = curve.get("type") or edge.get("curve_type") or edge.get("type")
+                topology_sources.append((samples, curve_type, edge.get("id")))
+                coordinate_values.extend(samples)
+
+        coordinate_scale = 1.0
+        for coordinates in coordinate_values:
+            try:
+                coordinate_scale = max(
+                    coordinate_scale,
+                    abs(float(coordinates[0])),
+                    abs(float(coordinates[1])),
+                )
+            except (TypeError, ValueError, IndexError, OverflowError):
+                continue
+        coordinate_tolerance = max(1e-12, coordinate_scale * 1e-10)
+
+        def loose_endpoint(endpoint, owner_id, owner_points):
+            if math.dist(owner_points[0], owner_points[-1]) <= coordinate_tolerance:
+                return False
+            for other_samples, other_type, other_id in topology_sources:
+                if other_id == owner_id:
+                    continue
+                try:
+                    other_points = [
+                        tuple(float(value) for value in sample[:2])
+                        for sample in other_samples
+                    ]
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    continue
+                if len(other_points) < 2:
+                    continue
+                if any(
+                    math.dist(endpoint, other_endpoint) <= coordinate_tolerance
+                    for other_endpoint in (other_points[0], other_points[-1])
+                ):
+                    return False
+                # A line endpoint meeting the interior of another line is a
+                # T-junction, so it is not a loose endpoint either.
+                if other_type == "line":
+                    for first, second in zip(other_points, other_points[1:]):
+                        dx, dy = second[0] - first[0], second[1] - first[1]
+                        length_squared = dx * dx + dy * dy
+                        if length_squared <= coordinate_tolerance**2:
+                            continue
+                        projection = (
+                            (endpoint[0] - first[0]) * dx
+                            + (endpoint[1] - first[1]) * dy
+                        ) / length_squared
+                        if not 0.0 < projection < 1.0:
+                            continue
+                        nearest = (first[0] + projection * dx, first[1] + projection * dy)
+                        if math.dist(endpoint, nearest) <= coordinate_tolerance:
+                            return False
+            return True
 
         candidates = []
         selected_edge_id = preferred_edge_id or getattr(self, "selected_edge_id", None)
-        for samples, curve, edge_id in sources:
+        sources = []
+        for entity in entities:
+            if entity.get("type") != "line":
+                continue
+            entity_id = entity.get("id")
+            samples = entity.get("sampled_points") or entity.get("points") or []
+            linked_edges = edges_by_entity.get(entity_id, [])
+            linked_ids = {edge.get("id") for edge in linked_edges}
+            if preferred_edge_id and preferred_edge_id not in linked_ids and preferred_edge_id != entity_id:
+                continue
+            if len(samples) >= 2:
+                candidate_edge_id = preferred_edge_id if preferred_edge_id in linked_ids else entity_id
+                sources.append((samples, entity, candidate_edge_id, entity_id))
+        for edge in edges:
+            if edge.get("sketch_entity_id") in represented:
+                continue
+            curve = edge.get("curve") if isinstance(edge.get("curve"), dict) else {}
+            if (curve.get("type") or edge.get("curve_type") or edge.get("type")) != "line":
+                continue
+            samples = curve.get("sampled_points") or edge.get("vertices", [])
+            if len(samples) >= 2 and (not preferred_edge_id or edge.get("id") == preferred_edge_id):
+                sources.append((samples, curve, edge.get("id"), edge.get("id")))
+
+        for samples, curve, edge_id, source_id in sources:
             try:
                 points = [tuple(float(value) for value in sample[:2]) for sample in samples]
             except (TypeError, ValueError, IndexError, OverflowError):
                 continue
             if len(points) < 2:
                 continue
-            curve_type = curve.get("type")
-            control = curve.get("control_point")
-            center = curve.get("center")
             for at_start, endpoint, neighbor in (
                 (True, points[0], points[1]),
                 (False, points[-1], points[-2]),
             ):
+                if not loose_endpoint(endpoint, source_id, points):
+                    continue
                 screen = project(endpoint)
                 distance = math.hypot(target[0] - screen[0], target[1] - screen[1])
                 if distance > tolerance_px:
                     continue
 
                 tangent = (endpoint[0] - neighbor[0], endpoint[1] - neighbor[1])
-                if curve_type == "spline3" and isinstance(control, (list, tuple)) and len(control) >= 2:
-                    tangent = (endpoint[0] - float(control[0]), endpoint[1] - float(control[1]))
-                elif curve_type == "arc" and isinstance(center, (list, tuple)) and len(center) >= 2:
-                    radial = (endpoint[0] - float(center[0]), endpoint[1] - float(center[1]))
-                    direction = -1.0 if curve.get("clockwise", False) else 1.0
-                    forward = (-direction * radial[1], direction * radial[0])
-                    tangent = (-forward[0], -forward[1]) if at_start else forward
-
                 norm = math.hypot(*tangent)
                 if norm <= 1e-15:
                     continue
@@ -4849,7 +4904,10 @@ class SolveWorkspace(Div):
                     point, preferred_edge_id=source_edge_id
                 )
                 if tangent_start is None:
-                    self._message("Tangent arc must start at an existing line or curve endpoint.", error=True)
+                    self._message(
+                        "Tangent arc must start at a loose endpoint of an existing line segment.",
+                        error=True,
+                    )
                     return False
                 endpoint, tangent = tangent_start
                 self._pending_arc_points = [tuple(endpoint), tuple(tangent)]
@@ -11778,7 +11836,11 @@ class SolveWorkspace(Div):
                 _input("Mass coefficient (alpha)", mechanics.get("rayleigh_alpha", "0"), lambda event: self._set_physics("mechanics", "rayleigh_alpha", event.value), suffix="1/s"),
                 _input("Stiffness coefficient (beta)", mechanics.get("rayleigh_beta", "0"), lambda event: self._set_physics("mechanics", "rayleigh_beta", event.value), suffix="s"),
             ])
-        if physics.get("harmonic_electromagnetic", {}).get("enabled", False):
+        harmonic_study_enabled = any(
+            bool(physics.get(key, {}).get("enabled", False))
+            for key in ("harmonic_electromagnetic", "mechanics")
+        )
+        if harmonic_study_enabled:
             children.append(_button("Configure study frequencies", "mdi-play-box-outline", lambda *a: self.select_section("studies")))
         else:
             children.append(Div("Frequency is unused by static studies.", ui_style="font-size:11px; line-height:1.4; color:var(--fg-muted); padding-top:8px;"))
@@ -11925,12 +11987,17 @@ class SolveWorkspace(Div):
 
     def _study_properties(self):
         studies = self.studies.get("studies", [])
-        harmonic_enabled = bool(
-            self.model.get("physics", {}).get("harmonic_electromagnetic", {}).get("enabled", False)
+        physics = self.model.get("physics", {})
+        harmonic_em_enabled = bool(
+            physics.get("harmonic_electromagnetic", {}).get("enabled", False)
         )
+        mechanics_enabled = bool(physics.get("mechanics", {}).get("enabled", False))
+        harmonic_enabled = harmonic_em_enabled or mechanics_enabled
         description = (
             "One DC + time-harmonic study; enter a single frequency or a comma-separated sweep."
-            if harmonic_enabled else
+            if harmonic_em_enabled else
+            "One time-harmonic mechanics study; enter a single frequency or a comma-separated sweep."
+            if mechanics_enabled else
             "Static electromagnetic study; no frequency is required."
         )
         children = [_section_title("Study", description)]

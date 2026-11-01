@@ -706,7 +706,7 @@ def test_3d_preview_opens_large_modal_and_exit_restores_editable_sketch(standalo
     assert workspace._preview_3d_viewport.ui_children == [preview]
     assert workspace._canvas_host.ui_children == [original_canvas, workspace._canvas_resize_observer, workspace._canvas_context_menu, workspace._canvas_dimension_editor]
     assert workspace._preview_3d_dialog._props["maximized"] is True
-    assert workspace._preview_3d_dialog._props["persistent"] is True
+    assert workspace._preview_3d_dialog._props["persistent"] is False
     assert workspace._preview_3d_exit_button.ui_label == "Exit 3D Preview"
     assert workspace._preview_3d_button.ui_label == "Exit 3D Preview"
     assert all(not control.ui_hidden for control in workspace._sketch_view_controls)
@@ -1807,7 +1807,7 @@ def test_tangent_arc_uses_outward_direction_at_both_curve_endpoints(
 
 
 
-def test_tangent_arc_prefers_clicked_edge_and_uses_exact_outward_tangent(standalone_components):
+def test_tangent_arc_rejects_shared_endpoints_even_when_an_edge_is_selected(standalone_components):
     workspace = SolveWorkspace()
     shared = (0.004, 0.002)
     assert workspace._add_sketch_entity("line", [shared, (0.009, 0.002)])
@@ -1821,17 +1821,28 @@ def test_tangent_arc_prefers_clicked_edge_and_uses_exact_outward_tangent(standal
         if edge.get("sketch_entity_id") == workspace.model["geometry"]["sketch_entities"][1]["id"]
     )
 
-    horizontal = workspace._tangent_at_sketch_endpoint(
+    assert workspace._tangent_at_sketch_endpoint(
         shared, preferred_edge_id=horizontal_edge["id"]
-    )
-    vertical = workspace._tangent_at_sketch_endpoint(
+    ) is None
+    assert workspace._tangent_at_sketch_endpoint(
         shared, preferred_edge_id=vertical_edge["id"]
-    )
+    ) is None
 
-    assert horizontal[0] == pytest.approx(shared)
-    assert horizontal[1] == pytest.approx((-1.0, 0.0))
-    assert vertical[0] == pytest.approx(shared)
-    assert vertical[1] == pytest.approx((0.0, -1.0))
+
+def test_tangent_arc_rejects_midpoints_and_connected_vertices_without_mutation(standalone_components):
+    workspace = SolveWorkspace()
+    assert workspace._add_sketch_entity("line", [(0.002, 0.002), (0.006, 0.002)])
+    connected = (0.006, 0.002)
+    assert workspace._add_sketch_entity("line", [connected, (0.006, 0.006)])
+    entity_count = len(workspace.model["geometry"]["sketch_entities"])
+    edge_count = len(workspace.model["geometry"]["edges"])
+
+    assert not workspace._accept_arc_sketch_point((0.004, 0.002), variant="tangent")
+    assert not workspace._accept_arc_sketch_point(connected, variant="tangent")
+    assert workspace._pending_arc_points == []
+    assert len(workspace.model["geometry"]["sketch_entities"]) == entity_count
+    assert len(workspace.model["geometry"]["edges"]) == edge_count
+    assert workspace.message_is_error
 
 
 def test_tangent_arc_from_first_endpoint_uses_short_tangent_sweep(standalone_components):
@@ -5297,6 +5308,43 @@ def test_static_electromagnetic_study_has_no_frequency_input(standalone_componen
         == ["Static electromagnetic study; no frequency is required."]
         for component in walk(Div(*workspace._study_properties()))
     )
+
+
+def test_mechanics_only_harmonic_study_exposes_and_serializes_frequencies(standalone_components):
+    from ngsolve_gui.axisymmetric_model import package_model, unpack_model
+
+    workspace = SolveWorkspace()
+    workspace.model["physics"]["harmonic_electromagnetic"]["enabled"] = False
+    workspace.model["physics"]["mechanics"]["enabled"] = True
+    workspace.studies["studies"][0]["physics"] = ["mechanics"]
+    workspace.studies["studies"][0]["frequency_hz"] = ["125", "250"]
+
+    def walk(component):
+        yield component
+        for child in getattr(component, "ui_children", []) or []:
+            yield from walk(child)
+
+    physics_labels = [
+        str(getattr(component, "ui_label", ""))
+        for component in walk(Div(*workspace._physics_properties()))
+    ]
+    study_components = list(walk(Div(*workspace._study_properties())))
+    study_labels = [str(getattr(component, "ui_label", "")) for component in study_components]
+    assert "Configure study frequencies" in physics_labels
+    assert "Frequency points (comma separated)" in study_labels
+    assert any(
+        getattr(component, "ui_children", None)
+        == ["One time-harmonic mechanics study; enter a single frequency or a comma-separated sweep."]
+        for component in study_components
+    )
+
+    workspace._set_study_frequencies(workspace.studies["studies"][0]["id"], "125, 250")
+    packed_model, packed_studies, _layout = unpack_model(
+        package_model(workspace.model, workspace.studies)
+    )
+    assert packed_model["physics"]["harmonic_electromagnetic"]["enabled"] is False
+    assert packed_model["physics"]["mechanics"]["enabled"] is True
+    assert packed_studies["studies"][0]["frequency_hz"] == ["125", "250"]
 
 
 

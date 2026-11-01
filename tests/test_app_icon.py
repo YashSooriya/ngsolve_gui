@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 from ngsolve_gui.app import _set_window_icon
@@ -37,3 +38,25 @@ def test_window_icon_replaces_ngapp_favicons_with_mm_fem_icon():
     assert icon.rel == "icon"
     assert icon.type == "image/png"
     assert icon.href == "data:image/png;base64,mmfem"
+
+
+def test_magmechsim_png_and_all_ico_sizes_have_transparent_corners():
+    from PIL import Image
+
+    assets = Path(__file__).parents[1] / "src" / "ngsolve_gui" / "assets"
+    png_path = assets / "magmechsim_icon_128x128.png"
+    ico_path = assets / "magmechsim_icon.ico"
+
+    with Image.open(png_path) as icon:
+        rgba = icon.convert("RGBA")
+        assert rgba.size == (128, 128)
+        assert all(rgba.getpixel(point)[3] <= 4 for point in ((0, 0), (127, 0), (0, 127), (127, 127)))
+        assert rgba.getpixel((64, 64))[3] == 255
+
+    with Image.open(ico_path) as icon:
+        sizes = icon.ico.sizes()
+        assert {(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)} <= sizes
+        for size in sizes:
+            rgba = icon.ico.getimage(size).convert("RGBA")
+            corners = ((0, 0), (rgba.width - 1, 0), (0, rgba.height - 1), (rgba.width - 1, rgba.height - 1))
+            assert all(rgba.getpixel(point)[3] <= 8 for point in corners), (rgba.size, corners)

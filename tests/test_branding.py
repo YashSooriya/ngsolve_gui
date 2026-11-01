@@ -1,16 +1,23 @@
 from pathlib import Path
 
 
-def test_product_identity_uses_package_version_and_available_documentation():
+def test_product_identity_uses_package_version_and_local_documentation(monkeypatch, tmp_path):
     from ngsolve_gui import __version__
     from ngsolve_gui.appconfig import config
-    from ngsolve_gui.branding import DOCUMENTATION_URL, PRODUCT_NAME
+    from ngsolve_gui.branding import PRODUCT_NAME
+    from ngsolve_gui.documentation import find_documentation_index
 
     assert PRODUCT_NAME == config.name == "MagMechSim"
     assert config.version == __version__
-    assert DOCUMENTATION_URL.endswith("/docs/user-guide.md")
-    assert DOCUMENTATION_URL.startswith("https://")
-    assert (Path(__file__).parents[1] / "docs" / "user-guide.md").is_file()
+    monkeypatch.delenv("MMFEM_DOCUMENTATION_DIR", raising=False)
+    monkeypatch.delenv("COUPLED_SOLVER_ROOT", raising=False)
+    assert find_documentation_index() is None
+    docs = tmp_path / "offline-docs"
+    docs.mkdir()
+    index = docs / "index.html"
+    index.write_text("<html>offline</html>", encoding="utf-8")
+    monkeypatch.setenv("MMFEM_DOCUMENTATION_DIR", str(docs))
+    assert find_documentation_index() == index
 
 
 def test_official_brand_assets_are_packaged_without_old_product_logos():
