@@ -19,6 +19,15 @@ import ngsolve as ngs
 _SYMMETRY_BOUNDARY = re.compile(r"(?:symm|symmetry)[ _-]*([xyz])", re.IGNORECASE)
 
 
+def _normal_vector3(values):
+    """Construct a Netgen 3-vector across old and current binding names."""
+    for name in ("Vec3d", "Vec<3>", "Vec"):
+        constructor = getattr(ngm, name, None)
+        if constructor is not None:
+            return constructor(*values)
+    raise RuntimeError("This Netgen build does not expose a 3D vector constructor")
+
+
 def find_quarter_symmetry_planes(mesh):
     """Return tagged coordinate planes for a quarter-domain 3D mesh.
 
@@ -133,7 +142,7 @@ def mirror_quarter_gridfunction(
             point[axis] = float(plane["coordinate"])
             normal[axis] = 1.0
             mirrored_ngmesh = mirrored_ngmesh.Mirror(
-                ngm.Pnt(*point), ngm.Vec3d(*normal)
+                ngm.Pnt(*point), _normal_vector3(normal)
             )
 
         target_mesh = ngs.Mesh(mirrored_ngmesh)

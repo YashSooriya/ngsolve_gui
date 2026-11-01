@@ -17,8 +17,16 @@ from .helpers import _draw
 
 
 def _use_plot_baseline_viewport(page: Page) -> None:
-    # Plotly's layout baselines were captured at this page height.
-    page.set_viewport_size({"width": 1441, "height": 768})
+    # Plotly baselines use the same browser width as the rest of the suite.
+    # The 1441px override made current ngapp expand the plot canvas by 161px.
+    page.set_viewport_size({"width": 1280, "height": 768})
+
+
+def _assert_plot_baseline(page: Page, target, filename: str) -> None:
+    # Keep Plotly's hover-only mode bar out of screenshots. It appears when the
+    # pointer is left on the plot and was not part of the saved baselines.
+    page.mouse.move(0, 0)
+    assert_matches_baseline(page, target, filename)
 
 
 def test_click_dispatch_keeps_two_argument_callbacks_and_passes_point_index() -> None:
@@ -89,7 +97,7 @@ def test_plot_single_figure(page: Page, app) -> None:
     page.wait_for_function("window.Plotly && window.Plotly.version === '2.35.2'")
     page.wait_for_timeout(100)
     locator = page.locator(".js-plotly-plot").first
-    assert_matches_baseline(page, locator, "plot_single_scatter.png")
+    _assert_plot_baseline(page, locator, "plot_single_scatter.png")
 
 
 @app_test("ngsolve_gui.appconfig")
@@ -103,7 +111,7 @@ def test_plot_bar_chart(page: Page, app) -> None:
 
     page.wait_for_timeout(100)
     locator = page.locator(".js-plotly-plot").first
-    assert_matches_baseline(page, locator, "plot_bar_chart.png")
+    _assert_plot_baseline(page, locator, "plot_bar_chart.png")
 
 
 @app_test("ngsolve_gui.appconfig")
@@ -124,7 +132,7 @@ def test_plot_with_layout(page: Page, app) -> None:
 
     page.wait_for_timeout(100)
     locator = page.locator(".js-plotly-plot").first
-    assert_matches_baseline(page, locator, "plot_with_layout.png")
+    _assert_plot_baseline(page, locator, "plot_with_layout.png")
 
 
 @app_test("ngsolve_gui.appconfig")
@@ -136,7 +144,7 @@ def test_plot_dict_figure(page: Page, app) -> None:
 
     page.wait_for_timeout(100)
     locator = page.locator(".js-plotly-plot").first
-    assert_matches_baseline(page, locator, "plot_dict_figure.png")
+    _assert_plot_baseline(page, locator, "plot_dict_figure.png")
 
 
 @app_test("ngsolve_gui.appconfig")
@@ -152,5 +160,5 @@ def test_plot_multiple_figures(page: Page, app) -> None:
     page.wait_for_selector(".js-plotly-plot >> nth=1", timeout=10000)
     page.wait_for_timeout(500)
     plots = page.locator(".js-plotly-plot")
-    assert_matches_baseline(page, plots.first, "plot_multi_first.png")
-    assert_matches_baseline(page, plots.nth(1), "plot_multi_second.png")
+    _assert_plot_baseline(page, plots.first, "plot_multi_first.png")
+    _assert_plot_baseline(page, plots.nth(1), "plot_multi_second.png")

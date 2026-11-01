@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import traceback
+from collections import defaultdict
 from pathlib import Path
 
 import psutil
@@ -30,21 +31,70 @@ PLOTLY_TEST_BUNDLE = TESTS_DIR / "vendor" / "plotly-2.35.2.min.js"
 PLOTLY_CDN_URL = "https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"
 
 
-def _children_with_procfs_retry():
-    """Retry a transient psutil parse race while a child exits on Linux.
+def _child_process_ids():
+    """Snapshot descendant PIDs without constructing psutil objects for exits.
 
-    psutil can raise IndexError when a process disappears between reading
-    /proc/<pid>/stat and parsing its fields. Retrying lets the next snapshot
-    reflect the process tree after that exit; persistent inspection errors
-    still fail the test cleanup check.
+    psutil can parse a just-exited process's truncated ``/proc/<pid>/stat``
+    while recursively enumerating children. Parse parent IDs independently
+    and ignore only entries that disappeared during this snapshot. A process
+    that remains present but has repeatedly malformed stat data is a cleanup
+    error, not an empty process tree.
     """
-    for attempt in range(4):
-        try:
-            return psutil.Process().children(recursive=True)
-        except IndexError:
-            if attempt == 3:
-                raise
-            time.sleep(0.025)
+    if Path("/proc").is_dir():
+        children_by_parent = defaultdict(list)
+        with os.scandir("/proc") as entries:
+            for entry in entries:
+                if not entry.name.isdecimal():
+                    continue
+                process_path = Path(entry.path)
+                stat_path = process_path / "stat"
+                parent_pid = None
+                for attempt in range(3):
+                    try:
+                        stat = stat_path.read_bytes()
+                    except FileNotFoundError:
+                        break  # The process exited between scandir and read.
+                    closing_parenthesis = stat.rfind(b")")
+                    fields = (
+                        stat[closing_parenthesis + 2 :].split()
+                        if closing_parenthesis >= 0
+                        else ()
+                    )
+                    if len(fields) >= 2:
+                        try:
+                            parent_pid = int(fields[1])
+                            break
+                        except ValueError:
+                            pass
+                    try:
+                        os.stat(process_path)
+                    except FileNotFoundError:
+                        break
+                    if attempt < 2:
+                        time.sleep(0.002)
+                if parent_pid is None:
+                    try:
+                        os.stat(process_path)
+                    except FileNotFoundError:
+                        continue
+                    else:
+                        raise RuntimeError(
+                            f"Could not read a valid parent PID from {stat_path}"
+                        )
+                children_by_parent[parent_pid].append(int(entry.name))
+
+        descendants = set()
+        pending = [os.getpid()]
+        while pending:
+            parent_pid = pending.pop()
+            for pid in children_by_parent.get(parent_pid, ()):
+                if pid not in descendants:
+                    descendants.add(pid)
+                    pending.append(pid)
+        descendants.discard(os.getpid())
+        return descendants
+
+    return {process.pid for process in psutil.Process().children(recursive=True)}
 
 
 def pytest_configure(config):
@@ -157,6 +207,29 @@ def _isolate_ngapp_test_lifecycle(monkeypatch):
     renderer_cleanup_failures = []
     original_start = LocalAppRunner.start
     original_stop = LocalAppRunner.stop
+
+    def close_active_test_pages():
+        for page in tuple(_ACTIVE_TEST_PAGES):
+            try:
+                if not page.is_closed():
+                    page.close()
+            except Exception as error:
+                renderer_cleanup_failures.append(
+                    f"Browser page close failed during ngapp teardown: "
+                    f"{type(error).__name__}: {error}"
+                )
+
+    def wait_for_webgpu_disconnect(server):
+        # The pinned WebGPU server dispatches incoming frames through an
+        # executor. Close the browser side and let its handler finish before
+        # runner.stop() shuts that executor down.
+        deadline = time.monotonic() + 1
+        while getattr(server, "_connection", None) is not None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if getattr(server, "_connection", None) is not None:
+            renderer_cleanup_failures.append(
+                "WebGPU websocket remained connected after its test page closed"
+            )
 
     def checked_stop(runner):
         thread = runner._thread
@@ -271,10 +344,8 @@ def _isolate_ngapp_test_lifecycle(monkeypatch):
                                 "WebGPU canvas resize callback remained active during teardown"
                             )
         # app_test stops its host before pytest finalizes the page fixture.
-        # Keep the browser connected for a short graceful window because
-        # platform.js.close() uses that connection. The upstream runner waits
-        # ten seconds before returning control here; if the synchronous
-        # WebSocket close is stuck, that leaves no useful time to release it.
+        # Give platform.js.close() a short graceful window before disconnecting
+        # the browser; the upstream runner waits ten seconds here.
         if thread is not None and thread.is_alive():
             stop_event = runner._stop_event
             if stop_event is not None:
@@ -284,12 +355,7 @@ def _isolate_ngapp_test_lifecycle(monkeypatch):
                 # A lost WebGPU device can prevent the synchronous close RPC
                 # from completing. Disconnect the browser and stop the link
                 # explicitly, then wait for host_local_app to unwind.
-                for page in tuple(_ACTIVE_TEST_PAGES):
-                    try:
-                        if not page.is_closed():
-                            page.close()
-                    except Exception:
-                        pass
+                close_active_test_pages()
                 try:
                     from webgpu import platform as webgpu_platform
 
@@ -301,19 +367,36 @@ def _isolate_ngapp_test_lifecycle(monkeypatch):
                         # get() unwind when stop() releases outstanding RPCs.
                         # Without this the host thread can survive teardown.
                         server._event_is_connected.set()
+                        wait_for_webgpu_disconnect(server)
                         server.stop()
                 except Exception as error:
                     renderer_cleanup_failures.append(
                         f"WebGPU websocket shutdown failed: {type(error).__name__}: {error}"
                     )
                 thread.join(timeout=5)
-            if thread.is_alive():
-                frame = sys._current_frames().get(thread.ident)
-                stack = "".join(traceback.format_stack(frame)) if frame else "<stack unavailable>"
-                raise RuntimeError(
-                    "ngapp application host thread survived stop and WebGPU shutdown:\n"
-                    + stack
-                )
+        host_thread_error = None
+        if thread is not None and thread.is_alive():
+            frame = sys._current_frames().get(thread.ident)
+            stack = "".join(traceback.format_stack(frame)) if frame else "<stack unavailable>"
+            host_thread_error = RuntimeError(
+                "ngapp application host thread survived stop and WebGPU shutdown:\n"
+                + stack
+            )
+        # app_test returns before pytest finalizes the page fixture. At this
+        # point queued GPU work has been drained and Python scenes unmounted;
+        # close the browser now, before LocalAppRunner stops the websocket
+        # executor, so no late frontend frame can be submitted during shutdown.
+        close_active_test_pages()
+        try:
+            from webgpu import platform as webgpu_platform
+
+            server = webgpu_platform.websocket_server
+            if server is not None:
+                wait_for_webgpu_disconnect(server)
+        except Exception as error:
+            renderer_cleanup_failures.append(
+                f"WebGPU disconnect check failed: {type(error).__name__}: {error}"
+            )
         # Clear runner fields only after its host has exited. Subprocess based
         # tests still use ngapp's regular stop implementation.
         original_stop(runner)
@@ -326,15 +409,6 @@ def _isolate_ngapp_test_lifecycle(monkeypatch):
             renderer_cleanup_failures.append(
                 "WebGPU platform globals remained set after ngapp host shutdown"
             )
-        # app_test returns before pytest finalizes the page fixture, so close
-        # it as soon as the backend has shut down to dispose its WebGPU
-        # context before the next app starts.
-        for page in tuple(_ACTIVE_TEST_PAGES):
-            try:
-                if not page.is_closed():
-                    page.close()
-            except Exception:
-                pass
         if process is not None and process.poll() is None:
             process.terminate()
             try:
@@ -342,6 +416,8 @@ def _isolate_ngapp_test_lifecycle(monkeypatch):
             except psutil.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=3)
+        if host_thread_error is not None:
+            raise host_thread_error
 
     def checked_start(runner, *args, **kwargs):
         try:
@@ -367,8 +443,8 @@ def _isolate_ngapp_test_lifecycle(monkeypatch):
     monkeypatch.setattr(LocalAppRunner, "stop", checked_stop)
 
     baseline_pids = {
-        process.pid
-        for process in _children_with_procfs_retry()
+        pid
+        for pid in _child_process_ids()
     }
     yield
 
@@ -383,12 +459,13 @@ def _isolate_ngapp_test_lifecycle(monkeypatch):
 
     def owned_test_workers():
         workers = []
-        for process in _children_with_procfs_retry():
-            if process.pid in baseline_pids:
+        for pid in _child_process_ids():
+            if pid in baseline_pids:
                 continue
             try:
+                process = psutil.Process(pid)
                 command_line = " ".join(process.cmdline())
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
+            except (psutil.NoSuchProcess, psutil.ZombieProcess, IndexError):
                 continue
             if any(
                 marker in command_line
