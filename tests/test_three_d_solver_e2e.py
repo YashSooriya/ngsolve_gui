@@ -462,7 +462,10 @@ def test_3d_failed_process_finishes_with_actionable_diagnostics(page: Page, app)
             while context is None and time.monotonic() < deadline:
                 page.wait_for_timeout(100)
                 context = app._solver_run_context
-            assert context is not None
+            assert context is not None, (
+                "The failed-process study did not start: "
+                f"{workspace._status.ui_children!r}"
+            )
             output_dir = Path(context["output_dir"])
 
             deadline = time.monotonic() + 10
@@ -541,7 +544,10 @@ def test_3d_cancelled_process_finishes_with_cancelled_status(page: Page, app):
             while context is None and time.monotonic() < deadline:
                 page.wait_for_timeout(100)
                 context = app._solver_run_context
-            assert context is not None
+            assert context is not None, (
+                "The cancellation study did not start: "
+                f"{workspace._status.ui_children!r}"
+            )
             output_dir = Path(context["output_dir"])
 
             deadline = time.monotonic() + 5
@@ -562,6 +568,9 @@ def test_3d_cancelled_process_finishes_with_cancelled_status(page: Page, app):
             manifest = json.loads((output_dir / "run_manifest.json").read_text(encoding="utf-8"))
             assert manifest["status"] == "cancelled"
             assert "Study cancelled" in " ".join(workspace._status.ui_children)
+            deadline = time.monotonic() + 5
+            while workspace._study_running and time.monotonic() < deadline:
+                page.wait_for_timeout(100)
             assert workspace._study_running is False
 
             screenshot_dir = os.environ.get("MMFEM_UI_SCREENSHOT_DIR")

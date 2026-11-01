@@ -21,6 +21,7 @@ jobs:
         run: docker build -t ngsolve-gui-tests .
 
       # Keep viewport-sensitive generic renderer screenshots in the full suite below.
+      # The fake-solver lifecycle cases are small and do not execute FEM workloads.
       - name: Run core preprocessing checks
         run: |
           docker run --rm \
@@ -37,7 +38,9 @@ jobs:
             tests/test_three_d_project.py \
             tests/test_three_d_solver_setup.py \
             tests/test_three_d_workspace.py \
-            tests/test_three_d_workspace_e2e.py
+            tests/test_three_d_workspace_e2e.py \
+            tests/test_three_d_solver_e2e.py::test_3d_failed_process_finishes_with_actionable_diagnostics \
+            tests/test_three_d_solver_e2e.py::test_3d_cancelled_process_finishes_with_cancelled_status
 
       - name: Upload core test output
         if: failure()
