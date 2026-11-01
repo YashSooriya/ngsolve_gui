@@ -415,8 +415,21 @@ def test_3d_failed_process_finishes_with_actionable_diagnostics(page: Page, app)
         fake_solver_root = root / "solver"
         runner = fake_solver_root / "scripts" / "run_gui_3d_model.py"
         runner.parent.mkdir(parents=True)
+        started_marker = root / "failure-solver-started"
+        release_marker = root / "release-failure-solver"
         runner.write_text(
-            "import sys\nprint('intentional solver failure', flush=True)\nraise SystemExit(7)\n",
+            "from pathlib import Path\n"
+            "import time\n"
+            f"started = Path({str(started_marker)!r})\n"
+            f"release = Path({str(release_marker)!r})\n"
+            "started.write_text('started', encoding='utf-8')\n"
+            "deadline = time.monotonic() + 15\n"
+            "while not release.exists() and time.monotonic() < deadline:\n"
+            "    time.sleep(0.02)\n"
+            "if not release.exists():\n"
+            "    raise SystemExit(8)\n"
+            "print('intentional solver failure', flush=True)\n"
+            "raise SystemExit(7)\n",
             encoding="utf-8",
         )
         evidence_dir = os.environ.get("MMFEM_STAGE8A_EVIDENCE_DIR")
@@ -459,13 +472,19 @@ def test_3d_failed_process_finishes_with_actionable_diagnostics(page: Page, app)
             page.get_by_role("button", name="Run study").click()
             deadline = time.monotonic() + 5
             context = app._solver_run_context
-            while context is None and time.monotonic() < deadline:
-                page.wait_for_timeout(100)
+            while (
+                (context is None or not started_marker.exists())
+                and time.monotonic() < deadline
+            ):
+                page.wait_for_timeout(50)
                 context = app._solver_run_context
-            assert context is not None, (
-                "The failed-process study did not start: "
-                f"{workspace._status.ui_children!r}"
-            )
+            try:
+                assert context is not None and started_marker.exists(), (
+                    "The failed-process study did not reach the fake child process: "
+                    f"{workspace._status.ui_children!r}"
+                )
+            finally:
+                release_marker.write_text("release", encoding="utf-8")
             output_dir = Path(context["output_dir"])
 
             deadline = time.monotonic() + 10
