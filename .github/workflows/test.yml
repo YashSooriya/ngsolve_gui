@@ -20,6 +20,7 @@ jobs:
       - name: Build test image
         run: docker build -t ngsolve-gui-tests .
 
+      # Keep viewport-sensitive generic renderer screenshots in the full suite below.
       - name: Run core preprocessing checks
         run: |
           docker run --rm \
@@ -29,8 +30,6 @@ jobs:
             tests/test_axisymmetric_model.py \
             tests/test_axisymmetric_geometry_preview_e2e.py \
             tests/test_file_loader.py \
-            tests/test_geometry.py \
-            tests/test_mesh.py \
             tests/test_project_startup.py \
             tests/test_run_history.py \
             tests/test_three_d_mesh.py \

@@ -23,8 +23,10 @@ def _use_plot_baseline_viewport(page: Page) -> None:
 
 
 def _assert_plot_baseline(page: Page, target, filename: str) -> None:
-    # Keep Plotly's hover-only mode bar out of screenshots. It appears when the
-    # pointer is left on the plot and was not part of the saved baselines.
+    # The baseline checks the rendered figure, not Plotly's transient controls.
+    # The mode bar is part of the plot element, so moving the pointer elsewhere
+    # in the page can still leave it visible in page-level screenshot capture.
+    page.add_style_tag(content=".modebar-container { display: none !important; }")
     page.mouse.move(0, 0)
     assert_matches_baseline(page, target, filename)
 
