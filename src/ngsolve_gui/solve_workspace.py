@@ -980,6 +980,10 @@ class SolveWorkspace(Div):
             ui_transition_duration=160,
             ui_class="mmfem-3d-preview-dialog",
         )
+        # QDialog may mount its children before the overlay becomes visible.
+        # The first WebGPU resize can therefore see a zero-sized viewport; resize
+        # again on Quasar's post-transition show event once layout has settled.
+        self._preview_3d_dialog.on("show", self._resize_visible_3d_preview)
         self._canvas_panel = Div(
             self._canvas_host,
             ui_style="display:flex; flex:1 1 auto; flex-direction:column; width:100%; height:100%; min-width:0; min-height:0;",
@@ -12796,6 +12800,11 @@ class SolveWorkspace(Div):
         except Exception:
             # Browser resize/render can race component mount in some frontends.
             pass
+
+    def _resize_visible_3d_preview(self, *_args):
+        preview = self._preview_3d_component
+        if preview is not None:
+            self._resize_3d_preview(preview)
 
     def toggle_3d_preview(self, *args):
         """Open or close the large read-only 3D preview window."""

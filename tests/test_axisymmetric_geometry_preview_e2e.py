@@ -77,13 +77,15 @@ def test_axisymmetric_geometry_creation_renders_3d_preview(page: Page, app):
     preview = workspace._preview_3d_component
     assert preview is not None, workspace.message
 
+    page.get_by_role("dialog").wait_for(state="visible", timeout=5_000)
+
     from ngapp.e2e_webgpu import _ensure_scene_ready, capture_canvas
 
     _ensure_scene_ready(page, preview)
     page.wait_for_function(
         """() => Array.from(document.querySelectorAll('canvas')).some(canvas => {
             const rect = canvas.getBoundingClientRect();
-            return canvas.width > 0 && canvas.height > 0
+            return canvas.isConnected && canvas.width > 0 && canvas.height > 0
                 && rect.width > 400 && rect.height > 300;
         })""",
         timeout=15_000,
