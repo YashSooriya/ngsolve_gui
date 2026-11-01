@@ -79,6 +79,16 @@ cropped panel or full-page document image, inspect the resulting dimensions,
 and record them in the evidence manifest. Compact viewports remain useful for
 responsive-layout tests, but must not be used as the primary review screenshots.
 
+## Launching the reviewed version
+
+Every work-package handoff must state how to launch the exact reviewed revision.
+Include the source branch and commit, working directory, and copyable launch
+command. State explicitly whether the standalone Windows package or shortcut
+was rebuilt. If it was not rebuilt, identify the source-checkout launcher and
+make clear that an existing packaged installation may still run an older build.
+When a portable package is produced, include its exact path and version alongside
+the source-checkout command.
+
 ## Known comprehensive-suite baseline
 
 The latest recorded full run before this strategy change completed with 513
