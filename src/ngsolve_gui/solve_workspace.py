@@ -12619,7 +12619,7 @@ class SolveWorkspace(Div):
         preview = WebgpuComponent(
             ui_style="display:block; flex:1 1 auto; width:100%; height:100%; min-width:0; min-height:0;",
         )
-        preview.ui_class = "fit"
+        preview.ui_class = "fit mmfem-axisymmetric-3d-preview-canvas"
         preview.on_mounted(lambda *_: self._resize_3d_preview(preview))
         scene = preview.draw(renderers)
         self._preview_3d_scene = scene

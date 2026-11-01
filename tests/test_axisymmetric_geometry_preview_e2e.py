@@ -60,6 +60,7 @@ def _axisymmetric_preview_model():
 
 @app_test("ngsolve_gui.appconfig")
 def test_axisymmetric_geometry_creation_renders_3d_preview(page: Page, app):
+    page.locator(".q-layout").wait_for(state="visible", timeout=15_000)
     assert app._start_new_problem() is True
     workspace = app.solve_workspace
     workspace.set_model(
@@ -69,6 +70,13 @@ def test_axisymmetric_geometry_creation_renders_3d_preview(page: Page, app):
     )
     app._update()
 
+    screenshot_dir = os.environ.get("MMFEM_UI_SCREENSHOT_DIR")
+    if screenshot_dir:
+        Path(screenshot_dir).mkdir(parents=True, exist_ok=True)
+        page.screenshot(
+            path=str(Path(screenshot_dir) / "00-axisymmetric-geometry-creation.png"),
+            full_page=True,
+        )
     page.get_by_role("button", name="Preview in 3D", exact=True).click()
     deadline = time.monotonic() + 15
     while not workspace._preview_3d_active and time.monotonic() < deadline:
@@ -83,11 +91,15 @@ def test_axisymmetric_geometry_creation_renders_3d_preview(page: Page, app):
 
     _ensure_scene_ready(page, preview)
     page.wait_for_function(
-        """() => Array.from(document.querySelectorAll('canvas')).some(canvas => {
+        """() => {
+            const canvas = document.querySelector(
+                'canvas.mmfem-axisymmetric-3d-preview-canvas'
+            );
+            if (!canvas) return false;
             const rect = canvas.getBoundingClientRect();
             return canvas.isConnected && canvas.width > 0 && canvas.height > 0
                 && rect.width > 400 && rect.height > 300;
-        })""",
+        }""",
         timeout=15_000,
     )
     assert workspace._preview_3d_active is True
@@ -116,9 +128,7 @@ def test_axisymmetric_geometry_creation_renders_3d_preview(page: Page, app):
         f"foreground fraction={foreground_fraction:.4f}"
     )
 
-    screenshot_dir = os.environ.get("MMFEM_UI_SCREENSHOT_DIR")
     if screenshot_dir:
-        Path(screenshot_dir).mkdir(parents=True, exist_ok=True)
         page.screenshot(
             path=str(Path(screenshot_dir) / "07-axisymmetric-geometry-3d-preview.png"),
             full_page=True,

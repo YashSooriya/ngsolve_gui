@@ -5,10 +5,25 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+    types: [opened, synchronize, reopened, labeled]
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      comprehensive:
+        description: Run the comprehensive test suite
+        required: true
+        type: boolean
+        default: false
 
 jobs:
   core-preprocessing:
     name: Core preprocessing and branding
+    if: >-
+      github.event_name != 'schedule' &&
+      github.event_name != 'push' &&
+      !(github.event_name == 'workflow_dispatch' && inputs.comprehensive) &&
+      !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'comprehensive-tests'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,8 +32,17 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Build test image
-        run: docker build -t ngsolve-gui-tests .
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build cached test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: ngsolve-gui-tests
+          load: true
+          cache-from: type=gha,scope=ngsolve-gui-tests
+          cache-to: type=gha,scope=ngsolve-gui-tests,mode=max
 
       # Keep viewport-sensitive generic renderer screenshots in the full suite below.
       # The fake-solver lifecycle cases are small and do not execute FEM workloads.
@@ -50,6 +74,11 @@ jobs:
           path: tests/output/
 
   test:
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.comprehensive) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'comprehensive-tests'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,18 +87,28 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Build test image
-        run: docker build -t ngsolve-gui-tests .
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Run tests
+      - name: Build cached test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: ngsolve-gui-tests
+          load: true
+          cache-from: type=gha,scope=ngsolve-gui-tests
+          cache-to: type=gha,scope=ngsolve-gui-tests,mode=max
+
+      - name: Run comprehensive suite
         run: |
           docker run --rm \
             -v "${{ github.workspace }}/tests/output:/app/tests/output" \
-            ngsolve-gui-tests
+            ngsolve-gui-tests pytest -q --junitxml=/app/tests/output/comprehensive-junit.xml
 
-      - name: Upload test output
-        if: failure()
+      - name: Upload comprehensive test output
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-output
+          name: comprehensive-test-output
           path: tests/output/
+          if-no-files-found: warn
