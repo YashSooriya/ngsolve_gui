@@ -24,6 +24,22 @@ import ngsolve_gui.solve_workspace as solve_workspace
 from .solver_test_support import SOLVER_UNAVAILABLE_REASON, solver_checkout_available
 
 
+_REVIEW_SCREEN_SIZE = {"width": 1920, "height": 1080}
+
+
+def _capture_review_screenshot(page, path):
+    previous_size = page.viewport_size
+    try:
+        if previous_size != _REVIEW_SCREEN_SIZE:
+            page.set_viewport_size(_REVIEW_SCREEN_SIZE)
+            page.wait_for_timeout(350)
+        page.screenshot(path=str(path), full_page=False)
+    finally:
+        if previous_size and previous_size != _REVIEW_SCREEN_SIZE:
+            page.set_viewport_size(previous_size)
+            page.wait_for_timeout(150)
+
+
 def _harmonic_coil_project():
     model = new_model("Stage 8A axisymmetric coil")
     model["materials"] = builtin_materials()
@@ -173,9 +189,8 @@ def _exercise_axisymmetric_run(page, app, root):
 
     screenshot_dir = os.environ.get("MMFEM_UI_SCREENSHOT_DIR")
     if screenshot_dir:
-        page.screenshot(
-            path=str(Path(screenshot_dir) / "08-axisymmetric-study-setup.png"),
-            full_page=True,
+        _capture_review_screenshot(
+            page, Path(screenshot_dir) / "08-axisymmetric-study-setup.png"
         )
 
     page.get_by_role("button", name="Run study").click()
@@ -246,9 +261,8 @@ def _exercise_axisymmetric_run(page, app, root):
     workspace.select_section("runs")
     app._update()
     if screenshot_dir:
-        page.screenshot(
-            path=str(Path(screenshot_dir) / "09-axisymmetric-completed-run-history.png"),
-            full_page=True,
+        _capture_review_screenshot(
+            page, Path(screenshot_dir) / "09-axisymmetric-completed-run-history.png"
         )
     evidence_dir = os.environ.get("MMFEM_STAGE8A_EVIDENCE_DIR")
     if evidence_dir:

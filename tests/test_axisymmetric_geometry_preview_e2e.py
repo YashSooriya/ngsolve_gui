@@ -15,6 +15,21 @@ from ngsolve_gui.axisymmetric_model import (
     validate_model,
 )
 
+_REVIEW_SCREEN_SIZE = {"width": 1920, "height": 1080}
+
+
+def _capture_review_screenshot(page, path):
+    previous_size = page.viewport_size
+    try:
+        if previous_size != _REVIEW_SCREEN_SIZE:
+            page.set_viewport_size(_REVIEW_SCREEN_SIZE)
+            page.wait_for_timeout(350)
+        page.screenshot(path=str(path), full_page=False)
+    finally:
+        if previous_size and previous_size != _REVIEW_SCREEN_SIZE:
+            page.set_viewport_size(previous_size)
+            page.wait_for_timeout(150)
+
 
 def _axisymmetric_preview_model():
     model = new_model("Axisymmetric 3D preview")
@@ -82,10 +97,8 @@ def test_axisymmetric_geometry_creation_renders_3d_preview(page: Page, app):
 
     screenshot_dir = os.environ.get("MMFEM_UI_SCREENSHOT_DIR")
     if screenshot_dir:
-        Path(screenshot_dir).mkdir(parents=True, exist_ok=True)
-        page.screenshot(
-            path=str(Path(screenshot_dir) / "00-axisymmetric-geometry-creation.png"),
-            full_page=True,
+        _capture_review_screenshot(
+            page, Path(screenshot_dir) / "00-axisymmetric-geometry-creation.png"
         )
     page.get_by_role("button", name="Preview in 3D", exact=True).click()
     deadline = time.monotonic() + 15
@@ -139,9 +152,8 @@ def test_axisymmetric_geometry_creation_renders_3d_preview(page: Page, app):
     )
 
     if screenshot_dir:
-        page.screenshot(
-            path=str(Path(screenshot_dir) / "07-axisymmetric-geometry-3d-preview.png"),
-            full_page=True,
+        _capture_review_screenshot(
+            page, Path(screenshot_dir) / "07-axisymmetric-geometry-3d-preview.png"
         )
         from PIL import Image
 

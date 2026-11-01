@@ -148,6 +148,59 @@ def test_mechanical_builder_sets_structural_sources_supports_and_no_air_domain(t
     assert inputs["mechanical_body_force_n_m3"] == [1e8, 0.0, 0.0]
 
 
+@pytest.mark.parametrize("supported_solids", [0, 1, 2])
+def test_mechanical_builder_accepts_free_and_partially_supported_solids(
+    tmp_path, supported_solids
+):
+    from netgen.occ import Box, Glue, OCCGeometry, Pnt
+    from ngsolve_gui.three_d_project import step_geometry_tags
+
+    step_path = tmp_path / "two_free_or_supported_blocks.step"
+    Glue([
+        Box(Pnt(0, 0, 0), Pnt(10, 10, 10)),
+        Box(Pnt(20, 0, 0), Pnt(30, 10, 10)),
+    ]).WriteStep(str(step_path))
+    materials = builtin_materials()
+    project = new_3d_project("Two-solid mechanics setup")
+    project["study"].update(
+        physics="harmonic_mechanical",
+        frequency_hz=50.0,
+        mechanical_body_force_n_m3=[1e5, 0.0, 0.0],
+    )
+    project["materials"] = [materials[4]]
+    assets = {}
+    geometry = add_step_geometry(
+        project, assets, step_path.name, step_path.read_bytes(), units="mm",
+        material=materials[4]["name"],
+    )
+    geometry["material"] = materials[4]["name"]
+    geometry["mesh_maxh_mm"] = 20.0
+    solids = list(OCCGeometry(str(step_path)).solids)
+    _solid_tags, face_refs = step_geometry_tags(solids)
+    tags_by_solid = {}
+    for face_tag, solid_tag, _face in face_refs:
+        if face_tag:
+            tags_by_solid.setdefault(solid_tag, face_tag)
+    selected_tags = list(tags_by_solid.values())[:supported_solids]
+    if selected_tags:
+        geometry["boundary_selections"] = [{
+            "id": "partial-support",
+            "name": "Partial support",
+            "boundary_ids": list(range(len(selected_tags))),
+            "boundary_tags": selected_tags,
+            "boundary_condition": "mechanical_fixed",
+        }]
+
+    inputs = build_time_harmonic_em_problem(
+        project, {geometry["asset"]: step_path}
+    )
+    problem = inputs["problem"]
+
+    assert len([key for key in problem["objects"] if key.startswith("_mmfem_g0_")]) == 2
+    assert len([key for key in problem["dirkeysMech"].split("|") if key]) == supported_solids
+    assert len(problem["dirconditionMech"]) == supported_solids
+
+
 @pytest.mark.parametrize(
     ("change", "message"),
     [
@@ -549,9 +602,125 @@ def test_small_3d_mechanical_solver_run_exports_nonzero_displacement(tmp_path):
     assert displacement_values.size > 0
     assert all(math.isfinite(float(value.real)) for value in displacement_values)
     assert float(abs(displacement_values).max()) > 0
+    free_dofs = displacement.space.FreeDofs()
+    constrained_dofs = [
+        index for index in range(displacement.space.ndof)
+        if not free_dofs[index]
+    ]
+    assert constrained_dofs, "The selected mechanical support constrained no DOFs."
+    assert float(abs(displacement_values[constrained_dofs]).max()) <= 1e-12
     print(
         f"Bounded mechanical run: {manifest['mesh']['elements']} elements, "
         f"max |u|={float(abs(displacement_values).max()):.6g} m"
+    )
+
+
+@pytest.mark.skipif(
+    not solver_checkout_available(),
+    reason=SOLVER_UNAVAILABLE_REASON,
+)
+@pytest.mark.parametrize("frequency_hz", [50.0, 100.0])
+def test_free_body_harmonic_displacement_matches_inertial_solution(
+    tmp_path, frequency_hz
+):
+    """A freely translating body has exact u = -f/(rho*omega^2) at f > 0."""
+    from netgen.occ import Box, Pnt
+    from ngsolve import Integrate, VOL
+
+    gui_root = Path(__file__).resolve().parents[1]
+    solver_roots = []
+    configured_solver_root = os.environ.get("COUPLED_SOLVER_ROOT")
+    if configured_solver_root:
+        solver_roots.append(Path(configured_solver_root).expanduser())
+    solver_roots.extend([
+        gui_root / "coupled_solver",
+        gui_root.parent / "ngsolve-ui" / "coupled_solver",
+        Path.cwd() / "coupled_solver",
+    ])
+    solver_root = next(
+        root.resolve()
+        for root in solver_roots
+        if (root / "scripts" / "run_gui_3d_model.py").is_file()
+    )
+    step_path = tmp_path / "free_body_block.step"
+    Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).WriteStep(str(step_path))
+
+    materials = builtin_materials()
+    material = materials[4]
+    body_force = 1.0e5
+    project = new_3d_project("Free body harmonic check")
+    project["study"].update(
+        physics="harmonic_mechanical",
+        frequency_hz=frequency_hz,
+        polynomial_order=1,
+        mechanical_body_force_n_m3=[body_force, 0.0, 0.0],
+    )
+    project["materials"] = [material]
+    assets = {}
+    geometry = add_step_geometry(
+        project,
+        assets,
+        step_path.name,
+        step_path.read_bytes(),
+        units="mm",
+        material=material["name"],
+    )
+    geometry["material"] = material["name"]
+    geometry["mesh_maxh_mm"] = 10.0
+
+    model_path = tmp_path / "free_body.mmfem3d"
+    model_path.write_bytes(package_3d_project(project, assets))
+    output_dir = tmp_path / "free_body_output"
+    environment = os.environ.copy()
+    environment.pop("COUPLED_SOLVER_OUTPUT_DIR", None)
+    environment.pop("COUPLED_SOLVER_SHARED_FILES_DIR", None)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(gui_root / "src"), *filter(None, [environment.get("PYTHONPATH")])]
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(solver_root / "scripts" / "run_gui_3d_model.py"),
+            "--model", str(model_path),
+            "--output-dir", str(output_dir),
+        ],
+        cwd=solver_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=90,
+        env=environment,
+        check=False,
+    )
+    solver_output = re.sub(
+        re.escape(str(tmp_path)), "<temporary-run>",
+        f"{completed.stdout}\n{completed.stderr}", flags=re.IGNORECASE,
+    )
+    assert completed.returncode == 0, solver_output[-5000:]
+    manifest = json.loads((output_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "complete"
+    assert manifest["mesh"]["elements"] < 50_000
+    displacement_file = next(
+        field for field in manifest["fields"] if "gfuAC" in field
+    )
+    with (output_dir / displacement_file).open("rb") as stream:
+        displacement = pickle.load(stream)
+    displacement_volume = Integrate(1, displacement.space.mesh, VOL)
+    mean_x = Integrate(displacement[0], displacement.space.mesh, VOL) / displacement_volume
+    mean_y = Integrate(displacement[1], displacement.space.mesh, VOL) / displacement_volume
+    mean_z = Integrate(displacement[2], displacement.space.mesh, VOL) / displacement_volume
+    density = float(material["properties"]["density"])
+    omega = 2.0 * math.pi * frequency_hz
+    expected_x = -body_force / (density * omega**2)
+    assert mean_x.real == pytest.approx(expected_x, rel=1e-5, abs=1e-10)
+    assert mean_x.imag == pytest.approx(0.0, abs=1e-10)
+    assert mean_y == pytest.approx(0.0, abs=1e-10)
+    assert mean_z == pytest.approx(0.0, abs=1e-10)
+    print(
+        f"Free-body harmonic check: f={frequency_hz:g} Hz, "
+        f"{manifest['mesh']['elements']} elements, mean ux={mean_x.real:.9g} m, "
+        f"analytic ux={expected_x:.9g} m"
     )
 
 

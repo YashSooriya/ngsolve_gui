@@ -319,6 +319,45 @@ def test_preview_worker_dispatches_ui_updates_to_the_application_loop(monkeypatc
     assert len(drawn) == 1
 
 
+def test_preview_selection_updates_are_coalesced_on_the_application_loop(monkeypatch):
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+
+    class Handle:
+        def __init__(self):
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    class Loop:
+        def __init__(self):
+            self.callbacks = []
+
+        def is_running(self):
+            return True
+
+        def call_later(self, delay, callback):
+            handle = Handle()
+            self.callbacks.append((delay, callback, handle))
+            return handle
+
+    loop = Loop()
+    workspace = ThreeDWorkspace(SimpleNamespace(loop=loop))
+    calls = []
+    workspace._update_preview_selection = lambda: calls.append("restyled")
+
+    workspace._schedule_preview_selection_update()
+    first_handle = workspace._preview_selection_update_handle
+    workspace._schedule_preview_selection_update()
+
+    assert first_handle.cancelled is True
+    assert [entry[0] for entry in loop.callbacks] == [0.05, 0.05]
+    assert calls == []
+    loop.callbacks[-1][1]()
+    assert calls == ["restyled"]
+    assert workspace._preview_selection_update_handle is None
+
+
 def test_view_controls_keep_geometry_and_plot_canvas(monkeypatch):
     import plotly.graph_objects as go
 
@@ -745,7 +784,7 @@ def test_mechanical_study_property_editor_exposes_only_relevant_configuration(mo
     assert "Air-region padding (model spans)" not in controls
     assert workspace._set_mechanical_body_force(0, SimpleNamespace(value="1000")) is True
     assert workspace.project["study"]["mechanical_body_force_n_m3"] == [1000.0, 0.0, 0.0]
-    assert workspace._run_study_button.ui_disable is True
+    assert workspace._run_study_button.ui_disable is False
 
     geometry["boundary_selections"].append({
         "id": "fixed-face",
@@ -760,6 +799,130 @@ def test_mechanical_study_property_editor_exposes_only_relevant_configuration(mo
     geometry["boundary_selections"][0]["boundary_condition"] = "magnetic_potential_zero"
     workspace._update_study_controls()
     assert workspace._run_study_button.ui_disable is True
+
+
+def test_invalidated_boundary_assignment_can_be_reassigned_from_current_mesh(monkeypatch):
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    selection = {
+        "id": "old-support",
+        "name": "Old support faces",
+        "boundary_ids": [0],
+        "boundary_tags": ["MMFEM_FACE_000000000000000000000099"],
+        "boundary_condition": "mechanical_fixed",
+    }
+    geometry["boundary_selections"].append(selection)
+    geometry["material"] = "Stainless steel (4 K / OVC)"
+    workspace.project["study"].update(
+        physics="harmonic_mechanical",
+        mechanical_body_force_n_m3=[1.0, 0.0, 0.0],
+    )
+    workspace._rebuild_items()
+
+    assert workspace._selection_recovery_message(geometry, "boundary", selection)
+    assert workspace._run_study_button.ui_disable is True
+    tree_row = workspace._named_selection_tree_item(geometry, "boundary", selection)
+    assert any(
+        getattr(node, "ui_children", None) == ["Needs review"]
+        for node in tree_row.ui_children
+    )
+
+    workspace.select_item("named_selection", selection["id"])
+    assert workspace._begin_named_selection_reassignment(
+        geometry, "boundary", selection
+    )
+    assert workspace._selection_draft["selection_id"] == selection["id"]
+    assert workspace._selection_draft["region_ids"] == []
+    workspace._set_selection_draft_regions(geometry, SimpleNamespace(value=[1]))
+    assert workspace._save_named_selection(geometry)
+
+    assert selection["boundary_ids"] == [1]
+    assert selection["boundary_tags"] == ["MMFEM_FACE_000000000000000000000001"]
+    assert workspace._selection_recovery_message(geometry, "boundary", selection) is None
+    assert workspace._selection == ("named_selection", selection["id"])
+    assert workspace._run_study_button.ui_disable is False
+
+
+def test_invalidated_domain_material_and_mesh_control_can_be_reassigned(monkeypatch):
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    selection = {
+        "id": "old-domain",
+        "name": "Old solid assignment",
+        "domain_ids": [0],
+        "domain_tags": ["MMFEM_SOLID_000000000000000000000099"],
+        "material": "Copper",
+        "mesh_maxh_mm": 2.0,
+    }
+    geometry["domain_selections"].append(selection)
+
+    assert workspace._selection_recovery_message(geometry, "domain", selection)
+    workspace.select_item("named_selection", selection["id"])
+    assert workspace._begin_named_selection_reassignment(
+        geometry, "domain", selection
+    )
+    workspace._set_selection_draft_regions(geometry, SimpleNamespace(value=[0]))
+    assert workspace._save_named_selection(geometry)
+
+    assert selection["domain_ids"] == [0]
+    assert selection["domain_tags"] == ["MMFEM_SOLID_000000000000000000000001"]
+    assert selection["material"] == "Copper"
+    assert selection["mesh_maxh_mm"] == 2.0
+    assert workspace._selection_recovery_message(geometry, "domain", selection) is None
+
+
+def test_replace_step_keeps_saved_assignments_and_invalidates_old_mesh(monkeypatch):
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+    workspace = ThreeDWorkspace(SimpleNamespace())
+    project = new_3d_project("Replace STEP test")
+    assets = {}
+    fixture = Path(__file__).parent / "fixtures" / "magnet_shield_4k.step"
+    geometry = add_step_geometry(project, assets, fixture.name, fixture.read_bytes(), units="mm")
+    geometry["material"] = "Copper"
+    geometry["boundary_selections"] = [{
+        "id": "keep-selection",
+        "name": "Support faces",
+        "boundary_ids": [0],
+        "boundary_tags": ["MMFEM_FACE_000000000000000000000001"],
+        "boundary_condition": "mechanical_fixed",
+    }]
+    workspace.project = project
+    workspace.assets = assets
+    workspace._mesh_results[geometry["id"]] = {"status": "ready"}
+    workspace._selection = ("geometry", geometry["id"])
+    workspace.app = SimpleNamespace(
+        _pick_artifact=lambda **_kwargs: (str(fixture), fixture.read_bytes())
+    )
+    old_asset = geometry["asset"]
+    old_hash = geometry["sha256"]
+
+    assert workspace.replace_step(geometry)
+
+    assert geometry["id"] == project["geometries"][0]["id"]
+    assert geometry["asset"] != old_asset
+    assert geometry["sha256"] == old_hash
+    assert old_asset not in workspace.assets
+    assert workspace.assets[geometry["asset"]] == fixture.read_bytes()
+    assert geometry["material"] == "Copper"
+    assert geometry["boundary_selections"][0]["id"] == "keep-selection"
+    assert geometry["boundary_selections"][0]["boundary_tags"] == [
+        "MMFEM_FACE_000000000000000000000001"
+    ]
+    assert geometry["id"] not in workspace._mesh_results
+
+
+def test_failed_step_replacement_preserves_the_existing_asset(monkeypatch):
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    original_asset = geometry["asset"]
+    original_payload = workspace.assets[original_asset]
+    original_hash = geometry["sha256"]
+    workspace.app = SimpleNamespace(
+        _pick_artifact=lambda **_kwargs: ("broken.step", b"not a STEP file")
+    )
+
+    assert workspace.replace_step(geometry) is False
+
+    assert geometry["asset"] == original_asset
+    assert geometry["sha256"] == original_hash
+    assert workspace.assets[original_asset] == original_payload
 
 
 def test_named_volume_domain_selection_is_saved_with_region_indices(monkeypatch):

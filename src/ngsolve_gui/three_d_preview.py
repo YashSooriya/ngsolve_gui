@@ -102,8 +102,38 @@ def _sample_trace_points(points, limit):
     return sampled
 
 
+def boundary_overlay_edge_cache(triangles, boundary_region_ids):
+    """Index unique surface edges by CAD region for quick repeated selection."""
+    import numpy as np
+
+    triangles = np.asarray(triangles, dtype=np.int32)
+    region_ids = np.asarray(boundary_region_ids, dtype=np.int32)
+    if triangles.ndim != 2 or triangles.shape[1] != 3 or len(region_ids) != len(triangles):
+        return {}
+    order = np.argsort(region_ids, kind="stable")
+    sorted_region_ids = region_ids[order]
+    if not len(sorted_region_ids):
+        return {}
+    split_points = np.flatnonzero(np.diff(sorted_region_ids)) + 1
+    boundaries = np.concatenate(([0], split_points, [len(sorted_region_ids)]))
+    cache = {}
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        region_id = int(sorted_region_ids[start])
+        selected_triangles = triangles[order[start:end]]
+        edges = np.concatenate((
+            selected_triangles[:, [0, 1]],
+            selected_triangles[:, [1, 2]],
+            selected_triangles[:, [2, 0]],
+        ), axis=0)
+        edges.sort(axis=1)
+        unique_edges, edge_counts = np.unique(edges, axis=0, return_counts=True)
+        cache[region_id] = (unique_edges, edge_counts.astype(np.int32, copy=False))
+    return cache
+
+
 def boundary_overlay_trace(
-    vertices, triangles, boundary_region_ids, selected_region_ids, *, geometry_id, name
+    vertices, triangles, boundary_region_ids, selected_region_ids, *, geometry_id, name,
+    edge_cache=None,
 ):
     """Return a lightweight line trace outlining the selected mesh boundaries."""
     import numpy as np
@@ -115,24 +145,24 @@ def boundary_overlay_trace(
     selected_ids = {int(region_id) for region_id in selected_region_ids}
     edge_x, edge_y, edge_z = [], [], []
     if selected_ids and len(region_ids) == len(triangles):
-        selected_triangles = triangles[np.isin(region_ids, list(selected_ids))]
-        if len(selected_triangles):
-            selected_edges = np.concatenate((
-                selected_triangles[:, [0, 1]],
-                selected_triangles[:, [1, 2]],
-                selected_triangles[:, [2, 0]],
-            ), axis=0)
-            selected_edges.sort(axis=1)
-            unique_edges, edge_counts = np.unique(
-                selected_edges, axis=0, return_counts=True
+        edge_cache = edge_cache or boundary_overlay_edge_cache(triangles, region_ids)
+        selected_edges = [edge_cache[region_id] for region_id in selected_ids if region_id in edge_cache]
+        if selected_edges:
+            joined_edges = np.concatenate([edges for edges, _counts in selected_edges], axis=0)
+            joined_counts = np.concatenate([counts for _edges, counts in selected_edges])
+            unique_edges, inverse = np.unique(joined_edges, axis=0, return_inverse=True)
+            edge_counts = np.bincount(
+                inverse.reshape(-1), weights=joined_counts, minlength=len(unique_edges)
             )
             outline = unique_edges[edge_counts == 1]
             if len(outline):
                 edge_coordinates = vertices[outline]
-                for start, end in edge_coordinates:
-                    edge_x.extend((float(start[0]), float(end[0]), None))
-                    edge_y.extend((float(start[1]), float(end[1]), None))
-                    edge_z.extend((float(start[2]), float(end[2]), None))
+                coordinates = np.empty((len(outline), 3, 3), dtype=object)
+                coordinates[:, 0, :] = edge_coordinates[:, 0, :]
+                coordinates[:, 1, :] = edge_coordinates[:, 1, :]
+                coordinates[:, 2, :] = None
+                flattened = coordinates.reshape((-1, 3))
+                edge_x, edge_y, edge_z = flattened[:, 0].tolist(), flattened[:, 1].tolist(), flattened[:, 2].tolist()
 
     return go.Scatter3d(
         x=edge_x,

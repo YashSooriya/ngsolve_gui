@@ -144,3 +144,31 @@ def test_generated_mesh_keeps_an_empty_boundary_overlay_trace():
     assert overlay.meta["mmfem_boundary_overlay"] is True
     assert list(overlay.x) == []
     assert overlay.visible is False
+
+
+def test_boundary_overlay_uses_cached_edges_without_rebuilding_region_index(monkeypatch):
+    import numpy as np
+    import ngsolve_gui.three_d_preview as preview
+
+    vertices = np.asarray([
+        [0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],
+    ], dtype=np.float32)
+    triangles = np.asarray([[0, 1, 2], [1, 3, 2]], dtype=np.int32)
+    region_ids = np.asarray([4, 4], dtype=np.int32)
+    edge_cache = preview.boundary_overlay_edge_cache(triangles, region_ids)
+    expected = preview.boundary_overlay_trace(
+        vertices, triangles, region_ids, [4], geometry_id="g", name="box"
+    )
+
+    def unexpected_cache_rebuild(*_args, **_kwargs):
+        raise AssertionError("Cached boundary edges should be reused")
+
+    monkeypatch.setattr(preview, "boundary_overlay_edge_cache", unexpected_cache_rebuild)
+    actual = preview.boundary_overlay_trace(
+        vertices, triangles, region_ids, [4], geometry_id="g", name="box",
+        edge_cache=edge_cache,
+    )
+
+    assert list(actual.x) == list(expected.x)
+    assert list(actual.y) == list(expected.y)
+    assert list(actual.z) == list(expected.z)

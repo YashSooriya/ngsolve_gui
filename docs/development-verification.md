@@ -69,6 +69,16 @@ when the test command fails. Its failures remain visible as a failed job. This
 keeps routine pull requests fast without hiding regressions or making the
 known full-suite failures look successful.
 
+## Review screenshots
+
+Screenshots included in milestone review packages must show the full
+application at a maximized, screen-sized desktop viewport. Use at least
+1920×1080 when the host display is not directly available, or the host's full
+resolution when it is larger. Capture the complete app window rather than a
+cropped panel or full-page document image, inspect the resulting dimensions,
+and record them in the evidence manifest. Compact viewports remain useful for
+responsive-layout tests, but must not be used as the primary review screenshots.
+
 ## Known comprehensive-suite baseline
 
 The latest recorded full run before this strategy change completed with 513

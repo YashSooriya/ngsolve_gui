@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import math
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -109,6 +110,7 @@ class ThreeDWorkspace(Div):
         self._mesh_job = None
         self._mesh_worker_active = False
         self._mesh_results = {}
+        self._preview_selection_update_handle = None
         self._mesh_surface_visible = True
         self._mesh_edges_visible = True
         self._selection_draft = {
@@ -519,22 +521,31 @@ class ThreeDWorkspace(Div):
                 selection.get("boundary_condition") in (None, compatible_condition)
                 for selection in geometry.get("boundary_selections", [])
             )
-            and (
-                physics != "harmonic_mechanical"
-                or any(
-                    selection.get("boundary_condition") == "mechanical_fixed"
-                    and selection.get("boundary_tags")
-                    and all(
-                        isinstance(tag, str)
-                        and tag.startswith("MMFEM_FACE_")
-                        and len(tag.rsplit("_", 1)[-1]) == 24
-                        for tag in selection["boundary_tags"]
-                    )
-                    for selection in geometry.get("boundary_selections", [])
-                )
-            )
             for geometry in self.project.get("geometries", [])
         )
+        assignments_ready = True
+        for geometry in self.project.get("geometries", []):
+            mesh_result = self._mesh_results.get(geometry.get("id"), {})
+            if mesh_result.get("status") != "ready":
+                continue
+            active_selections = [
+                ("domain", selection)
+                for selection in geometry.get("domain_selections", [])
+                if selection.get("material") or selection.get("mesh_maxh_mm") is not None
+            ]
+            active_selections.extend(
+                ("boundary", selection)
+                for selection in geometry.get("boundary_selections", [])
+                if selection.get("boundary_condition")
+            )
+            if any(
+                self._selection_recovery_message(
+                    geometry, selection_kind, selection, mesh_result
+                )
+                for selection_kind, selection in active_selections
+            ):
+                assignments_ready = False
+                break
         body_force = self.project.get("study", {}).get(
             "mechanical_body_force_n_m3", [0, 0, 0]
         )
@@ -556,6 +567,7 @@ class ThreeDWorkspace(Div):
                 )
                 or not self._has_resolved_study_materials()
                 or not boundary_ready
+                or not assignments_ready
                 or not mechanical_load_ready
             )
         if hasattr(self, "_cancel_study_button"):
@@ -718,6 +730,7 @@ class ThreeDWorkspace(Div):
             self._rebuild_properties()
             return False
         self._mark_changed()
+        self._update_study_controls()
         self._set_status("Mechanical body force updated.")
         return True
 
@@ -1037,6 +1050,9 @@ class ThreeDWorkspace(Div):
 
     def _named_selection_tree_item(self, geometry, kind, selection):
         selected = self._selection == ("named_selection", selection["id"])
+        recovery_message = self._selection_recovery_message(
+            geometry, kind, selection
+        )
         label = Div(
             selection["name"],
             ui_style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px;",
@@ -1059,6 +1075,14 @@ class ThreeDWorkspace(Div):
                 ),
                 ui_class="cb-muted",
                 ui_style="font-size:9px; padding:1px 4px; border-radius:4px; background:var(--panel-header);",
+            ),
+            *(
+                [Div(
+                    "Needs review",
+                    ui_class="mmfem-3d-status-error",
+                    ui_style="font-size:9px; padding:1px 4px; border-radius:4px; white-space:nowrap;",
+                )]
+                if recovery_message else []
             ),
             _button(
                 "",
@@ -1283,6 +1307,184 @@ class ThreeDWorkspace(Div):
             return []
         return sorted(regions_by_tag[tag] for tag in tags)
 
+    def _selection_recovery_message(self, geometry, kind, selection, result=None):
+        """Describe saved CAD references that no longer resolve in the current mesh."""
+        result = result or self._mesh_results.get(geometry.get("id"), {})
+        if result.get("status") != "ready":
+            return None
+        is_domain = kind == "domain"
+        region_key = "domain_regions" if is_domain else "boundary_regions"
+        tag_key = "domain_tag" if is_domain else "boundary_tag"
+        selection_tag_key = "domain_tags" if is_domain else "boundary_tags"
+        saved_tags = selection.get(selection_tag_key) or []
+        current_tags = {
+            region.get(tag_key)
+            for region in result.get(region_key, [])
+            if isinstance(region.get(tag_key), str)
+        }
+        if saved_tags and not set(saved_tags).issubset(current_tags):
+            return "Saved CAD references do not match the current geometry. Reassign the affected entities."
+
+        saved_ids = selection.get("domain_ids" if is_domain else "boundary_ids", [])
+        current_ids = {
+            int(region["id"]) for region in result.get(region_key, [])
+        }
+        active_domain_assignment = (
+            is_domain
+            and (selection.get("material") or selection.get("mesh_maxh_mm") is not None)
+        )
+        active_boundary_assignment = not is_domain and bool(
+            selection.get("boundary_condition")
+        )
+        if not saved_tags and (active_domain_assignment or active_boundary_assignment):
+            purpose = "material or mesh control" if is_domain else "boundary condition"
+            return (
+                f"This {purpose} has no stable CAD mapping. Reassign the affected entities "
+                "from the current mesh."
+            )
+        if saved_tags and saved_ids and not set(saved_ids).issubset(current_ids):
+            # IDs are informational. A tag match is authoritative, so remapping
+            # after remeshing is valid and must not be treated as an error.
+            return None
+        if not saved_tags and saved_ids and not set(saved_ids).issubset(current_ids):
+            return "Saved mesh regions no longer exist. Reassign the affected entities from the current mesh."
+        return None
+
+    def _begin_named_selection_reassignment(self, geometry, kind, selection):
+        if self._mesh_worker_active:
+            self._set_status("Wait for mesh generation to finish before editing selections.", error=True)
+            return False
+        if self._mesh_results.get(geometry["id"], {}).get("status") != "ready":
+            self._set_status("Generate a volume mesh before reassigning CAD entities.", error=True)
+            return False
+        self._selection_draft = {
+            "geometry_id": geometry["id"],
+            "kind": kind,
+            "selection_id": selection["id"],
+            "name": selection.get("name", ""),
+            "region_ids": [],
+            "material": selection.get("material"),
+            "boundary_condition": selection.get("boundary_condition") or "default",
+        }
+        self._selection = ("named_selection", selection["id"])
+        self._rebuild_properties()
+        self._update_boundary_overlay()
+        self._set_status(
+            f"Select current {('volume domains' if kind == 'domain' else 'boundary regions')} "
+            "and choose Update selection to apply the reassignment."
+        )
+        return True
+
+    def replace_step(self, geometry, *_args):
+        """Replace an imported STEP asset while keeping assignments reviewable."""
+        if self._mesh_worker_active:
+            self._set_status("Wait for mesh generation to finish before replacing geometry.", error=True)
+            return False
+        try:
+            path, data = self.app._pick_artifact(
+                title=f"Replace STEP geometry for {geometry['name']}",
+                description="STEP geometry (.step or .stp)",
+                extension=".step",
+                additional_extensions=(".stp",),
+            )
+            if not path:
+                return False
+            data = bytes(data)
+            selected_units = self._read_units(self._geometry_units)
+            units = selected_units if selected_units != "auto" else detect_step_unit(data)
+            if units is None:
+                raise ValueError(
+                    "The STEP file does not declare length units. Choose STEP units above and try again."
+                )
+
+            # Parse the replacement before touching the current project so a
+            # bad STEP import cannot discard the existing embedded geometry.
+            from netgen.occ import OCCGeometry
+
+            with tempfile.TemporaryDirectory(prefix="mmfem_step_replace_") as directory:
+                source = Path(directory) / Path(path).name
+                source.write_bytes(data)
+                imported = OCCGeometry(str(source))
+                if not list(imported.solids):
+                    raise ValueError("The STEP file does not contain a closed 3D solid.")
+
+            candidate_project = new_3d_project(geometry.get("name", "Geometry"))
+            candidate_assets = {}
+            candidate = add_step_geometry(
+                candidate_project,
+                candidate_assets,
+                Path(path).name,
+                data,
+                units=units,
+                material=geometry.get("material", UNASSIGNED_MATERIAL),
+            )
+            candidate["unit_source"] = (
+                "manual" if selected_units != "auto" else "detected"
+            )
+
+            old_record = copy.deepcopy(geometry)
+            old_asset = geometry["asset"]
+            old_payload = self.assets.get(old_asset)
+            new_asset = candidate["asset"]
+            try:
+                # Keep the geometry ID, user-facing name, material and saved
+                # selections. New tags are checked after the next mesh run.
+                geometry.update({
+                    "asset": new_asset,
+                    "sha256": candidate["sha256"],
+                    "units": candidate["units"],
+                    "unit_source": candidate["unit_source"],
+                })
+                self.assets.pop(old_asset, None)
+                self.assets.update(candidate_assets)
+                validate_3d_project(self.project, self.assets)
+            except Exception:
+                geometry.clear()
+                geometry.update(old_record)
+                self.assets.pop(new_asset, None)
+                if old_payload is not None:
+                    self.assets[old_asset] = old_payload
+                raise
+
+            self._mesh_results.pop(geometry["id"], None)
+            if self._selection[0] == "named_selection":
+                context = self._find_named_selection(self._selection[1])
+            else:
+                context = None
+            if context and context[0]["id"] == geometry["id"]:
+                selection_kind, selection = context[1], context[2]
+                self._selection_draft = {
+                    "geometry_id": geometry["id"],
+                    "kind": selection_kind,
+                    "selection_id": selection["id"],
+                    "name": selection.get("name", ""),
+                    "region_ids": [],
+                    "material": selection.get("material"),
+                    "boundary_condition": selection.get("boundary_condition") or "default",
+                }
+            elif self._selection == ("geometry", geometry["id"]):
+                self._selection_draft = {
+                    "geometry_id": geometry["id"],
+                    "kind": "boundary",
+                    "selection_id": None,
+                    "name": "",
+                    "region_ids": [],
+                    "material": None,
+                    "boundary_condition": "default",
+                }
+            self._mark_changed()
+            self._rebuild_items()
+            self._rebuild_properties()
+            self._rebuild_preview()
+            self._set_status(
+                f"Replaced geometry with {Path(path).name}. Existing assignments were retained; "
+                "generate a new mesh to review and repair changed CAD references."
+            )
+            return True
+        except Exception as error:
+            self._set_status(f"Could not replace STEP geometry: {error}", error=True)
+            return False
+
     def _set_selection_draft_kind(self, geometry, event):
         kind = str(getattr(event, "value", event) or "boundary")
         if kind not in {"domain", "boundary"}:
@@ -1399,6 +1601,7 @@ class ThreeDWorkspace(Div):
         self._mark_changed()
         self._rebuild_items()
         self._rebuild_properties()
+        self._update_study_controls()
         self._set_status("3D boundary condition updated.")
         return True
 
@@ -1526,6 +1729,7 @@ class ThreeDWorkspace(Div):
         validate_3d_project(self.project, self.assets)
         self._rebuild_items()
         self._rebuild_properties()
+        self._update_study_controls()
         self._update_boundary_overlay()
         self._set_status(f"Saved {kind} selection {name!r}.")
         return True
@@ -1786,6 +1990,49 @@ class ThreeDWorkspace(Div):
                         ui_class="mmfem-3d-status-error",
                         ui_style="font-size:10px; line-height:1.4;",
                     ))
+                recovery_message = self._selection_recovery_message(
+                    geometry,
+                    selection_kind,
+                    selection,
+                    self._mesh_results.get(geometry["id"], {}),
+                )
+                if recovery_message:
+                    children.append(Div(
+                        recovery_message,
+                        ui_class="mmfem-3d-status-error",
+                        ui_style="font-size:10px; line-height:1.4;",
+                    ))
+                    children.append(_button(
+                        "Reassign entities",
+                        "mdi-target-account",
+                        lambda *_args, geom=geometry, sk=selection_kind, obj=selection: (
+                            self._begin_named_selection_reassignment(geom, sk, obj)
+                        ),
+                        tooltip="Pick regions from the current mesh; saved assignments change only when updated",
+                    ))
+                result = self._mesh_results.get(geometry["id"], {})
+                ready = result.get("status") == "ready"
+                region_key = "domain_regions" if selection_kind == "domain" else "boundary_regions"
+                regions = result.get(region_key, [])
+                region_options = [
+                    {
+                        "label": (
+                            f"{region['name']} · {region['elements']:,} "
+                            f"{'volume elements' if selection_kind == 'domain' else 'surface triangles'}"
+                        ),
+                        "value": int(region["id"]),
+                    }
+                    for region in regions
+                ]
+                children.extend([
+                    self._multi_select_options(
+                        "Volume domains" if selection_kind == "domain" else "Boundary regions",
+                        draft.get("region_ids", []),
+                        lambda event, geom=geometry: self._set_selection_draft_regions(geom, event),
+                        region_options,
+                        disabled=not ready or self._mesh_worker_active,
+                    ),
+                ])
                 if selection_kind == "domain":
                     geometry_material = geometry.get("material", UNASSIGNED_MATERIAL)
                     local_mesh_size = _input(
@@ -1851,6 +2098,12 @@ class ThreeDWorkspace(Div):
                             ui_style="font-size:10px; line-height:1.4;",
                         ),
                     ])
+                children.append(_button(
+                    "Update selection",
+                    "mdi-content-save-outline",
+                    lambda *_args, geom=geometry: self._save_named_selection(geom),
+                    color="primary",
+                ))
                 self._mesh_property_status = None
             else:
                 children.extend([
@@ -1882,6 +2135,12 @@ class ThreeDWorkspace(Div):
                             "font-size:11px; overflow:hidden; text-overflow:ellipsis; "
                             "white-space:nowrap;"
                         ),
+                    ),
+                    _button(
+                        "Replace STEP",
+                        "mdi-file-replace-outline",
+                        lambda *_args, obj=item: self.replace_step(obj),
+                        tooltip="Replace this CAD asset and review retained named assignments after remeshing",
                     ),
                     Div("3D mesh", ui_style="font-size:13px; font-weight:650; margin-top:8px;"),
                     mesh_size_input,
@@ -1974,7 +2233,7 @@ class ThreeDWorkspace(Div):
                         width="100%",
                     ))
                 children.append(Div(
-                    "Solves linear time-harmonic elasticity on all solid domains. Apply a fixed support to each body and a non-zero body force; materials need Young’s modulus, Poisson ratio and density.",
+                    "Solves linear time-harmonic elasticity on all solid domains. Supports are optional at non-zero frequency; undamped resonance can make the system singular. Apply a non-zero body force. Materials need Young’s modulus, Poisson ratio and density.",
                     ui_class="cb-muted",
                     ui_style="font-size:10px; line-height:1.45; padding:8px; background:var(--panel-header); border-radius:5px;",
                 ))
@@ -2147,9 +2406,18 @@ class ThreeDWorkspace(Div):
     def _schedule_preview_selection_update(self):
         loop = getattr(self.app, "loop", None)
         if loop is not None and loop.is_running():
-            loop.call_later(0.75, self._update_preview_selection)
+            previous = self._preview_selection_update_handle
+            if previous is not None:
+                previous.cancel()
+            self._preview_selection_update_handle = loop.call_later(
+                0.05, self._flush_preview_selection_update
+            )
         else:
             self._update_preview_selection()
+
+    def _flush_preview_selection_update(self):
+        self._preview_selection_update_handle = None
+        self._update_preview_selection()
 
     def _update_boundary_overlay(self):
         """Update selected mesh boundaries without resending the full 3D scene."""
@@ -2195,6 +2463,7 @@ class ThreeDWorkspace(Div):
                 self._active_boundary_region_ids(geometry_id),
                 geometry_id=geometry_id,
                 name=geometry.get("name", "Geometry"),
+                edge_cache=mesh_result.get("boundary_edge_cache"),
             )
             trace = figure.data[overlay_index]
             trace.x, trace.y, trace.z = overlay.x, overlay.y, overlay.z
@@ -2369,6 +2638,16 @@ class ThreeDWorkspace(Div):
             mesh_result = generate_step_mesh(
                 step_data, maxh_mm=maxh, domain_maxh_mm=local_maxh
             )
+            try:
+                from .three_d_preview import boundary_overlay_edge_cache
+
+                mesh_result["boundary_edge_cache"] = boundary_overlay_edge_cache(
+                    mesh_result["triangles"], mesh_result["boundary_region_ids"]
+                )
+            except Exception:
+                # The cache only accelerates repeated viewport selection. A
+                # valid mesh remains usable if indexing its edges fails.
+                pass
             error = None
         except Exception as exception:
             mesh_result = None

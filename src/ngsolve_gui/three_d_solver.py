@@ -232,14 +232,17 @@ def build_time_harmonic_em_problem(project, asset_paths):
             raise ValueError(f"Assign a material to {geometry['name']!r} before running.")
         resolve_material(default_material)
         source = OCCGeometry(geometry_input["filename"])
-        shape = source.shape
-        scaled_shape = shape.Scale(Pnt(0, 0, 0), geometry_input["unit_scale"])
-        if scaled_shape is not None:
-            shape = scaled_shape
-        solids = list(shape.solids)
-        if not solids:
+        source_shape = source.shape
+        source_solids = list(source_shape.solids)
+        if not source_solids:
             raise ValueError(f"{geometry['name']!r} does not contain a closed STEP solid.")
-        solid_tags, face_refs = step_geometry_tags(solids)
+        # Project selections are tagged from the source STEP coordinates. Resolve
+        # those tags before converting the OCC shape to metres: scaling a
+        # translated solid can move a few OCC edge coordinates across the
+        # descriptor's rounding boundary and invalidate otherwise identical
+        # face tags. Boundary names assigned below are carried through OCC's
+        # scale transform.
+        solid_tags, face_refs = step_geometry_tags(source_solids)
 
         selected_boundary_conditions = {}
         for selection in geometry.get("boundary_selections", []):
@@ -281,18 +284,6 @@ def build_time_harmonic_em_problem(project, asset_paths):
                 f"Boundary selections for {geometry['name']!r} no longer match unique STEP faces. "
                 "Inspect the changed or ambiguous geometry and recreate affected selections."
             )
-        if mechanical:
-            supported_solid_tags = {
-                faces_by_tag[tag][0]
-                for tag, conditions in selected_boundary_conditions.items()
-                if "mechanical_fixed" in conditions
-            }
-            unsupported = set(solid_tags) - supported_solid_tags
-            if unsupported:
-                raise ValueError(
-                    f"Apply a fixed support to every solid body in {geometry['name']!r} "
-                    "before running a mechanical study."
-                )
 
         for tag, solid_tag, face in face_refs:
             conditions = selected_boundary_conditions.get(tag, set()) if tag else set()
@@ -306,6 +297,16 @@ def build_time_harmonic_em_problem(project, asset_paths):
                 mechanical_boundary_names.append(boundary_name)
             else:
                 face.bc("Transmission_Interface")
+
+        scaled_shape = source_shape.Scale(
+            Pnt(0, 0, 0), geometry_input["unit_scale"]
+        )
+        shape = scaled_shape if scaled_shape is not None else source_shape
+        solids = list(shape.solids)
+        if len(solids) != len(solid_tags):
+            raise ValueError(
+                f"Could not preserve the solid mapping for {geometry['name']!r} while converting units."
+            )
 
         overrides = {}
         local_mesh_overrides = domain_mesh_size_overrides(

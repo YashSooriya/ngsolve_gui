@@ -14,6 +14,23 @@ from ngsolve_gui.three_d_project import (
 )
 
 
+_REVIEW_SCREEN_SIZE = {"width": 1920, "height": 1080}
+
+
+def _capture_review_screenshot(page, path):
+    """Capture a screen-sized workspace view, then restore the test viewport."""
+    previous_size = page.viewport_size
+    try:
+        if previous_size != _REVIEW_SCREEN_SIZE:
+            page.set_viewport_size(_REVIEW_SCREEN_SIZE)
+            page.wait_for_timeout(250)
+        page.screenshot(path=str(path), full_page=False)
+    finally:
+        if previous_size and previous_size != _REVIEW_SCREEN_SIZE:
+            page.set_viewport_size(previous_size)
+            page.wait_for_timeout(150)
+
+
 @app_test("ngsolve_gui.appconfig")
 def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     page_errors = []
@@ -126,9 +143,8 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     page.wait_for_timeout(500)
     screenshot_dir = os.environ.get("MMFEM_UI_SCREENSHOT_DIR")
     if screenshot_dir:
-        page.screenshot(
-            path=str(Path(screenshot_dir) / "01-3d-step-awaiting-material.png"),
-            full_page=True,
+        _capture_review_screenshot(
+            page, Path(screenshot_dir) / "01-3d-step-awaiting-material.png"
         )
     page.get_by_label("Default material").click()
     page.get_by_text("Stainless steel (4 K / OVC)", exact=True).last.click()
@@ -158,9 +174,8 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     page.get_by_label("Maximum element size (mm)").wait_for(timeout=10_000)
     page.wait_for_timeout(250)
     if screenshot_dir:
-        page.screenshot(
-            path=str(Path(screenshot_dir) / "02-3d-material-assigned.png"),
-            full_page=True,
+        _capture_review_screenshot(
+            page, Path(screenshot_dir) / "02-3d-material-assigned.png"
         )
 
     graph = page.locator(".mmfem-3d-viewport .js-plotly-plot").first
@@ -212,11 +227,43 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     page.get_by_text("Tetrahedral mean ratio", exact=False).wait_for(timeout=10_000)
     if screenshot_dir:
         page.wait_for_timeout(1000)
-        page.screenshot(
-            path=str(Path(screenshot_dir) / "03-3d-generated-mesh.png"),
-            full_page=True,
+        _capture_review_screenshot(
+            page, Path(screenshot_dir) / "03-3d-generated-mesh.png"
         )
     selected_boundary = int(workspace._mesh_results[geometry["id"]]["boundary_region_ids"][0])
+    boundary_profile = {
+        "click_to_editor_ms": [],
+        "rebuild_items_ms": [],
+        "rebuild_properties_ms": [],
+        "update_boundary_overlay_ms": [],
+        "boundary_overlay_trace_ms": [],
+        "preview_selection_update_ms": [],
+    }
+
+    def timed_workspace_method(name, original):
+        def timed(*args, **kwargs):
+            started = time.perf_counter()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                boundary_profile[name].append((time.perf_counter() - started) * 1000)
+        return timed
+
+    for method_name, result_key in (
+        ("_rebuild_items", "rebuild_items_ms"),
+        ("_rebuild_properties", "rebuild_properties_ms"),
+        ("_update_boundary_overlay", "update_boundary_overlay_ms"),
+        ("_update_preview_selection", "preview_selection_update_ms"),
+    ):
+        setattr(
+            workspace,
+            method_name,
+            timed_workspace_method(result_key, getattr(workspace, method_name)),
+        )
+    from ngsolve_gui import three_d_preview
+    three_d_preview.boundary_overlay_trace = timed_workspace_method(
+        "boundary_overlay_trace_ms", three_d_preview.boundary_overlay_trace
+    )
     boundary_selection_started = time.perf_counter()
     graph.evaluate(
         "element => element.emit('plotly_click', {points: [{curveNumber: 0, pointNumber: 0}]})"
@@ -225,6 +272,7 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     boundary_selection_ms = (
         time.perf_counter() - boundary_selection_started
     ) * 1000
+    boundary_profile["click_to_editor_ms"].append(boundary_selection_ms)
     deadline = time.monotonic() + 10
     while (
         selected_boundary not in workspace._selection_draft.get("region_ids", [])
@@ -232,6 +280,80 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     ):
         page.wait_for_timeout(100)
     assert selected_boundary in workspace._selection_draft["region_ids"]
+
+    # Repeated face picks measure the same path without repeating STEP import
+    # or meshing. Use one point from each distinct current-mesh boundary region.
+    mesh_result = workspace._mesh_results[geometry["id"]]
+    points_by_region = {}
+    for point_index, region_id in enumerate(mesh_result["boundary_region_ids"]):
+        points_by_region.setdefault(int(region_id), point_index)
+    repeated_regions = [
+        (region_id, point_index)
+        for region_id, point_index in points_by_region.items()
+        if region_id != selected_boundary
+    ][:5]
+    repeated_selection_samples = []
+    for region_id, point_index in repeated_regions:
+        started = time.perf_counter()
+        graph.evaluate(
+            "(element, point) => element.emit('plotly_click', "
+            "{points: [{curveNumber: 0, pointNumber: point}]})",
+            point_index,
+        )
+        deadline = time.monotonic() + 5
+        while (
+            region_id not in workspace._selection_draft.get("region_ids", [])
+            and time.monotonic() < deadline
+        ):
+            page.wait_for_timeout(10)
+        assert region_id in workspace._selection_draft["region_ids"]
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        boundary_profile["click_to_editor_ms"].append(elapsed_ms)
+        repeated_selection_samples.append({
+            "region_id": region_id,
+            "click_to_selection_update_ms": round(elapsed_ms, 2),
+        })
+    boundary_performance = {
+        "environment": {
+            "storage_change": "VM moved to SSD after the earlier Stage 8B baseline; comparisons with the older timings are confounded by the storage change.",
+            "viewport_px": initial_viewport,
+            "mesh_volume_elements": mesh_result["volume_elements"],
+            "mesh_boundary_triangles": int(len(mesh_result["boundary_region_ids"])),
+            "measurement": "Local Playwright development environment; methods timed on the Python side; end-to-end samples include browser event dispatch.",
+        },
+        "first_selection_ms": {
+            key: round(values[0], 2) if values else None
+            for key, values in boundary_profile.items()
+        },
+        "repeated_selection_samples": repeated_selection_samples,
+        "repeated_method_medians_ms": {
+            key: round(sorted(values[1:])[len(values[1:]) // 2], 2)
+            if len(values) > 1 else None
+            for key, values in boundary_profile.items()
+        },
+    }
+    for region_id, point_index in repeated_regions:
+        graph.evaluate(
+            "(element, point) => element.emit('plotly_click', "
+            "{points: [{curveNumber: 0, pointNumber: point}]})",
+            point_index,
+        )
+        deadline = time.monotonic() + 5
+        while (
+            region_id in workspace._selection_draft.get("region_ids", [])
+            and time.monotonic() < deadline
+        ):
+            page.wait_for_timeout(10)
+        assert region_id not in workspace._selection_draft["region_ids"]
+    workspace._update_boundary_overlay()
+    # Let the coalesced Plotly restyle run before writing method timings.
+    page.wait_for_timeout(100)
+    evidence_dir = os.environ.get("MMFEM_STAGE8A_EVIDENCE_DIR")
+    if evidence_dir:
+        Path(evidence_dir).mkdir(parents=True, exist_ok=True)
+        (Path(evidence_dir) / "ui-3d-boundary-selection-profile.json").write_text(
+            json.dumps(boundary_performance, indent=2), encoding="utf-8"
+        )
     page.get_by_label("Selection name").fill("Selected STEP boundary")
     deadline = time.monotonic() + 10
     while (
@@ -313,9 +435,75 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
         print("THREED_BOUNDARY_OVERLAY_TIMEOUT " + json.dumps(diagnostics, default=str))
         raise
     if screenshot_dir:
-        page.screenshot(
-            path=str(Path(screenshot_dir) / "04-3d-named-boundary-selection.png"),
-            full_page=True,
+        _capture_review_screenshot(
+            page, Path(screenshot_dir) / "04-3d-named-boundary-selection.png"
+        )
+    # Simulate CAD edits invalidating a previously saved boundary assignment.
+    # The property editor must identify it, block the affected study, and let
+    # the user pick current faces before updating the saved condition.
+    selection["boundary_tags"] = ["MMFEM_FACE_000000000000000000000099"]
+    workspace._rebuild_items()
+    workspace.select_item("named_selection", selection["id"])
+    app._update()
+    assert workspace._run_study_button.ui_disable is True
+    page.get_by_text("Needs review", exact=True).wait_for(timeout=10_000)
+    page.get_by_role("button", name="Reassign entities").wait_for(timeout=10_000)
+    if screenshot_dir:
+        _capture_review_screenshot(
+            page, Path(screenshot_dir) / "04a-3d-invalid-boundary-recovery.png"
+        )
+    page.get_by_role("button", name="Reassign entities").click()
+    page.get_by_text("Select current boundary regions", exact=False).wait_for(
+        timeout=10_000
+    )
+    assert workspace._selection_draft["region_ids"] == []
+    graph.evaluate(
+        "element => element.emit('plotly_click', "
+        "{points: [{curveNumber: 0, pointNumber: 0}]})"
+    )
+    deadline = time.monotonic() + 5
+    while (
+        selected_boundary not in workspace._selection_draft.get("region_ids", [])
+        and time.monotonic() < deadline
+    ):
+        page.wait_for_timeout(10)
+    assert selected_boundary in workspace._selection_draft["region_ids"]
+    page.get_by_role("button", name="Update selection").click()
+    expected_boundary_tag = next(
+        region["boundary_tag"]
+        for region in workspace._mesh_results[geometry["id"]]["boundary_regions"]
+        if int(region["id"]) == selected_boundary
+    )
+    deadline = time.monotonic() + 5
+    while (
+        selection.get("boundary_tags") != [expected_boundary_tag]
+        and time.monotonic() < deadline
+    ):
+        page.wait_for_timeout(50)
+    assert selection["boundary_ids"] == [selected_boundary]
+    assert selection["boundary_tags"] == [expected_boundary_tag]
+    deadline = time.monotonic() + 5
+    while workspace._run_study_button.ui_disable and time.monotonic() < deadline:
+        page.wait_for_timeout(10)
+    assert workspace._run_study_button.ui_disable is False, json.dumps({
+        "physics": workspace.project["study"].get("physics"),
+        "has_resolved_materials": workspace._has_resolved_study_materials(),
+        "boundary_condition": selection.get("boundary_condition"),
+        "boundary_tags": selection.get("boundary_tags"),
+        "current_boundary_tags": [
+            region.get("boundary_tag")
+            for region in workspace._mesh_results[geometry["id"]]["boundary_regions"]
+        ],
+        "recovery_message": workspace._selection_recovery_message(
+            geometry, "boundary", selection
+        ),
+        "mesh_status": workspace._mesh_results[geometry["id"]].get("status"),
+        "geometry_material": geometry.get("material"),
+        "wire_trace_material": workspace.project.get("wire_trace_sets", [{}])[0].get("material"),
+    }, default=str)
+    if screenshot_dir:
+        _capture_review_screenshot(
+            page, Path(screenshot_dir) / "04b-3d-reassigned-boundary.png"
         )
     page.get_by_role("button", name="Mesh edges").click()
     page.wait_for_function(
@@ -346,9 +534,8 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     tree.get_by_text("Time-harmonic EM", exact=True).click()
     page.get_by_label("Frequency (Hz)").wait_for(timeout=10_000)
     if screenshot_dir:
-        page.screenshot(
-            path=str(Path(screenshot_dir) / "05-3d-study-configuration.png"),
-            full_page=True,
+        _capture_review_screenshot(
+            page, Path(screenshot_dir) / "05-3d-study-configuration.png"
         )
     page.wait_for_timeout(2500)
     properties = page.locator(".mmfem-property-editor-body")
@@ -443,12 +630,20 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     page.get_by_text(
         "Solves linear time-harmonic elasticity on all solid domains.", exact=False
     ).wait_for(timeout=10_000)
-    assert page.get_by_role("button", name="Run study").is_disabled()
+    page.wait_for_function(
+        """() => {
+            const button = Array.from(document.querySelectorAll('button')).find(
+                item => item.textContent.includes('Run study')
+            );
+            return button && !button.disabled;
+        }""",
+        timeout=10_000,
+    )
+    assert not page.get_by_role("button", name="Run study").is_disabled()
     page.evaluate("document.activeElement && document.activeElement.blur()")
     if screenshot_dir:
-        page.screenshot(
-            path=str(Path(screenshot_dir) / "07-3d-harmonic-mechanics-settings.png"),
-            full_page=True,
+        _capture_review_screenshot(
+            page, Path(screenshot_dir) / "07-3d-harmonic-mechanics-settings.png"
         )
     tree.get_by_text("Selected STEP boundary", exact=True).click()
     page.get_by_label("Boundary condition").click()
@@ -462,12 +657,20 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     ):
         page.wait_for_timeout(100)
     assert selection["boundary_condition"] == "mechanical_fixed"
+    page.wait_for_function(
+        """() => {
+            const button = Array.from(document.querySelectorAll('button')).find(
+                item => item.textContent.includes('Run study')
+            );
+            return button && !button.disabled;
+        }""",
+        timeout=10_000,
+    )
     assert not page.get_by_role("button", name="Run study").is_disabled()
     page.evaluate("document.activeElement && document.activeElement.blur()")
     if screenshot_dir:
-        page.screenshot(
-            path=str(Path(screenshot_dir) / "08-3d-mechanical-fixed-support.png"),
-            full_page=True,
+        _capture_review_screenshot(
+            page, Path(screenshot_dir) / "08-3d-mechanical-fixed-support.png"
         )
     # Return to EM with the saved condition cleared; the same named faces and
     # domain selection continue to persist in the project.
@@ -518,9 +721,8 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     )
     page.wait_for_timeout(300)
     if screenshot_dir:
-        page.screenshot(
-            path=str(Path(screenshot_dir) / "05-3d-local-domain-mesh-control.png"),
-            full_page=True,
+        _capture_review_screenshot(
+            page, Path(screenshot_dir) / "05-3d-local-domain-mesh-control.png"
         )
 
     graph_width_before_resize = graph.bounding_box()["width"]
@@ -543,9 +745,8 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     page.get_by_text("Harmonic study", exact=True).wait_for(timeout=10_000)
     page.get_by_label("Frequency (Hz)").wait_for(timeout=10_000)
     if screenshot_dir:
-        page.screenshot(
-            path=str(Path(screenshot_dir) / "06-3d-harmonic-study-settings.png"),
-            full_page=True,
+        _capture_review_screenshot(
+            page, Path(screenshot_dir) / "06-3d-harmonic-study-settings.png"
         )
     evidence_dir = os.environ.get("MMFEM_STAGE8A_EVIDENCE_DIR")
     if evidence_dir:
@@ -556,6 +757,12 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
                     "mesh_volume_elements": mesh_volume_elements,
                 "viewport_initial_px": initial_viewport,
                 "viewport_after_resize_px": {"width": 1440, "height": 900},
+                "review_screenshot_px": _REVIEW_SCREEN_SIZE,
+                "storage_note": (
+                    "The VM moved to an SSD after the earlier Stage 8B timings. "
+                    "Any timing comparison with that baseline includes a hardware/storage change."
+                ),
+                "boundary_selection_profile": boundary_performance,
                 "measurements_ms": {
                     "geometry_selection_to_property_editor": round(
                         geometry_selection_ms, 2
@@ -570,7 +777,7 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
                         mesh_generation_seconds * 1000, 2
                     ),
                 },
-                "notes": "Local Playwright development environment; timings include browser event dispatch and are diagnostic, not release benchmarks.",
+                "notes": "Local Playwright development environment; interaction timings include browser event dispatch and are diagnostic, not release benchmarks. Review screenshots use a 1920x1080 viewport and capture the full application window.",
             }, indent=2),
             encoding="utf-8",
         )
