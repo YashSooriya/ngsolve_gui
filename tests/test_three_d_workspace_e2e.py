@@ -354,12 +354,13 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
         path=str(Path(tempfile.gettempdir()) / "mmfem_stage4_3d_mesh_inspection_compact.png"),
         full_page=True,
     )
-    workspace.select_item("named_selection", live_geometry["boundary_selections"][0]["id"])
-    app._update()
-    page.get_by_text("Named boundary selection", exact=True).wait_for(timeout=10_000)
     tree = page.locator(".mmfem-3d-model-tree")
+    tree.get_by_text(live_geometry["name"], exact=True).click()
+    page.get_by_text("Geometry model", exact=True).wait_for(timeout=10_000)
     tree.get_by_text("magnet_shield_4k.step", exact=True).wait_for(timeout=10_000)
     tree.get_by_text("Selected STEP boundary", exact=True).wait_for(timeout=10_000)
+    tree.get_by_text("Selected STEP boundary", exact=True).click()
+    page.get_by_text("Named boundary selection", exact=True).wait_for(timeout=10_000)
     page.screenshot(
         path=str(Path(tempfile.gettempdir()) / "mmfem_stage5_3d_boundary_properties.png"),
         full_page=True,
