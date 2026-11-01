@@ -2,8 +2,9 @@ name: Tests
 
 on:
   push:
-    branches: [main, master, testing]
+    branches: [main, master]
   pull_request:
+    branches: [main, master]
 
 jobs:
   core-preprocessing:
@@ -21,7 +22,9 @@ jobs:
 
       - name: Run core preprocessing checks
         run: |
-          docker run --rm ngsolve-gui-tests pytest -q \
+          docker run --rm \
+            -v "${{ github.workspace }}/tests/output:/app/tests/output" \
+            ngsolve-gui-tests pytest -q \
             tests/test_branding.py \
             tests/test_axisymmetric_model.py \
             tests/test_axisymmetric_geometry_preview_e2e.py \
@@ -36,6 +39,13 @@ jobs:
             tests/test_three_d_solver_setup.py \
             tests/test_three_d_workspace.py \
             tests/test_three_d_workspace_e2e.py
+
+      - name: Upload core test output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-output
+          path: tests/output/
 
   test:
     runs-on: ubuntu-latest
