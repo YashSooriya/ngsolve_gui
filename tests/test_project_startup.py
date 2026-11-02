@@ -118,3 +118,95 @@ def test_recent_project_view_can_render_after_relaunch(monkeypatch, tmp_path):
     )
     NGSolveGui._refresh_recent_projects_view(app)
     assert len(app._startup_recent_list.ui_children) == 1
+
+
+def test_recent_project_tile_selects_and_opens_the_matching_project(
+    monkeypatch, tmp_path
+):
+    from types import SimpleNamespace
+    from ngapp.components import Component, Div
+    import ngsolve_gui.app as app_module
+
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        app_module,
+        "cached_thumbnail",
+        lambda _path: "data:image/png;base64,iVBORw0KGgo=",
+    )
+    project_path = tmp_path / "Long engineering shield assembly.mmfem3d"
+    project_path.write_bytes(b"project payload")
+    opened = []
+    selected = []
+    app = SimpleNamespace(
+        _startup_recent_list=Div(),
+        _startup_selected_recent_path=None,
+        _project_path_key=NGSolveGui._project_path_key,
+        _recent_project_entries=lambda: [{
+            "name": "Shield assembly",
+            "path": str(project_path),
+            "kind": "3d",
+        }],
+        _open_recent_project=lambda entry: opened.append(dict(entry)),
+        _locate_recent_project=lambda entry: None,
+        _remove_recent_project=lambda path: None,
+    )
+    app._refresh_recent_projects_view = lambda: NGSolveGui._refresh_recent_projects_view(app)
+    app._select_recent_project = lambda path: (
+        selected.append(path), NGSolveGui._select_recent_project(app, path)
+    )
+
+    NGSolveGui._refresh_recent_projects_view(app)
+
+    card = app._startup_recent_list.ui_children[0]
+    tile = card.ui_slots["default"][0]
+    original_tile = tile
+    preview, filename, _status = tile.ui_slots["default"]
+    assert preview._props.get("src") == "data:image/png;base64,iVBORw0KGgo="
+    assert filename.ui_slots["default"] == [project_path.name]
+    assert tile._props["role"] == "button"
+    assert tile._props["aria-label"] == f"Open {project_path.name}"
+    assert "text-overflow:ellipsis" in filename._props["style"]
+
+    tile._callbacks["click"][0](SimpleNamespace())
+    assert app._startup_recent_list.ui_children[0].ui_slots["default"][0] is original_tile
+    tile._callbacks["dblclick"][0](SimpleNamespace())
+
+    assert selected == [str(project_path)]
+    assert opened == [{
+        "name": "Shield assembly",
+        "path": str(project_path),
+        "kind": "3d",
+    }]
+    assert "is-selected" in app._startup_recent_list.ui_children[0].ui_slots[
+        "default"
+    ][0]._props["class"]
+
+
+def test_missing_recent_project_tile_offers_locate_action(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from ngapp.components import Component, Div
+
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+    missing_path = tmp_path / "Moved model.json"
+    located = []
+    app = SimpleNamespace(
+        _startup_recent_list=Div(),
+        _recent_project_entries=lambda: [{
+            "name": "Moved model",
+            "path": str(missing_path),
+            "kind": "axisymmetric",
+        }],
+        _open_recent_project=lambda _entry: None,
+        _locate_recent_project=lambda entry: located.append(entry["path"]),
+        _remove_recent_project=lambda _path: None,
+        _select_recent_project=lambda _path: None,
+    )
+
+    NGSolveGui._refresh_recent_projects_view(app)
+
+    card = app._startup_recent_list.ui_children[0]
+    tile = card.ui_slots["default"][0]
+    tile._callbacks["dblclick"][0](SimpleNamespace())
+
+    assert located == [str(missing_path)]
+    assert card.ui_slots["default"][0].ui_slots["default"][2].ui_hidden is False

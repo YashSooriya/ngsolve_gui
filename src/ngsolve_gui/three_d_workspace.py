@@ -122,6 +122,9 @@ class ThreeDWorkspace(Div):
             "material": None,
             "boundary_condition": "default",
         }
+        self._selection_region_select = None
+        self._selection_region_summary = None
+        self._selection_region_labels = {}
         self._study_running = False
         self._preview_lock = threading.Lock()
         self._preview_running = False
@@ -956,6 +959,7 @@ class ThreeDWorkspace(Div):
                         getattr(self.app, "_last_saved_path", None),
                         kind="3d",
                         name=self.project["name"],
+                        project_data=archive,
                     )
                 return True
             return False
@@ -1516,6 +1520,10 @@ class ThreeDWorkspace(Div):
             if region_id >= 0 and region_id not in region_ids:
                 region_ids.append(region_id)
         draft["region_ids"] = sorted(region_ids)
+        if self._selection_region_summary is not None:
+            self._selection_region_summary.ui_children = [
+                self._selection_region_summary_text()
+            ]
         self._update_boundary_overlay()
 
     def _set_selection_draft_name(self, event):
@@ -1779,6 +1787,23 @@ class ThreeDWorkspace(Div):
             }
             for region in regions
         ]
+        self._selection_region_labels = {
+            int(option["value"]): option["label"] for option in region_options
+        }
+        region_select = self._multi_select_options(
+            "Boundary regions" if kind == "boundary" else "Volume domains",
+            draft.get("region_ids", []),
+            lambda event, item=geometry: self._set_selection_draft_regions(item, event),
+            region_options,
+            disabled=not ready,
+        )
+        self._selection_region_select = region_select
+        region_summary = Div(
+            self._selection_region_summary_text(),
+            ui_class="cb-muted",
+            ui_style="font-size:10px; line-height:1.4; overflow-wrap:anywhere;",
+        )
+        self._selection_region_summary = region_summary
         children = []
         quality_message = self._mesh_quality_message(item_id)
         if quality_message:
@@ -1831,13 +1856,8 @@ class ThreeDWorkspace(Div):
                     {"label": "Volume domains", "value": "domain"},
                 ],
             ),
-            self._multi_select_options(
-                "Boundary regions" if kind == "boundary" else "Volume domains",
-                draft.get("region_ids", []),
-                lambda event, item=geometry: self._set_selection_draft_regions(item, event),
-                region_options,
-                disabled=not ready,
-            ),
+            region_select,
+            region_summary,
             _input(
                 "Selection name",
                 draft.get("name", ""),
@@ -1889,6 +1909,9 @@ class ThreeDWorkspace(Div):
         kind, item_id = self._selection
         children = []
         self._mesh_property_status = None
+        self._selection_region_select = None
+        self._selection_region_summary = None
+        self._selection_region_labels = {}
         named_context = (
             self._find_named_selection(item_id) if kind == "named_selection" else None
         )
@@ -2020,14 +2043,28 @@ class ThreeDWorkspace(Div):
                     }
                     for region in regions
                 ]
+                self._selection_region_labels = {
+                    int(option["value"]): option["label"]
+                    for option in region_options
+                }
+                region_select = self._multi_select_options(
+                    "Volume domains" if selection_kind == "domain" else "Boundary regions",
+                    draft.get("region_ids", []),
+                    lambda event, geom=geometry: self._set_selection_draft_regions(geom, event),
+                    region_options,
+                    disabled=not ready or self._mesh_worker_active,
+                )
+                self._selection_region_select = region_select
+                region_summary_text = self._selection_region_summary_text()
+                region_summary = Div(
+                    region_summary_text,
+                    ui_class="cb-muted",
+                    ui_style="font-size:10px; line-height:1.4; overflow-wrap:anywhere;",
+                )
+                self._selection_region_summary = region_summary
                 children.extend([
-                    self._multi_select_options(
-                        "Volume domains" if selection_kind == "domain" else "Boundary regions",
-                        draft.get("region_ids", []),
-                        lambda event, geom=geometry: self._set_selection_draft_regions(geom, event),
-                        region_options,
-                        disabled=not ready or self._mesh_worker_active,
-                    ),
+                    region_select,
+                    region_summary,
                 ])
                 if selection_kind == "domain":
                     geometry_material = geometry.get("material", UNASSIGNED_MATERIAL)
@@ -2241,6 +2278,28 @@ class ThreeDWorkspace(Div):
             ])
         self._properties.ui_children = children
 
+    def _selection_region_summary_text(self):
+        region_ids = list(self._selection_draft.get("region_ids", []))
+        if not region_ids:
+            return "No regions selected. Pick mesh faces or choose from the list above."
+        labels = [
+            self._selection_region_labels.get(int(region_id), f"Region {region_id}")
+            for region_id in region_ids
+        ]
+        count_label = "region" if len(labels) == 1 else "regions"
+        return f"{len(labels)} {count_label} selected: " + "; ".join(labels)
+
+    def _update_selection_region_controls(self):
+        """Update the existing selector after a viewport pick, without remounting it."""
+        if self._selection_region_select is not None:
+            self._selection_region_select.ui_model_value = list(
+                self._selection_draft.get("region_ids", [])
+            )
+        if self._selection_region_summary is not None:
+            self._selection_region_summary.ui_children = [
+                self._selection_region_summary_text()
+            ]
+
     def select_item(self, kind, item_id=None):
         if kind == "geometry":
             geometry = next(
@@ -2334,7 +2393,9 @@ class ThreeDWorkspace(Div):
                 selection_changed = self._selection != previous_selection
                 if selection_changed:
                     self._rebuild_items()
-                self._rebuild_properties()
+                    self._rebuild_properties()
+                else:
+                    self._update_selection_region_controls()
                 self._update_boundary_overlay(
                     update_selection_style=selection_changed
                 )
@@ -2936,9 +2997,7 @@ class ThreeDWorkspace(Div):
         self._set_number(item, key, event)
 
     def _show_empty_preview(self):
-        self._preview.data = {"obj": []}
-        self._preview._plots = []
-        self._preview._figures = []
+        self._preview.clear()
         self._preview.ui_hidden = True
         self._preview_empty_state.ui_hidden = False
         self._preview_empty_title.ui_children = ["No 3D assets yet"]

@@ -10,6 +10,94 @@ from ngapp.components.visualization import PlotlyComponent
 from .property_panel import PropertyPanelMixin
 
 
+_PICK_BRIDGE_SETUP_JS = r"""
+(() => {
+const graph = document.querySelector('.mmfem-3d-viewport .js-plotly-plot');
+const dispatch = window[__CALLBACK_NAME__];
+document.documentElement.setAttribute(
+    'data-mmfem-pick-bridge-bootstrap',
+    graph ? (typeof dispatch === 'function' ? 'ready' : 'no-dispatch') : 'no-graph'
+);
+if (!graph || typeof dispatch !== 'function') return;
+if (graph._mmfemPickBridge) graph._mmfemPickBridge.dispose();
+const bridge = {
+    graph,
+    dispatch,
+    lastHover: null,
+    lastPlotlyClick: -1,
+    cancelled: false,
+    bound: false,
+    attempts: 0,
+};
+bridge.onHover = event => {
+    const point = event && event.points && event.points[0];
+    const mouse = event && event.event;
+    bridge.lastHover = point ? {
+        curveNumber: Number(point.curveNumber),
+        pointNumber: Number(point.pointNumber),
+        x: mouse && Number(mouse.clientX),
+        y: mouse && Number(mouse.clientY),
+        at: performance.now(),
+    } : null;
+};
+bridge.onPlotlyClick = event => {
+    bridge.lastPlotlyClick = performance.now();
+    const points = event && event.points;
+    if (!points) return;
+    bridge.dispatch({points: points.map(point => ({
+        curveNumber: Number(point.curveNumber),
+        pointNumber: Number(point.pointNumber),
+    }))});
+};
+bridge.onCanvasClick = event => {
+    if (!event || !event.isTrusted || !event.target ||
+        event.target.tagName !== 'CANVAS') return;
+    const point = bridge.lastHover;
+    const clickedAt = performance.now();
+    if (!point || clickedAt - point.at > 750) return;
+    if (Number.isFinite(point.x) && Math.abs(event.clientX - point.x) > 10) return;
+    if (Number.isFinite(point.y) && Math.abs(event.clientY - point.y) > 10) return;
+    // Let Plotly's native click handler run first. Mesh3d often emits no
+    // plotly_click, while other traces may emit one and must not toggle twice.
+    setTimeout(() => {
+        if (bridge.cancelled || bridge.lastPlotlyClick >= clickedAt) return;
+        bridge.lastPlotlyClick = performance.now();
+        bridge.dispatch({points: [{
+            curveNumber: point.curveNumber,
+            pointNumber: point.pointNumber,
+        }]});
+    }, 0);
+};
+bridge.dispose = () => {
+    if (bridge.cancelled) return;
+    bridge.cancelled = true;
+    if (bridge.bound) {
+        try { graph.removeListener('plotly_hover', bridge.onHover); } catch (_) {}
+        try { graph.removeListener('plotly_click', bridge.onPlotlyClick); } catch (_) {}
+        try { graph.removeEventListener('click', bridge.onCanvasClick, true); } catch (_) {}
+    }
+    if (graph._mmfemPickBridge === bridge) graph._mmfemPickBridge = null;
+    bridge.lastHover = null;
+};
+bridge.bind = () => {
+    if (bridge.cancelled || bridge.bound) return;
+    if (typeof graph.on === 'function' && graph._fullLayout) {
+        graph.on('plotly_hover', bridge.onHover);
+        graph.on('plotly_click', bridge.onPlotlyClick);
+        graph.addEventListener('click', bridge.onCanvasClick, true);
+        bridge.bound = true;
+        document.documentElement.setAttribute('data-mmfem-pick-bridge-status', 'bound');
+        return;
+    }
+    bridge.attempts += 1;
+    if (bridge.attempts < 120) requestAnimationFrame(bridge.bind);
+};
+graph._mmfemPickBridge = bridge;
+bridge.bind();
+})();
+"""
+
+
 def _make_click_handler(callback, figure_index):
     try:
         parameters = inspect.signature(callback).parameters.values()
@@ -38,6 +126,10 @@ class _InteractivePlotlyComponent(PlotlyComponent):
     def __init__(self, *args, **kwargs):
         self._click_handler = None
         self._click_proxy = None
+        self._click_bridge = None
+        self._click_callback_name = f"__mmfemPickDispatch_{id(self):x}"
+        self._click_listeners_bound = False
+        self._click_bind_error = None
         self._render_lock = threading.Lock()
         self._render_running = False
         self._render_pending = False
@@ -47,6 +139,16 @@ class _InteractivePlotlyComponent(PlotlyComponent):
 
     def set_click_handler(self, handler):
         self._click_handler = handler
+
+    def draw(self, figure):
+        """Keep the source figure once; the base class also builds a full copy."""
+        self._figure = figure
+        # PlotlyComponent.draw stores figure.to_dict() in ``data`` while also
+        # retaining ``_figure``. Large tetrahedral surfaces can contain tens of
+        # thousands of triangles, so retaining both Python representations
+        # needlessly multiplies the renderer's peak memory.
+        self.data = None
+        self.redraw()
 
     def redraw(self):
         if self._click_handler is None:
@@ -110,26 +212,45 @@ class _InteractivePlotlyComponent(PlotlyComponent):
                 return
 
     def _bind_click_handler_js(self, js):
-        if self._click_unmounted:
+        if self._click_unmounted or self._click_listeners_bound:
             return
-        root = self._js_component
-        element = root
-        if root is not None:
-            try:
-                graph = root._call_method("querySelector", [".js-plotly-plot"])
-                if graph is not None:
-                    element = graph
-            except Exception:
-                pass
-        if element is None or not hasattr(element, "_call_method_ignore_return"):
+        graph = self._js_component
+        if graph is None:
             return
-        if getattr(element, "_mmfem_click_bound", False):
-            self._click_element = element
-            return
-        element._call_method("on", ["plotly_click", self._click_proxy])
-        element._mmfem_click_bound = True
-        self._click_element = element
+        try:
+            import webgpu.platform as pl
 
+            if self._click_proxy is None:
+                self._click_proxy = pl.create_proxy(
+                    self._dispatch_click, ignore_return_value=True
+                )
+            # Plotly's gl3d Mesh3d trace emits plotly_hover with a picked face,
+            # but its click event is missing in the packaged Plotly build. Keep
+            # the frontend's hover pick in JavaScript and send only one small
+            # click payload back to Python. This keeps pointer movement local
+            # and avoids serialising Plotly's large event object through the
+            # backend websocket on every hover.
+            import json
+
+            source = _PICK_BRIDGE_SETUP_JS.replace(
+                "__CALLBACK_NAME__", json.dumps(self._click_callback_name)
+            )
+            js.window[self._click_callback_name] = self._click_proxy
+            script = js.document.createElement("script")
+            script.textContent = source
+            js.document.head.appendChild(script)
+            js.document.head.removeChild(script)
+            self._click_bridge = graph._mmfemPickBridge
+            if self._click_bridge is None:
+                raise RuntimeError("inline 3D pick bridge did not attach to Plotly graph")
+            self._click_element = graph
+            self._click_listeners_bound = True
+            self._click_bind_error = None
+        except Exception as error:
+            self._click_bind_error = repr(error)
+            logging.getLogger(__name__).exception(
+                "Could not bind 3D viewport interaction listeners"
+            )
 
     def _dispatch_click(self, event):
         points = getattr(event, "points", None)
@@ -152,33 +273,57 @@ class _InteractivePlotlyComponent(PlotlyComponent):
             point_number = None
         self._click_handler(int(curve_number), point_number)
 
-    def _on_unmount(self):
+    def dispose(self):
+        """Release click bridges, Python figure data and Plotly WebGL resources."""
+        if self._click_unmounted:
+            return
         self._click_unmounted = True
         proxy = self._click_proxy
+        element = self._click_element or self._js_component
         with self._render_lock:
             self._render_pending = False
-        if proxy is not None:
+
+        try:
+            from ngapp.components.visualization import PlotlyComponent
+
+            while self in PlotlyComponent._waiting:
+                PlotlyComponent._waiting.remove(self)
+        except (AttributeError, ValueError):
+            pass
+
+        if proxy is not None or element is not None:
             def cleanup(js):
-                element = self._click_element
                 if element is not None:
                     try:
-                        element._call_method_ignore_return(
-                            "removeListener", ["plotly_click", proxy]
-                        )
+                        if proxy is not None:
+                            element._call_method_ignore_return(
+                                "removeListener", ["plotly_click", proxy]
+                            )
+                        bridge = element._mmfemPickBridge
+                        if bridge is not None:
+                            bridge._call_method_ignore_return("dispose")
                     except Exception:
                         pass
                     try:
-                        element._mmfem_click_bound = False
+                        from ngapp.components.visualization import PlotlyComponent
+
+                        plotly = PlotlyComponent._plotly
+                        if plotly is not None:
+                            plotly._call_method_ignore_return("purge", [element])
                     except Exception:
                         pass
-                try:
-                    proxy.destroy()
-                except Exception:
-                    pass
 
-            self.call_js(cleanup)
-            self._click_proxy = None
-            self._click_element = None
+            try:
+                self.call_js(cleanup)
+            except Exception:
+                pass
+        try:
+            def remove_dispatch(js):
+                js.window[self._click_callback_name] = None
+
+            self.call_js(remove_dispatch)
+        except Exception:
+            pass
         try:
             import webgpu.platform as pl
 
@@ -186,6 +331,16 @@ class _InteractivePlotlyComponent(PlotlyComponent):
                 pl.destroy_proxy(proxy)
         except Exception:
             pass
+        self._click_proxy = None
+        self._click_bridge = None
+        self._click_element = None
+        self._click_listeners_bound = False
+        self._click_handler = None
+        self._figure = None
+        self.data = None
+
+    def _on_unmount(self):
+        self.dispose()
         super()._on_unmount()
 
 
@@ -266,6 +421,10 @@ class PlotComponent(PropertyPanelMixin, Div):
         obj = self.data.get("obj") if isinstance(self.data, dict) else self.data
         figures = self._normalize_figures(obj)
 
+        for previous_plot in self._plots:
+            dispose = getattr(previous_plot, "dispose", None)
+            if callable(dispose):
+                dispose()
         self._figures = []
         self._plots = []
         plot_height = "100%" if len(figures) == 1 else "480px"
@@ -316,6 +475,17 @@ class PlotComponent(PropertyPanelMixin, Div):
             self._plots[0].draw(figure)
         else:
             self.draw()
+
+    def clear(self):
+        """Clear a scene and release its WebGL context and retained arrays."""
+        for plot in self._plots:
+            dispose = getattr(plot, "dispose", None)
+            if callable(dispose):
+                dispose()
+        self._plots = []
+        self._figures = []
+        self.data = {"obj": []}
+        self.container.ui_children = []
 
     def set_component(self, comp):
         self.ui_children = [comp]

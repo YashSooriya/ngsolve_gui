@@ -10,6 +10,7 @@ import mimetypes
 import re
 import subprocess
 import tempfile
+import queue
 from datetime import datetime as _datetime, timezone as _timezone
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from .three_d_project import PROJECT_SUFFIX, package_3d_project, unpack_3d_proje
 from . import __version__
 from .branding import AXISYMMETRIC_ICON, PRODUCT_DESCRIPTION, PRODUCT_NAME
 from .documentation import find_documentation_index
+from .project_thumbnails import cached_thumbnail, generate_project_thumbnail
 from .result_files import (
     MESH_SUFFIX,
     SOLUTION_SUFFIX,
@@ -219,6 +221,55 @@ def _inject_solve_status_styles(js):
   .mmfem-compact-app-bar .cb-monitor-value { font-size: 9px; }
 }
 """
+    js.document.head.appendChild(style)
+
+
+def _inject_recent_project_tile_styles(js):
+    style = js.document.createElement("style")
+    style.id = "mmfem-recent-project-tile-styles"
+    style.textContent = """
+.mmfem-recent-project-tile {
+  border: 1px solid var(--border);
+}
+.mmfem-recent-project-tile:hover {
+  border-color: var(--accent);
+  box-shadow: 0 4px 14px #14263816;
+  transform: translateY(-1px);
+}
+.mmfem-recent-project-tile.is-selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.mmfem-recent-project-tile:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.mmfem-recent-project-card .mmfem-recent-project-remove {
+  opacity: .72;
+  transition: opacity .12s ease;
+}
+.mmfem-recent-project-card:hover .mmfem-recent-project-remove,
+.mmfem-recent-project-card:focus-within .mmfem-recent-project-remove {
+  opacity: 1;
+}
+.mmfem-recent-project-image img {
+  object-fit: contain;
+}
+@media (max-width: 620px) {
+  .mmfem-recent-project-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mmfem-recent-project-tile,
+  .mmfem-recent-project-card .mmfem-recent-project-remove {
+    transition: none;
+  }
+}
+"""
+    existing = js.document.getElementById(style.id)
+    if existing:
+        existing.remove()
     js.document.head.appendChild(style)
 
 
@@ -685,6 +736,12 @@ class NGSolveGui(App):
         self._loaded_mesh_path = None
         self._loaded_mesh_problem_sha256 = None
         self._solution_import_dirs = []
+        self._startup_selected_recent_path = None
+        self._recent_thumbnail_queue = queue.Queue()
+        self._recent_thumbnail_lock = threading.Lock()
+        self._recent_thumbnail_pending = {}
+        self._recent_thumbnail_attempted = set()
+        self._recent_thumbnail_worker_running = False
 
         # Frequent document and history actions stay one click away; the full
         # artifact workflow lives in the application menus below.
@@ -961,7 +1018,11 @@ class NGSolveGui(App):
             ui_style="min-height:20px; padding:0 24px 10px; color:var(--negative); font-size:13px;",
         )
         self._startup_recent_list = Div(
-            ui_style="display:flex; flex-direction:column; gap:6px; max-height:38vh; overflow:auto;",
+            ui_class="mmfem-recent-project-grid",
+            ui_style=(
+                "display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); "
+                "gap:10px; max-height:38vh; overflow:auto; padding:2px;"
+            ),
         )
         axisymmetric_choice = QBtn(
             ui_label="Axisymmetric",
@@ -1047,6 +1108,7 @@ class NGSolveGui(App):
         sync_default_viewport_clear()
         keybinding_styles.inject(self)
         self.call_js(_inject_solve_status_styles)
+        self.call_js(_inject_recent_project_tile_styles)
         self.call_js(_set_window_title)
         self.call_js(_set_window_icon, self.load_asset("magmechsim_icon_128x128.png"))
         self.on_load(self.__on_load)
@@ -1138,27 +1200,93 @@ class NGSolveGui(App):
         entries = self._recent_project_entries()
         if not entries:
             self._startup_recent_list.ui_children = [
-                Div("No recent projects.", ui_style="padding:10px 12px; color:var(--fg-muted); font-size:13px;")
+                Div("No recent projects.", ui_style="padding:10px 4px; color:var(--fg-muted); font-size:13px;")
             ]
             return
-        rows = []
+        tiles = []
         for entry in entries:
-            exists = Path(entry["path"]).is_file()
-            open_button = QBtn(
-                ui_label="Open" if exists else "Locate",
-                ui_flat=True,
-                ui_dense=True,
-                ui_no_caps=True,
-                ui_color="primary",
-            )
-            if exists:
-                open_button.on_click(
-                    lambda *_args, item=dict(entry): self._open_recent_project(item)
+            path = entry["path"]
+            exists = Path(path).is_file()
+            thumbnail = cached_thumbnail(path) if exists else None
+            if exists and thumbnail is None:
+                queue_thumbnail = getattr(self, "_queue_recent_project_thumbnail", None)
+                if callable(queue_thumbnail):
+                    queue_thumbnail(entry)
+
+            if thumbnail:
+                preview = QImg(
+                    ui_src=thumbnail,
+                    ui_width="100%",
+                    ui_height="112px",
+                    ui_fit="contain",
+                    ui_class="mmfem-recent-project-image",
                 )
             else:
-                open_button.on_click(
-                    lambda *_args, item=dict(entry): self._locate_recent_project(item)
+                preview = Div(
+                    QIcon(
+                        ui_name="mdi-image-outline",
+                        ui_size="38px",
+                        ui_color="grey-5",
+                    ),
+                    ui_class="mmfem-recent-project-placeholder",
+                    ui_style=(
+                        "height:112px; display:grid; place-items:center; "
+                        "background:#f7f9fc; border-radius:6px;"
+                    ),
                 )
+            filename = Path(path).name
+            selected = NGSolveGui._project_path_key(path) == getattr(
+                self, "_startup_selected_recent_path", None
+            )
+            tile = Div(
+                preview,
+                Div(
+                    filename,
+                    ui_class="mmfem-recent-project-filename",
+                    ui_style=(
+                        "margin-top:7px; font-size:12px; font-weight:600; "
+                        "line-height:1.35; white-space:nowrap; overflow:hidden; "
+                        "text-overflow:ellipsis;"
+                    ),
+                ),
+                Div(
+                    "File not found" if not exists else "",
+                    ui_hidden=exists,
+                    ui_style="margin-top:3px; color:var(--negative); font-size:10px;",
+                ),
+                ui_class="mmfem-recent-project-tile" + (" is-selected" if selected else ""),
+                ui_style=(
+                    "box-sizing:border-box; width:100%; min-width:0; padding:8px; "
+                    "text-align:left; border-radius:8px; background:var(--surface); "
+                    "cursor:pointer; transition:border-color .12s ease, "
+                    "box-shadow .12s ease, transform .12s ease;"
+                ),
+            )
+            tile._props["title"] = str(path)
+            tile._props["role"] = "button"
+            tile._props["tabindex"] = "0"
+            tile._props["aria-label"] = f"Open {filename}"
+            tile._props["aria-pressed"] = "true" if selected else "false"
+            tile._props["data-project-key"] = NGSolveGui._project_path_key(path)
+            tile.on("click", lambda _event=None, value=path: self._select_recent_project(value))
+            tile.on(
+                "dblclick",
+                lambda _event=None, item=dict(entry), present=exists: (
+                    self._open_recent_project(item)
+                    if present else self._locate_recent_project(item)
+                ),
+            )
+            tile.on(
+                "keydown",
+                lambda event, item=dict(entry), present=exists: (
+                    self._open_recent_project(item)
+                    if str(getattr(event, "key", "")) in {"Enter", " "}
+                    and present
+                    else self._locate_recent_project(item)
+                    if str(getattr(event, "key", "")) in {"Enter", " "}
+                    else None
+                ),
+            )
             remove_button = QBtn(
                 QTooltip("Remove from recent"),
                 ui_icon="mdi-close",
@@ -1166,24 +1294,122 @@ class NGSolveGui(App):
                 ui_dense=True,
                 ui_round=True,
                 ui_size="sm",
+                ui_class="mmfem-recent-project-remove",
+                ui_style=(
+                    "position:absolute; right:10px; top:10px; background:var(--surface); "
+                    "box-shadow:0 1px 4px #14263822;"
+                ),
             )
             remove_button.on_click(
-                lambda *_args, item=dict(entry): self._remove_recent_project(item["path"])
+                lambda *_args, value=path: self._remove_recent_project(value)
             )
-            rows.append(Div(
-                Div(
-                    Div(entry["name"], ui_style="font-size:13px; font-weight:600;"),
-                    Div(str(Path(entry["path"]).parent), ui_style="font-size:11px; color:var(--fg-muted); overflow-wrap:anywhere;"),
-                    ui_style="flex:1 1 auto; min-width:0;",
-                ),
-                open_button,
+            tiles.append(Div(
+                tile,
                 remove_button,
-                ui_style=(
-                    "display:flex; align-items:center; gap:8px; padding:7px 10px; "
-                    "border:1px solid var(--border); border-radius:8px; min-width:0;"
-                ),
+                ui_class="mmfem-recent-project-card",
+                ui_style="position:relative; min-width:0;",
             ))
-        self._startup_recent_list.ui_children = rows
+        self._startup_recent_list.ui_children = tiles
+
+    def _select_recent_project(self, path):
+        self._startup_selected_recent_path = self._project_path_key(path)
+        # Patch the existing tiles so the first click of a double-click does
+        # not replace its DOM target before the browser can deliver dblclick.
+        for card in getattr(self._startup_recent_list, "ui_children", ()):
+            try:
+                tile = card.ui_slots["default"][0]
+                classes = [
+                    value for value in tile._props.get("class", "").split()
+                    if value != "is-selected"
+                ]
+                selected = (
+                    tile._props.get("data-project-key")
+                    == self._startup_selected_recent_path
+                )
+                if selected:
+                    classes.append("is-selected")
+                tile._props["class"] = " ".join(classes)
+                tile._props["aria-pressed"] = "true" if selected else "false"
+            except (AttributeError, KeyError, IndexError, TypeError):
+                continue
+
+    def _queue_recent_project_thumbnail(
+        self, entry, *, project_data=None, force=False
+    ):
+        """Generate a missing/stale recent preview on one bounded worker."""
+        path = str(entry.get("path", ""))
+        if not path:
+            return
+        try:
+            source = Path(path)
+            stat = source.stat()
+            signature = (stat.st_size, stat.st_mtime_ns)
+            if not source.is_file():
+                return
+        except OSError:
+            return
+        if not force and cached_thumbnail(path) is not None:
+            return
+        path_key = self._project_path_key(path)
+        if project_data is not None:
+            project_data = bytes(project_data)
+            job_signature = hashlib.sha256(project_data).hexdigest()
+        else:
+            job_signature = f"{signature[0]}-{signature[1]}"
+        job_key = (path_key, job_signature)
+        attempt_key = (path_key, signature[0], signature[1])
+        with self._recent_thumbnail_lock:
+            if self._recent_thumbnail_pending.get(path_key) == job_key:
+                return
+            if path_key in self._recent_thumbnail_pending and not force:
+                return
+            if not force and attempt_key in self._recent_thumbnail_attempted:
+                return
+            self._recent_thumbnail_pending[path_key] = job_key
+            self._recent_thumbnail_queue.put((
+                job_key, attempt_key, path, entry.get("kind"),
+                project_data, signature,
+            ))
+            if self._recent_thumbnail_worker_running:
+                return
+            self._recent_thumbnail_worker_running = True
+            threading.Thread(
+                target=self._run_recent_thumbnail_queue,
+                name="MMFEM-project-thumbnails",
+                daemon=True,
+            ).start()
+
+    def _run_recent_thumbnail_queue(self):
+        while True:
+            try:
+                job = self._recent_thumbnail_queue.get(timeout=0.25)
+            except queue.Empty:
+                with self._recent_thumbnail_lock:
+                    if self._recent_thumbnail_queue.empty():
+                        self._recent_thumbnail_worker_running = False
+                        return
+                continue
+            job_key, attempt_key, path, kind, project_data, signature = job
+            generated = False
+            try:
+                generated = generate_project_thumbnail(
+                    path,
+                    project_data,
+                    kind=kind,
+                    expected_stat=signature,
+                )
+            finally:
+                self._recent_thumbnail_queue.task_done()
+                with self._recent_thumbnail_lock:
+                    self._recent_thumbnail_attempted.add(attempt_key)
+                    if self._recent_thumbnail_pending.get(job_key[0]) == job_key:
+                        self._recent_thumbnail_pending.pop(job_key[0], None)
+            loop = getattr(self, "loop", None)
+            if generated and loop is not None and loop.is_running():
+                try:
+                    loop.call_soon_threadsafe(self._refresh_recent_projects_view)
+                except RuntimeError:
+                    pass
 
     def _set_startup_status(self, message, *, error=True):
         self._startup_status.ui_children = [str(message)] if message else []
@@ -1197,7 +1423,7 @@ class NGSolveGui(App):
             self._startup_screen.ui_hidden = True
             self._startup_card.ui_hidden = False
 
-    def _remember_recent_project(self, path, *, kind, name=None):
+    def _remember_recent_project(self, path, *, kind, name=None, project_data=None):
         if not path:
             return
         try:
@@ -1216,6 +1442,10 @@ class NGSolveGui(App):
             })
             entries = entries[:8]
             self.usersettings.set("recent_projects", entries)
+            if project_data is not None:
+                self._queue_recent_project_thumbnail(
+                    entries[0], project_data=project_data, force=True
+                )
             self._refresh_recent_projects_view()
         except (OSError, TypeError, ValueError):
             return
@@ -2405,6 +2635,7 @@ class NGSolveGui(App):
                     getattr(self, "_last_saved_path", None),
                     kind="axisymmetric",
                     name=model.get("name", "Axisymmetric project"),
+                    project_data=data.encode("utf-8"),
                 )
             self._notify(
                 "Project saved." if save_as else "Project saved.",
@@ -3273,6 +3504,7 @@ class NGSolveGui(App):
         if data is not None:
             self.app_data._data.update(data)
         self._update()
+        self._refresh_recent_projects_view()
         self.app_data._update = self._update_from_app_data
 
     def _click_tab(self, tabname):
