@@ -132,6 +132,18 @@ These stages are **directional**, with dependencies and scopes to be refined by 
 
 **Gate:** Repeatable profiling identifies bottlenecks, representative interactions improve measurably, no CAD assignment/solver regression.
 
+**Milestone status (2 November 2026 — rendering and responsiveness pass): Partial; keep Phase A open.** The implementation is in GUI commit `25450a9476197de9244024c20391c81a7dc53f8b`; the Windows package was built from that GUI revision and solver/release commit `b27702905a9db63edca0d12439cfa89a15bb7d5a`.
+
+- The axisymmetric geometry-creation preview now uses a bounded OCC tessellation rendered with Plotly WebGL. It shows the revolved region with physical XYZ proportions, feature edges and per-region visibility. A clear message is shown if WebGL is unavailable. The old WebGPU renderer remains in the main STEP and results workspaces; the axisymmetric preview itself now uses WebGL even on WebGPU-capable systems. The VirtualBox adapter reports GPU/WebGPU unavailable, so the fallback was verified in the packaged app, but physical-GPU behavior has not been checked.
+- In the maximized packaged application, a drawn annulus with a bore rendered, rotated, zoomed and returned to the editable sketch. Ten wheel events did not make the sketch grid disappear, and the measured sketch dimensions remained unchanged. A saved axisymmetric project was reopened with its geometry intact. This grid issue did not reproduce, so no forced redraw was added.
+- 3D selection handling now avoids rebuilding the model tree when a face pick leaves the selected tree item unchanged, and boundary-overlay edge data is cached. On the same post-SSD VM and 22,132-element test mesh, the Playwright profile's five repeated event-to-editor samples improved from median `2734.37 ms` / p95 `3286.34 ms` to median `443.98 ms` / p95 `474.17 ms`. The first/cold after sample was `1914.59 ms`. These events are emitted programmatically to measure the event-to-editor path; they do not measure real pointer hit-testing. Do not treat them as proof that native CAD picking is correct or near-immediate.
+- The actual packaged 3D workspace imported the STEP fixture and generated/rendered a coarse 100 mm mesh (`22,132` volume elements, `14,588` surface triangles). Direct native mesh clicks did not visibly create a boundary-region assignment in the recorded checks. A later pointer move over the mesh produced Chrome's `Aw, Snap! Out of Memory` page. An earlier, denser 30 mm mesh (`105,523` volume elements, `69,978` surface triangles) also preceded a renderer OOM after repeated plot interactions. Mesh generation succeeded; no solver was run. Mesh-hover stability and physical face picking remain release-blocking Phase A findings.
+- The packaged executable is `0.2.8.dev216`, SHA-256 `da3e597dd12cbf0c0c541c80b23ed68489e392bfdf4919bbca9de6a7d39c2a95`. The latest launcher opened the maximized app. After the renderer crash, a same-package browser relaunch stayed white while the loopback server still returned HTTP 200; stopping only the verified stale package controller/GUI-host processes and relaunching restored the maximized project chooser. This is a recovery workaround, not a code fix. The app window and full-desktop screenshots were verified at `1920 × 1094`.
+- Focused regression evidence: `290 passed` in the GUI unit suite, `1 passed` for the axisymmetric preview E2E, and `1 passed` for the bounded 3D workspace E2E. The 3D E2E imports STEP and wire-trace fixtures, meshes and exercises model/named-selection flows; its selection timing dispatches synthetic Plotly events. No numerical solver algorithm or dependency changed, and no simulation was run. The VM's move to SSD prevents comparison with pre-SSD timings as a controlled benchmark.
+- The release package repository `ngsolve-ui` was confirmed private on 2 November 2026. The separate GUI source repository `ngsolve_gui` remains public.
+
+**Next Phase A gate:** diagnose and contain the native WebGL/Plotly renderer OOM, verify that actual desktop pointer movement/face selection updates the boundary editor, and make renderer-crash recovery work without manually restarting package processes. Do not start Phase B until these checks pass or the limitation is explicitly accepted.
+
 ### Phase B. Complete the 3D model-preparation workflow (high priority)
 
 **Outcome:** Engineers can create, edit and validate all supported 3D inputs directly within the GUI, without editing Python.
@@ -208,8 +220,7 @@ These stages are **directional**, with dependencies and scopes to be refined by 
 ## 5. Practical sequencing and dependencies
 
 ```text
-NEXT: UI coherence & correctness (Section 3)
-    |------> 3D interaction performance (Phase A, recurring)
+NEXT: Complete Phase A native selection and renderer/recovery gate
     |------> Complete supported 3D preprocessing (Phase B)
                       |
                       v
@@ -244,12 +255,13 @@ Release, packaging and comprehensive quality gates occur throughout, with final 
 
 | Risk | Why it matters | Mitigation |
 |---|---|---|
-| 3D face selection ~1.6 s | Engineers perceive input lag | End-to-end profiling and incremental rendering changes, representative p50/p95 measurements |
+| 3D face selection and renderer stability | Actual mesh picking did not visibly update the native boundary editor; mesh hover caused Chrome OOM on the VM | Profile real pointer hit-testing and memory/lifecycle behavior; keep synthetic event timings separate; add native regression coverage |
 | Geometry identity ambiguity | Can silently change loads or supports | Continue safe invalidation, user-guided reassignment and verification |
 | Coupling not exposed in 3D | Core product capability unavailable | Implement and verify DC prerequisite, then coupled pipeline, rather than unrelated UI controls |
 | Axisymmetric viewport/tangent errors | Foundational geometry UX and model validity | Fix now with scale/geometry tests |
 | Menus expose irrelevant commands | Confusing and potentially hazardous workflow | Context-aware command taxonomy and capability checks |
-| Axisymmetric geometry-creation 3D preview requires unavailable WebGPU on the VM | Users see a blank preview on the installed VirtualBox display adapter | Add adapter detection and WebGL/limited-preview fallbacks; verify the packaged desktop directly |
+| Axisymmetric geometry-creation preview needs WebGPU on some systems | Users see a blank preview on the installed VirtualBox display adapter | Packaged VM now uses Plotly WebGL and reports unavailable WebGL; physical-GPU path remains unverified |
+| Reload after a renderer crash can leave a blank window | Users cannot return to the model without restarting the package UI service | Fix frontend/server recovery and verify cold launch, reload and restart lifecycle |
 | Startup measured ~16.3 s | First-use experience feels sluggish | Profile native/backend/frontend stages and optimise controlled bottlenecks |
 | Documentation is linked to GitHub | Poor offline and packaged UX | Bundle local Sphinx HTML now; refresh/index in later documentation phase |
 | Broad CI has known failures | Can conceal regressions and waste iteration time | Keep focused gates, track known failures, schedule comprehensive checks |
