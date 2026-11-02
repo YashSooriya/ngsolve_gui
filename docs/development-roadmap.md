@@ -105,13 +105,16 @@ Make the top-level application layout, commands, modal behaviour, branding and a
 
 **Deliverables:** Changes implemented; actual native desktop screenshots at normal and constrained sizes; UX and regression checks; simple timing comparisons; Git commit/push records; concise outstanding issues; review ZIP. Update this roadmap only when meaningful discoveries change priorities.
 
-**Milestone status (1 November 2026):** The implementation and focused automated checks are complete. The packaged native desktop launch, maximized visual inspection, and final screenshots remain the release gate for this milestone.
+**Milestone status (2 November 2026):** The UI-coherence milestone and native release gate are complete. The final MagMechSim executable was built from GUI commit `e57d95695315dca061a83c242fa77448ec9e5c4c` and solver/release commit `b27702905a9db63edca0d12439cfa89a15bb7d5a`, launched, and verified maximized on the 1920×1094 desktop.
 
 - The shared application shell now presents consistent Model/Results navigation, shared file actions, context-aware menus, local documentation help, and the relocated CPU field viewer. Axisymmetric sketching and the existing 3D STEP/wire-trace workflow remain in place.
 - Tangent-arc eligibility, mechanics-only harmonic frequencies, dismissal of safe overlays, and alpha-clean application icons have targeted regression coverage.
-- Focused GUI unit checks pass (**341 passed**); axisymmetric geometry 3D preview and repeated small axisymmetric solver workflow pass; the 22,132-tetrahedron 3D mesh/selection workflow passes without running a 3D solver. The complete Sphinx HTML build succeeds offline.
+- Focused GUI unit checks pass (**341 passed**); axisymmetric geometry 3D preview and repeated small axisymmetric solver workflow pass; the 22,132-tetrahedron 3D mesh/selection workflow passes without running a 3D solver. The complete Sphinx HTML build succeeds offline. Four Windows launcher tests also verify MagMechSim maximization, delayed window-manager confirmation, Mike compatibility, and explicit failure if maximization cannot be confirmed.
 - Fresh 3D selection profiling still reports a **2.49 s median** click-to-editor time, while Python tree/property rebuilds are approximately **10 ms / 7 ms**. The residual latency is outside those measured methods and needs browser/Plotly/transport profiling in Phase A. The VM's move to SSD means comparisons with the earlier measurements are not controlled.
-- No numerical solver algorithms were changed. A separate review package will carry test logs, native screenshots, the built executable identity, and the unresolved performance observation.
+- A post-restart review found that `--start-maximized` alone did not reliably restore an existing Chrome app-profile window. The MagMechSim launcher now locates the browser process for its isolated install profile, requests maximization after the interface mounts, checks the Windows maximized state, and reports a clear startup error if that state cannot be confirmed. The Mike (`MM-FEM`) branch retains its previous window-restoration behavior.
+- The actual packaged axisymmetric **geometry-creation** 3D preview remains blank on this VM. The installed browser has no working WebGPU adapter with the VirtualBox WDDM display adapter. Headless renderer readback succeeds, but this is not a native-desktop pass. Capability detection and a non-WebGPU preview fallback are now a high-priority follow-up; post-processing is a separate issue.
+- Computer Use can enumerate the application but its native screenshot capture timed out after the Windows restart. The release screenshots were captured from the full desktop and visually inspected at the real 1920×1094 resolution. This capture-channel fault does not change the app's independently queried maximized state.
+- No numerical solver algorithms were changed. The VM's move to SSD is a performance confound; the prior 16.3 s startup and 2.49 s selection timing are not controlled same-hardware comparisons. The review package records the final executable identity, logs, screenshots, performance observations, and remaining preview limitation.
 
 ## 4. Future phases, after the immediate milestone
 
@@ -123,6 +126,7 @@ These stages are **directional**, with dependencies and scopes to be refined by 
 
 - Profile the complete user interaction pipeline, including browser rendering, Plotly redraws, WebSocket communication, ngapp state updates, NGSolve/OCC work, logging and panel changes.
 - Eliminate unnecessary full redraws and heavy recomputations on selection, reuse costly geometry/mesh data, and keep UI updates responsive. Re-evaluate renderer choices only on proven benefits, not WebGPU fashion.
+- For the axisymmetric geometry-creation 3D preview, detect WebGPU adapter availability before rendering. Provide a supported WebGL preview fallback when WebGPU is unavailable and a clear reduced-preview state when neither renderer is available. Validate geometry fidelity, selection-independent navigation, resize behaviour and actual packaged desktop output; the CPU 2D results viewer does not cover this workflow.
 - Benchmark repeatable selection p50/p95, viewport interaction, panel switching, geometry loading and startup on representative models and **unchanged hardware**. Separate VM/SwiftShader limits from production hardware. Avoid claiming speedups after storage/hardware changes without a controlled baseline.
 - Aim for near-immediate common interactions. Set numerical latency budgets after obtaining reproducible hardware conditions; do not trade correctness for a number.
 
@@ -232,7 +236,7 @@ Release, packaging and comprehensive quality gates occur throughout, with final 
 4. **Reliability:** Save/reopen, cancel/fail, invalid data and geometry-change paths exercised where affected. Preserve stable CAD identity and fail-safe recovery.
 5. **Testing efficiency:** Targeted tests while editing; related end-to-end/numerical tests at milestone boundary; full suite at planned integration/release gates. Never weaken tests to hide failures.
 6. **Git discipline:** Protect existing work, logically commit and push verified changes, and report branch/SHAs, clean/dirty working tree and blockers.
-7. **Native review evidence:** Build a Windows executable from reviewed source at milestone completion, launch it and capture the real native app; record exact revisions, version and executable hash. Do this once at a milestone gate, not after every trivial code change. Preserve a currently running side-by-side installation.
+7. **Native review evidence:** Build a Windows executable from the current reviewed source, launch it and capture the real native app; record exact revisions, version and executable hash. The tested executable must be the newest source version and open maximized. Capture screenshots at the full native display resolution (at least a normal 1920×1080-class screen), never in a smaller restored window. Do this once at a milestone gate, not after every trivial code change. Preserve a currently running side-by-side installation.
 8. **Handoff:** Concise report, actual screenshots, focused test evidence, performance observations, outstanding issues, next recommendation and a ZIP. Never claim native GPU/splash behaviour was verified from a browser screenshot alone.
 
 ## 7. Risk register
@@ -244,7 +248,7 @@ Release, packaging and comprehensive quality gates occur throughout, with final 
 | Coupling not exposed in 3D | Core product capability unavailable | Implement and verify DC prerequisite, then coupled pipeline, rather than unrelated UI controls |
 | Axisymmetric viewport/tangent errors | Foundational geometry UX and model validity | Fix now with scale/geometry tests |
 | Menus expose irrelevant commands | Confusing and potentially hazardous workflow | Context-aware command taxonomy and capability checks |
-| Blank WebGPU automated screenshots | Can hide visual defects or cause false failures | Test actual packaged desktop and label readback/headless evidence accurately |
+| Axisymmetric geometry-creation 3D preview requires unavailable WebGPU on the VM | Users see a blank preview on the installed VirtualBox display adapter | Add adapter detection and WebGL/limited-preview fallbacks; verify the packaged desktop directly |
 | Startup measured ~16.3 s | First-use experience feels sluggish | Profile native/backend/frontend stages and optimise controlled bottlenecks |
 | Documentation is linked to GitHub | Poor offline and packaged UX | Bundle local Sphinx HTML now; refresh/index in later documentation phase |
 | Broad CI has known failures | Can conceal regressions and waste iteration time | Keep focused gates, track known failures, schedule comprehensive checks |
