@@ -781,17 +781,31 @@ def test_3d_preview_region_table_lists_each_region_with_three_visibility_states(
 def test_3d_preview_supports_opaque_translucent_and_hidden_regions_with_axis(
     standalone_components, monkeypatch
 ):
-    import ngapp.components
+    import numpy as np
     import netgen
+    from ngsolve_gui import three_d_preview
 
-    axis_indicator = object()
-    geometry_renderers = []
-    circle_profiles = []
+    axis_profile_calls = []
+    plots = []
+
+    class Edge:
+        pass
+
+    class Face:
+        def __init__(self, edges=()):
+            self.edges = list(edges)
+
+    class Profile:
+        def __init__(self, edges=()):
+            self.edges = list(edges)
 
     class Solid:
         def __init__(self, profile):
-            self.faces = [profile]
-            self.edges = [object()]
+            if len(profile.edges) == 1:
+                self.faces = [Face(profile.edges)]
+            else:
+                shared_edge = Edge()
+                self.faces = [Face([*profile.edges, shared_edge]), Face([shared_edge])]
 
         def __sub__(self, _child):
             return self
@@ -799,79 +813,60 @@ def test_3d_preview_supports_opaque_translucent_and_hidden_regions_with_axis(
         def mat(self, _name):
             return self
 
-    class Renderer:
-        def __init__(self, geometry):
-            self.geo = geometry
-            self.faces = SimpleNamespace(active=None, transparent=False, colors=None)
-            self.faces.set_colors = lambda colors: setattr(
-                self.faces, "colors", colors.copy()
-            )
-            self.edges = SimpleNamespace(active=None, colors=None)
-            self.edges.set_colors = lambda colors: setattr(
-                self.edges, "colors", colors.copy()
-            )
-            self.update_requests = 0
+    class PreviewPlot:
+        def __init__(self, _name, data, _app_data):
+            self.data = data
+            self._figures = []
+            self._plots = []
+            self.update_calls = []
+            plots.append(self)
 
-        def set_needs_update(self):
-            self.update_requests += 1
-
-    def make_geometry_renderer(geometry):
-        renderer = Renderer(geometry)
-        geometry_renderers.append(renderer)
-        return renderer
-
-    def make_circle(center, normal, radius):
-        profile = object()
-        circle_profiles.append((center, normal, radius, profile))
-        return profile
-
-    class Axes:
-        def __new__(cls):
-            return axis_indicator
-
-    class Preview:
-        def __init__(self, **kwargs):
-            self.ui_class = None
-            self.renderers = None
-
-        def on_mounted(self, callback):
+        def on_mounted(self, _callback):
             pass
 
-        def draw(self, renderers):
-            self.renderers = renderers
-            return SimpleNamespace(
-                options=SimpleNamespace(camera=SimpleNamespace(reset=lambda *_args: None)),
-                bounding_box=(),
-                render=lambda: None,
-            )
+        def call_js(self, _callback):
+            pass
+
+        def update_figure(self, figure):
+            self._figures = [figure]
+            self.update_calls.append(figure)
+
+    def fake_tessellate_shape(shape, *, max_triangles):
+        assert max_triangles > 0
+        return {
+            "vertices": np.asarray([[0, 0, 0], [1, 0, 0], [0, 0, 1]], dtype=np.float32),
+            "triangles": np.asarray([[0, 1, 2]], dtype=np.int32),
+        }
+
+    def fake_tessellate_feature_edges(shape):
+        axis_profile_calls.append(shape)
+        return np.asarray([[[0, 0, 0], [1, 0, 0]]], dtype=np.float32)
 
     occ = ModuleType("netgen.occ")
-    occ.ArcOfCircle = lambda *_args: object()
+    occ.ArcOfCircle = lambda *_args: Edge()
     occ.Axis = lambda *_args: object()
-    occ.Circle = make_circle
-    occ.Compound = lambda edges: edges
+    occ.Circle = lambda *_args: Edge()
+    occ.Compound = lambda edges: list(edges)
     occ.Dir = lambda *args: args
     occ.Face = lambda profile: profile
-    occ.MakePolygon = lambda _vertices: object()
-    occ.OCCGeometry = lambda solid: SimpleNamespace(
-        faces=list(solid.faces), edges=list(solid.edges), shape=solid
-    )
+    occ.MakePolygon = lambda _vertices: Profile([Edge(), Edge(), Edge()])
+    occ.OCCGeometry = lambda _shape: object()
     occ.Pnt = lambda *args: args
     occ.Revolve = lambda profile, *_args: Solid(profile)
-    occ.Segment = lambda *_args: object()
-    occ.SplineInterpolation = lambda *_args, **_kwargs: object()
+    occ.Segment = lambda *_args: Edge()
+    occ.SplineInterpolation = lambda *_args, **_kwargs: Edge()
     occ.Vec = lambda *_args: object()
     occ.Vertex = lambda _point: object()
-    occ.Wire = lambda profile: profile
-    ngsolve_webgpu = ModuleType("ngsolve_webgpu")
-    ngsolve_webgpu.GeometryRenderer = make_geometry_renderer
-    webgpu = ModuleType("webgpu")
-    webgpu.CoordinateAxes = Axes
+    occ.Wire = lambda edges: Profile(
+        edges if isinstance(edges, (list, tuple)) else [edges]
+    )
     monkeypatch.setattr(netgen, "occ", occ, raising=False)
     monkeypatch.setitem(sys.modules, "netgen.occ", occ)
-    monkeypatch.setitem(sys.modules, "ngsolve_webgpu", ngsolve_webgpu)
-    monkeypatch.setitem(sys.modules, "webgpu", webgpu)
-    monkeypatch.setattr(ngapp.components, "WebgpuComponent", Preview)
+    monkeypatch.setattr(three_d_preview, "tessellate_occ_shape", fake_tessellate_shape)
+    monkeypatch.setattr(
+        three_d_preview, "tessellate_occ_feature_edges", fake_tessellate_feature_edges
+    )
+    monkeypatch.setattr("ngsolve_gui.plot.PlotComponent", PreviewPlot)
 
     workspace = SolveWorkspace()
     workspace.model["geometry"]["regions"] = [
@@ -893,94 +888,99 @@ def test_3d_preview_supports_opaque_translucent_and_hidden_regions_with_axis(
             "parent_id": "circle-outer",
         },
     ]
-    preview = workspace._build_3d_preview_component()
+    workspace._build_3d_preview_component()
 
-    assert len(geometry_renderers) == 2
-    outer = workspace._preview_3d_renderers["circle-outer"]
-    inner = workspace._preview_3d_renderers["circle-inner"]
-    assert outer.faces.active is True
-    assert inner.faces.active is True
-    assert outer.edges.active is False
-    assert inner.edges.active is False
-    assert [center for center, _normal, _radius, _profile in circle_profiles] == [
-        (0.02, 0.0, 0.0), (0.02, 0.0, 0.0),
-    ]
-    assert [normal for _center, normal, _radius, _profile in circle_profiles] == [
-        (0.0, 1.0, 0.0), (0.0, 1.0, 0.0),
-    ]
-    assert [radius for _center, _normal, radius, _profile in circle_profiles] == pytest.approx([0.01, 0.002])
-    assert outer.faces.colors[3::4].tolist() == [1.0]
-    assert inner.faces.colors[3::4].tolist() == [1.0]
-    assert outer.faces.transparent is False
-    assert inner.faces.transparent is False
-    assert preview.renderers == [outer, inner, axis_indicator]
+    assert len(plots) == 1
+    figure = workspace._preview_3d_figure
+    outer_index = workspace._preview_3d_region_trace_indices["circle-outer"]
+    inner_index = workspace._preview_3d_region_trace_indices["circle-inner"]
+    assert len(figure.data) == 2
+    assert figure.data[outer_index].type == "mesh3d"
+    assert figure.data[inner_index].type == "mesh3d"
+    assert figure.layout.scene.aspectmode == "data"
+    assert figure.layout.scene.zaxis.title.text == "Z (m)"
+    assert [figure.data[index].opacity for index in (outer_index, inner_index)] == [1, 1]
+    assert axis_profile_calls == []
 
     workspace._set_3d_region_visibility("circle-inner", "translucent")
-    assert outer.faces.colors[3::4].tolist() == [1.0]
-    assert inner.faces.colors[3::4].tolist() == pytest.approx([0.38])
-    assert outer.faces.transparent is False
-    assert inner.faces.transparent is True
-
-    # The exterior and each child retain independent alpha in their own passes.
-    workspace._set_3d_region_visibility("circle-inner", "opaque")
-    workspace._set_3d_region_visibility("circle-outer", "translucent")
-    assert outer.faces.colors[3::4].tolist() == pytest.approx([0.38])
-    assert inner.faces.colors[3::4].tolist() == [1.0]
-    assert outer.faces.transparent is True
-    assert inner.faces.transparent is False
-
-    workspace._set_3d_region_visibility("circle-inner", "translucent")
-    assert outer.faces.colors[3::4].tolist() == pytest.approx([0.38])
-    assert inner.faces.colors[3::4].tolist() == pytest.approx([0.38])
-    assert outer.faces.transparent is True
-    assert inner.faces.transparent is True
-
-    workspace._set_3d_region_visibility("circle-inner", "hidden")
-    assert outer.faces.colors[3::4].tolist() == pytest.approx([0.38])
-    assert inner.faces.colors[3::4].tolist() == [0.0]
-    assert outer.faces.active is True
-    assert inner.faces.active is False
-    assert outer.edges.active is False
-    assert inner.edges.active is False
-    assert "circle-inner" not in workspace._preview_3d_edge_renderers
+    assert figure.data[outer_index].opacity == 1
+    assert figure.data[inner_index].opacity == pytest.approx(0.38)
+    workspace._set_3d_region_visibility("circle-outer", "hidden")
+    assert figure.data[outer_index].visible is False
+    assert figure.data[inner_index].visible is True
+    assert len(plots[0].update_calls) == 2
 
 
-def test_3d_preview_uses_smooth_sketch_arcs_and_hides_circle_seams(
+def test_3d_preview_uses_smooth_sketch_arcs_and_only_true_feature_edges(
     standalone_components, monkeypatch
 ):
-    import ngapp.components
-    import ngsolve_webgpu
+    import numpy as np
+    import netgen
+    from ngsolve_gui import three_d_preview
 
-    rendered = []
+    feature_compounds = []
 
-    class Renderer:
-        def __init__(self, geometry):
-            self.geo = geometry
-            self.faces = SimpleNamespace(active=None, transparent=False)
-            self.edges = SimpleNamespace(active=None)
-            self.faces.set_colors = lambda colors: setattr(self.faces, "colors", colors.copy())
-            self.edges.set_colors = lambda colors: setattr(self.edges, "colors", colors.copy())
-            self.edges.get_shader_code = lambda: "const EDGE_DEPTH_OFFSET: f32 = 2.0e-4;"
+    class Edge:
+        pass
 
-        def set_needs_update(self):
-            pass
+    class Face:
+        def __init__(self, edges):
+            self.edges = list(edges)
 
-    class Preview:
-        def __init__(self, **_kwargs):
-            self.ui_class = None
+    class Profile:
+        def __init__(self, edges):
+            self.edges = list(edges)
 
-        def on_mounted(self, _callback):
-            pass
+    class Solid:
+        def __init__(self, profile):
+            if len(profile.edges) == 1:
+                # A torus has a periodic seam belonging to one face only.
+                self.faces = [Face(profile.edges)]
+            else:
+                shared_edge = Edge()
+                self.faces = [Face([*profile.edges, shared_edge]), Face([shared_edge])]
 
-        def draw(self, items):
-            rendered.extend(items)
-            return SimpleNamespace(
-                options=SimpleNamespace(camera=SimpleNamespace(reset=lambda *_args: None)),
-                bounding_box=(), render=lambda: None,
-            )
+        def __sub__(self, _child):
+            return self
 
-    monkeypatch.setattr(ngapp.components, "WebgpuComponent", Preview)
-    monkeypatch.setattr(ngsolve_webgpu, "GeometryRenderer", Renderer)
+        def mat(self, _name):
+            return self
+
+    def fake_tessellate_shape(_shape, *, max_triangles):
+        assert max_triangles > 0
+        return {
+            "vertices": np.asarray([[0, 0, 0], [1, 0, 0], [0, 0, 1]], dtype=np.float32),
+            "triangles": np.asarray([[0, 1, 2]], dtype=np.int32),
+        }
+
+    def fake_tessellate_feature_edges(shape):
+        feature_compounds.append(shape)
+        return np.asarray([[[0, 0, 0], [1, 0, 0]]], dtype=np.float32)
+
+    occ = ModuleType("netgen.occ")
+    occ.ArcOfCircle = lambda *_args: Edge()
+    occ.Axis = lambda *_args: object()
+    occ.Circle = lambda *_args: Edge()
+    occ.Compound = lambda edges: list(edges)
+    occ.Dir = lambda *args: args
+    occ.Face = lambda profile: profile
+    occ.MakePolygon = lambda _vertices: Profile([Edge(), Edge(), Edge()])
+    occ.OCCGeometry = lambda _shape: object()
+    occ.Pnt = lambda *args: args
+    occ.Revolve = lambda profile, *_args: Solid(profile)
+    occ.Segment = lambda *_args: Edge()
+    occ.SplineInterpolation = lambda *_args, **_kwargs: Edge()
+    occ.Vec = lambda *_args: object()
+    occ.Vertex = lambda _point: object()
+    occ.Wire = lambda edges: Profile(
+        edges if isinstance(edges, (list, tuple)) else [edges]
+    )
+    monkeypatch.setattr(netgen, "occ", occ, raising=False)
+    monkeypatch.setitem(sys.modules, "netgen.occ", occ)
+    monkeypatch.setattr(three_d_preview, "tessellate_occ_shape", fake_tessellate_shape)
+    monkeypatch.setattr(
+        three_d_preview, "tessellate_occ_feature_edges", fake_tessellate_feature_edges
+    )
 
     workspace = SolveWorkspace()
     start = [0.02, 0.0]
@@ -1014,21 +1014,16 @@ def test_3d_preview_uses_smooth_sketch_arcs_and_hides_circle_seams(
     ]
 
     workspace._build_3d_preview_component()
-
-    # A revolved circle is a smooth torus; its OCC meridian seam is not a
-    # visible feature edge. The arc-and-chord profile retains its real rims.
-    assert "torus" not in workspace._preview_3d_edge_renderers
-    assert "arc-region" in workspace._preview_3d_edge_renderers
-    assert workspace._preview_3d_renderers["torus"].edges.active is False
-    assert workspace._preview_3d_renderers["arc-region"].edges.active is False
-    arc_edges = workspace._preview_3d_edge_renderers["arc-region"].geo.edges
-    assert len(arc_edges) == 2
-    assert workspace._preview_3d_edge_renderers["arc-region"].edges.active is True
-    edge_shader = workspace._preview_3d_edge_renderers["arc-region"].edges.get_shader_code()
-    assert "EDGE_DEPTH_OFFSET: f32 = 2.0e-7;" in edge_shader
-    assert "EDGE_DEPTH_OFFSET: f32 = 2.0e-4;" not in edge_shader
-    assert len(rendered) == 4  # two face renderers, one feature-edge overlay, and axes
-
+    figure = workspace._preview_3d_figure
+    assert len(feature_compounds) == 1
+    assert "torus" not in workspace._preview_3d_edge_trace_indices
+    assert "arc-region" in workspace._preview_3d_edge_trace_indices
+    edge_trace = figure.data[
+        workspace._preview_3d_edge_trace_indices["arc-region"]
+    ]
+    assert edge_trace.type == "scatter3d"
+    assert edge_trace.x == (0.0, 1.0, None)
+    assert edge_trace.y == (0.0, 0.0, None)
 
 def test_3d_preview_failure_keeps_editable_sketch_active(standalone_components):
     workspace = SolveWorkspace()

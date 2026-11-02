@@ -12,6 +12,147 @@ from .three_d_project import LENGTH_UNITS, parse_wire_trace, step_unit_scale
 _MATERIAL_COLORS = ("#6886ac", "#d58651", "#69a77b", "#ae8bb7", "#d1b44f", "#4cabb0")
 _MAX_SURFACE_TRIANGLES = 80_000
 _MAX_TRACE_POINTS = 20_000
+_MAX_FEATURE_EDGE_SEGMENTS = 50_000
+
+
+def tessellate_occ_shape(shape, *, max_triangles=_MAX_SURFACE_TRIANGLES):
+    """Tessellate an OCC shape for a display-only WebGL preview."""
+    try:
+        import numpy as np
+        from netgen.occ import OCCGeometry
+    except ImportError as error:
+        raise RuntimeError("The 3D preview requires the Netgen/NGSolve runtime.") from error
+
+    visual = OCCGeometry(shape)._visualizationData()
+    raw_vertices = visual.get("vertices")
+    if raw_vertices is None or not len(raw_vertices) or len(raw_vertices) % 9:
+        raise ValueError("The geometry did not produce a valid surface for preview.")
+    triangle_count = len(raw_vertices) // 9
+    if triangle_count > max_triangles:
+        raise ValueError(
+            f"The 3D preview is too detailed ({triangle_count:,} surface triangles). "
+            "Simplify the geometry before opening the preview."
+        )
+    corners = np.asarray(raw_vertices, dtype=np.float64).reshape((-1, 3))
+    if not np.isfinite(corners).all():
+        raise ValueError("The geometry preview contains non-finite coordinates.")
+    vertices, inverse = np.unique(corners, axis=0, return_inverse=True)
+    triangles = inverse.astype(np.int32).reshape((-1, 3))
+    return {
+        "vertices": vertices.astype(np.float32),
+        "triangles": triangles,
+    }
+
+
+def tessellate_occ_feature_edges(shape, *, max_segments=_MAX_FEATURE_EDGE_SEGMENTS):
+    """Return display segments from a compound containing only feature edges."""
+    try:
+        import numpy as np
+        from netgen.occ import OCCGeometry
+    except ImportError as error:
+        raise RuntimeError("The 3D preview requires the Netgen/NGSolve runtime.") from error
+
+    visual = OCCGeometry(shape)._visualizationData()
+    raw_edges = visual.get("edges")
+    if raw_edges is None or not len(raw_edges):
+        return np.empty((0, 2, 3), dtype=np.float32)
+    if len(raw_edges) % 6:
+        raise ValueError("The geometry produced malformed feature edges for preview.")
+    segments = np.asarray(raw_edges, dtype=np.float64).reshape((-1, 2, 3))
+    if len(segments) > max_segments:
+        raise ValueError(
+            f"The 3D preview has too many feature-edge segments ({len(segments):,})."
+        )
+    if not np.isfinite(segments).all():
+        raise ValueError("The geometry preview contains non-finite feature edges.")
+    return segments.astype(np.float32)
+
+
+def axisymmetric_preview_figure(regions):
+    """Create an interactive, display-only revolved geometry scene."""
+    try:
+        import numpy as np
+        import plotly.graph_objects as go
+    except ImportError as error:
+        raise RuntimeError("The axisymmetric 3D preview requires Plotly.") from error
+
+    figure = go.Figure()
+    for index, item in enumerate(regions):
+        vertices = np.asarray(item["vertices"], dtype=np.float32)
+        triangles = np.asarray(item["triangles"], dtype=np.int32)
+        if vertices.ndim != 2 or vertices.shape[1] != 3:
+            raise ValueError("The preview surface vertices must be three-dimensional.")
+        if triangles.ndim != 2 or triangles.shape[1] != 3:
+            raise ValueError("The preview surface triangles are malformed.")
+        if len(vertices) == 0 or len(triangles) == 0:
+            continue
+        color = item.get("color") or _MATERIAL_COLORS[index % len(_MATERIAL_COLORS)]
+        region_id = item.get("id")
+        figure.add_trace(go.Mesh3d(
+            x=vertices[:, 0].tolist(),
+            y=vertices[:, 1].tolist(),
+            z=vertices[:, 2].tolist(),
+            i=triangles[:, 0].tolist(),
+            j=triangles[:, 1].tolist(),
+            k=triangles[:, 2].tolist(),
+            name=item.get("name", f"Region {index + 1}"),
+            color=color,
+            opacity=1.0,
+            flatshading=False,
+            lighting={
+                "ambient": 0.75,
+                "diffuse": 0.8,
+                "specular": 0.05,
+                "roughness": 0.8,
+            },
+            hoverinfo="name",
+            showscale=False,
+            meta={
+                "mmfem_kind": "axisymmetric_region",
+                "mmfem_region_id": region_id,
+            },
+        ))
+        segments = np.asarray(
+            item.get("feature_edges", np.empty((0, 2, 3))), dtype=np.float32
+        )
+        if segments.size:
+            if segments.ndim != 3 or segments.shape[1:] != (2, 3):
+                raise ValueError("The preview feature edges are malformed.")
+            x, y, z = [], [], []
+            for start, end in segments:
+                x.extend((float(start[0]), float(end[0]), None))
+                y.extend((float(start[1]), float(end[1]), None))
+                z.extend((float(start[2]), float(end[2]), None))
+            figure.add_trace(go.Scatter3d(
+                x=x,
+                y=y,
+                z=z,
+                mode="lines",
+                name=f"{item.get('name', 'Region')} feature edges",
+                line={"color": "#24394d", "width": 2},
+                hoverinfo="skip",
+                showlegend=False,
+                meta={
+                    "mmfem_kind": "axisymmetric_feature_edges",
+                    "mmfem_region_id": region_id,
+                },
+            ))
+
+    figure.update_layout(
+        margin={"l": 0, "r": 0, "t": 0, "b": 0},
+        showlegend=False,
+        uirevision="mmfem-axisymmetric-geometry-preview",
+        scene={
+            "aspectmode": "data",
+            "dragmode": "orbit",
+            "xaxis_title": "X (m)",
+            "yaxis_title": "Y (m)",
+            "zaxis_title": "Z (m)",
+            "bgcolor": "rgba(0,0,0,0)",
+        },
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return figure
 
 
 def tessellate_step(data, *, units="m", max_triangles=_MAX_SURFACE_TRIANGLES):

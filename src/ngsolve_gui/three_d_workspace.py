@@ -2326,13 +2326,18 @@ class ThreeDWorkspace(Div):
                 else:
                     draft_ids.append(region_id)
                     draft_ids.sort()
+                previous_selection = self._selection
                 self._selection = (
                     ("named_selection", context[2]["id"])
                     if continue_editing else ("geometry", item_id)
                 )
-                self._rebuild_items()
+                selection_changed = self._selection != previous_selection
+                if selection_changed:
+                    self._rebuild_items()
                 self._rebuild_properties()
-                self._update_boundary_overlay()
+                self._update_boundary_overlay(
+                    update_selection_style=selection_changed
+                )
                 return
         exists = any(
             item.get("id") == item_id
@@ -2415,7 +2420,7 @@ class ThreeDWorkspace(Div):
         self._preview_selection_update_handle = None
         self._update_preview_selection()
 
-    def _update_boundary_overlay(self):
+    def _update_boundary_overlay(self, *, update_selection_style=True):
         """Update selected mesh boundaries without resending the full 3D scene."""
         figures = getattr(self._preview, "_figures", ())
         if not figures:
@@ -2479,7 +2484,8 @@ class ThreeDWorkspace(Div):
                     # The current Python figure remains authoritative; a later
                     # Plotly render will include this updated trace.
                     pass
-        self._schedule_preview_selection_update()
+        if update_selection_style:
+            self._schedule_preview_selection_update()
 
     def delete_selected(self):
         kind, item_id = self._selection
@@ -2970,7 +2976,28 @@ class ThreeDWorkspace(Div):
             if self._preview_running:
                 return
             self._preview_running = True
+        loop = self._preview_ui_loop()
+        if loop is None or not loop.is_running():
+            # A standalone workspace (including isolated UI tests) has no event
+            # loop to receive worker results. Build on the caller thread so UI
+            # components are never mutated from a worker after that context ends.
+            self._run_preview_queue()
+            return
         threading.Thread(target=self._run_preview_queue, name="MMFEM-3D-preview", daemon=True).start()
+
+    def _preview_ui_loop(self):
+        """Return the live ngapp callback loop, with a test-double fallback."""
+        try:
+            from webgpu import platform
+
+            server = platform.websocket_server
+        except Exception:
+            server = None
+        if server is not None:
+            loop = getattr(server, "_callback_loop", None)
+            if loop is not None:
+                return loop
+        return getattr(self.app, "loop", None)
 
     def _cache_preview_item(self, key, value):
         if key in self._preview_cache:
@@ -3105,7 +3132,7 @@ class ThreeDWorkspace(Div):
 
     def _dispatch_preview_result(self, generation, *, figure=None, error=None):
         """Publish worker results on the UI loop and discard superseded previews."""
-        loop = getattr(self.app, "loop", None)
+        loop = self._preview_ui_loop()
         if loop is not None and loop.is_running():
             try:
                 loop.call_soon_threadsafe(self._publish_preview_result, generation, figure, error)
@@ -3113,6 +3140,10 @@ class ThreeDWorkspace(Div):
             except RuntimeError:
                 # The application may be closing while OCC finishes its current call.
                 return
+        if threading.current_thread() is not threading.main_thread():
+            # The UI loop stopped while OCC was working. Discard the late result
+            # rather than calling component setters from a dead UI context.
+            return
         self._publish_preview_result(generation, figure, error)
 
     def _publish_preview_result(self, generation, figure, error):

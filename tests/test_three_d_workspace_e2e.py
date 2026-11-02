@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import math
 import tempfile
 import time
 import os
@@ -233,12 +234,79 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     selected_boundary = int(workspace._mesh_results[geometry["id"]]["boundary_region_ids"][0])
     boundary_profile = {
         "click_to_editor_ms": [],
+        "page_evaluate_ms": [],
+        "click_to_handler_ms": [],
+        "handler_ms": [],
+        "handler_to_editor_ms": [],
         "rebuild_items_ms": [],
         "rebuild_properties_ms": [],
         "update_boundary_overlay_ms": [],
         "boundary_overlay_trace_ms": [],
         "preview_selection_update_ms": [],
     }
+
+    click_contexts = []
+    click_context_lock = threading.Lock()
+    plot = workspace._preview._plots[0]
+    original_click_handler = plot._click_handler
+
+    def timed_click_handler(curve_number, point_number=None):
+        with click_context_lock:
+            context = next(
+                (entry for entry in click_contexts if not entry["claimed"]), None
+            )
+            if context is not None:
+                context["claimed"] = True
+                context["handler_started"] = time.perf_counter()
+        try:
+            return original_click_handler(curve_number, point_number)
+        finally:
+            if context is not None:
+                context["handler_finished"] = time.perf_counter()
+                context["handler_done"].set()
+
+    plot._click_handler = timed_click_handler
+
+    def begin_profiled_click():
+        context = {
+            "started": time.perf_counter(),
+            "claimed": False,
+            "handler_done": threading.Event(),
+        }
+        with click_context_lock:
+            click_contexts.append(context)
+        return context
+
+    def record_profiled_click(context, editor_visible_at):
+        assert context["handler_done"].wait(10), "Plotly click handler did not finish"
+        handler_started = context["handler_started"]
+        handler_finished = context["handler_finished"]
+        boundary_profile["click_to_editor_ms"].append(
+            (editor_visible_at - context["started"]) * 1000
+        )
+        boundary_profile["page_evaluate_ms"].append(context["page_evaluate_ms"])
+        boundary_profile["click_to_handler_ms"].append(
+            (handler_started - context["started"]) * 1000
+        )
+        boundary_profile["handler_ms"].append(
+            (handler_finished - handler_started) * 1000
+        )
+        boundary_profile["handler_to_editor_ms"].append(
+            max(0.0, (editor_visible_at - handler_finished) * 1000)
+        )
+        return {
+            "click_to_editor_ms": round(
+                (editor_visible_at - context["started"]) * 1000, 2
+            ),
+            "page_evaluate_ms": round(context["page_evaluate_ms"], 2),
+            "click_to_handler_start_ms": round(
+                (handler_started - context["started"]) * 1000, 2
+            ),
+            "handler_ms": round((handler_finished - handler_started) * 1000, 2),
+            "handler_to_editor_ms": round(
+                max(0.0, (editor_visible_at - handler_finished) * 1000), 2
+            ),
+        }
 
     def timed_workspace_method(name, original):
         def timed(*args, **kwargs):
@@ -264,15 +332,15 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     three_d_preview.boundary_overlay_trace = timed_workspace_method(
         "boundary_overlay_trace_ms", three_d_preview.boundary_overlay_trace
     )
-    boundary_selection_started = time.perf_counter()
+    boundary_click_context = begin_profiled_click()
+    evaluate_started = time.perf_counter()
     graph.evaluate(
         "element => element.emit('plotly_click', {points: [{curveNumber: 0, pointNumber: 0}]})"
     )
-    page.get_by_label("Selection name").wait_for(timeout=10_000)
-    boundary_selection_ms = (
-        time.perf_counter() - boundary_selection_started
+    boundary_click_context["page_evaluate_ms"] = (
+        time.perf_counter() - evaluate_started
     ) * 1000
-    boundary_profile["click_to_editor_ms"].append(boundary_selection_ms)
+    page.get_by_label("Selection name").wait_for(timeout=10_000)
     deadline = time.monotonic() + 10
     while (
         selected_boundary not in workspace._selection_draft.get("region_ids", [])
@@ -280,6 +348,27 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     ):
         page.wait_for_timeout(100)
     assert selected_boundary in workspace._selection_draft["region_ids"]
+    def wait_for_boundary_chip(region_id):
+        region = next(
+            item
+            for item in workspace._mesh_results[geometry["id"]]["boundary_regions"]
+            if int(item["id"]) == int(region_id)
+        )
+        label = f"{region['name']} · {region['elements']:,} surface triangles"
+        page.wait_for_function(
+            """label => {
+                return [...document.querySelectorAll(
+                    '.mmfem-property-editor-body input[aria-label="Boundary regions"]'
+                )].some(input => input.value.includes(label));
+            }""",
+            arg=label,
+            timeout=10_000,
+        )
+
+    wait_for_boundary_chip(selected_boundary)
+    first_selection_sample = record_profiled_click(
+        boundary_click_context, time.perf_counter()
+    )
 
     # Repeated face picks measure the same path without repeating STEP import
     # or meshing. Use one point from each distinct current-mesh boundary region.
@@ -294,12 +383,14 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     ][:5]
     repeated_selection_samples = []
     for region_id, point_index in repeated_regions:
-        started = time.perf_counter()
+        context = begin_profiled_click()
+        evaluate_started = time.perf_counter()
         graph.evaluate(
             "(element, point) => element.emit('plotly_click', "
             "{points: [{curveNumber: 0, pointNumber: point}]})",
             point_index,
         )
+        context["page_evaluate_ms"] = (time.perf_counter() - evaluate_started) * 1000
         deadline = time.monotonic() + 5
         while (
             region_id not in workspace._selection_draft.get("region_ids", [])
@@ -307,12 +398,16 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
         ):
             page.wait_for_timeout(10)
         assert region_id in workspace._selection_draft["region_ids"]
-        elapsed_ms = (time.perf_counter() - started) * 1000
-        boundary_profile["click_to_editor_ms"].append(elapsed_ms)
-        repeated_selection_samples.append({
-            "region_id": region_id,
-            "click_to_selection_update_ms": round(elapsed_ms, 2),
-        })
+        wait_for_boundary_chip(region_id)
+        sample = record_profiled_click(context, time.perf_counter())
+        repeated_selection_samples.append({"region_id": region_id, **sample})
+
+    def nearest_rank_percentile(values, fraction):
+        ordered = sorted(values)
+        if not ordered:
+            return None
+        index = max(0, min(len(ordered) - 1, math.ceil(fraction * len(ordered)) - 1))
+        return round(ordered[index], 2)
     boundary_performance = {
         "environment": {
             "storage_change": "VM moved to SSD after the earlier Stage 8B baseline; comparisons with the older timings are confounded by the storage change.",
@@ -325,7 +420,16 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
             key: round(values[0], 2) if values else None
             for key, values in boundary_profile.items()
         },
+        "first_selection_sample": first_selection_sample,
         "repeated_selection_samples": repeated_selection_samples,
+        "selection_latency_ms": {
+            "sample_count": len(boundary_profile["click_to_editor_ms"]),
+            "p50": nearest_rank_percentile(boundary_profile["click_to_editor_ms"], 0.50),
+            "p95_nearest_rank": nearest_rank_percentile(boundary_profile["click_to_editor_ms"], 0.95),
+            "handler_start_p50": nearest_rank_percentile(boundary_profile["click_to_handler_ms"], 0.50),
+            "handler_p50": nearest_rank_percentile(boundary_profile["handler_ms"], 0.50),
+            "after_handler_p50": nearest_rank_percentile(boundary_profile["handler_to_editor_ms"], 0.50),
+        },
         "repeated_method_medians_ms": {
             key: round(sorted(values[1:])[len(values[1:]) // 2], 2)
             if len(values) > 1 else None
@@ -768,7 +872,7 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
                         geometry_selection_ms, 2
                     ),
                     "face_selection_to_boundary_property_editor": round(
-                        boundary_selection_ms, 2
+                        boundary_performance["selection_latency_ms"]["p50"], 2
                     ),
                     "viewport_resize_to_plot_width_update": round(
                         viewport_resize_ms, 2

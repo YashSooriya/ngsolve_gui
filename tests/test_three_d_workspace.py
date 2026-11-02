@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+import threading
 
 from ngapp.components import Component
 import plotly.graph_objects as go
@@ -291,7 +292,11 @@ def test_preview_worker_dispatches_ui_updates_to_the_application_loop(monkeypatc
         def call_later(self, _delay, callback, *args):
             callback(*args)
 
-    workspace = ThreeDWorkspace(SimpleNamespace(loop=Loop()))
+    monkeypatch.setattr(
+        "webgpu.platform.websocket_server",
+        SimpleNamespace(_callback_loop=Loop()),
+    )
+    workspace = ThreeDWorkspace(SimpleNamespace())
     workspace._preview_generation = 4
     drawn = []
     statuses = []
@@ -317,6 +322,58 @@ def test_preview_worker_dispatches_ui_updates_to_the_application_loop(monkeypatc
     callback, args = scheduled.pop()
     callback(*args)
     assert len(drawn) == 1
+
+
+def test_preview_without_application_loop_runs_on_the_caller_thread(monkeypatch):
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+    workspace = ThreeDWorkspace(SimpleNamespace())
+    workspace.project["geometries"] = [{
+        "id": "geometry-1",
+        "name": "shield.step",
+        "asset": "geometry.step",
+        "units": "m",
+    }]
+    workspace.assets["geometry.step"] = b"fixture"
+    figure = go.Figure()
+    built_on = []
+    published = []
+    workspace._build_preview_figure = lambda *_args: (
+        built_on.append(threading.current_thread()), figure
+    )[1]
+    workspace._publish_preview_result = lambda generation, figure, error: published.append(
+        (generation, figure, error, threading.current_thread())
+    )
+
+    workspace._rebuild_preview()
+
+    assert built_on == [threading.main_thread()]
+    assert len(published) == 1
+    assert published[0][0] == workspace._preview_generation
+    assert published[0][1] is figure
+    assert published[0][2] is None
+    assert published[0][3] is threading.main_thread()
+
+
+def test_late_preview_result_is_dropped_if_application_loop_has_stopped(monkeypatch):
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+    class StoppedLoop:
+        def is_running(self):
+            return False
+
+    workspace = ThreeDWorkspace(SimpleNamespace(loop=StoppedLoop()))
+    published = []
+    workspace._publish_preview_result = lambda *args, **kwargs: published.append(
+        (args, kwargs)
+    )
+    worker = threading.Thread(
+        target=lambda: workspace._dispatch_preview_result(0, figure=go.Figure())
+    )
+
+    worker.start()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert published == []
 
 
 def test_preview_selection_updates_are_coalesced_on_the_application_loop(monkeypatch):
@@ -996,12 +1053,30 @@ def test_plot_mesh_face_click_selects_boundary_region_and_visibility_controls(mo
         ),
     ])
     workspace._preview._figures = [figure]
+    item_rebuilds = []
+    property_rebuilds = []
+    overlay_updates = []
+    workspace._rebuild_items = lambda: item_rebuilds.append(True)
+    workspace._rebuild_properties = lambda: property_rebuilds.append(True)
+    workspace._update_boundary_overlay = lambda **kwargs: overlay_updates.append(kwargs)
 
     workspace._on_preview_plotly_click(0, 0, 1)
     assert workspace._selection_draft["region_ids"] == [1]
     assert workspace._active_boundary_region_ids(geometry["id"]) == [1]
+    assert item_rebuilds == []
+    assert property_rebuilds == [True]
+    assert overlay_updates == [{"update_selection_style": False}]
     updates = workspace._style_preview_figure(figure)
     assert figure.data[0].visible is True
+
+    # A face pick can also switch the active tree row (for example, from the
+    # project node). In that case keep the tree and geometry highlight in sync.
+    workspace._selection = ("project", None)
+    workspace._on_preview_plotly_click(0, 0, 1)
+    assert workspace._selection == ("geometry", geometry["id"])
+    assert item_rebuilds == [True]
+    assert property_rebuilds == [True, True]
+    assert overlay_updates[-1] == {"update_selection_style": True}
 
     workspace.toggle_mesh_edges()
     workspace._style_preview_figure(figure)

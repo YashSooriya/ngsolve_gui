@@ -81,24 +81,99 @@ _HIDDEN_RUN_HISTORY_FILE = ".mm_fem_hidden_run_history.json"
 _CANVAS_GRID_SUBDIVISIONS = 5
 
 
-def _surface_visible_preview_edge_shader(shader_source):
-    """Use a minimal depth bias so the depth buffer hides far-side preview edges."""
-    updated, replacements = re.subn(
-        r"(?m)^(const EDGE_DEPTH_OFFSET: f32 = )[^;]+;",
-        r"\g<1>2.0e-7;",
-        shader_source,
-        count=1,
-    )
-    if replacements != 1:
-        raise RuntimeError("The NGSolve edge shader no longer exposes its depth offset.")
-    return updated
-
-
 _PREVIEW_VISIBILITY_ALPHA = {
     "opaque": 1.0,
     "translucent": 0.38,
     "hidden": 0.0,
 }
+
+
+def _check_axisymmetric_preview_webgl(js):
+    """Show actionable guidance when the browser cannot create WebGL."""
+    js.eval("""(() => {
+      const check = () => {
+        const warning = document.querySelector(
+          '.mmfem-axisymmetric-3d-preview-webgl-warning'
+        );
+        const plot = document.querySelector(
+          '.mmfem-axisymmetric-3d-preview-plot'
+        );
+        if (!warning || !plot) {
+          if (!window.__mmfemAxisPreviewWebGLObserver) {
+            const root = document.body || document.documentElement;
+            const observer = new MutationObserver(() => {
+              if (document.querySelector('.mmfem-axisymmetric-3d-preview-webgl-warning')
+                  && document.querySelector('.mmfem-axisymmetric-3d-preview-plot')) {
+                observer.disconnect();
+                window.__mmfemAxisPreviewWebGLObserver = null;
+                check();
+              }
+            });
+            observer.observe(root, {childList: true, subtree: true});
+            window.__mmfemAxisPreviewWebGLObserver = observer;
+            queueMicrotask(check);
+          }
+          return;
+        }
+        if (window.__mmfemAxisPreviewWebGLObserver) {
+          window.__mmfemAxisPreviewWebGLObserver.disconnect();
+          window.__mmfemAxisPreviewWebGLObserver = null;
+        }
+        if (warning.__mmfemWebGLCheckScheduled) return;
+        warning.__mmfemWebGLCheckScheduled = true;
+        const deadline = performance.now() + 2500;
+        const settle = () => {
+          const graph = plot.querySelector('.js-plotly-plot');
+          if ((!graph || !graph._fullLayout) && performance.now() < deadline) {
+            setTimeout(settle, 100);
+            return;
+          }
+          let context = null;
+          let ownsContext = false;
+          if (graph && graph._fullLayout) {
+            for (const canvas of graph.querySelectorAll('canvas')) {
+              try {
+                context = canvas.getContext('webgl2')
+                  || canvas.getContext('webgl')
+                  || canvas.getContext('experimental-webgl');
+                if (context && !context.isContextLost()) break;
+                context = null;
+              } catch (_) {
+                context = null;
+              }
+            }
+          }
+          if (!context) {
+            try {
+              const canvas = document.createElement('canvas');
+              context = canvas.getContext('webgl2')
+                || canvas.getContext('webgl')
+                || canvas.getContext('experimental-webgl');
+              ownsContext = Boolean(context);
+            } catch (_) {
+              context = null;
+            }
+          }
+          const available = Boolean(context) && !context.isContextLost();
+          if (context && ownsContext) {
+            context.getExtension('WEBGL_lose_context')?.loseContext();
+          }
+          if (available) {
+            warning.style.display = 'none';
+            plot.style.display = 'flex';
+          } else {
+            warning.setAttribute('role', 'alert');
+            warning.style.display = 'flex';
+            plot.style.display = 'none';
+          }
+          warning.setAttribute(
+            'data-webgl-check', available ? 'available' : 'unavailable'
+          );
+        };
+        settle();
+      };
+      check();
+    })()""")
 
 
 def _run_history_path_key(path):
@@ -462,9 +537,11 @@ class SolveWorkspace(Div):
         self._canvas_zoom_generation = 0
         self._preview_3d_active = False
         self._preview_3d_component = None
-        self._preview_3d_scene = None
-        self._preview_3d_renderers = {}
-        self._preview_3d_edge_renderers = {}
+        self._preview_3d_plot = None
+        self._preview_3d_figure = None
+        self._preview_3d_region_trace_indices = {}
+        self._preview_3d_edge_trace_indices = {}
+        self._preview_3d_webgl_warning = None
         self._preview_region_visibility = {}
         self._preview_visibility_controls = {}
         self._editor_drawer = None
@@ -947,7 +1024,7 @@ class SolveWorkspace(Div):
         preview_header = Div(
             Div(
                 Div("3D Geometry Preview", ui_style="font-size:17px; font-weight:650;"),
-                Div("Rotate, pan, and zoom the revolved axisymmetric geometry.", ui_style="font-size:12px; color:var(--fg-muted); margin-top:2px;"),
+                Div("WebGL preview · drag to rotate, right-drag to pan, scroll to zoom.", ui_style="font-size:12px; color:var(--fg-muted); margin-top:2px;"),
                 ui_style="display:flex; flex-direction:column; min-width:0;",
             ),
             Div(ui_style="flex:1;"),
@@ -981,8 +1058,7 @@ class SolveWorkspace(Div):
             ui_class="mmfem-3d-preview-dialog",
         )
         # QDialog may mount its children before the overlay becomes visible.
-        # The first WebGPU resize can therefore see a zero-sized viewport; resize
-        # again on Quasar's post-transition show event once layout has settled.
+        # Recheck WebGL availability and dispatch a resize after the transition.
         self._preview_3d_dialog.on("show", self._resize_visible_3d_preview)
         self._canvas_panel = Div(
             self._canvas_host,
@@ -12469,9 +12545,14 @@ class SolveWorkspace(Div):
             OCCGeometry, Pnt, Revolve, Segment, SplineInterpolation, Vec,
             Vertex, Wire,
         )
-        from ngapp.components import WebgpuComponent
-        from ngsolve_webgpu import GeometryRenderer
-        from webgpu import CoordinateAxes
+        import numpy as np
+        from .plot import PlotComponent
+        from .three_d_preview import (
+            _MAX_SURFACE_TRIANGLES,
+            axisymmetric_preview_figure,
+            tessellate_occ_feature_edges,
+            tessellate_occ_shape,
+        )
 
         regions = self.model.get("geometry", {}).get("regions", [])
         live_region_ids = {region.get("id") for region in regions if region.get("id")}
@@ -12637,64 +12718,98 @@ class SolveWorkspace(Div):
                 if len(adjacent_faces) > 1
             ]
 
-        renderers = []
-        self._preview_3d_renderers = {}
-        self._preview_3d_edge_renderers = {}
-        self._preview_3d_scene = None
-        self._preview_face_region_ids = {}
-        self._preview_edge_region_ids = {}
+        preview_regions = []
         if preview_solids:
-            # Separate region renderers preserve independent opacity settings.
-            for region, solid in zip(regions, preview_solids):
-                for face in solid.faces:
-                    self._preview_face_region_ids.setdefault(hash(face), []).append(region["id"])
-
-            for region, solid in zip(regions, preview_solids):
-                geometry = OCCGeometry(solid)
-                renderer = GeometryRenderer(geometry)
-                renderer.faces.active = True
-                # OCC includes periodic seam edges in the solid topology. Keep
-                # surface rendering smooth and overlay only true feature edges
-                # shared by distinct faces.
-                renderer.edges.active = False
-                self._preview_3d_renderers[region["id"]] = renderer
-                renderers.append(renderer)
-
+            material_index = {
+                material.get("id"): index
+                for index, material in enumerate(self.model.get("materials", []))
+            }
+            used_triangles = 0
+            for index, (region, solid) in enumerate(zip(regions, preview_solids)):
+                remaining_triangles = _MAX_SURFACE_TRIANGLES - used_triangles
+                if remaining_triangles <= 0:
+                    raise ValueError(
+                        "The combined geometry preview is too detailed "
+                        f"({used_triangles:,} surface triangles). Simplify the geometry."
+                    )
+                mesh = tessellate_occ_shape(
+                    solid,
+                    max_triangles=remaining_triangles,
+                )
+                used_triangles += len(mesh["triangles"])
                 feature_edges = true_feature_edges(solid)
+                segments = np.empty((0, 2, 3), dtype=np.float32)
                 if feature_edges:
-                    edge_geometry = OCCGeometry(Compound(feature_edges))
-                    edge_renderer = GeometryRenderer(edge_geometry)
-                    # The upstream edge shader pushes lines substantially toward
-                    # the camera, making far-side edges show through opaque faces.
-                    # Keep only a sub-pixel bias for stable surface-edge rasterization;
-                    # the normal depth test then occludes edges behind the solid.
-                    edge_shader_getter = getattr(edge_renderer.edges, "get_shader_code", None)
-                    if callable(edge_shader_getter):
-                        edge_renderer.edges.get_shader_code = lambda getter=edge_shader_getter: (
-                            _surface_visible_preview_edge_shader(getter())
-                        )
-                    edge_renderer.faces.active = False
-                    edge_renderer.edges.active = True
-                    self._preview_3d_edge_renderers[region["id"]] = edge_renderer
-                    for edge in edge_geometry.edges:
-                        self._preview_edge_region_ids.setdefault(hash(edge), set()).add(region["id"])
-                    renderers.append(edge_renderer)
+                    segments = tessellate_occ_feature_edges(
+                        Compound(feature_edges)
+                    )
+                color_index = material_index.get(
+                    region.get("material_id"), index
+                )
+                preview_regions.append({
+                    "id": region["id"],
+                    "name": region.get("name") or f"Region {index + 1}",
+                    "color": _MATERIAL_COLORS[
+                        color_index % len(_MATERIAL_COLORS)
+                    ],
+                    **mesh,
+                    "feature_edges": segments,
+                })
 
-        axes = CoordinateAxes()
-        renderers.append(axes)
-
-        preview = WebgpuComponent(
-            ui_style="display:block; flex:1 1 auto; width:100%; height:100%; min-width:0; min-height:0;",
+        figure = axisymmetric_preview_figure(preview_regions)
+        plot = PlotComponent(
+            "axisymmetric_3d_preview",
+            {"obj": figure},
+            {},
         )
-        preview.ui_class = "fit mmfem-axisymmetric-3d-preview-canvas"
-        preview.on_mounted(lambda *_: self._resize_3d_preview(preview))
-        scene = preview.draw(renderers)
-        self._preview_3d_scene = scene
-        if preview_solids:
-            scene.options.camera.reset(*scene.bounding_box)
-            scene.render()
-            self._apply_3d_preview_visibility(render=False)
-            scene.render()
+        plot.ui_class = "fit mmfem-axisymmetric-3d-preview-plot"
+        plot.ui_style = (
+            "display:flex; flex:1 1 auto; width:100%; height:100%; "
+            "min-width:0; min-height:0; overflow:hidden;"
+        )
+        warning = Div(
+            Div(
+                "WebGL is unavailable on this graphics device.",
+                ui_style="font-size:16px; font-weight:650; margin-bottom:8px;",
+            ),
+            Div(
+                "Enable browser hardware acceleration or update the graphics driver, "
+                "then reopen this preview. Your editable 2D geometry remains available.",
+                ui_style="font-size:13px; line-height:1.5; max-width:520px;",
+            ),
+            ui_class="mmfem-axisymmetric-3d-preview-webgl-warning",
+            ui_style=(
+                "display:none; position:absolute; inset:0; z-index:2; "
+                "flex-direction:column; align-items:center; justify-content:center; "
+                "padding:28px; text-align:center; color:#233246; "
+                "background:var(--canvas-bg, #f4f6f8);"
+            ),
+            id="mmfem-axisymmetric-3d-preview-webgl-warning",
+        )
+        preview = Div(
+            plot,
+            warning,
+            ui_class="fit mmfem-axisymmetric-3d-preview-canvas",
+            ui_style=(
+                "position:relative; display:flex; flex:1 1 auto; width:100%; "
+                "height:100%; min-width:0; min-height:0; overflow:hidden;"
+            ),
+        )
+        plot.on_mounted(lambda *_: self._resize_3d_preview(plot))
+        preview.on_mounted(lambda *_: self._resize_visible_3d_preview())
+        self._preview_3d_plot = plot
+        self._preview_3d_figure = figure
+        self._preview_3d_region_trace_indices = {}
+        self._preview_3d_edge_trace_indices = {}
+        for trace_index, trace in enumerate(figure.data):
+            metadata = trace.meta or {}
+            region_id = metadata.get("mmfem_region_id")
+            if metadata.get("mmfem_kind") == "axisymmetric_region":
+                self._preview_3d_region_trace_indices[region_id] = trace_index
+            elif metadata.get("mmfem_kind") == "axisymmetric_feature_edges":
+                self._preview_3d_edge_trace_indices[region_id] = trace_index
+        self._preview_3d_webgl_warning = warning
+        self._apply_3d_preview_visibility(render=False)
         return preview
 
     def _render_3d_preview_region_table(self):
@@ -12772,106 +12887,61 @@ class SolveWorkspace(Div):
         self._apply_3d_preview_visibility()
 
     def _apply_3d_preview_visibility(self, *, render=True):
-        """Apply opacity independently so opaque child regions keep the opaque pass."""
-        renderers = getattr(self, "_preview_3d_renderers", {})
-        if not renderers:
+        """Apply per-region visibility and opacity to the preview scene."""
+        figure = getattr(self, "_preview_3d_figure", None)
+        if figure is None:
             return
-        import numpy as np
+        for region_id, trace_index in self._preview_3d_region_trace_indices.items():
+            alpha = _PREVIEW_VISIBILITY_ALPHA[
+                self._preview_region_visibility.get(region_id, "opaque")
+            ]
+            figure.data[trace_index].visible = alpha > 0.0
+            figure.data[trace_index].opacity = alpha
+            edge_index = self._preview_3d_edge_trace_indices.get(region_id)
+            if edge_index is not None:
+                figure.data[edge_index].visible = alpha > 0.0
 
-        material_index = {
-            material.get("id"): index
-            for index, material in enumerate(self.model.get("materials", []))
-        }
-        region_order = {
-            region.get("id"): index
-            for index, region in enumerate(self.model.get("geometry", {}).get("regions", []))
-        }
-        regions_by_id = {
-            region.get("id"): region
-            for region in self.model.get("geometry", {}).get("regions", [])
-        }
-
-        for own_region_id, renderer in renderers.items():
-            faces = list(renderer.geo.faces)
-            face_colors = np.tile(
-                np.array([0.42, 0.55, 0.68, 1.0], dtype=np.float32), len(faces)
-            )
-            face_alphas = []
-            for face_index, face in enumerate(faces):
-                region_ids = self._preview_face_region_ids.get(hash(face), (own_region_id,))
-                visible_regions = [rid for rid in region_ids if rid in regions_by_id]
-                if not visible_regions:
-                    visible_regions = [own_region_id]
-                region_id = max(
-                    visible_regions,
-                    key=lambda rid: _PREVIEW_VISIBILITY_ALPHA[
-                        self._preview_region_visibility.get(rid, "opaque")
-                    ],
-                )
-                region = regions_by_id[region_id]
-                palette_index = material_index.get(
-                    region.get("material_id"), region_order.get(region_id, 0)
-                )
-                palette = _MATERIAL_COLORS[palette_index % len(_MATERIAL_COLORS)]
-                rgb = tuple(int(palette[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
-                alpha = max(
-                    _PREVIEW_VISIBILITY_ALPHA[
-                        self._preview_region_visibility.get(rid, "opaque")
-                    ]
-                    for rid in visible_regions
-                )
-                face_colors[4 * face_index:4 * face_index + 4] = (*rgb, alpha)
-                face_alphas.append(alpha)
-            renderer.faces.set_colors(face_colors)
-            renderer.faces.transparent = any(0.0 < alpha < 1.0 for alpha in face_alphas)
-            renderer.faces.active = any(alpha > 0.0 for alpha in face_alphas)
-
-            # True feature edges are drawn separately from the face renderer;
-            # this prevents OCC seam and polygon segmentation edges appearing
-            # as a dense black cage on curved surfaces.
-            renderer.edges.active = False
-            edge_renderer = getattr(self, "_preview_3d_edge_renderers", {}).get(own_region_id)
-            if edge_renderer is not None:
-                edges = list(edge_renderer.geo.edges)
-                edge_colors = np.tile(
-                    np.array([0.12, 0.16, 0.21, 1.0], dtype=np.float32), len(edges)
-                )
-                for edge_index, edge in enumerate(edges):
-                    region_ids = self._preview_edge_region_ids.get(hash(edge), {own_region_id})
-                    alpha = max(
-                        _PREVIEW_VISIBILITY_ALPHA[
-                            self._preview_region_visibility.get(rid, "opaque")
-                        ]
-                        for rid in region_ids
-                    )
-                    edge_colors[4 * edge_index + 3] = 0.0 if alpha == 0.0 else 1.0
-                edge_renderer.edges.set_colors(edge_colors)
-                edge_renderer.edges.active = any(edge_colors[3::4] > 0.0)
-                edge_renderer.set_needs_update()
-            # Alpha changes select a different GPU render pipeline. Invalidate
-            # the cached pass so a formerly opaque shell cannot keep writing
-            # depth over the opaque child renderers.
-            renderer.set_needs_update()
-
-        if render and self._preview_3d_scene is not None:
-            self._preview_3d_scene.render()
+        plot = getattr(self, "_preview_3d_plot", None)
+        if render and plot is not None:
+            plot.update_figure(figure)
 
     @staticmethod
     def _resize_3d_preview(preview):
-        """Resize after the canvas has entered the visible flex viewport."""
+        """Resize the responsive WebGL plot after it enters the modal viewport."""
         try:
-            if preview.canvas is not None:
-                preview.canvas.resize()
-            if preview.scene is not None:
-                preview.scene.render()
+            preview.call_js(
+                lambda js: js.eval(
+                    "window.dispatchEvent(new Event('resize'))"
+                )
+            )
         except Exception:
-            # Browser resize/render can race component mount in some frontends.
+            # Browser resize can race component mounting and dialog transitions.
             pass
 
     def _resize_visible_3d_preview(self, *_args):
-        preview = self._preview_3d_component
-        if preview is not None:
-            self._resize_3d_preview(preview)
+        plot = self._preview_3d_plot
+        if plot is not None:
+            try:
+                _check_axisymmetric_preview_webgl(self.js)
+            except Exception:
+                warning = self._preview_3d_webgl_warning
+                if warning is not None:
+                    warning.ui_children = [
+                        Div(
+                            "WebGL support could not be verified.",
+                            ui_style="font-size:16px; font-weight:650; margin-bottom:8px;",
+                        ),
+                        Div(
+                            "Enable browser hardware acceleration or update the graphics "
+                            "driver, then reopen this preview. Your editable 2D geometry "
+                            "remains available.",
+                            ui_style="font-size:13px; line-height:1.5; max-width:520px;",
+                        ),
+                    ]
+                    warning.ui_style = warning.ui_style.replace(
+                        "display:none;", "display:flex;"
+                    )
+            self._resize_3d_preview(plot)
 
     def toggle_3d_preview(self, *args):
         """Open or close the large read-only 3D preview window."""
@@ -12880,11 +12950,11 @@ class SolveWorkspace(Div):
             self._preview_3d_dialog.ui_model_value = False
             self._preview_3d_viewport.ui_children = []
             self._preview_3d_component = None
-            self._preview_3d_scene = None
-            self._preview_3d_renderers = {}
-            self._preview_3d_edge_renderers = {}
-            self._preview_face_region_ids = {}
-            self._preview_edge_region_ids = {}
+            self._preview_3d_plot = None
+            self._preview_3d_figure = None
+            self._preview_3d_region_trace_indices = {}
+            self._preview_3d_edge_trace_indices = {}
+            self._preview_3d_webgl_warning = None
             self._preview_visibility_controls = {}
             self._preview_3d_button.ui_label = "Preview in 3D"
             self._preview_3d_button.ui_icon = "mdi-cube-scan"
@@ -12911,6 +12981,7 @@ class SolveWorkspace(Div):
         self._preview_3d_button.ui_flat = False
         self._preview_3d_tooltip.ui_children = ["Return to the editable meridian sketch."]
         self._message("3D preview: left-drag to rotate, middle-drag or Shift+left-drag to pan, scroll to zoom.")
+        self._resize_visible_3d_preview()
 
     @_history_tracked
     def _set_region_value(self, region_id, key, value):

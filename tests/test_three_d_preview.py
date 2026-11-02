@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from ngsolve_gui.three_d_preview import preview_figure, project_preview_payload
+from ngsolve_gui.three_d_preview import (
+    axisymmetric_preview_figure,
+    preview_figure,
+    project_preview_payload,
+    tessellate_occ_feature_edges,
+    tessellate_occ_shape,
+)
 from ngsolve_gui.three_d_project import (
     add_step_geometry,
     add_wire_trace,
@@ -11,6 +17,37 @@ from ngsolve_gui.three_d_project import (
     package_3d_project,
     unpack_3d_project,
 )
+
+
+def test_axisymmetric_occ_preview_tessellation_preserves_dimensions_and_edges():
+    import numpy as np
+    from netgen.occ import Axis, Circle, Compound, Dir, Face, Pnt, Revolve, Segment, Vec, Wire
+
+    profile = Face(Wire(Circle(Pnt(0.035, 0.0, 0.0), Dir(0.0, 1.0, 0.0), 0.015)))
+    solid = Revolve(profile, Axis(Pnt(0.0, 0.0, 0.0), Vec(0.0, 0.0, 1.0)), 360.0)
+    mesh = tessellate_occ_shape(solid)
+    edge = Segment(Pnt(0.02, 0.0, -0.1), Pnt(0.05, 0.0, -0.1))
+    feature_edges = tessellate_occ_feature_edges(Compound([edge]))
+
+    assert mesh["vertices"].ndim == 2 and mesh["vertices"].shape[1] == 3
+    assert mesh["triangles"].ndim == 2 and mesh["triangles"].shape[1] == 3
+    assert np.isfinite(mesh["vertices"]).all()
+    assert float(mesh["vertices"][:, 2].max() - mesh["vertices"][:, 2].min()) == pytest.approx(
+        0.03, rel=0.03
+    )
+    assert feature_edges.ndim == 3 and feature_edges.shape[1:] == (2, 3)
+    assert len(feature_edges) > 0
+
+    figure = axisymmetric_preview_figure([{
+        "id": "test-region",
+        "name": "Torus",
+        "color": "#6886ac",
+        **mesh,
+        "feature_edges": feature_edges,
+    }])
+    assert [trace.type for trace in figure.data] == ["mesh3d", "scatter3d"]
+    assert figure.layout.scene.aspectmode == "data"
+    assert figure.layout.scene.dragmode == "orbit"
 
 
 def test_realistic_magnet_shield_step_imports_and_combines_with_golay_trace():
