@@ -1558,7 +1558,11 @@ def test_small_3d_dc_sphere_matches_uniform_field_and_permeability_effect(tmp_pa
     geometry["mesh_maxh_mm"] = 2.0
 
     measured = {}
+    mesh_elements = {}
     for relative_permeability in (1.0, 2.0):
+        mesh_sizes = (2.0,) if relative_permeability == 1.0 else (2.0, 1.5)
+        measured[relative_permeability] = {}
+        mesh_elements[relative_permeability] = {}
         project["materials"] = [{
             "id": "dc-sphere-alloy",
             "name": "DC sphere alloy",
@@ -1570,44 +1574,72 @@ def test_small_3d_dc_sphere_matches_uniform_field_and_permeability_effect(tmp_pa
                 "density": 0.0,
             },
         }]
-        manifest, output_dir = _run_packaged_solver_model(
-            project, assets, tmp_path, f"dc-sphere-mur-{relative_permeability:g}"
-        )
-        assert manifest["physics"] == "Static/DC magnetics"
-        assert "frequency_hz" not in manifest
-        assert manifest["status"] == "complete"
-        assert manifest["mesh"]["elements"] < 50_000
-        artifact = output_dir / manifest["dc_background_field"]["file"]
-        assert artifact.is_file()
-        with np.load(artifact, allow_pickle=False) as archive:
-            stored_coefficients = archive["coefficients"]
-            stored_metadata = json.loads(str(archive["metadata"].item()))
-        assert stored_coefficients.size == stored_metadata["dof_count"]
-        assert stored_metadata["mesh_sha256"]
-        assert stored_metadata["input_fingerprint"] == manifest["dc_input_fingerprint"]
-        field_path = next(
-            output_dir / name for name in manifest["fields"] if "gfBDC" in name
-        )
-        with field_path.open("rb") as stream:
-            flux_density = pickle.load(stream)
-        mesh = __import__("ngsolve").Mesh(str(output_dir / "mesh.vol"))
-        value = np.asarray(flux_density(mesh(0.0, 0.0, 0.0)), dtype=float)
-        assert np.isfinite(value).all()
-        measured[relative_permeability] = float(value[2])
+        for mesh_maxh_mm in mesh_sizes:
+            geometry["mesh_maxh_mm"] = mesh_maxh_mm
+            run_name = (
+                f"dc-sphere-mur-{relative_permeability:g}-h-{mesh_maxh_mm:g}"
+            )
+            manifest, output_dir = _run_packaged_solver_model(
+                project, assets, tmp_path, run_name
+            )
+            assert manifest["physics"] == "Static/DC magnetics"
+            assert "frequency_hz" not in manifest
+            assert manifest["status"] == "complete"
+            assert manifest["mesh"]["elements"] < 50_000
+            artifact = output_dir / manifest["dc_background_field"]["file"]
+            assert artifact.is_file()
+            with np.load(artifact, allow_pickle=False) as archive:
+                stored_coefficients = archive["coefficients"]
+                stored_metadata = json.loads(str(archive["metadata"].item()))
+            assert stored_coefficients.size == stored_metadata["dof_count"]
+            assert stored_metadata["mesh_sha256"]
+            assert stored_metadata["input_fingerprint"] == manifest["dc_input_fingerprint"]
+            field_path = next(
+                output_dir / name for name in manifest["fields"] if "gfBDC" in name
+            )
+            with field_path.open("rb") as stream:
+                flux_density = pickle.load(stream)
+            mesh = __import__("ngsolve").Mesh(str(output_dir / "mesh.vol"))
+            value = np.asarray(flux_density(mesh(0.0, 0.0, 0.0)), dtype=float)
+            assert np.isfinite(value).all()
+            measured[relative_permeability][mesh_maxh_mm] = float(value[2])
+            mesh_elements[relative_permeability][mesh_maxh_mm] = manifest[
+                "mesh"
+            ]["elements"]
 
     # For a sphere in a uniform applied field, the infinite-domain interior
     # solution is B_in = 3*mu_r/(mu_r+2)*B0. The finite air box and coarse
     # first-order mesh introduce a bounded approximation error.
-    assert measured[1.0] == pytest.approx(0.02, rel=0.03, abs=5e-4)
-    assert measured[2.0] == pytest.approx(0.03, rel=0.05, abs=5e-4)
-    assert measured[2.0] > measured[1.0] * 1.25
+    assert measured[1.0][2.0] == pytest.approx(0.02, rel=0.03, abs=5e-4)
+    assert measured[2.0][2.0] == pytest.approx(0.03, rel=0.05, abs=5e-4)
+    assert measured[2.0][1.5] == pytest.approx(0.03, rel=0.05, abs=5e-4)
+    coarse_error = abs(measured[2.0][2.0] - 0.03)
+    refined_error = abs(measured[2.0][1.5] - 0.03)
+    assert refined_error < coarse_error, (
+        f"The refined 1.5 mm mesh did not improve the analytic sphere error: "
+        f"coarse={coarse_error}, refined={refined_error}, "
+        f"measured={measured[2.0]!r}"
+    )
+    assert measured[2.0][2.0] > measured[1.0][2.0] * 1.25
     print(json.dumps({
         "reference": "uniform-field permeable sphere",
         "applied_Bz_T": 0.02,
         "analytic_Bz_center_T": {"mur_1": 0.02, "mur_2": 0.03},
-        "measured_Bz_center_T": {
-            f"mur_{mur:g}": field for mur, field in measured.items()
+        "measured_Bz_center_T_by_mur_and_mesh_maxh_mm": {
+            f"mur_{mur:g}": {
+                f"h_{mesh_maxh_mm:g}_mm": field
+                for mesh_maxh_mm, field in fields.items()
+            }
+            for mur, fields in measured.items()
         },
+        "mesh_tetrahedra_by_mur_and_mesh_maxh_mm": {
+            f"mur_{mur:g}": {
+                f"h_{mesh_maxh_mm:g}_mm": count
+                for mesh_maxh_mm, count in fields.items()
+            }
+            for mur, fields in mesh_elements.items()
+        },
+        "analytic_error_reduced_by_mesh_refinement": True,
     }, sort_keys=True))
 
 
