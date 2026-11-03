@@ -704,7 +704,7 @@ def test_3d_preview_opens_large_modal_and_exit_restores_editable_sketch(standalo
     assert workspace._preview_3d_component is preview
     assert workspace._preview_3d_dialog.ui_model_value is True
     assert workspace._preview_3d_viewport.ui_children == [preview]
-    assert workspace._canvas_host.ui_children == [original_canvas, workspace._canvas_resize_observer, workspace._canvas_context_menu, workspace._canvas_dimension_editor]
+    assert workspace._canvas_host.ui_children == [original_canvas, workspace._canvas_context_menu, workspace._canvas_dimension_editor]
     assert workspace._preview_3d_dialog._props["maximized"] is True
     assert workspace._preview_3d_dialog._props["persistent"] is False
     assert workspace._preview_3d_exit_button.ui_label == "Exit 3D Preview"
@@ -717,7 +717,7 @@ def test_3d_preview_opens_large_modal_and_exit_restores_editable_sketch(standalo
     assert workspace._preview_3d_dialog.ui_model_value is False
     assert workspace._preview_3d_component is None
     assert workspace._preview_3d_viewport.ui_children == []
-    assert workspace._canvas_host.ui_children == [original_canvas, workspace._canvas_resize_observer, workspace._canvas_context_menu, workspace._canvas_dimension_editor]
+    assert workspace._canvas_host.ui_children == [original_canvas, workspace._canvas_context_menu, workspace._canvas_dimension_editor]
     assert workspace._preview_3d_button.ui_label == "Preview in 3D"
     assert all(not control.ui_hidden for control in workspace._sketch_view_controls)
 
@@ -1033,7 +1033,7 @@ def test_3d_preview_failure_keeps_editable_sketch_active(standalone_components):
 
     assert not workspace._preview_3d_active
     assert workspace._preview_3d_dialog.ui_model_value is False
-    assert workspace._canvas_host.ui_children == [workspace._canvas, workspace._canvas_resize_observer, workspace._canvas_context_menu, workspace._canvas_dimension_editor]
+    assert workspace._canvas_host.ui_children == [workspace._canvas, workspace._canvas_context_menu, workspace._canvas_dimension_editor]
     assert workspace._preview_3d_button.ui_label == "Preview in 3D"
     assert "invalid profile" in workspace.message
 
@@ -4127,7 +4127,7 @@ def test_sketch_grid_has_five_snap_subdivisions_per_major_cell(standalone_compon
 
 def test_sketch_reprojects_to_resized_viewport_without_distorting_geometry(standalone_components):
     workspace = SolveWorkspace()
-    workspace._on_canvas_resize(SimpleNamespace(value={"width": 1200.4, "height": 600.2}))
+    workspace._apply_canvas_resize({"width": 1200.4, "height": 600.2})
 
     assert workspace._canvas_width == 1200
     assert workspace._canvas_height == 600

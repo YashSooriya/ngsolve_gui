@@ -28,7 +28,6 @@ from ngapp.components import (
     QCard,
     QCardSection,
     QSplitter,
-    QResizeObserver,
     QIcon,
     QList,
     QItem,
@@ -753,8 +752,6 @@ class SolveWorkspace(Div):
             ui_hidden=True,
             ui_style="display:flex; flex-direction:column; max-height:180px; flex:none; min-height:0; overflow:hidden; border-top:1px solid var(--border); background:var(--surface);",
         )
-        self._canvas_resize_observer = QResizeObserver(ui_debounce=80)
-        self._canvas_resize_observer.on_resize(self._on_canvas_resize)
         self._canvas_dimension_input = QInput(
             ui_label="Dimension",
             ui_model_value="",
@@ -804,7 +801,6 @@ class SolveWorkspace(Div):
         self._canvas_context_menu = self._region_context_menu()
         self._canvas_host = Div(
             self._canvas,
-            self._canvas_resize_observer,
             self._canvas_context_menu,
             self._canvas_dimension_editor,
             ui_class="relative-position",
@@ -1744,9 +1740,8 @@ class SolveWorkspace(Div):
         # separate inset plot area.
         return (0.0, 0.0, float(self._canvas_width), float(self._canvas_height))
 
-    def _on_canvas_resize(self, event):
+    def _apply_canvas_resize(self, value):
         """Reproject the sketch after the available viewport size changes."""
-        value = getattr(event, "value", None)
         if not isinstance(value, dict):
             return
         try:
@@ -1997,8 +1992,8 @@ class SolveWorkspace(Div):
         script = r"""
 (() => {
   window.__ngsolveSketchTool = '__SKETCH_TOOL__';
-  if (window.__ngsolveSketchPointerCaptureVersion === 19) return;
-  window.__ngsolveSketchPointerCaptureVersion = 19;
+  if (window.__ngsolveSketchPointerCaptureVersion === 20) return;
+  window.__ngsolveSketchPointerCaptureVersion = 20;
   let active = false;
   let activePointerId = null;
   let dragStart = null;
@@ -2021,6 +2016,9 @@ class SolveWorkspace(Div):
   let visualTranslateY = 0;
   let viewVersion = 0;
   let pendingViewResetToken = 0;
+  let resizePending = false;
+  let resizeFrame = 0;
+  let scheduleCanvasResize = null;
   const committedRegionOffsets = new Map();
   window.__ngsolveSketchViewTransform = [1, 0, 0, viewVersion];
   window.__ngsolveSketchCompletedGesture = null;
@@ -3244,6 +3242,7 @@ class SolveWorkspace(Div):
     active = false;
     activePointerId = null;
     window.__ngsolveSketchGestureActive = false;
+    if (resizePending && scheduleCanvasResize) scheduleCanvasResize();
     if (svg) svg.style.cursor = (window.__ngsolveSketchTool || 'select') === 'select' ? 'default' : 'crosshair';
     if (svg) requestAnimationFrame(() => {
       if (!active) svg.style.cursor = (window.__ngsolveSketchTool || 'select') === 'select' ? 'default' : 'crosshair';
@@ -3281,6 +3280,7 @@ class SolveWorkspace(Div):
     active = false;
     activePointerId = null;
     window.__ngsolveSketchGestureActive = false;
+    if (resizePending && scheduleCanvasResize) scheduleCanvasResize();
     clearPreview(svg, false, true);
     svg.style.cursor = (window.__ngsolveSketchTool || 'select') === 'select' ? 'default' : 'crosshair';
     if (wasActive && notifyPython) {
@@ -3477,6 +3477,10 @@ class SolveWorkspace(Div):
     if (forwardedEvents.has(event)) return;
     const svg = currentSvg();
     if (!svg) return;
+    if (event.type === 'mouseup') {
+      const pendingResize = window.__ngsolveSketchPendingCanvasResize;
+      if (pendingResize && Math.abs(pendingResize.timeStamp - event.timeStamp) < 1) return;
+    }
     const targetIsCanvas = targetIsSvg(event, svg);
     if (event.type === 'wheel') {
       handleWheel(event, svg);
@@ -3547,6 +3551,64 @@ class SolveWorkspace(Div):
   document.addEventListener('mouseup', capture, true);
   document.addEventListener('click', capture, true);
   document.addEventListener('wheel', capture, {capture:true, passive:false});
+  const measureCanvasSize = () => {
+    resizeFrame = 0;
+    const svg = currentSvg();
+    if (!svg) {
+      resizePending = true;
+      return;
+    }
+    const rect = svg.getBoundingClientRect();
+    const width = Math.round(rect.width);
+    const height = Math.round(rect.height);
+    if (width < 100 || height < 100) {
+      resizePending = true;
+      return;
+    }
+    if (active || window.__ngsolveSketchGestureActive) {
+      resizePending = true;
+      return;
+    }
+    const previous = window.__ngsolveSketchCanvasSize;
+    if (previous && previous[0] === width && previous[1] === height) {
+      resizePending = false;
+      return;
+    }
+    resizePending = false;
+    window.__ngsolveSketchCanvasSize = [width, height];
+    const event = new MouseEvent('mouseup', {
+      bubbles: true, cancelable: false, button: 0,
+    });
+    window.__ngsolveSketchPendingCanvasResize = {
+      timeStamp: event.timeStamp, width, height,
+    };
+    svg.dispatchEvent(event);
+  };
+  scheduleCanvasResize = () => {
+    if (resizeFrame) return;
+    resizeFrame = requestAnimationFrame(() => {
+      resizeFrame = requestAnimationFrame(measureCanvasSize);
+    });
+  };
+  const previousResizeObserver = window.__ngsolveSketchResizeObserver;
+  if (previousResizeObserver && previousResizeObserver.disconnect) {
+    previousResizeObserver.disconnect();
+  }
+  if (typeof ResizeObserver === 'function') {
+    const observer = new ResizeObserver(() => {
+      resizePending = true;
+      scheduleCanvasResize();
+    });
+    const svg = currentSvg();
+    if (svg) observer.observe(svg);
+    window.__ngsolveSketchResizeObserver = observer;
+  }
+  window.addEventListener('resize', () => {
+    resizePending = true;
+    scheduleCanvasResize();
+  });
+  resizePending = true;
+  scheduleCanvasResize();
 })()
 """
         try:
@@ -3860,6 +3922,24 @@ class SolveWorkspace(Div):
             self._canvas_drag["moved"] = moved
 
     def _on_canvas_mouse_up(self, event):
+        value = getattr(event, "value", None)
+        timestamp = value.get("timeStamp") if isinstance(value, dict) else None
+        if timestamp is not None:
+            try:
+                timestamp = float(timestamp)
+                resize = self.js.eval(
+                    "((timestamp) => { "
+                    "const pending = window.__ngsolveSketchPendingCanvasResize; "
+                    "if (!pending || Math.abs(pending.timeStamp - timestamp) >= 1) return null; "
+                    "window.__ngsolveSketchPendingCanvasResize = null; "
+                    "return [pending.width, pending.height]; })"
+                    f"({timestamp!r})"
+                )
+            except Exception:
+                resize = None
+            if isinstance(resize, (list, tuple)) and len(resize) == 2:
+                self._apply_canvas_resize({"width": resize[0], "height": resize[1]})
+                return
         try:
             completed = self.js.eval(
                 "(() => { const gesture = window.__ngsolveSketchCompletedGesture || null; "
@@ -12404,7 +12484,6 @@ class SolveWorkspace(Div):
             del self._canvas_region_nodes[region_id]
         self._canvas_host.ui_children = [
             self._canvas,
-            self._canvas_resize_observer,
             self._canvas_context_menu,
             self._canvas_dimension_editor,
         ]

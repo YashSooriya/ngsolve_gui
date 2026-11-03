@@ -138,6 +138,17 @@ def test_axisymmetric_geometry_creation_renders_3d_preview(page: Page, app):
         }""",
         timeout=10_000,
     )
+    page.wait_for_function(
+        """() => {
+            const svg = document.querySelector('svg.solve-sketch-canvas');
+            if (!svg) return false;
+            const rect = svg.getBoundingClientRect();
+            const box = svg.viewBox.baseVal;
+            return Math.abs(box.width - rect.width) < 2
+                && Math.abs(box.height - rect.height) < 2;
+        }""",
+        timeout=10_000,
+    )
 
     def grid_state():
         return page.locator("svg.solve-sketch-canvas").evaluate(
@@ -154,6 +165,14 @@ def test_axisymmetric_geometry_creation_renders_3d_preview(page: Page, app):
                     && liveStyle.visibility !== 'hidden';
                 return {
                     visible: staticVisible || liveVisible,
+                    svgBounds: (() => {
+                        const rect = svg.getBoundingClientRect();
+                        return {width: rect.width, height: rect.height};
+                    })(),
+                    viewBox: (() => {
+                        const box = svg.viewBox.baseVal;
+                        return {width: box.width, height: box.height};
+                    })(),
                     staticDisplay: staticStyle ? staticStyle.display : null,
                     staticVisibility: staticStyle ? staticStyle.visibility : null,
                     staticVisibilityAttribute: grid ? grid.getAttribute('visibility') : null,
@@ -187,10 +206,33 @@ def test_axisymmetric_geometry_creation_renders_3d_preview(page: Page, app):
 
     grid_before = grid_state()
     assert grid_before["visible"] and grid_before["childCount"] > 0
+    assert grid_before["viewBox"]["width"] == pytest.approx(
+        grid_before["svgBounds"]["width"], abs=2
+    )
+    assert grid_before["viewBox"]["height"] == pytest.approx(
+        grid_before["svgBounds"]["height"], abs=2
+    )
     initial_viewport = page.viewport_size
     if initial_viewport != _REVIEW_SCREEN_SIZE:
         page.set_viewport_size(_REVIEW_SCREEN_SIZE)
-        page.wait_for_timeout(300)
+        page.wait_for_function(
+            """() => {
+                const svg = document.querySelector('svg.solve-sketch-canvas');
+                if (!svg) return false;
+                const box = svg.viewBox.baseVal;
+                const rect = svg.getBoundingClientRect();
+                return Math.abs(box.width - rect.width) < 2
+                    && Math.abs(box.height - rect.height) < 2;
+            }""",
+            timeout=10_000,
+        )
+    resized_canvas = grid_state()
+    assert resized_canvas["viewBox"]["width"] == pytest.approx(
+        resized_canvas["svgBounds"]["width"], abs=2
+    )
+    assert resized_canvas["viewBox"]["height"] == pytest.approx(
+        resized_canvas["svgBounds"]["height"], abs=2
+    )
     screenshot_dir = os.environ.get("MMFEM_UI_SCREENSHOT_DIR")
     if screenshot_dir:
         _capture_review_screenshot(
