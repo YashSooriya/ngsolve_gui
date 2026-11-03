@@ -3628,9 +3628,28 @@ class SolveWorkspace(Div):
             # The initial render can run before the browser JS bridge is ready.
             # Re-send settings after the mounted handler confirms that bridge.
             self._sync_canvas_interaction_settings()
+            self._refresh_canvas_svg_children_after_mount()
         except Exception:
             # Tests and non-browser frontends may not expose a JS runtime.
             return
+
+    def _refresh_canvas_svg_children_after_mount(self):
+        """Re-send nested SVG slots after the sketch canvas is mounted.
+
+        The app's initial component tree can be assembled before the browser
+        frontend has mounted. Generic ngapp components nested inside SVG groups
+        may then remain empty ``div`` placeholders until a later slot update.
+        Replaying these three retained layers once on mount lets the frontend
+        materialize the real SVG line, path, and annotation nodes immediately.
+        This also runs after a renderer reconnect, when the component tree is
+        hydrated into a new browser page.
+        """
+        for layer in (
+            self._canvas_grid,
+            self._canvas_scene,
+            self._canvas_dimensions,
+        ):
+            layer.ui_children = list(layer.ui_children)
 
     def _read_canvas_pointer(self, value):
         try:

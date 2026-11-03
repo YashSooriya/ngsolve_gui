@@ -1595,6 +1595,42 @@ def test_line_and_trim_preview_paths_are_separate_from_marquee(standalone_compon
     assert "corner rectangle" not in preview
 
 
+def test_canvas_mount_replays_nested_svg_layers_after_frontend_is_ready(
+    standalone_components, monkeypatch
+):
+    workspace = SolveWorkspace()
+    workspace._add_primitive("rectangle")
+    scripts = []
+    updates = []
+    layers = {
+        "grid": workspace._canvas_grid,
+        "scene": workspace._canvas_scene,
+        "dimensions": workspace._canvas_dimensions,
+    }
+    for name, layer in layers.items():
+        layer._update_frontend = (
+            lambda data, layer_name=name: updates.append((layer_name, data))
+        )
+    monkeypatch.setattr(
+        SolveWorkspace,
+        "js",
+        property(lambda self: SimpleNamespace(eval=scripts.append)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        workspace, "_sync_canvas_interaction_settings", lambda: None
+    )
+
+    workspace._install_canvas_pointer_capture()
+
+    assert len(scripts) == 1
+    assert {name for name, _ in updates} == set(layers)
+    assert all("default" in data["slots"] for _, data in updates)
+    slot_updates = {name: data["slots"]["default"] for name, data in updates}
+    assert slot_updates["grid"]
+    assert slot_updates["scene"]
+
+
 
 def test_click_line_chain_waits_until_finish_and_then_commits_all_segments(standalone_components):
     workspace = SolveWorkspace()
