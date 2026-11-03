@@ -12,6 +12,7 @@ from .three_d_project import (
     _LEGACY_DOMAIN_SELECTION_ERROR,
     build_3d_solver_inputs,
     build_wire_trace_sets,
+    domain_material_overrides,
     domain_mesh_size_overrides,
     step_geometry_tags,
 )
@@ -31,6 +32,110 @@ def _finite_material_property(material, key, *, default=None):
             f"Material {material.get('name', '')!r} has a non-finite {key.replace('_', ' ')} value."
         )
     return value
+
+
+def material_properties_for_study(material, physics, *, for_solid=True):
+    """Resolve only the properties required by the selected 3D formulation.
+
+    The existing solver API still receives all five coefficient dictionaries.
+    Values for the inactive formulation therefore receive neutral defaults;
+    incomplete inactive properties never prevent a supported single-physics
+    study from running.
+    """
+    if physics not in SUPPORTED_3D_STUDIES:
+        raise ValueError("Choose a supported 3D harmonic study.")
+    name = str(material.get("name", "Material"))
+    is_em = physics == "harmonic_em"
+    props = material.get("properties", {})
+    defaults = {
+        "relative_permeability": 1.0,
+        "electrical_conductivity": 0.0,
+        "youngs_modulus": 0.0,
+        "poissons_ratio": 0.3,
+        "density": 0.0,
+    }
+    required = (
+        ("relative_permeability", "electrical_conductivity")
+        if is_em else
+        ("youngs_modulus", "poissons_ratio", "density")
+    )
+    values = {}
+    for key in required:
+        value = _finite_material_property(material, key)
+        values[key] = value
+
+    # Populate all coefficient dictionaries expected by the existing solver.
+    # Invalid or absent inactive values are harmless to this single-physics
+    # formulation and are deliberately replaced with neutral values.
+    for key, default in defaults.items():
+        if key in values:
+            continue
+        raw = props.get(key)
+        try:
+            value = float(raw) if raw not in (None, "") else default
+            if not math.isfinite(value):
+                value = default
+        except (TypeError, ValueError, OverflowError):
+            value = default
+        values[key] = value
+
+    mur = values["relative_permeability"]
+    sigma = values["electrical_conductivity"]
+    youngs = values["youngs_modulus"]
+    poisson = values["poissons_ratio"]
+    density = values["density"]
+    if is_em and (mur <= 0 or sigma < 0):
+        raise ValueError(
+            f"Material {name!r} needs relative permeability > 0 and "
+            "electrical conductivity ≥ 0 for time-harmonic EM."
+        )
+    if not is_em:
+        if for_solid and name.strip().casefold() == "air":
+            raise ValueError(
+                "Air cannot be assigned to a mechanics solid. Choose a material "
+                "with mechanical properties."
+            )
+        if youngs <= 0:
+            raise ValueError(
+                f"Material {name!r} needs positive Young's modulus for a mechanical study."
+            )
+        if density <= 0:
+            raise ValueError(
+                f"Material {name!r} has density outside the supported physical range; "
+                "density must be positive for a mechanical study."
+            )
+        if not -0.99 < poisson < 0.5:
+            raise ValueError(
+                f"Material {name!r} needs Poisson's ratio between -0.99 and 0.5 "
+                "for a mechanical study."
+            )
+    return {
+        "mur": mur,
+        "sigma": sigma,
+        "youngs": youngs,
+        "poisson": poisson,
+        "density": density,
+    }
+
+
+def validate_material_definition(material):
+    """Validate values the user has entered without requiring both physics sets."""
+    props = material.get("properties", {})
+    for key in (
+        "relative_permeability", "electrical_conductivity", "youngs_modulus",
+        "poissons_ratio", "density",
+    ):
+        raw = props.get(key)
+        if raw in (None, ""):
+            continue
+        value = _finite_material_property(material, key)
+        if key == "relative_permeability" and value <= 0:
+            raise ValueError("Relative permeability must be greater than zero.")
+        if key in {"electrical_conductivity", "youngs_modulus", "density"} and value < 0:
+            raise ValueError(f"{key.replace('_', ' ').title()} cannot be negative.")
+        if key == "poissons_ratio" and not -0.99 < value < 0.5:
+            raise ValueError("Poisson's ratio must be between -0.99 and 0.5.")
+    return True
 
 
 def _point_coordinates(point):
@@ -98,6 +203,7 @@ def validate_time_harmonic_em_setup(project):
         raise ValueError("The Air material is unavailable; restore the built-in material library.")
 
     material_names = set()
+    solid_material_names = set()
     for geometry in project.get("geometries", []):
         default_material = str(geometry.get("material", "")).strip()
         if not default_material:
@@ -107,11 +213,7 @@ def validate_time_harmonic_em_setup(project):
                 f"Assign a physical material to {geometry.get('name', 'Geometry')!r} before running."
             )
         names = [default_material]
-        names.extend(
-            selection.get("material", "")
-            for selection in geometry.get("domain_selections", [])
-            if selection.get("material")
-        )
+        names.extend(domain_material_overrides(geometry, require_stable_tags=True).values())
         mesh_size = float(geometry.get("mesh_maxh_mm", 30.0))
         if not math.isfinite(mesh_size) or mesh_size <= 0:
             raise ValueError(f"{geometry.get('name', 'Geometry')!r} needs a positive mesh size.")
@@ -122,6 +224,7 @@ def validate_time_harmonic_em_setup(project):
                     f"{_LEGACY_DOMAIN_SELECTION_ERROR} Selection {selection.get('name', '')!r}."
                 )
         material_names.update(str(name).strip() for name in names if str(name).strip())
+        solid_material_names.update(str(name).strip() for name in names if str(name).strip())
     if electromagnetic:
         for trace_set in project.get("wire_trace_sets", []):
             for trace in trace_set.get("traces", []):
@@ -129,6 +232,7 @@ def validate_time_harmonic_em_setup(project):
 
     resolved = {}
     required_material_names = material_names | ({"Air"} if electromagnetic else set())
+    solid_material_keys = {item.casefold() for item in solid_material_names}
     for name in required_material_names:
         record = records.get(name.casefold())
         if record is None:
@@ -139,25 +243,12 @@ def validate_time_harmonic_em_setup(project):
             raise ValueError(
                 f"Material {name!r} is not embedded in this project. Choose it from the material library."
             )
-        mur = _finite_material_property(record, "relative_permeability")
-        sigma = _finite_material_property(record, "electrical_conductivity")
-        youngs = _finite_material_property(record, "youngs_modulus", default=0)
-        poisson = _finite_material_property(record, "poissons_ratio", default=0.3)
-        density = _finite_material_property(record, "density", default=0)
-        if mur <= 0 or sigma < 0 or youngs < 0 or density < 0 or not -0.99 < poisson < 0.5:
-            raise ValueError(f"Material {name!r} has values outside the supported physical range.")
-        if mechanical and name.casefold() != "air" and (youngs <= 0 or density <= 0):
-            raise ValueError(
-                f"Material {name!r} needs positive Young's modulus and density for a mechanical study."
-            )
-        resolved[record["name"]] = {
-            "name": record["name"],
-            "mur": mur,
-            "sigma": sigma,
-            "youngs": youngs,
-            "poisson": poisson,
-            "density": density,
-        }
+        properties = material_properties_for_study(
+            record,
+            physics,
+            for_solid=name.casefold() in solid_material_keys,
+        )
+        resolved[record["name"]] = {"name": record["name"], **properties}
     return {
         "physics": physics,
         "frequency_hz": frequency_hz,
@@ -437,8 +528,13 @@ def build_time_harmonic_em_problem(project, asset_paths):
         "Edict": {name: item["youngs"] for name, item in material_data.items()},
         "nudict": {name: item["poisson"] for name, item in material_data.items()},
         "rhodict": {name: item["density"] for name, item in material_data.items()},
+        # The current 3D harmonic formulation distinguishes conducting
+        # domains from nonconducting media through this flag.  Derive it from
+        # the assigned conductivity so a zero-conductivity solid receives the
+        # same magnetic-only regularized form as the surrounding air.
         "inoroutdict": {
-            name: int(name != "_mmfem_air") for name in material_names
+            name: int(material_data[name]["sigma"] > 0.0)
+            for name in material_names
         },
         "mechSubdom": "|".join(solid_domain_keys),
         "Neudict": {"Neu_0": 0},

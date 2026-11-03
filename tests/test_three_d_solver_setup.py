@@ -80,6 +80,82 @@ def test_mechanical_setup_accepts_body_force_without_electromagnetic_trace():
     assert "Air" not in validated["materials"]
 
 
+def test_em_materials_require_only_em_properties():
+    project = _study_project()
+    project["geometries"][0]["material"] = "EM-only alloy"
+    project["geometries"][0]["domain_selections"] = []
+    project["materials"] = [{
+        "id": "em-only-alloy",
+        "name": "EM-only alloy",
+        "properties": {
+            "relative_permeability": "1.2",
+            "electrical_conductivity": "3.4e6",
+            "youngs_modulus": "not used by EM",
+            "poissons_ratio": "not used by EM",
+            "density": "not used by EM",
+        },
+    }]
+
+    validated = validate_time_harmonic_em_setup(project)
+
+    assert validated["materials"]["EM-only alloy"] == {
+        "name": "EM-only alloy",
+        "mur": pytest.approx(1.2),
+        "sigma": pytest.approx(3.4e6),
+        "youngs": 0.0,
+        "poisson": 0.3,
+        "density": 0.0,
+    }
+
+
+def test_mechanics_materials_require_only_mechanical_properties():
+    project = _study_project()
+    project["geometries"][0]["material"] = "Elastic-only material"
+    project["geometries"][0]["domain_selections"] = []
+    project["materials"] = [{
+        "id": "elastic-only",
+        "name": "Elastic-only material",
+        "properties": {
+            "youngs_modulus": "2.1e9",
+            "poissons_ratio": "0.29",
+            "density": "1200",
+            "relative_permeability": "not used by mechanics",
+            "electrical_conductivity": "not used by mechanics",
+        },
+    }]
+    project["wire_trace_sets"] = []
+    project["study"].update(
+        physics="harmonic_mechanical",
+        mechanical_body_force_n_m3=[1.0, 0.0, 0.0],
+    )
+
+    validated = validate_time_harmonic_em_setup(project)
+
+    assert validated["materials"]["Elastic-only material"] == {
+        "name": "Elastic-only material",
+        "mur": 1.0,
+        "sigma": 0.0,
+        "youngs": pytest.approx(2.1e9),
+        "poisson": pytest.approx(0.29),
+        "density": pytest.approx(1200),
+    }
+
+
+def test_mechanics_rejects_air_as_a_solid_material():
+    project = _study_project()
+    project["geometries"][0]["material"] = "Air"
+    project["geometries"][0]["domain_selections"] = []
+    project["materials"] = [builtin_materials()[0]]
+    project["wire_trace_sets"] = []
+    project["study"].update(
+        physics="harmonic_mechanical",
+        mechanical_body_force_n_m3=[1.0, 0.0, 0.0],
+    )
+
+    with pytest.raises(ValueError, match="Air cannot be assigned to a mechanics solid"):
+        validate_time_harmonic_em_setup(project)
+
+
 @pytest.mark.parametrize(
     ("body_force", "material_change", "message"),
     [
@@ -228,6 +304,20 @@ def test_study_setup_rejects_legacy_order_based_active_domain_assignment():
         validate_time_harmonic_em_setup(project)
 
 
+def test_study_setup_rejects_conflicting_overlapping_domain_materials():
+    project = _study_project()
+    project["geometries"][0]["domain_selections"].append({
+        "id": "domain-conflict",
+        "name": "Conflicting override",
+        "domain_ids": [0],
+        "domain_tags": ["MMFEM_SOLID_000000000000000000000001"],
+        "material": "Aluminium (77 K shield)",
+    })
+
+    with pytest.raises(ValueError, match="conflicting material assignments"):
+        validate_time_harmonic_em_setup(project)
+
+
 def test_study_setup_rejects_non_numeric_material_properties():
     project = _study_project()
     project["materials"][0]["properties"]["electrical_conductivity"] = "10 megasiemens"
@@ -249,6 +339,7 @@ def test_solver_problem_preserves_local_domain_sizes_and_physical_materials(tmp_
 
     materials = builtin_materials()
     project = new_3d_project("Local mesh setup")
+    materials[5]["properties"]["electrical_conductivity"] = "2.75e5"
     project["materials"] = [materials[4], materials[5]]
     assets = {}
     geometry = add_step_geometry(
@@ -295,11 +386,37 @@ def test_solver_problem_preserves_local_domain_sizes_and_physical_materials(tmp_
     assert problem["murdict"][refined_object] == pytest.approx(
         float(materials[5]["properties"]["relative_permeability"])
     )
+    assert problem["sigmadict"][refined_object] == pytest.approx(2.75e5)
     assert problem["murdict"][coarse_object] == pytest.approx(
         float(materials[4]["properties"]["relative_permeability"])
     )
     assert inputs["material_display_names"][refined_object] == materials[5]["name"]
     assert inputs["material_display_names"][coarse_object] == materials[4]["name"]
+
+
+def test_mesh_maps_boundary_regions_to_stable_step_solids(tmp_path):
+    from netgen.occ import Box, Glue, OCCGeometry, Pnt
+    from ngsolve_gui.three_d_mesh import generate_step_mesh
+    from ngsolve_gui.three_d_project import step_geometry_tags
+
+    step_path = tmp_path / "two_named_bodies.step"
+    Glue([
+        Box(Pnt(0, 0, 0), Pnt(10, 10, 10)),
+        Box(Pnt(20, 0, 0), Pnt(30, 10, 10)),
+    ]).WriteStep(str(step_path))
+    expected_tags, _face_refs = step_geometry_tags(
+        list(OCCGeometry(str(step_path)).solids)
+    )
+
+    result = generate_step_mesh(step_path.read_bytes(), maxh_mm=10.0)
+
+    assert {item["domain_tag"] for item in result["domain_regions"]} == set(expected_tags)
+    assert len(result["boundary_domain_tags"]) == len(result["boundary_region_ids"])
+    assert set(result["boundary_domain_tags"]) == set(expected_tags)
+    assert all(
+        item["domain_tag"] in expected_tags
+        for item in result["boundary_regions"]
+    )
 
 
 def test_named_surface_condition_reaches_solver_mesh_and_dirichlet_boundaries(tmp_path):
@@ -491,12 +608,88 @@ def test_small_3d_solver_run_completes_with_scoped_surface_condition(tmp_path):
     solver_mesh = ngs.Mesh(str(output_dir / "mesh.vol"))
     with (output_dir / flux_field).open("rb") as stream:
         flux_density = pickle.load(stream)
-    value = flux_density(solver_mesh(0.011, 0.005, 0.005))
+    probe_point = (0.0025, 0.005, 0.005)
+    value = flux_density(solver_mesh(*probe_point))
     magnitude = math.sqrt(sum(abs(component) ** 2 for component in value))
     assert math.isfinite(magnitude) and magnitude > 1e-12
+
+    changed_project = copy.deepcopy(project)
+    changed_material = copy.deepcopy(materials[4])
+    changed_material["properties"]["electrical_conductivity"] = "0"
+    changed_project["materials"] = [changed_material]
+    changed_model_path = tmp_path / "small_scoped_boundary_insulating.mmfem3d"
+    changed_model_path.write_bytes(package_3d_project(changed_project, assets))
+    changed_trace = changed_project["wire_trace_sets"][0]["traces"][0]
+    adapted_problem = build_time_harmonic_em_problem(
+        changed_project,
+        {
+            geometry["asset"]: step_path,
+            changed_trace["filename"]: trace_path,
+        },
+    )["problem"]
+    solid_solver_name = next(
+        name for name in adapted_problem["murdict"] if name.startswith("_mmfem_g0_")
+    )
+    assert adapted_problem["sigmadict"][solid_solver_name] == 0
+    assert adapted_problem["inoroutdict"][solid_solver_name] == 0
+    changed_output_dir = tmp_path / "solver-output-insulating"
+    changed_run = subprocess.run(
+        [
+            sys.executable,
+            str(solver_root / "scripts" / "run_gui_3d_model.py"),
+            "--model",
+            str(changed_model_path),
+            "--output-dir",
+            str(changed_output_dir),
+        ],
+        cwd=solver_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=90,
+        env=environment,
+        check=False,
+    )
+    changed_output = re.sub(
+        re.escape(str(tmp_path)),
+        "<temporary-run>",
+        f"{changed_run.stdout}\n{changed_run.stderr}",
+        flags=re.IGNORECASE,
+    )
+    assert changed_run.returncode == 0, changed_output[-5000:]
+    changed_manifest = json.loads(
+        (changed_output_dir / "run_manifest.json").read_text(encoding="utf-8")
+    )
+    assert changed_manifest["status"] == "complete"
+    solver_configuration = json.loads(
+        (changed_output_dir / changed_manifest["problem_file"]).read_text(encoding="utf-8")
+    )
+    solid_material_name = next(
+        name for name in solver_configuration["materials"] if name.startswith("_mmfem_g0_")
+    )
+    assert solver_configuration["materials"][solid_material_name][
+        "electrical_conductivity"
+    ] == 0
+    changed_flux_field = next(
+        field for field in changed_manifest["fields"] if "gfBAC" in field
+    )
+    changed_mesh = ngs.Mesh(str(changed_output_dir / "mesh.vol"))
+    with (changed_output_dir / changed_flux_field).open("rb") as stream:
+        changed_flux_density = pickle.load(stream)
+    changed_value = changed_flux_density(changed_mesh(*probe_point))
+    changed_magnitude = math.sqrt(
+        sum(abs(component) ** 2 for component in changed_value)
+    )
+    assert math.isfinite(changed_magnitude)
+    material_response_delta = changed_magnitude - magnitude
+    assert not math.isclose(magnitude, changed_magnitude, rel_tol=0, abs_tol=1e-12)
     print(
-        "Bounded scoped-boundary run: "
-        f"{solver_mesh.ne} volume elements, |B|={magnitude:.6g} T"
+        "Bounded material-response comparison: "
+        f"{solver_mesh.ne} volume elements at probe {probe_point}, "
+        f"|B| sigma=1.4e6 S/m {magnitude:.12g} T; "
+        f"sigma=0 S/m {changed_magnitude:.12g} T; "
+        f"delta={material_response_delta:.6e} T"
     )
 
 

@@ -109,6 +109,11 @@ def generate_step_mesh(data, *, maxh_mm=30.0, domain_maxh_mm=None):
                 )
             volume = sum(float(solid.mass) for solid in solids)
             solid_tags, face_refs = step_geometry_tags(solids)
+            solid_by_face_tag = {
+                face_tag: solid_tag
+                for face_tag, solid_tag, _face in face_refs
+                if face_tag is not None
+            }
             for solid_tag, solid in zip(solid_tags, solids):
                 solid.mat(solid_tag)
 
@@ -228,6 +233,16 @@ def generate_step_mesh(data, *, maxh_mm=30.0, domain_maxh_mm=None):
             "Boundary",
             include_boundary_tags=True,
         )
+        solid_by_boundary_id = {
+            region["id"]: solid_by_face_tag.get(region.get("boundary_tag"))
+            for region in boundary_regions
+        }
+        for region in boundary_regions:
+            region["domain_tag"] = solid_by_boundary_id[region["id"]]
+        boundary_domain_tags = [
+            solid_by_boundary_id.get(region_id)
+            for region_id in surface_region_ids
+        ]
 
         edge_pairs = np.concatenate(
             (triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]),
@@ -248,6 +263,7 @@ def generate_step_mesh(data, *, maxh_mm=30.0, domain_maxh_mm=None):
             "volume_elements": len(volume_elements),
             "domain_regions": domain_regions,
             "boundary_regions": boundary_regions,
+            "boundary_domain_tags": boundary_domain_tags,
             "tetra_quality": quality,
             "surface_faces": len(triangles),
             "wireframe_available": wireframe_available,

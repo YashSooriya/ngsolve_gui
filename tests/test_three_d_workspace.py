@@ -1,4 +1,5 @@
 from pathlib import Path
+import copy
 from types import SimpleNamespace
 import threading
 
@@ -276,6 +277,121 @@ def test_material_reference_selection_updates_project_and_tree_badge(monkeypatch
     assert workspace.dirty is True
     assert workspace._geometry_items.ui_children[0].ui_children[2].ui_children == ["Copper"]
     assert "Material data is embedded in the project." in workspace._properties.ui_children[3].ui_children[0]
+
+
+def test_3d_material_library_create_edit_and_validation(monkeypatch):
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+
+    class Library:
+        def __init__(self):
+            self.materials = []
+
+        def load(self):
+            return copy.deepcopy(self.materials)
+
+        def save(self, materials):
+            self.materials = copy.deepcopy(materials)
+
+    library = Library()
+    workspace = ThreeDWorkspace(SimpleNamespace(), material_library=library)
+
+    assert workspace._new_material() is True
+    material_id = workspace._material_draft["id"]
+    workspace._set_material_draft_value("name", SimpleNamespace(value="Cryogenic alloy"))
+    workspace._set_material_draft_value(
+        "electrical_conductivity", SimpleNamespace(value="2.4e6")
+    )
+    assert workspace._save_material_draft() is True
+
+    material = next(item for item in library.materials if item["id"] == material_id)
+    assert material["name"] == "Cryogenic alloy"
+    assert material["properties"]["electrical_conductivity"] == "2.4e6"
+    assert any(
+        row.ui_children[1].ui_children == ["Cryogenic alloy"]
+        for row in workspace._materials_items.ui_children
+    )
+    assert workspace.dirty is False
+
+    workspace._begin_material_edit(material_id)
+    workspace._set_material_draft_value(
+        "electrical_conductivity", SimpleNamespace(value="not a number")
+    )
+    assert workspace._save_material_draft() is False
+    assert "numeric electrical conductivity" in workspace._status.ui_children[0]
+    assert library.materials[0]["properties"]["electrical_conductivity"] == "2.4e6"
+
+
+def test_3d_material_edit_updates_references_and_embedded_snapshot(monkeypatch):
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+
+    class Library:
+        def __init__(self, materials):
+            self.materials = copy.deepcopy(materials)
+
+        def load(self):
+            return copy.deepcopy(self.materials)
+
+        def save(self, materials):
+            self.materials = copy.deepcopy(materials)
+
+    material = {
+        "id": "custom-alloy-id",
+        "name": "Custom alloy",
+        "properties": {
+            "relative_permeability": "1.1",
+            "electrical_conductivity": "6e6",
+            "youngs_modulus": "2.0e11",
+            "poissons_ratio": "0.29",
+            "density": "7800",
+        },
+    }
+    library = Library([material])
+    workspace = ThreeDWorkspace(SimpleNamespace(), material_library=library)
+    project = new_3d_project("Material edit persistence")
+    assets = {}
+    geometry = add_step_geometry(
+        project,
+        assets,
+        "part.step",
+        b"ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n",
+        units="mm",
+        material=material["name"],
+    )
+    geometry["domain_selections"] = [{
+        "id": "domain-selection",
+        "name": "Shell solid",
+        "domain_ids": [0],
+        "domain_tags": ["MMFEM_SOLID_000000000000000000000001"],
+        "material": material["name"],
+    }]
+    project["materials"] = [copy.deepcopy(material)]
+    trace_set = add_wire_trace(project, assets, "coil.txt", b"0 0 0\n0 0 1\n")
+    trace_set["material"] = material["name"]
+    trace_set["traces"][0]["material"] = material["name"]
+    workspace.project = project
+    workspace.assets = assets
+    workspace._rebuild_items()
+
+    workspace.select_item("material", material["id"])
+    assert workspace._begin_material_edit(material["id"]) is True
+    workspace._set_material_draft_value("name", SimpleNamespace(value="Cryogenic alloy"))
+    workspace._set_material_draft_value(
+        "electrical_conductivity", SimpleNamespace(value="2.75e5")
+    )
+    assert workspace._save_material_draft() is True
+
+    assert library.materials[0]["name"] == "Cryogenic alloy"
+    assert geometry["material"] == "Cryogenic alloy"
+    assert geometry["domain_selections"][0]["material"] == "Cryogenic alloy"
+    assert trace_set["material"] == trace_set["traces"][0]["material"] == "Cryogenic alloy"
+    assert project["materials"][0]["name"] == "Cryogenic alloy"
+    assert project["materials"][0]["properties"]["electrical_conductivity"] == "2.75e5"
+    assert workspace.dirty is True
+
+    archive = package_3d_project(project, assets)
+    reopened, _reopened_assets = unpack_3d_project(archive)
+    assert reopened["geometries"][0]["material"] == "Cryogenic alloy"
+    assert reopened["materials"][0]["properties"]["electrical_conductivity"] == "2.75e5"
 
 
 def test_preview_worker_dispatches_ui_updates_to_the_application_loop(monkeypatch):
@@ -627,6 +743,7 @@ def _workspace_with_test_mesh(monkeypatch):
     project = new_3d_project("Named selection test")
     assets = {}
     fixture = Path(__file__).parent / "fixtures" / "magnet_shield_4k.step"
+    domain_tag = "MMFEM_SOLID_000000000000000000000001"
     geometry = add_step_geometry(project, assets, fixture.name, fixture.read_bytes(), units="mm")
     workspace.project = project
     workspace.assets = assets
@@ -643,25 +760,28 @@ def _workspace_with_test_mesh(monkeypatch):
                 "name": "Boundary 1",
                 "elements": 1,
                 "boundary_tag": "MMFEM_FACE_000000000000000000000000",
+                "domain_tag": domain_tag,
             },
             {
                 "id": 1,
                 "name": "Boundary 2",
                 "elements": 1,
                 "boundary_tag": "MMFEM_FACE_000000000000000000000001",
+                "domain_tag": domain_tag,
             },
             {
                 "id": 2,
                 "name": "Boundary 3",
                 "elements": 1,
                 "boundary_tag": "MMFEM_FACE_000000000000000000000002",
+                "domain_tag": domain_tag,
             },
         ],
         "domain_regions": [{
             "id": 0,
             "name": "Shield",
             "elements": 4,
-            "domain_tag": "MMFEM_SOLID_000000000000000000000001",
+            "domain_tag": domain_tag,
         }],
         "tetra_quality": {
             "minimum": 0.3,
@@ -676,6 +796,74 @@ def _workspace_with_test_mesh(monkeypatch):
     workspace._rebuild_items()
     workspace._rebuild_properties()
     return workspace, geometry
+
+
+def test_solid_tree_renames_assigns_and_persists_stable_body_identity(monkeypatch):
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    geometry["material"] = "Copper"
+    workspace._rebuild_items()
+    tag = workspace._mesh_results[geometry["id"]]["domain_regions"][0]["domain_tag"]
+
+    body_row = next(
+        row for row in workspace._geometry_items.ui_children
+        if getattr(row, "_props", {}).get("title", "").startswith("Shield")
+    )
+    assert body_row._props["title"].startswith("Shield")
+    workspace.select_item("solid", (geometry["id"], tag))
+    assert workspace._selection == ("solid", (geometry["id"], tag))
+    assert workspace._active_boundary_region_ids(geometry["id"]) == [0, 1, 2]
+
+    assert workspace._set_solid_name(geometry, tag, SimpleNamespace(value="Cryostat shell"))
+    assert geometry["solid_names"][tag] == "Cryostat shell"
+    assert workspace._set_solid_material(
+        geometry,
+        workspace._mesh_results[geometry["id"]]["domain_regions"][0],
+        SimpleNamespace(value="Aluminium (77 K shield)"),
+    )
+    selection = geometry["domain_selections"][0]
+    assert selection["domain_tags"] == [tag]
+    assert selection["material"] == "Aluminium (77 K shield)"
+    assert "Aluminium (77 K shield)" in [item["name"] for item in workspace.project["materials"]]
+
+    archive = package_3d_project(workspace.project, workspace.assets)
+    reopened, _assets = unpack_3d_project(archive)
+    restored = reopened["geometries"][0]
+    assert restored["solid_names"][tag] == "Cryostat shell"
+    assert restored["domain_selections"][0]["domain_tags"] == [tag]
+    assert restored["domain_selections"][0]["material"] == "Aluminium (77 K shield)"
+
+
+def test_solid_tree_selection_isolates_bodies_without_changing_solver_model(monkeypatch):
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    workspace._rebuild_preview = lambda: None
+    result = workspace._mesh_results[geometry["id"]]
+    second_tag = "MMFEM_SOLID_000000000000000000000002"
+    result["domain_regions"].append({
+        "id": 1, "name": "Domain 2", "elements": 4, "domain_tag": second_tag,
+    })
+    for index in range(3):
+        result["boundary_regions"].append({
+            "id": index + 3,
+            "name": f"Boundary {index + 4}",
+            "elements": 1,
+            "boundary_tag": f"MMFEM_FACE_{index + 3:024d}",
+            "domain_tag": second_tag,
+        })
+    result["boundary_region_ids"] = np.asarray([0, 1, 2, 3, 4, 5], dtype=np.int32)
+    workspace._rebuild_items()
+    workspace.select_item("solid", (geometry["id"], second_tag))
+
+    assert workspace._active_boundary_region_ids(geometry["id"]) == [3, 4, 5]
+    assert workspace._isolate_solid(geometry, second_tag) is True
+    assert workspace._hidden_solid_tags[geometry["id"]] == {
+        "MMFEM_SOLID_000000000000000000000001"
+    }
+    assert workspace._active_boundary_region_ids(geometry["id"]) == [3, 4, 5]
+    workspace._toggle_solid_visibility(geometry, second_tag)
+    assert workspace._active_boundary_region_ids(geometry["id"]) == []
+    workspace._show_all_solids(geometry)
+    assert geometry["id"] not in workspace._hidden_solid_tags
+    assert workspace._active_boundary_region_ids(geometry["id"]) == [3, 4, 5]
 
 
 def test_mesh_quality_and_named_domain_boundary_selections_persist(monkeypatch):

@@ -183,6 +183,39 @@ def test_generated_mesh_keeps_an_empty_boundary_overlay_trace():
     assert overlay.visible is False
 
 
+def test_solid_visibility_filters_display_facets_and_pick_regions():
+    import numpy as np
+
+    figure = preview_figure({
+        "geometry": [{
+            "id": "geometry-1",
+            "name": "two_body.step",
+            "vertices": np.asarray([
+                [0, 0, 0], [1, 0, 0], [0, 1, 0],
+                [2, 0, 0], [3, 0, 0], [2, 1, 0],
+            ]),
+            "triangles": np.asarray([[0, 1, 2], [3, 4, 5]]),
+            "edges": np.asarray([
+                [0, 1], [0, 2], [1, 2], [3, 4], [3, 5], [4, 5],
+            ]),
+            "generated_mesh": True,
+            "boundary_region_ids": [10, 20],
+            "boundary_domain_tags": ["solid-a", "solid-b"],
+            "hidden_solid_tags": ["solid-b"],
+            "highlighted_boundary_ids": [10],
+        }],
+        "traces": [],
+    })
+
+    surface = figure.data[0]
+    edges = figure.data[1]
+    assert list(surface.i) == [0]
+    assert list(surface.j) == [1]
+    assert list(surface.k) == [2]
+    assert surface.meta["mmfem_visible_boundary_region_ids"] == [10]
+    assert set(value for value in edges.x if value is not None) <= {0.0, 1.0}
+
+
 def test_boundary_overlay_uses_cached_edges_without_rebuilding_region_index(monkeypatch):
     import numpy as np
     import ngsolve_gui.three_d_preview as preview

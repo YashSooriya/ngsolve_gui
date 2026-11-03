@@ -35,13 +35,19 @@ from .three_d_project import (
     new_3d_project,
     package_3d_project,
     snapshot_material,
+    update_material_references,
     step_unit_scale,
     _LEGACY_DOMAIN_SELECTION_ERROR,
     unpack_3d_project,
     validate_3d_project,
+    domain_material_overrides,
     domain_mesh_size_overrides,
 )
 from .workspace_components import panel_header, property_editor_body
+from .three_d_solver import (
+    material_properties_for_study,
+    validate_material_definition,
+)
 
 
 _UNIT_OPTIONS = [
@@ -87,9 +93,10 @@ def _button(label, icon, callback, *, color=None, tooltip=None):
     return button
 
 
-def _input(label, value, callback, *, number=False, width="118px"):
+def _input(label, value, callback, *, number=False, width="118px", suffix=None):
     widget = QInput(
         ui_label=label,
+        ui_suffix=suffix,
         ui_model_value=value,
         ui_type="number" if number else "text",
         ui_dense=True,
@@ -114,6 +121,11 @@ class ThreeDWorkspace(Div):
         self._mesh_job = None
         self._mesh_worker_active = False
         self._mesh_results = {}
+        self._hidden_solid_tags = {}
+        self._isolated_solid = None
+        self._material_draft = None
+        self._material_draft_source = None
+        self._material_draft_original_name = None
         self._preview_selection_update_handle = None
         self._mesh_surface_visible = True
         self._mesh_edges_visible = True
@@ -211,10 +223,17 @@ class ThreeDWorkspace(Div):
         self._study_node = Div()
         self._study_node.on("click", lambda _event=None: self.select_item("study", None))
         self._geometry_items = Div(ui_style="display:flex; flex-direction:column; gap:2px;")
+        self._materials_items = Div(ui_style="display:flex; flex-direction:column; gap:2px;")
         self._trace_items = Div(ui_style="display:flex; flex-direction:column; gap:2px;")
         self._items = Div(
             self._project_node,
             self._study_node,
+            Div(
+                Div(QIcon(ui_name="mdi-flask-outline", ui_size="16px"), "Materials", ui_style="display:flex; align-items:center; gap:7px; font-weight:650;"),
+                _button("", "mdi-plus", self._new_material, tooltip="Create a reusable material"),
+                ui_style="display:flex; align-items:center; justify-content:space-between; padding:5px 8px; margin-top:10px;",
+            ),
+            self._materials_items,
             Div(
                 Div(QIcon(ui_name="mdi-cube-outline", ui_size="16px"), "Geometry", ui_style="display:flex; align-items:center; gap:7px; font-weight:650;"),
                 _button("", "mdi-plus", self.import_step, tooltip="Import STEP geometry"),
@@ -575,9 +594,8 @@ class ThreeDWorkspace(Div):
         """Require each solver region to reference a known material record."""
         records = self._material_records()
         physics = self.project.get("study", {}).get("physics", "harmonic_em")
-        mechanical = physics == "harmonic_mechanical"
 
-        def is_resolved(name):
+        def is_resolved(name, *, for_solid=True):
             value = str(name or "").strip()
             if (
                 not value
@@ -585,21 +603,20 @@ class ThreeDWorkspace(Div):
                 or value.casefold() not in records
             ):
                 return False
-            if mechanical and value.casefold() != "air":
-                properties = records[value.casefold()].get("properties", {})
-                try:
-                    youngs = float(properties.get("youngs_modulus", 0))
-                    density = float(properties.get("density", 0))
-                except (TypeError, ValueError, OverflowError):
-                    return False
-                if not math.isfinite(youngs) or not math.isfinite(density):
-                    return False
-                if youngs <= 0 or density <= 0:
-                    return False
+            try:
+                material_properties_for_study(
+                    records[value.casefold()], physics, for_solid=for_solid
+                )
+            except ValueError:
+                return False
             return True
 
         for geometry in self.project.get("geometries", []):
             if not is_resolved(geometry.get("material")):
+                return False
+            try:
+                domain_material_overrides(geometry, require_stable_tags=True)
+            except ValueError:
                 return False
             if any(
                 selection.get("material")
@@ -607,12 +624,15 @@ class ThreeDWorkspace(Div):
                 for selection in geometry.get("domain_selections", [])
             ):
                 return False
-        if not mechanical:
+        if physics == "harmonic_em":
             for trace_set in self.project.get("wire_trace_sets", []):
-                if not is_resolved(trace_set.get("material", "Air")):
+                if not is_resolved(trace_set.get("material", "Air"), for_solid=False):
                     return False
                 if any(
-                    not is_resolved(trace.get("material", trace_set.get("material", "Air")))
+                    not is_resolved(
+                        trace.get("material", trace_set.get("material", "Air")),
+                        for_solid=False,
+                    )
                     for trace in trace_set.get("traces", [])
                 ):
                     return False
@@ -641,6 +661,236 @@ class ThreeDWorkspace(Div):
             if name:
                 by_name[name.casefold()] = record
         return by_name
+
+    def _material_tree_records(self):
+        builtins = builtin_materials()
+        library = self._material_library.load()
+        projects = self.project.get("materials", [])
+        builtins_by_id = {item.get("id"): item for item in builtins}
+        library_by_id = {item.get("id"): item for item in library}
+        rows = []
+        seen_ids = set()
+        seen_names = set()
+        for material, source in [
+            *((item, "Built-in") for item in builtins),
+            *((item, "User library") for item in library),
+            *((item, "Project copy") for item in projects),
+        ]:
+            material_id = material.get("id")
+            name = str(material.get("name", "")).strip()
+            if not material_id or not name or material_id in seen_ids or name.casefold() in seen_names:
+                continue
+            # Project snapshots are authoritative only when they are not a
+            # built-in or local material-library definition.
+            if material_id in builtins_by_id:
+                continue
+            if material_id in library_by_id:
+                source = "User library"
+                material = library_by_id[material_id]
+                name = str(material.get("name", "")).strip()
+            rows.append((material, source))
+            seen_ids.add(material_id)
+            seen_names.add(name.casefold())
+        if self._material_draft and self._material_draft.get("id") not in seen_ids:
+            rows.insert(0, (self._material_draft, "Draft"))
+        return rows
+
+    def _material_by_id(self, material_id):
+        for material in self._material_library.load():
+            if material.get("id") == material_id:
+                return material, "library"
+        for material in builtin_materials():
+            if material.get("id") == material_id:
+                return material, "builtin"
+        for material in self.project.get("materials", []):
+            if material.get("id") == material_id:
+                return material, "project"
+        return None, None
+
+    def _new_material(self, *_args):
+        if self._material_draft is not None:
+            self._set_status("Save or cancel the current material edit before creating another.", error=True)
+            return False
+        template = next(
+            material for material in builtin_materials()
+            if material.get("id") == "material-copper"
+        )
+        draft = copy.deepcopy(template)
+        draft.update({"id": f"material-{uuid4().hex}", "name": "New material"})
+        return self._start_material_draft(draft, "new", None)
+
+    def _start_material_draft(self, material, source, original_name):
+        self._material_draft = copy.deepcopy(material)
+        self._material_draft_source = source
+        self._material_draft_original_name = original_name
+        self._selection = ("material", material["id"])
+        self._rebuild_items()
+        self._rebuild_properties()
+        return True
+
+    def _duplicate_material(self, material):
+        draft = copy.deepcopy(material)
+        existing = {name.casefold() for name in self._material_records()}
+        base = f"{material.get('name', 'Material')} (custom)"
+        name = base
+        index = 2
+        while name.casefold() in existing:
+            name = f"{base} {index}"
+            index += 1
+        draft.update({"id": f"material-{uuid4().hex}", "name": name})
+        self._start_material_draft(draft, "new", None)
+
+    def _begin_material_edit(self, material_id):
+        if self._material_draft is not None:
+            if self._material_draft.get("id") == material_id:
+                return True
+            self._set_status("Save or cancel the current material edit before editing another.", error=True)
+            return False
+        material, source = self._material_by_id(material_id)
+        if material is None:
+            self._set_status("This material definition is no longer available.", error=True)
+            return False
+        if source == "builtin":
+            self._duplicate_material(material)
+            return True
+        return self._start_material_draft(material, source, material.get("name", ""))
+
+    def _set_material_draft_value(self, key, event):
+        if self._material_draft is None:
+            return
+        value = str(getattr(event, "value", event) or "").strip()
+        if key == "name":
+            self._material_draft["name"] = value
+        else:
+            self._material_draft.setdefault("properties", {})[key] = value
+
+    def _cancel_material_edit(self, *_args):
+        self._material_draft = None
+        self._material_draft_source = None
+        self._material_draft_original_name = None
+        self._rebuild_items()
+        self._rebuild_properties()
+
+    def _save_material_draft(self, *, save_to_library=False):
+        draft = self._material_draft
+        if draft is None:
+            return False
+        name = str(draft.get("name", "")).strip()
+        if not name:
+            self._set_status("Material name cannot be empty.", error=True)
+            return False
+        draft["name"] = name
+        draft.setdefault("properties", {})
+        if not isinstance(draft["properties"], dict):
+            self._set_status("Material properties must be a mapping of supported values.", error=True)
+            return False
+        material_id = draft.get("id")
+        for other in [*builtin_materials(), *self._material_library.load(), *self.project.get("materials", [])]:
+            if other.get("id") != material_id and str(other.get("name", "")).strip().casefold() == name.casefold():
+                self._set_status(f"A material named {name!r} already exists.", error=True)
+                return False
+        try:
+            validate_material_definition(draft)
+            # An assigned material must be complete for the selected study.
+            original_key = str(self._material_draft_original_name or name).casefold()
+            solid_references = [
+                geometry.get("material")
+                for geometry in self.project.get("geometries", [])
+            ] + [
+                selection.get("material")
+                for geometry in self.project.get("geometries", [])
+                for selection in geometry.get("domain_selections", [])
+            ]
+            trace_references = [
+                trace.get("material", trace_set.get("material", "Air"))
+                for trace_set in self.project.get("wire_trace_sets", [])
+                for trace in trace_set.get("traces", [])
+            ]
+            if any(str(reference or "").casefold() == original_key for reference in solid_references):
+                material_properties_for_study(
+                    draft, self.project.get("study", {}).get("physics", "harmonic_em"),
+                    for_solid=True,
+                )
+            elif (
+                self.project.get("study", {}).get("physics", "harmonic_em") == "harmonic_em"
+                and any(str(reference or "").casefold() == original_key for reference in trace_references)
+            ):
+                material_properties_for_study(draft, "harmonic_em", for_solid=False)
+        except ValueError as error:
+            self._set_status(str(error), error=True)
+            return False
+
+        library = self._material_library.load()
+        source = self._material_draft_source
+        should_save_library = source in {"new", "library"} or save_to_library
+        if should_save_library:
+            next_library = copy.deepcopy(library)
+            existing_index = next(
+                (index for index, item in enumerate(next_library) if item.get("id") == material_id),
+                None,
+            )
+            if existing_index is None:
+                next_library.append(copy.deepcopy(draft))
+            else:
+                next_library[existing_index] = copy.deepcopy(draft)
+            try:
+                self._material_library.save(next_library)
+            except Exception as error:
+                self._set_status(f"Could not save the material library: {error}", error=True)
+                return False
+
+        original_name = self._material_draft_original_name or name
+        project_changed = update_material_references(
+            self.project, draft, previous_name=original_name
+        )
+        self._material_draft = None
+        self._material_draft_source = None
+        self._material_draft_original_name = None
+        if project_changed:
+            self._mark_changed()
+        self._rebuild_items()
+        self._rebuild_properties()
+        self._update_study_controls()
+        self._set_status(
+            f"Saved material {name!r}" + (" to the project and material library." if should_save_library else " to this project.")
+        )
+        return True
+
+    def _delete_material_from_library(self, material_id):
+        library = self._material_library.load()
+        material = next((item for item in library if item.get("id") == material_id), None)
+        if material is None:
+            return False
+        try:
+            self._material_library.save(
+                [item for item in library if item.get("id") != material_id]
+            )
+        except Exception as error:
+            self._set_status(f"Could not update the material library: {error}", error=True)
+            return False
+        self._material_draft = None
+        self._material_draft_source = None
+        self._material_draft_original_name = None
+        self._rebuild_items()
+        self._rebuild_properties()
+        self._set_status(
+            f"Removed {material['name']!r} from the reusable library. Existing project copies are retained."
+        )
+        return True
+
+    def _material_validation_message(self, material_name, *, for_solid=True):
+        record = self._material_records().get(str(material_name or "").strip().casefold())
+        if record is None:
+            return f"Material {material_name!r} is not available in this project or the material library."
+        try:
+            material_properties_for_study(
+                record,
+                self.project.get("study", {}).get("physics", "harmonic_em"),
+                for_solid=for_solid,
+            )
+        except ValueError as error:
+            return str(error)
+        return None
 
     def _snapshot_material_reference(self, name):
         material = self._material_records().get(str(name or "").strip().casefold())
@@ -739,6 +989,8 @@ class ThreeDWorkspace(Div):
         self._mesh_generation += 1
         self._mesh_job = None
         self._mesh_results = {}
+        self._hidden_solid_tags = {}
+        self._isolated_solid = None
         self._mesh_surface_visible = True
         self._mesh_edges_visible = True
         self._selection_draft = {
@@ -977,10 +1229,17 @@ class ThreeDWorkspace(Div):
         self.assets.pop(asset, None)
         for item in removed:
             self._mesh_results.pop(item["id"], None)
+            self._hidden_solid_tags.pop(item["id"], None)
+            if self._isolated_solid and self._isolated_solid[0] == item["id"]:
+                self._isolated_solid = None
             if self._mesh_job and self._mesh_job["geometry_id"] == item["id"]:
                 self._mesh_generation += 1
                 self._mesh_job = None
-        if removed and self._selection == ("geometry", removed[0]["id"]):
+        if removed and (
+            self._selection == ("geometry", removed[0]["id"])
+            or self._selection[0] == "solid"
+            and self._selection[1][0] == removed[0]["id"]
+        ):
             self._selection = ("project", None)
         self._mark_changed()
         self._rebuild_items()
@@ -1108,6 +1367,98 @@ class ThreeDWorkspace(Div):
         )
         return row
 
+    def _material_tree_item(self, material, source):
+        material_id = material["id"]
+        selected = self._selection == ("material", material_id)
+        label = Div(
+            material.get("name", "Material"),
+            ui_style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px;",
+        )
+        label._props["title"] = material.get("name", "Material")
+        row = Div(
+            QIcon(
+                ui_name="mdi-flask-outline",
+                ui_size="14px",
+                ui_color="primary" if selected else "grey-7",
+            ),
+            label,
+            Div(
+                source,
+                ui_class="cb-muted",
+                ui_style="font-size:9px; padding:1px 4px; border-radius:4px; background:var(--panel-header); white-space:nowrap;",
+            ),
+            ui_style=(
+                "display:flex; align-items:center; gap:5px; min-width:0; padding:3px 5px 3px 18px; "
+                "border-radius:5px; cursor:pointer; "
+                + ("background:var(--accent-subtle); color:var(--accent);" if selected else "")
+            ),
+        )
+        row.on(
+            "click",
+            lambda _event=None, key=material_id: self.select_item("material", key),
+        )
+        return row
+
+    def _solid_display_name(self, geometry, region):
+        tag = region.get("domain_tag")
+        return geometry.get("solid_names", {}).get(
+            tag, region.get("name") or f"Solid {int(region.get('id', 0)) + 1}"
+        )
+
+    def _solid_effective_material(self, geometry, domain_tag):
+        overrides = domain_material_overrides(geometry)
+        return overrides.get(domain_tag, geometry.get("material", UNASSIGNED_MATERIAL))
+
+    def _solid_tree_item(self, geometry, region):
+        domain_tag = region.get("domain_tag")
+        item_id = (geometry["id"], domain_tag)
+        selected = self._selection == ("solid", item_id)
+        name = self._solid_display_name(geometry, region)
+        hidden = domain_tag in self._hidden_solid_tags.get(geometry["id"], set())
+        try:
+            material_name = self._solid_effective_material(geometry, domain_tag)
+        except ValueError:
+            material_name = "Conflict"
+        label = Div(
+            name,
+            ui_style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px;",
+        )
+        label._props["title"] = f"{name} · {domain_tag}"
+        visibility = _button(
+            "",
+            "mdi-eye-off-outline" if hidden else "mdi-eye-outline",
+            lambda *_args, g=geometry, tag=domain_tag: self._toggle_solid_visibility(g, tag),
+            tooltip=("Show solid" if hidden else "Hide solid") + f" {name}",
+        )
+        visibility._props["aria-label"] = (
+            ("Show solid " if hidden else "Hide solid ") + name
+        )
+        row = Div(
+            QIcon(
+                ui_name="mdi-cube-outline",
+                ui_size="14px",
+                ui_color="primary" if selected else "grey-7",
+            ),
+            label,
+            Div(
+                material_name,
+                ui_class="cb-muted",
+                ui_style="max-width:78px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:9px; padding:1px 4px; border-radius:4px; background:var(--panel-header);",
+            ),
+            visibility,
+            ui_style=(
+                "display:flex; align-items:center; gap:5px; min-width:0; padding:3px 5px 3px 30px; "
+                "border-radius:5px; cursor:pointer; "
+                + ("background:var(--accent-subtle); color:var(--accent);" if selected else "")
+            ),
+        )
+        row._props["title"] = f"{name} · {region.get('elements', 0):,} volume elements"
+        row.on(
+            "click",
+            lambda _event=None, key=item_id: self.select_item("solid", key),
+        )
+        return row
+
     def _remove_named_selection(self, geometry, kind, selection):
         if self._mesh_worker_active:
             self._set_status("Wait for mesh generation to finish before editing selections.", error=True)
@@ -1175,6 +1526,21 @@ class ThreeDWorkspace(Div):
                 ),
                 mesh_status=self._mesh_tree_label(geometry["id"]),
             ))
+            mesh_result = self._mesh_results.get(geometry["id"], {})
+            solid_regions = [
+                region for region in mesh_result.get("domain_regions", [])
+                if region.get("domain_tag")
+            ] if mesh_result.get("status") == "ready" else []
+            if solid_regions:
+                geometry_rows.append(Div(
+                    "SOLIDS",
+                    ui_class="cb-muted",
+                    ui_style="padding:5px 4px 1px 18px; font-size:9px; letter-spacing:.06em; font-weight:650;",
+                ))
+                geometry_rows.extend(
+                    self._solid_tree_item(geometry, region)
+                    for region in solid_regions
+                )
             selections = [
                 (kind, selection)
                 for kind in ("domain", "boundary")
@@ -1199,6 +1565,10 @@ class ThreeDWorkspace(Div):
             for trace_set in self.project.get("wire_trace_sets", [])
         ]
         self._geometry_items.ui_children = geometry_rows
+        self._materials_items.ui_children = [
+            self._material_tree_item(material, source)
+            for material, source in self._material_tree_records()
+        ]
         self._trace_items.ui_children = trace_rows
         self._update_study_controls()
         self._update_preview_selection()
@@ -1451,6 +1821,14 @@ class ThreeDWorkspace(Div):
                 raise
 
             self._mesh_results.pop(geometry["id"], None)
+            self._hidden_solid_tags.pop(geometry["id"], None)
+            if self._isolated_solid and self._isolated_solid[0] == geometry["id"]:
+                self._isolated_solid = None
+            if (
+                self._selection[0] == "solid"
+                and self._selection[1][0] == geometry["id"]
+            ):
+                self._selection = ("geometry", geometry["id"])
             if self._selection[0] == "named_selection":
                 context = self._find_named_selection(self._selection[1])
             else:
@@ -1745,17 +2123,245 @@ class ThreeDWorkspace(Div):
     def _active_boundary_region_ids(self, geometry_id):
         kind, item_id = self._selection
         draft = self._selection_draft
+        selected_ids = []
+        selected_solid_tags = set()
         if (
             draft.get("geometry_id") == geometry_id
             and draft.get("kind") == "boundary"
             and (kind == "geometry" or draft.get("selection_id") == item_id)
         ):
-            return draft.get("region_ids", [])
-        if kind == "named_selection":
+            selected_ids = list(draft.get("region_ids", []))
+        elif kind == "solid" and isinstance(item_id, (tuple, list)) and item_id[0] == geometry_id:
+            selected_solid_tags.add(item_id[1])
+        elif kind == "named_selection":
             context = self._find_named_selection(item_id)
-            if context and context[0]["id"] == geometry_id and context[1] == "boundary":
-                return context[2].get("boundary_ids", [])
-        return []
+            if context and context[0]["id"] == geometry_id:
+                if context[1] == "boundary":
+                    selected_ids = list(context[2].get("boundary_ids", []))
+                else:
+                    selected_solid_tags.update(context[2].get("domain_tags", []))
+        if selected_solid_tags:
+            result = self._mesh_results.get(geometry_id, {})
+            selected_ids.extend(
+                region["id"]
+                for region in result.get("boundary_regions", [])
+                if region.get("domain_tag") in selected_solid_tags
+            )
+        result = self._mesh_results.get(geometry_id, {})
+        hidden = self._hidden_solid_tags.get(geometry_id, set())
+        if hidden:
+            region_solid_tags = {
+                region["id"]: region.get("domain_tag")
+                for region in result.get("boundary_regions", [])
+            }
+            selected_ids = [
+                region_id for region_id in selected_ids
+                if region_solid_tags.get(region_id) not in hidden
+            ]
+        return list(dict.fromkeys(selected_ids))
+
+    def _find_solid_context(self, item_id):
+        if not isinstance(item_id, (tuple, list)) or len(item_id) != 2:
+            return None
+        geometry_id, domain_tag = item_id
+        geometry = next(
+            (item for item in self.project.get("geometries", []) if item.get("id") == geometry_id),
+            None,
+        )
+        result = self._mesh_results.get(geometry_id, {})
+        region = next(
+            (item for item in result.get("domain_regions", []) if item.get("domain_tag") == domain_tag),
+            None,
+        )
+        return (geometry, region) if geometry is not None and region is not None else None
+
+    def _toggle_solid_visibility(self, geometry, domain_tag):
+        hidden = self._hidden_solid_tags.setdefault(geometry["id"], set())
+        if domain_tag in hidden:
+            hidden.remove(domain_tag)
+        else:
+            hidden.add(domain_tag)
+        if not hidden:
+            self._hidden_solid_tags.pop(geometry["id"], None)
+        if self._isolated_solid and self._isolated_solid[0] == geometry["id"]:
+            self._isolated_solid = None
+        self._rebuild_items()
+        self._rebuild_preview()
+        self._set_status("Updated viewport visibility. Hidden solids remain in the mesh and solver model.")
+        return True
+
+    def _isolate_solid(self, geometry, domain_tag):
+        if self._isolated_solid == (geometry["id"], domain_tag):
+            self._hidden_solid_tags.pop(geometry["id"], None)
+            self._isolated_solid = None
+        else:
+            regions = self._mesh_results.get(geometry["id"], {}).get("domain_regions", [])
+            self._hidden_solid_tags[geometry["id"]] = {
+                region.get("domain_tag") for region in regions
+                if region.get("domain_tag") and region.get("domain_tag") != domain_tag
+            }
+            self._isolated_solid = (geometry["id"], domain_tag)
+        self._rebuild_items()
+        self._rebuild_preview()
+        self._set_status("Isolated selected solid in the viewport. The full model remains active for meshing and solving.")
+        return True
+
+    def _show_all_solids(self, geometry):
+        self._hidden_solid_tags.pop(geometry["id"], None)
+        self._isolated_solid = None
+        self._rebuild_items()
+        self._rebuild_preview()
+        self._set_status("All solids are visible in the viewport.")
+
+    def _set_solid_name(self, geometry, domain_tag, event):
+        name = str(getattr(event, "value", event) or "").strip()
+        if not name:
+            self._set_status("Solid name cannot be empty.", error=True)
+            return False
+        if len(name) > 120:
+            self._set_status("Solid names are limited to 120 characters.", error=True)
+            return False
+        names = geometry.setdefault("solid_names", {})
+        if any(
+            tag != domain_tag and str(existing).strip().casefold() == name.casefold()
+            for tag, existing in names.items()
+        ):
+            self._set_status("Solid names must be unique within this geometry model.", error=True)
+            return False
+        names[domain_tag] = name
+        self._mark_changed()
+        self._rebuild_items()
+        self._set_status(f"Renamed solid to {name!r}.")
+        return True
+
+    def _clear_stale_solid_names(self, geometry):
+        current_tags = {
+            region.get("domain_tag")
+            for region in self._mesh_results.get(geometry["id"], {}).get("domain_regions", [])
+        }
+        names = geometry.setdefault("solid_names", {})
+        stale = set(names) - current_tags
+        if not stale:
+            return False
+        for tag in stale:
+            names.pop(tag, None)
+        self._mark_changed()
+        self._rebuild_items()
+        self._rebuild_properties()
+        self._set_status(f"Removed {len(stale)} solid name(s) tied to the previous STEP topology.")
+        return True
+
+    def _create_named_selection_for_solid(self, geometry, region):
+        tag = region.get("domain_tag")
+        if not tag:
+            self._set_status("This solid has no stable STEP identity and cannot be assigned safely.", error=True)
+            return False
+        existing = next((
+            selection for selection in geometry.get("domain_selections", [])
+            if selection.get("domain_tags") == [tag]
+        ), None)
+        if existing:
+            self.select_item("named_selection", existing["id"])
+            return True
+        base = self._solid_display_name(geometry, region)
+        existing_names = {
+            item.get("name", "").casefold()
+            for item in geometry.get("domain_selections", [])
+        }
+        name = base
+        suffix = 2
+        while name.casefold() in existing_names:
+            name = f"{base} {suffix}"
+            suffix += 1
+        selection = {
+            "id": f"selection-{uuid4().hex}",
+            "name": name,
+            "domain_ids": [int(region["id"])],
+            "domain_tags": [tag],
+        }
+        geometry.setdefault("domain_selections", []).append(selection)
+        self._mark_changed()
+        self._selection = ("named_selection", selection["id"])
+        self._rebuild_items()
+        self._rebuild_properties()
+        self._update_boundary_overlay()
+        self._set_status(f"Created named domain selection {name!r}.")
+        return True
+
+    def _set_solid_material(self, geometry, region, event):
+        domain_tag = region.get("domain_tag")
+        if not domain_tag:
+            self._set_status("This solid has no stable STEP identity and cannot be assigned safely.", error=True)
+            return False
+        value = str(getattr(event, "value", event) or "").strip()
+        if value != "__inherit__" and value not in {
+            option["value"] for option in self._material_options(value)
+        }:
+            self._set_status("Choose a material from the project or material library.", error=True)
+            return False
+        if value == UNASSIGNED_MATERIAL:
+            self._set_status("Choose a physical material; an unassigned region cannot be solved.", error=True)
+            return False
+
+        related = [
+            selection for selection in geometry.get("domain_selections", [])
+            if domain_tag in selection.get("domain_tags", []) and selection.get("material")
+        ]
+        exact = next(
+            (selection for selection in related if selection.get("domain_tags") == [domain_tag]),
+            None,
+        )
+        default = geometry.get("material", UNASSIGNED_MATERIAL)
+        material = None if value == "__inherit__" else value
+        if any(selection is not exact for selection in related):
+            group_values = {selection.get("material", "").casefold() for selection in related}
+            if material is None or any(item != (material or "").casefold() for item in group_values):
+                selection_name = next(
+                    selection.get("name", "named selection")
+                    for selection in related if selection is not exact
+                )
+                self._set_status(
+                    f"This solid belongs to {selection_name!r}. Edit that named selection to change the shared assignment.",
+                    error=True,
+                )
+                return False
+        if exact is None:
+            if material is None:
+                return True
+            exact = {
+                "id": f"selection-{uuid4().hex}",
+                "name": f"{self._solid_display_name(geometry, region)} material",
+                "domain_ids": [int(region["id"])],
+                "domain_tags": [domain_tag],
+            }
+            geometry.setdefault("domain_selections", []).append(exact)
+        if material is None:
+            exact.pop("material", None)
+        else:
+            try:
+                record = self._material_records().get(material.casefold())
+                if record is None:
+                    raise ValueError(f"Material {material!r} is not available.")
+                material_properties_for_study(
+                    record,
+                    self.project.get("study", {}).get("physics", "harmonic_em"),
+                    for_solid=True,
+                )
+            except ValueError as error:
+                self._set_status(str(error), error=True)
+                return False
+            exact["material"] = material
+            self._snapshot_material_reference(material)
+        self._selection_draft["material"] = material
+        self._mark_changed()
+        self._rebuild_items()
+        self._rebuild_properties()
+        self._update_study_controls()
+        self._set_status(
+            f"{self._solid_display_name(geometry, region)} uses "
+            f"{material or f'the geometry default ({default})'}."
+        )
+        return True
 
     def _mesh_quality_message(self, item_id):
         result = self._mesh_results.get(item_id, {})
@@ -2098,6 +2704,16 @@ class ThreeDWorkspace(Div):
                             ],
                         ),
                         self._material_note(),
+                        *(
+                            [Div(
+                                message,
+                                ui_class="mmfem-3d-status-error",
+                                ui_style="font-size:10px; line-height:1.4;",
+                            )]
+                            if (message := self._material_validation_message(
+                                selection.get("material") or geometry_material
+                            )) else []
+                        ),
                         local_mesh_size,
                         Div(
                             "Blank uses the geometry size.",
@@ -2143,6 +2759,12 @@ class ThreeDWorkspace(Div):
                 ))
                 self._mesh_property_status = None
             else:
+                default_material = item.get("material", UNASSIGNED_MATERIAL)
+                default_material_error = (
+                    None
+                    if str(default_material).casefold() == UNASSIGNED_MATERIAL.casefold()
+                    else self._material_validation_message(default_material)
+                )
                 children.extend([
                     self._select_options(
                         "Default material",
@@ -2156,8 +2778,13 @@ class ThreeDWorkspace(Div):
                             ui_class="mmfem-3d-status-error",
                             ui_style="font-size:11px; line-height:1.4;",
                         )
-                        if str(item.get("material", UNASSIGNED_MATERIAL)).casefold()
-                        == UNASSIGNED_MATERIAL.casefold()
+                        if str(default_material).casefold() == UNASSIGNED_MATERIAL.casefold()
+                        else Div(
+                            default_material_error,
+                            ui_class="mmfem-3d-status-error",
+                            ui_style="font-size:10px; line-height:1.4;",
+                        )
+                        if default_material_error
                         else self._material_note()
                     ),
                     self._select_options(
@@ -2194,6 +2821,216 @@ class ThreeDWorkspace(Div):
                 ])
                 self._mesh_property_status = children[-2]
                 children.extend(self._mesh_setup_properties(item))
+                mesh_result = self._mesh_results.get(item["id"], {})
+                current_tags = {
+                    region.get("domain_tag")
+                    for region in mesh_result.get("domain_regions", [])
+                    if region.get("domain_tag")
+                }
+                stale_names = set(item.get("solid_names", {})) - current_tags
+                if stale_names:
+                    children.extend([
+                        Div(
+                            f"{len(stale_names)} saved solid name(s) no longer match the current STEP topology.",
+                            ui_class="mmfem-3d-status-error",
+                            ui_style="font-size:10px; line-height:1.4;",
+                        ),
+                        _button(
+                            "Remove stale solid names", "mdi-broom",
+                            lambda *_args, obj=item: self._clear_stale_solid_names(obj),
+                        ),
+                    ])
+        elif kind == "solid":
+            context = self._find_solid_context(item_id)
+            if context is None:
+                self._selection = ("project", None)
+                return self._rebuild_properties()
+            geometry, region = context
+            domain_tag = region["domain_tag"]
+            body_name = self._solid_display_name(geometry, region)
+            geometry_default = geometry.get("material", UNASSIGNED_MATERIAL)
+            try:
+                effective_material = self._solid_effective_material(geometry, domain_tag)
+                material_conflict = None
+            except ValueError as error:
+                effective_material = geometry_default
+                material_conflict = str(error)
+            material_value = (
+                "__inherit__"
+                if str(effective_material).casefold() == str(geometry_default).casefold()
+                else effective_material
+            )
+            material_options = [
+                {"label": f"Use geometry default ({geometry_default})", "value": "__inherit__"},
+                *[
+                    option for option in self._material_options(effective_material)
+                    if option["value"] != UNASSIGNED_MATERIAL
+                ],
+            ]
+            children.extend([
+                Div("Solid body", ui_style="font-size:13px; font-weight:650;"),
+                _input(
+                    "Name", body_name,
+                    lambda event, geom=geometry, tag=domain_tag: self._set_solid_name(geom, tag, event),
+                    width="100%",
+                ),
+                Div(
+                    f"{region.get('elements', 0):,} volume elements · domain {int(region['id']) + 1}",
+                    ui_class="cb-muted",
+                    ui_style="font-size:11px;",
+                ),
+                Div(
+                    domain_tag,
+                    ui_class="cb-muted",
+                    ui_style="font-size:9px; overflow-wrap:anywhere;",
+                ),
+                self._select_options(
+                    "Material assignment", material_value,
+                    lambda event, geom=geometry, item=region: self._set_solid_material(geom, item, event),
+                    material_options,
+                ),
+                self._material_note(),
+            ])
+            if material_conflict:
+                children.append(Div(
+                    material_conflict,
+                    ui_class="mmfem-3d-status-error",
+                    ui_style="font-size:10px; line-height:1.4;",
+                ))
+            else:
+                message = self._material_validation_message(effective_material)
+                if message:
+                    children.append(Div(
+                        message,
+                        ui_class="mmfem-3d-status-error",
+                        ui_style="font-size:10px; line-height:1.4;",
+                    ))
+            children.extend([
+                _button(
+                    "Create named selection", "mdi-select-group",
+                    lambda *_args, geom=geometry, item=region: self._create_named_selection_for_solid(geom, item),
+                    tooltip="Save this stable body identity for reuse in the model",
+                ),
+                _button(
+                    "Isolate body" if self._isolated_solid != (geometry["id"], domain_tag) else "Show all solids",
+                    "mdi-eye-settings-outline",
+                    lambda *_args, geom=geometry, tag=domain_tag: self._isolate_solid(geom, tag),
+                    tooltip="Change viewport visibility only; hidden solids remain in the solver model",
+                ),
+            ])
+            if self._hidden_solid_tags.get(geometry["id"]):
+                children.append(_button(
+                    "Show all solids", "mdi-eye-outline",
+                    lambda *_args, geom=geometry: self._show_all_solids(geom),
+                ))
+        elif kind == "material":
+            material, source = self._material_by_id(item_id)
+            editing = bool(
+                self._material_draft is not None
+                and self._material_draft.get("id") == item_id
+            )
+            if editing:
+                material = self._material_draft
+                source = self._material_draft_source
+            if material is None:
+                self._selection = ("project", None)
+                return self._rebuild_properties()
+            active_physics = self.project.get("study", {}).get("physics", "harmonic_em")
+            required = (
+                {"relative_permeability", "electrical_conductivity"}
+                if active_physics == "harmonic_em"
+                else {"youngs_modulus", "poissons_ratio", "density"}
+            )
+            fields = (
+                ("relative_permeability", "Relative permeability", None),
+                ("electrical_conductivity", "Electrical conductivity", "S/m"),
+                ("youngs_modulus", "Young's modulus", "Pa"),
+                ("poissons_ratio", "Poisson's ratio", None),
+                ("density", "Density", "kg/m³"),
+            )
+            source_label = {
+                "builtin": "Built-in material",
+                "library": "Reusable material",
+                "project": "Project material copy",
+                "new": "New material",
+            }.get(source, "Material")
+            children.extend([
+                Div("Material definition", ui_style="font-size:13px; font-weight:650;"),
+                Div(source_label, ui_class="cb-muted", ui_style="font-size:10px;"),
+            ])
+            if editing:
+                children.append(_input(
+                    "Material name", material.get("name", ""),
+                    lambda event: self._set_material_draft_value("name", event),
+                    width="100%",
+                ))
+            else:
+                children.append(Div(
+                    material.get("name", "Material"),
+                    ui_style="font-size:15px; font-weight:600; overflow-wrap:anywhere;",
+                ))
+            children.append(Div(
+                "EM requires μr and conductivity. Mechanics requires Young's modulus, Poisson's ratio and density.",
+                ui_class="cb-muted",
+                ui_style="font-size:10px; line-height:1.4;",
+            ))
+            properties = material.get("properties", {})
+            for key, label, suffix in fields:
+                field_label = f"{label} · Required" if key in required else label
+                value = properties.get(key, "")
+                if editing:
+                    children.append(_input(
+                        field_label, value,
+                        lambda event, prop=key: self._set_material_draft_value(prop, event),
+                        width="100%",
+                        suffix=suffix,
+                    ))
+                else:
+                    display = str(value).strip() if str(value or "").strip() else "Not set"
+                    children.append(Div(
+                        Div(field_label, ui_class="cb-muted", ui_style="font-size:10px;"),
+                        Div(display + (f" {suffix}" if suffix and display != "Not set" else ""), ui_style="font-size:12px;"),
+                        ui_style="display:flex; align-items:baseline; justify-content:space-between; gap:8px; padding:2px 0;",
+                    ))
+            if not editing:
+                assigned_names = {
+                    str(geometry.get("material", "")).casefold()
+                    for geometry in self.project.get("geometries", [])
+                } | {
+                    str(selection.get("material", "")).casefold()
+                    for geometry in self.project.get("geometries", [])
+                    for selection in geometry.get("domain_selections", [])
+                }
+                if material.get("name", "").casefold() in assigned_names:
+                    message = self._material_validation_message(material.get("name"))
+                    if message:
+                        children.append(Div(
+                            message,
+                            ui_class="mmfem-3d-status-error",
+                            ui_style="font-size:10px; line-height:1.4;",
+                        ))
+                if source == "builtin":
+                    children.append(_button(
+                        "Duplicate as custom", "mdi-content-copy",
+                        lambda *_args, item=copy.deepcopy(material): self._duplicate_material(item),
+                    ))
+                else:
+                    children.append(_button(
+                        "Edit definition", "mdi-pencil-outline",
+                        lambda *_args, key=item_id: self._begin_material_edit(key),
+                    ))
+                    if source == "library":
+                        children.append(_button(
+                            "Remove from library", "mdi-delete-outline",
+                            lambda *_args, key=item_id: self._delete_material_from_library(key),
+                            tooltip="Remove the reusable entry; existing project copies remain available",
+                        ))
+            else:
+                children.extend([
+                    _button("Save material", "mdi-content-save-outline", self._save_material_draft, color="primary"),
+                    _button("Save to material library", "mdi-library-plus", lambda *_args: self._save_material_draft(save_to_library=True)),
+                    _button("Cancel", "mdi-close", self._cancel_material_edit),
+                ])
         elif kind == "trace_set":
             item = next((entry for entry in self.project["wire_trace_sets"] if entry["id"] == item_id), None)
             if item is None:
@@ -2327,6 +3164,27 @@ class ThreeDWorkspace(Div):
                     "material": selection.get("material"),
                     "boundary_condition": selection.get("boundary_condition") or "default",
                 }
+        elif kind == "solid":
+            context = self._find_solid_context(item_id)
+            if context:
+                geometry, region = context
+                self._selection_draft = {
+                    "geometry_id": geometry["id"],
+                    "kind": "domain",
+                    "selection_id": None,
+                    "name": self._solid_display_name(geometry, region),
+                    "region_ids": [int(region["id"])],
+                    "material": self._solid_effective_material(
+                        geometry, region["domain_tag"]
+                    ),
+                    "boundary_condition": "default",
+                }
+        elif kind == "material":
+            if self._material_by_id(item_id)[0] is None and not (
+                self._material_draft and self._material_draft.get("id") == item_id
+            ):
+                self._selection = ("project", None)
+                kind, item_id = self._selection
         self._selection = (kind, item_id)
         self._rebuild_items()
         self._rebuild_properties()
@@ -2353,7 +3211,9 @@ class ThreeDWorkspace(Div):
             and point_number is not None
         ):
             result = self._mesh_results.get(item_id, {})
-            region_ids = result.get("boundary_region_ids", [])
+            region_ids = metadata.get("mmfem_visible_boundary_region_ids")
+            if region_ids is None:
+                region_ids = result.get("boundary_region_ids", [])
             if 0 <= point_number < len(region_ids):
                 context = (
                     self._find_named_selection(self._selection[1])
@@ -2874,13 +3734,31 @@ class ThreeDWorkspace(Div):
         if value not in options:
             self._set_status("Choose a material from the available library references.", error=True)
             return False
+        geometry = next((
+            item for item in self.project.get("geometries", [])
+            if selection in item.get("domain_selections", [])
+        ), None)
+        if geometry is None:
+            self._set_status("The named domain selection is no longer available.", error=True)
+            return False
+        old_material = selection.get("material")
         if value == "__inherit__":
             selection.pop("material", None)
             material = None
         else:
             selection["material"] = value
             material = value
-            self._snapshot_material_reference(value)
+        try:
+            domain_material_overrides(geometry, require_stable_tags=True)
+        except ValueError as error:
+            if old_material is None:
+                selection.pop("material", None)
+            else:
+                selection["material"] = old_material
+            self._set_status(str(error), error=True)
+            return False
+        if material:
+            self._snapshot_material_reference(material)
         self._selection_draft["material"] = material
         self._mark_changed()
         self._rebuild_items()
@@ -3051,7 +3929,10 @@ class ThreeDWorkspace(Div):
         project = copy.deepcopy(self.project)
         assets = dict(self.assets)
         meshes = {
-            item_id: result
+            item_id: {
+                **result,
+                "hidden_solid_tags": tuple(self._hidden_solid_tags.get(item_id, ())),
+            }
             for item_id, result in self._mesh_results.items()
             if result.get("status") == "ready"
         }
@@ -3169,6 +4050,9 @@ class ThreeDWorkspace(Div):
                     "edges": generated_mesh.get("edges"),
                     "generated_mesh": True,
                     "boundary_region_ids": generated_mesh.get("boundary_region_ids"),
+                    "boundary_domain_tags": generated_mesh.get("boundary_domain_tags"),
+                    "boundary_edge_cache": generated_mesh.get("boundary_edge_cache"),
+                    "hidden_solid_tags": generated_mesh.get("hidden_solid_tags", ()),
                     "highlighted_boundary_ids": highlighted_regions.get(item["id"], []),
                 })
                 continue

@@ -335,8 +335,26 @@ def preview_figure(payload):
     figure = go.Figure()
     for index, item in enumerate(payload.get("geometry", [])):
         vertices = np.asarray(item["vertices"])
-        triangles = np.asarray(item["triangles"])
-        if vertices.size == 0 or triangles.size == 0:
+        source_triangles = np.asarray(item["triangles"])
+        triangles = source_triangles
+        boundary_region_ids = item.get("boundary_region_ids")
+        visible_boundary_region_ids = boundary_region_ids
+        boundary_domain_tags = item.get("boundary_domain_tags")
+        hidden_solid_tags = set(item.get("hidden_solid_tags", ()))
+        if (
+            hidden_solid_tags
+            and boundary_domain_tags is not None
+            and len(boundary_domain_tags) == len(source_triangles)
+        ):
+            visible = np.fromiter(
+                (tag not in hidden_solid_tags for tag in boundary_domain_tags),
+                dtype=bool,
+                count=len(boundary_domain_tags),
+            )
+            triangles = source_triangles[visible]
+            if boundary_region_ids is not None and len(boundary_region_ids) == len(visible):
+                visible_boundary_region_ids = np.asarray(boundary_region_ids)[visible].tolist()
+        if vertices.size == 0 or source_triangles.size == 0:
             continue
         base_color = _MATERIAL_COLORS[index % len(_MATERIAL_COLORS)]
         mesh_trace = go.Mesh3d(
@@ -363,11 +381,25 @@ def preview_figure(payload):
                 "mmfem_item_id": item.get("id"),
                 "mmfem_base_color": base_color,
                 "mmfem_generated_mesh": bool(item.get("generated_mesh")),
+                "mmfem_visible_boundary_region_ids": (
+                    list(visible_boundary_region_ids)
+                    if visible_boundary_region_ids is not None else None
+                ),
             },
         )
         figure.add_trace(mesh_trace)
         edges = item.get("edges")
         if item.get("generated_mesh") and edges is not None and len(edges):
+            if len(triangles) != len(source_triangles):
+                if len(triangles):
+                    edge_pairs = np.concatenate(
+                        (triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]),
+                        axis=0,
+                    )
+                    edge_pairs.sort(axis=1)
+                    edges = np.unique(edge_pairs, axis=0).astype(np.int32, copy=False)
+                else:
+                    edges = np.empty((0, 2), dtype=np.int32)
             edge_coordinates = vertices[np.asarray(edges, dtype=np.int32)]
             edge_x = []
             edge_y = []
@@ -392,15 +424,15 @@ def preview_figure(payload):
                     "mmfem_mesh_edges": True,
                 },
             ))
-        boundary_region_ids = item.get("boundary_region_ids")
         if item.get("generated_mesh") and boundary_region_ids is not None:
             figure.add_trace(boundary_overlay_trace(
                 vertices,
-                triangles,
+                source_triangles,
                 boundary_region_ids,
                 item.get("highlighted_boundary_ids", []),
                 geometry_id=item.get("id"),
                 name=item.get("name", "Geometry"),
+                edge_cache=item.get("boundary_edge_cache"),
             ))
     for index, item in enumerate(payload.get("traces", [])):
         points = item["points"]

@@ -87,7 +87,13 @@ def new_3d_project(name="Untitled 3D project"):
 
 
 def snapshot_material(project, material):
-    """Keep the first assigned copy of a material inside the project archive."""
+    """Embed or refresh a material definition used by this project.
+
+    Project files carry snapshots so a future change to a user's library does
+    not silently alter an existing model. Re-selecting a material explicitly
+    refreshes its snapshot; editing a library material updates its snapshot
+    through :func:`update_material_references`.
+    """
     if not isinstance(material, dict):
         return False
     name = str(material.get("name", "")).strip()
@@ -96,18 +102,94 @@ def snapshot_material(project, material):
     if not name or not material_id or not isinstance(properties, dict):
         return False
     materials = project.setdefault("materials", [])
-    if any(
-        isinstance(existing, dict)
-        and str(existing.get("name", "")).strip().casefold() == name.casefold()
-        for existing in materials
-    ):
-        return False
-    materials.append(copy.deepcopy({
+    snapshot = copy.deepcopy({
         "id": material_id,
         "name": name,
         "properties": properties,
-    }))
+    })
+    existing = next(
+        (
+            item for item in materials
+            if isinstance(item, dict) and item.get("id") == material_id
+        ),
+        None,
+    )
+    if existing is None:
+        existing = next(
+            (
+                item for item in materials
+                if isinstance(item, dict)
+                and str(item.get("name", "")).strip().casefold() == name.casefold()
+            ),
+            None,
+        )
+    if existing is None:
+        materials.append(snapshot)
+        return True
+    if existing == snapshot:
+        return False
+    existing.clear()
+    existing.update(snapshot)
     return True
+
+
+def update_material_references(project, material, *, previous_name=None):
+    """Update a definition snapshot and all name-based assignments in a project."""
+    if not isinstance(material, dict):
+        return False
+    name = str(material.get("name", "")).strip()
+    if not name:
+        return False
+    old_name = str(previous_name if previous_name is not None else name).strip()
+    changed = False
+    assigned = False
+    old_key = old_name.casefold()
+
+    for geometry in project.get("geometries", []):
+        if str(geometry.get("material", "")).strip().casefold() == old_key:
+            assigned = True
+            geometry["material"] = name
+            changed = True
+        for selection in geometry.get("domain_selections", []):
+            if str(selection.get("material", "")).strip().casefold() == old_key:
+                assigned = True
+                selection["material"] = name
+                changed = True
+    for trace_set in project.get("wire_trace_sets", []):
+        if str(trace_set.get("material", "")).strip().casefold() == old_key:
+            assigned = True
+            trace_set["material"] = name
+            changed = True
+        for trace in trace_set.get("traces", []):
+            if str(trace.get("material", "")).strip().casefold() == old_key:
+                assigned = True
+                trace["material"] = name
+                changed = True
+
+    materials = project.setdefault("materials", [])
+    material_id = str(material.get("id", "")).strip()
+    snapshot = copy.deepcopy({
+        "id": material_id,
+        "name": name,
+        "properties": material.get("properties", {}),
+    })
+    existing = next(
+        (
+            item for item in materials
+            if isinstance(item, dict)
+            and (item.get("id") == material_id or
+                 str(item.get("name", "")).strip().casefold() == old_key)
+        ),
+        None,
+    )
+    if existing is not None and existing != snapshot:
+        existing.clear()
+        existing.update(snapshot)
+        changed = True
+    elif existing is None and assigned:
+        materials.append(snapshot)
+        changed = True
+    return changed
 
 
 def _safe_name(name, fallback):
@@ -232,7 +314,7 @@ def add_step_geometry(
     item = {
         "id": asset_id,
         "name": str(filename),
-        "material": _safe_name(material, UNASSIGNED_MATERIAL),
+        "material": str(material or "").strip() or UNASSIGNED_MATERIAL,
         "units": units,
         "asset": asset,
         "sha256": hashlib.sha256(payload).hexdigest(),
@@ -263,11 +345,11 @@ def add_wire_trace(project, assets, filename, data, *, units="m", material="Air"
         "dsv": 0.4,
         "centre": [0.0, 0.0, 0.0],
         "samples": 41,
-        "material": _safe_name(material, "Air"),
+        "material": str(material or "").strip() or "Air",
         "traces": [{
             "id": trace_id,
             "name": source_name,
-            "material": _safe_name(material, "Air"),
+            "material": str(material or "").strip() or "Air",
             "filename": asset,
             "sha256": hashlib.sha256(payload).hexdigest(),
             "current_scale": 1.0,
@@ -545,6 +627,31 @@ def domain_mesh_size_overrides(geometry, *, require_stable_tags=False):
     return overrides
 
 
+def domain_material_overrides(geometry, *, require_stable_tags=False):
+    """Return non-conflicting material overrides keyed by solid tag or region id."""
+    overrides = {}
+    for selection in geometry.get("domain_selections", []):
+        material = selection.get("material")
+        if not material:
+            continue
+        domain_tags = selection.get("domain_tags")
+        if require_stable_tags and not domain_tags:
+            raise ValueError(
+                f"{_LEGACY_DOMAIN_SELECTION_ERROR} Selection {selection.get('name', '')!r}."
+            )
+        refs = domain_tags if domain_tags else selection.get("domain_ids", [])
+        for region_ref in refs:
+            key = str(region_ref) if domain_tags else int(region_ref)
+            existing = overrides.get(key)
+            if existing is not None and existing.casefold() != str(material).strip().casefold():
+                raise ValueError(
+                    f"Domain {key} has conflicting material assignments. "
+                    "Edit the overlapping named selections so the solid has one material."
+                )
+            overrides[key] = str(material).strip()
+    return overrides
+
+
 def validate_3d_project(project, assets):
     if not isinstance(project, dict) or project.get("schema") != PROJECT_SCHEMA:
         raise ValueError("This is not a MagMechSim 3D project.")
@@ -634,6 +741,23 @@ def validate_3d_project(project, assets):
         _validate_named_selections(
             geometry, "domain_selections", "domain_ids", "domain"
         )
+        solid_names = geometry.setdefault("solid_names", {})
+        if not isinstance(solid_names, dict) or len(solid_names) > MAX_NAMED_SELECTIONS:
+            raise ValueError("Saved solid names must be a mapping of stable STEP solid ids to names.")
+        normalized_solid_names = set()
+        for solid_tag, solid_name in solid_names.items():
+            if (
+                not isinstance(solid_tag, str)
+                or not _STEP_SOLID_TAG_PATTERN.fullmatch(solid_tag)
+                or not isinstance(solid_name, str)
+                or not solid_name.strip()
+                or len(solid_name.strip()) > 120
+            ):
+                raise ValueError("Each saved solid name needs a stable STEP identity and a name of at most 120 characters.")
+            key = solid_name.strip().casefold()
+            if key in normalized_solid_names:
+                raise ValueError("Solid names must be unique within a geometry model.")
+            normalized_solid_names.add(key)
         for selection in geometry.get("domain_selections", []):
             assigned_material = selection.get("material")
             if assigned_material is not None and (
