@@ -859,11 +859,23 @@ def test_solid_tree_selection_isolates_bodies_without_changing_solver_model(monk
     assert workspace._hidden_solid_tags[geometry["id"]] == {
         "MMFEM_SOLID_000000000000000000000001"
     }
+    property_actions = {
+        getattr(child, "ui_label", None)
+        for child in workspace._properties.ui_children
+    }
+    assert "Show all solids" in property_actions
+    assert "Isolate body" not in property_actions
     assert workspace._active_boundary_region_ids(geometry["id"]) == [3, 4, 5]
     workspace._toggle_solid_visibility(geometry, second_tag)
     assert workspace._active_boundary_region_ids(geometry["id"]) == []
     workspace._show_all_solids(geometry)
     assert geometry["id"] not in workspace._hidden_solid_tags
+    property_actions = {
+        getattr(child, "ui_label", None)
+        for child in workspace._properties.ui_children
+    }
+    assert "Show all solids" not in property_actions
+    assert "Isolate body" in property_actions
     assert workspace._active_boundary_region_ids(geometry["id"]) == [3, 4, 5]
 
 

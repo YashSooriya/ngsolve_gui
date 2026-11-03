@@ -2186,6 +2186,7 @@ class ThreeDWorkspace(Div):
         if self._isolated_solid and self._isolated_solid[0] == geometry["id"]:
             self._isolated_solid = None
         self._rebuild_items()
+        self._rebuild_properties()
         self._rebuild_preview()
         self._set_status("Updated viewport visibility. Hidden solids remain in the mesh and solver model.")
         return True
@@ -2202,6 +2203,7 @@ class ThreeDWorkspace(Div):
             }
             self._isolated_solid = (geometry["id"], domain_tag)
         self._rebuild_items()
+        self._rebuild_properties()
         self._rebuild_preview()
         self._set_status("Isolated selected solid in the viewport. The full model remains active for meshing and solving.")
         return True
@@ -2210,6 +2212,7 @@ class ThreeDWorkspace(Div):
         self._hidden_solid_tags.pop(geometry["id"], None)
         self._isolated_solid = None
         self._rebuild_items()
+        self._rebuild_properties()
         self._rebuild_preview()
         self._set_status("All solids are visible in the viewport.")
 
