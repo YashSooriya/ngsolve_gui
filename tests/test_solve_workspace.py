@@ -4163,6 +4163,14 @@ def test_sketch_grid_has_five_snap_subdivisions_per_major_cell(standalone_compon
 
 def test_sketch_reprojects_to_resized_viewport_without_distorting_geometry(standalone_components):
     workspace = SolveWorkspace()
+    renders = []
+    render = workspace._render_canvas_after_interaction
+
+    def render_after_resize():
+        renders.append("render")
+        render()
+
+    workspace._render_canvas_after_interaction = render_after_resize
     workspace._apply_canvas_resize({"width": 1200.4, "height": 600.2})
 
     assert workspace._canvas_width == 1200
@@ -4176,6 +4184,23 @@ def test_sketch_reprojects_to_resized_viewport_without_distorting_geometry(stand
     radial_scale = (project((0.01, 0.0))[0] - project((0.0, 0.0))[0]) / 0.01
     axial_scale = (project((0.0, 0.01))[1] - project((0.0, 0.0))[1]) / 0.01
     assert radial_scale == pytest.approx(-axial_scale)
+    assert renders == ["render"]
+
+
+def test_fit_view_uses_batched_frontend_redraw(standalone_components):
+    workspace = SolveWorkspace()
+    workspace._view_center = (0.25, -0.5)
+    workspace._view_world_width = 2.0
+    calls = []
+    workspace._cancel_canvas_zoom_render = lambda: calls.append("cancel")
+    workspace._render_canvas_after_interaction = lambda: calls.append("render")
+
+    workspace.fit_canvas_view()
+
+    assert workspace._view_center is None
+    assert workspace._view_world_width is None
+    assert "view" not in workspace.layout
+    assert calls == ["cancel", "render"]
 
 
 def test_default_axisymmetric_fit_centres_z_zero_for_positive_z_geometry(standalone_components):

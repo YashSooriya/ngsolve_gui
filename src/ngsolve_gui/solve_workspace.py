@@ -1733,7 +1733,7 @@ class SolveWorkspace(Div):
         self._view_center = None
         self._view_world_width = None
         self._save_canvas_view_to_layout()
-        self.render_canvas()
+        self._render_canvas_after_interaction()
 
     def _canvas_plot_bounds(self):
         # The sketch, grid, and axes use the complete SVG viewport. Coordinate
@@ -1756,7 +1756,7 @@ class SolveWorkspace(Div):
             return
         self._canvas_width = width
         self._canvas_height = height
-        self.render_canvas()
+        self._render_canvas_after_interaction()
 
     def _fit_canvas_world_view(self):
         plot = self._canvas_plot_bounds()
