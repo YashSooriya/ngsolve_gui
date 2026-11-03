@@ -391,6 +391,42 @@ def test_3d_material_library_create_edit_and_validation(monkeypatch):
     assert library.materials[0]["properties"]["electrical_conductivity"] == "2.4e6"
 
 
+def test_dc_material_editor_marks_only_relative_permeability_as_required(monkeypatch):
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+    workspace = ThreeDWorkspace(SimpleNamespace())
+    project = new_3d_project("DC material requirements")
+    project["study"]["physics"] = "magnetostatic_dc"
+    project["materials"] = [{
+        "id": "dc-material",
+        "name": "DC alloy",
+        "properties": {
+            "relative_permeability": 1.4,
+            "electrical_conductivity": 4.0e6,
+            "youngs_modulus": 0,
+            "poissons_ratio": 0.3,
+            "density": 0,
+        },
+    }]
+    workspace.project = project
+    workspace._rebuild_items()
+    workspace.select_item("material", "dc-material")
+    assert workspace._begin_material_edit("dc-material") is True
+
+    controls = {
+        getattr(child, "ui_label", None): child
+        for child in workspace._properties.ui_children
+    }
+    assert "Relative permeability · Required" in controls
+    assert "Electrical conductivity · Required" not in controls
+    assert "Young's modulus · Required" not in controls
+    helper_text = " ".join(
+        str(text)
+        for child in workspace._properties.ui_children
+        for text in getattr(child, "ui_children", [])
+    )
+    assert "Static/DC magnetics requires μr" in helper_text
+
+
 def test_3d_material_edit_updates_references_and_embedded_snapshot(monkeypatch):
     monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
 
@@ -1183,6 +1219,7 @@ def test_mechanical_study_property_editor_exposes_only_relevant_configuration(mo
     assert {option["value"] for option in controls["Physics"].ui_options} == {
         "harmonic_em",
         "harmonic_mechanical",
+        "magnetostatic_dc",
     }
     assert {"Body force X (N/m³)", "Body force Y (N/m³)", "Body force Z (N/m³)"} <= set(controls)
     assert "Air-region padding (model spans)" not in controls
@@ -1199,11 +1236,80 @@ def test_mechanical_study_property_editor_exposes_only_relevant_configuration(mo
     })
     workspace._update_study_controls()
     assert workspace._run_study_button.ui_disable is False
-
     geometry["boundary_selections"][0]["boundary_condition"] = "magnetic_potential_zero"
     workspace._update_study_controls()
     assert workspace._run_study_button.ui_disable is False
 
+
+def test_static_dc_study_editor_exposes_real_field_sources_without_frequency(monkeypatch):
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    geometry["material"] = "Copper"
+    workspace.select_item("study")
+
+    assert workspace._set_study_physics(SimpleNamespace(value="magnetostatic_dc")) is True
+    assert workspace._study_node.ui_children[1].ui_children == ["Static/DC magnetics"]
+    controls = {
+        getattr(child, "ui_label", None): child
+        for child in workspace._properties.ui_children
+    }
+    assert controls["Physics"].ui_model_value == "magnetostatic_dc"
+    assert {option["value"] for option in controls["Physics"].ui_options} == {
+        "harmonic_em", "harmonic_mechanical", "magnetostatic_dc",
+    }
+    assert {"Applied BX (T)", "Applied BY (T)", "Applied BZ (T)"} <= set(controls)
+    assert "Frequency (Hz)" not in controls
+    assert "Air-region padding (model spans)" in controls
+    assert workspace._run_study_button.ui_disable is True
+
+    assert workspace._set_study_vector_component(
+        "dc_background_field_t", 2, SimpleNamespace(value="0.025"),
+        label="Applied DC magnetic field", limit=1e6,
+    ) is True
+    assert workspace._run_study_button.ui_disable is False
+
+    trace_bytes = b"0 0 0\n0 0 1\n"
+    trace = add_wire_trace(
+        workspace.project, workspace.assets, "dc_coil.txt", trace_bytes
+    )
+    workspace._rebuild_items()
+    workspace.select_item("trace_set", trace["id"])
+    trace_labels = {
+        getattr(child, "ui_label", None)
+        for child in workspace._properties.ui_children
+    }
+    assert "Current (A)" in trace_labels
+    assert "Current phase (°)" not in trace_labels
+    assert "Target gradient (T/m)" not in trace_labels
+    assert "Material reference" not in trace_labels
+
+    domain = {
+        "id": "dc-domain",
+        "name": "DC source domain",
+        "domain_ids": [0],
+        "domain_tags": ["MMFEM_SOLID_000000000000000000000001"],
+    }
+    geometry["domain_selections"].append(domain)
+    workspace.select_item("named_selection", domain["id"])
+    labels = {
+        getattr(child, "ui_label", None)
+        for child in workspace._properties.ui_children
+    }
+    assert "Add DC current-density source" in labels
+    workspace._add_domain_assignment(domain, "dc_current_density")
+    labels = {
+        getattr(child, "ui_label", None)
+        for child in workspace._properties.ui_children
+    }
+    assert {"JX (A/m²)", "JY (A/m²)", "JZ (A/m²)", "Suppress source"} <= labels
+    assert workspace._set_assignment_vector_component(
+        domain,
+        "dc_current_density_a_per_m2",
+        0,
+        SimpleNamespace(value="100000"),
+        label="DC current density",
+        limit=1e15,
+    ) is True
+    assert domain["dc_current_density_a_per_m2"] == [100000.0, 0.0, 0.0]
 
 def test_invalidated_boundary_assignment_can_be_reassigned_from_current_mesh(monkeypatch):
     workspace, geometry = _workspace_with_test_mesh(monkeypatch)

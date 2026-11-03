@@ -2113,16 +2113,24 @@ class NGSolveGui(App):
             workspace = self._three_d_workspace
             try:
                 from .three_d_project import validate_3d_project
-                from .three_d_solver import validate_time_harmonic_em_setup
+                from .three_d_solver import validate_3d_study_setup
 
                 validate_3d_project(workspace.project, workspace.assets)
-                setup = validate_time_harmonic_em_setup(workspace.project)
+                setup = validate_3d_study_setup(workspace.project)
             except Exception as error:
                 workspace._set_status(f"Study setup needs attention: {error}", error=True)
                 return False
-            label = "time-harmonic electromagnetic" if setup["physics"] == "harmonic_em" else "time-harmonic mechanics"
+            label = {
+                "harmonic_em": "time-harmonic electromagnetic",
+                "harmonic_mechanical": "time-harmonic mechanics",
+                "magnetostatic_dc": "static/DC magnetic",
+            }[setup["physics"]]
+            valid_at = (
+                f" at {setup['frequency_hz']:g} Hz"
+                if setup["frequency_hz"] is not None else ""
+            )
             workspace._set_status(
-                f"3D {label} setup is valid at {setup['frequency_hz']:g} Hz."
+                f"3D {label} setup is valid{valid_at}."
             )
             return True
         self._open_solve_section("studies")
@@ -2814,10 +2822,10 @@ class NGSolveGui(App):
             project = copy.deepcopy(workspace.project)
             assets = dict(workspace.assets)
             from .three_d_project import SUPPORTED_3D_STUDIES, validate_3d_project
-            from .three_d_solver import validate_time_harmonic_em_setup
+            from .three_d_solver import validate_3d_study_setup
 
             validate_3d_project(project, assets)
-            setup = validate_time_harmonic_em_setup(project)
+            setup = validate_3d_study_setup(project)
             study_label = SUPPORTED_3D_STUDIES[setup["physics"]]
             solver_root = self._find_solver_root()
             runner = solver_root / "scripts" / "run_gui_3d_model.py"
@@ -2845,7 +2853,6 @@ class NGSolveGui(App):
                 "model_name": project_name,
                 "problem_sha256": hashlib.sha256(model_bytes).hexdigest(),
                 "physics": study_label,
-                "frequency_hz": setup["frequency_hz"],
                 "polynomial_order": setup["polynomial_order"],
                 "diagnostics": {
                     "process_context": "solver_process.json",
@@ -2853,7 +2860,13 @@ class NGSolveGui(App):
                 },
             }
             if setup["physics"] == "harmonic_em":
+                manifest["frequency_hz"] = setup["frequency_hz"]
                 manifest["air_padding"] = setup["air_padding"]
+            elif setup["physics"] == "magnetostatic_dc":
+                manifest["air_padding"] = setup["air_padding"]
+                manifest["applied_dc_background_field_t"] = setup[
+                    "dc_background_field_t"
+                ]
             else:
                 manifest["mechanical_body_force_n_m3"] = setup[
                     "mechanical_body_force_n_m3"
@@ -2872,8 +2885,12 @@ class NGSolveGui(App):
         workspace._study_running = True
         self._set_application_menu_context(True)
         workspace._update_study_controls()
+        run_description = (
+            f"{setup['frequency_hz']:g} Hz "
+            if setup["frequency_hz"] is not None else ""
+        )
         workspace._set_status(
-            f"Running {setup['frequency_hz']:g} Hz {study_label} in {output_dir}…"
+            f"Running {run_description}{study_label} in {output_dir}…"
         )
 
         def run_job():

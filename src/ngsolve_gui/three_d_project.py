@@ -36,6 +36,7 @@ SUPPORTED_3D_BOUNDARY_CONDITIONS = {
 SUPPORTED_3D_STUDIES = {
     "harmonic_em": "Time-harmonic electromagnetics",
     "harmonic_mechanical": "Time-harmonic mechanics",
+    "magnetostatic_dc": "Static/DC magnetics",
 }
 SUPPORTED_3D_EM_SOURCE_MODES = {
     "wire_trace": "Wire traces",
@@ -88,6 +89,7 @@ def new_3d_project(name="Untitled 3D project"):
             "frequency_hz": 500.0,
             "polynomial_order": 1,
             "air_padding": 2.0,
+            "dc_background_field_t": [0.0, 0.0, 0.0],
             "mechanical_body_force_n_m3": [0.0, 0.0, 0.0],
             "mechanical_body_force_phase_deg": [0.0, 0.0, 0.0],
         },
@@ -504,6 +506,25 @@ def _validate_named_selections(geometry, key, region_key, label):
                     "A 3D boundary condition needs saved STEP face identifiers. "
                     "Regenerate the mesh and save the boundary selection again."
                 )
+        else:
+            if "dc_current_density_a_per_m2" in selection:
+                selection["dc_current_density_a_per_m2"] = _finite_vector(
+                    selection["dc_current_density_a_per_m2"],
+                    "DC current density (A/m²)",
+                    limit=1e15,
+                )
+                if not isinstance(selection.get("dc_current_density_suppressed", False), bool):
+                    raise ValueError("DC current-density suppression must be a boolean.")
+            if (
+                "dc_current_density_a_per_m2" in selection
+                and not selection.get("dc_current_density_suppressed", False)
+                and any(selection["dc_current_density_a_per_m2"])
+                and not tags
+            ):
+                raise ValueError(
+                    "A DC current-density source needs saved STEP solid identifiers. "
+                    "Regenerate the mesh and save the domain selection again."
+                )
         selection["name"] = name.strip()
         selection[region_key] = sorted(region_ids)
         used_ids.add(selection_id)
@@ -710,40 +731,54 @@ def validate_3d_project(project, assets):
         raise ValueError("The 3D study settings must be an object.")
     physics = study.get("physics", "harmonic_em")
     if physics not in SUPPORTED_3D_STUDIES:
-        raise ValueError("Choose a supported 3D harmonic study.")
+        raise ValueError("Choose a supported 3D study.")
     em_source_mode = study.get("em_source_mode", "wire_trace")
-    if em_source_mode not in SUPPORTED_3D_EM_SOURCE_MODES:
+    harmonic = physics in {"harmonic_em", "harmonic_mechanical"}
+    electromagnetic = physics in {"harmonic_em", "magnetostatic_dc"}
+    if physics == "harmonic_em" and em_source_mode not in SUPPORTED_3D_EM_SOURCE_MODES:
         raise ValueError("Choose a supported 3D electromagnetic excitation source.")
     try:
-        frequency_hz = float(study.get("frequency_hz", 500.0))
         polynomial_order = int(study.get("polynomial_order", 1))
-        air_padding = float(study.get("air_padding", 2.0))
-        body_force = study.get("mechanical_body_force_n_m3", [0.0, 0.0, 0.0])
-        if not math.isfinite(frequency_hz) or not 0 < frequency_hz <= 1e9:
-            raise ValueError("Frequency must be greater than 0 and no more than 1e9 Hz.")
         if polynomial_order not in {1, 2, 3, 4}:
             raise ValueError("Polynomial order must be between 1 and 4.")
-        if not math.isfinite(air_padding) or not 0.25 <= air_padding <= 20:
-            raise ValueError("Air-domain padding must be between 0.25 and 20 model spans.")
-        body_force = _finite_vector(
-            body_force, "Mechanical body force (N/m³)", limit=1e15
-        )
-        body_force_phase = _finite_vector(
-            study.get("mechanical_body_force_phase_deg", [0.0, 0.0, 0.0]),
-            "Mechanical body-force phase (degrees)",
-            limit=360_000.0,
-        )
+        if harmonic:
+            frequency_hz = float(study.get("frequency_hz", 500.0))
+            if not math.isfinite(frequency_hz) or not 0 < frequency_hz <= 1e9:
+                raise ValueError("Frequency must be greater than 0 and no more than 1e9 Hz.")
+        if electromagnetic:
+            air_padding = float(study.get("air_padding", 2.0))
+            if not math.isfinite(air_padding) or not 0.25 <= air_padding <= 20:
+                raise ValueError("Air-domain padding must be between 0.25 and 20 model spans.")
+        if physics == "magnetostatic_dc":
+            dc_background_field = _finite_vector(
+                study.get("dc_background_field_t", [0.0, 0.0, 0.0]),
+                "Applied DC magnetic flux density (T)",
+                limit=1e6,
+            )
+        if physics == "harmonic_mechanical":
+            body_force = _finite_vector(
+                study.get("mechanical_body_force_n_m3", [0.0, 0.0, 0.0]),
+                "Mechanical body force (N/m³)", limit=1e15,
+            )
+            body_force_phase = _finite_vector(
+                study.get("mechanical_body_force_phase_deg", [0.0, 0.0, 0.0]),
+                "Mechanical body-force phase (degrees)", limit=360_000.0,
+            )
     except (TypeError, ValueError, OverflowError) as error:
         raise ValueError(f"Invalid 3D study settings: {error}") from error
-    study.update({
-        "physics": physics,
-        "em_source_mode": em_source_mode,
-        "frequency_hz": frequency_hz,
-        "polynomial_order": polynomial_order,
-        "air_padding": air_padding,
-        "mechanical_body_force_n_m3": body_force,
-        "mechanical_body_force_phase_deg": body_force_phase,
-    })
+    study["physics"] = physics
+    study["polynomial_order"] = polynomial_order
+    if physics == "harmonic_em":
+        study["em_source_mode"] = em_source_mode
+    if electromagnetic:
+        study["air_padding"] = air_padding
+    if physics == "magnetostatic_dc":
+        study["dc_background_field_t"] = dc_background_field
+    if harmonic:
+        study["frequency_hz"] = frequency_hz
+    if physics == "harmonic_mechanical":
+        study["mechanical_body_force_n_m3"] = body_force
+        study["mechanical_body_force_phase_deg"] = body_force_phase
 
     materials = project.setdefault("materials", [])
     if not isinstance(materials, list) or len(materials) > MAX_PROJECT_ITEMS:

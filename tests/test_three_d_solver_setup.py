@@ -20,7 +20,11 @@ from ngsolve_gui.three_d_project import (
     package_3d_project,
 )
 from ngsolve_gui.three_d_solver import (
+    build_3d_study_problem,
     build_time_harmonic_em_problem,
+    dc_input_fingerprint_payload,
+    material_properties_for_study,
+    validate_3d_study_setup,
     validate_time_harmonic_em_setup,
 )
 from .solver_test_support import SOLVER_UNAVAILABLE_REASON, solver_checkout_available
@@ -117,6 +121,147 @@ def test_study_setup_uses_project_material_snapshots_and_single_frequency():
     assert validated["materials"]["Stainless steel (4 K / OVC)"]["sigma"] == 1.4e6
     assert validated["materials"]["Aluminium (77 K shield)"]["sigma"] == 33e6
     assert "Air" in validated["materials"]
+
+
+def test_magnetostatic_validation_requires_only_dc_inputs_and_permeability():
+    project = _study_project()
+    project["geometries"][0]["material"] = "DC test alloy"
+    project["geometries"][0]["domain_selections"] = []
+    project["materials"] = [{
+        "id": "dc-test-alloy",
+        "name": "DC test alloy",
+        "properties": {
+            "relative_permeability": "2.4",
+            "electrical_conductivity": "unused by magnetostatics",
+            "youngs_modulus": "unused by magnetostatics",
+            "poissons_ratio": "unused by magnetostatics",
+            "density": "unused by magnetostatics",
+        },
+    }]
+    project["wire_trace_sets"] = []
+    project["study"].update(
+        physics="magnetostatic_dc",
+        dc_background_field_t=[0.0, 0.0, 0.025],
+        frequency_hz="not a DC input",
+        em_source_mode="not applicable",
+    )
+
+    validated = validate_3d_study_setup(project)
+
+    assert validated["frequency_hz"] is None
+    assert validated["em_source_mode"] is None
+    assert validated["dc_background_field_t"] == [0.0, 0.0, 0.025]
+    assert validated["materials"]["DC test alloy"]["mur"] == 2.4
+    assert validated["materials"]["DC test alloy"]["sigma"] == 0.0
+    assert material_properties_for_study(
+        project["materials"][0], "magnetostatic_dc"
+    )["mur"] == 2.4
+
+
+def test_magnetostatic_builder_maps_real_dc_sources_and_uniform_field_boundary(tmp_path):
+    from netgen.occ import Box, OCCGeometry, Pnt
+    from ngsolve_gui.three_d_project import step_geometry_tags
+
+    step_path = tmp_path / "dc_block.step"
+    Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).WriteStep(str(step_path))
+    materials = builtin_materials()
+    project = new_3d_project("Static DC block")
+    alloy = {
+        "id": "dc-alloy",
+        "name": "DC test alloy",
+        "properties": {
+            "relative_permeability": 2.0,
+            "electrical_conductivity": 5e7,
+            "youngs_modulus": 0.0,
+            "poissons_ratio": 0.3,
+            "density": 0.0,
+        },
+    }
+    project["materials"] = [alloy]
+    project["study"].update(
+        physics="magnetostatic_dc",
+        dc_background_field_t=[0.0, 0.0, 0.02],
+        air_padding=2.5,
+    )
+    project["wire_trace_sets"] = []
+    assets = {}
+    geometry = add_step_geometry(
+        project, assets, step_path.name, step_path.read_bytes(),
+        units="mm", material=alloy["name"],
+    )
+    geometry["mesh_maxh_mm"] = 5.0
+    solid_tags, face_refs = step_geometry_tags(
+        list(OCCGeometry(str(step_path)).shape.solids)
+    )
+    face_tag = next(tag for tag, _solid_tag, _face in face_refs if tag is not None)
+    geometry["domain_selections"] = [{
+        "id": "dc-current-selection",
+        "name": "Driven solid",
+        "domain_ids": [0],
+        "domain_tags": [solid_tags[0]],
+        "dc_current_density_a_per_m2": [1e5, 0.0, 0.0],
+        "dc_current_density_suppressed": False,
+    }]
+    geometry["boundary_selections"] = [{
+        "id": "a-zero-selection",
+        "name": "Vector potential zero",
+        "boundary_ids": [0],
+        "boundary_tags": [face_tag],
+        "boundary_condition": "magnetic_potential_zero",
+    }]
+
+    inputs = build_3d_study_problem(project, {geometry["asset"]: step_path})
+    problem = inputs["problem"]
+
+    assert inputs["physics"] == "magnetostatic_dc"
+    assert inputs["frequency_hz"] is None
+    assert problem["temp_disc"] == "static"
+    assert problem["kACCoefDC"] == 1
+    assert problem["cACCoef"] == problem["kACCoef"] == 0
+    assert problem["statCond"] is True
+    assert problem["dirkeysADC"].startswith("DirEM")
+    assert "DirEM" in problem["dirconditionADC"]
+    assert f"DirEM_G0_{face_tag}" in problem["dirkeysADC"]
+    assert "omega" not in problem
+    assert problem["murdict"]["_mmfem_g0_" + solid_tags[0]] == 2.0
+    assert problem["srcdictDC"]["_mmfem_air"].dim == 3
+    assert problem["Aux"]["dc_current_density_by_domain"] == {
+        f"{geometry['id']}:{solid_tags[0]}": [1e5, 0.0, 0.0]
+    }
+    assert inputs["dc_input_fingerprint_payload"]["applied_background_field_t"] == [0.0, 0.0, 0.02]
+
+
+def test_dc_fingerprint_tracks_only_inputs_that_change_the_background(tmp_path):
+    from netgen.occ import Box, Pnt
+
+    step_path = tmp_path / "fingerprint_block.step"
+    Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).WriteStep(str(step_path))
+    material = {
+        "id": "ferrite",
+        "name": "Ferrite",
+        "properties": {"relative_permeability": 2.0},
+    }
+    project = new_3d_project("Fingerprint")
+    project["materials"] = [material]
+    project["study"].update(
+        physics="magnetostatic_dc", dc_background_field_t=[0.0, 0.0, 0.01]
+    )
+    project["wire_trace_sets"] = []
+    assets = {}
+    geometry = add_step_geometry(
+        project, assets, step_path.name, step_path.read_bytes(),
+        units="mm", material=material["name"],
+    )
+    paths = {geometry["asset"]: step_path}
+
+    first = dc_input_fingerprint_payload(project, paths)
+    project["study"]["frequency_hz"] = 1e99
+    project["study"]["mechanical_body_force_n_m3"] = [8e8, 0.0, 0.0]
+    unrelated = dc_input_fingerprint_payload(project, paths)
+    assert first == unrelated
+    project["materials"][0]["properties"]["relative_permeability"] = 2.2
+    changed_material = dc_input_fingerprint_payload(project, paths)
+    assert changed_material != first
 
 
 def test_mechanical_setup_accepts_body_force_without_electromagnetic_trace():
@@ -1384,3 +1529,152 @@ def test_small_3d_mechanical_domain_load_prescribed_motion_and_spring_run(tmp_pa
     assert constrained
     assert float(np.abs(values.imag).max()) == pytest.approx(1e-6, rel=1e-6)
     assert float(np.abs(values.real).max()) < 1e-12
+
+
+@pytest.mark.skipif(
+    not solver_checkout_available(),
+    reason=SOLVER_UNAVAILABLE_REASON,
+)
+def test_small_3d_dc_sphere_matches_uniform_field_and_permeability_effect(tmp_path):
+    import numpy as np
+    from netgen.occ import Pnt, Sphere
+
+    step_path = tmp_path / "small_dc_sphere.step"
+    Sphere(Pnt(0, 0, 0), r=5.0).WriteStep(str(step_path))
+    project = new_3d_project("Small DC magnetic sphere")
+    project["study"].update(
+        physics="magnetostatic_dc",
+        dc_background_field_t=[0.0, 0.0, 0.02],
+        polynomial_order=1,
+        air_padding=1.0,
+    )
+    project["study"].pop("frequency_hz", None)
+    project["wire_trace_sets"] = []
+    assets = {}
+    geometry = add_step_geometry(
+        project, assets, step_path.name, step_path.read_bytes(),
+        units="mm", material="DC sphere alloy",
+    )
+    geometry["mesh_maxh_mm"] = 2.0
+
+    measured = {}
+    for relative_permeability in (1.0, 2.0):
+        project["materials"] = [{
+            "id": "dc-sphere-alloy",
+            "name": "DC sphere alloy",
+            "properties": {
+                "relative_permeability": relative_permeability,
+                "electrical_conductivity": 4e6,
+                "youngs_modulus": 0.0,
+                "poissons_ratio": 0.3,
+                "density": 0.0,
+            },
+        }]
+        manifest, output_dir = _run_packaged_solver_model(
+            project, assets, tmp_path, f"dc-sphere-mur-{relative_permeability:g}"
+        )
+        assert manifest["physics"] == "Static/DC magnetics"
+        assert "frequency_hz" not in manifest
+        assert manifest["status"] == "complete"
+        assert manifest["mesh"]["elements"] < 50_000
+        artifact = output_dir / manifest["dc_background_field"]["file"]
+        assert artifact.is_file()
+        with np.load(artifact, allow_pickle=False) as archive:
+            stored_coefficients = archive["coefficients"]
+            stored_metadata = json.loads(str(archive["metadata"].item()))
+        assert stored_coefficients.size == stored_metadata["dof_count"]
+        assert stored_metadata["mesh_sha256"]
+        assert stored_metadata["input_fingerprint"] == manifest["dc_input_fingerprint"]
+        field_path = next(
+            output_dir / name for name in manifest["fields"] if "gfBDC" in name
+        )
+        with field_path.open("rb") as stream:
+            flux_density = pickle.load(stream)
+        mesh = __import__("ngsolve").Mesh(str(output_dir / "mesh.vol"))
+        value = np.asarray(flux_density(mesh(0.0, 0.0, 0.0)), dtype=float)
+        assert np.isfinite(value).all()
+        measured[relative_permeability] = float(value[2])
+
+    # For a sphere in a uniform applied field, the infinite-domain interior
+    # solution is B_in = 3*mu_r/(mu_r+2)*B0. The finite air box and coarse
+    # first-order mesh introduce a bounded approximation error.
+    assert measured[1.0] == pytest.approx(0.02, rel=0.03, abs=5e-4)
+    assert measured[2.0] == pytest.approx(0.03, rel=0.05, abs=5e-4)
+    assert measured[2.0] > measured[1.0] * 1.25
+    print(json.dumps({
+        "reference": "uniform-field permeable sphere",
+        "applied_Bz_T": 0.02,
+        "analytic_Bz_center_T": {"mur_1": 0.02, "mur_2": 0.03},
+        "measured_Bz_center_T": {
+            f"mur_{mur:g}": field for mur, field in measured.items()
+        },
+    }, sort_keys=True))
+
+
+@pytest.mark.skipif(
+    not solver_checkout_available(),
+    reason=SOLVER_UNAVAILABLE_REASON,
+)
+def test_small_3d_dc_domain_current_density_produces_right_hand_field(tmp_path):
+    import numpy as np
+    from netgen.occ import Box, Pnt
+    import ngsolve as ngs
+
+    from ngsolve_gui.three_d_mesh import generate_step_mesh
+
+    step_path = tmp_path / "small_dc_current_block.step"
+    Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).WriteStep(str(step_path))
+    mesh_setup = generate_step_mesh(step_path.read_bytes(), maxh_mm=5.0)
+    assert 0 < mesh_setup["volume_elements"] < 50_000
+    material = builtin_materials()[4]
+    project = new_3d_project("Small DC current-density check")
+    project["study"].update(
+        physics="magnetostatic_dc",
+        dc_background_field_t=[0.0, 0.0, 0.0],
+        polynomial_order=1,
+        air_padding=0.5,
+    )
+    project["study"].pop("frequency_hz", None)
+    project["wire_trace_sets"] = []
+    project["materials"] = [material]
+    assets = {}
+    geometry = add_step_geometry(
+        project, assets, step_path.name, step_path.read_bytes(),
+        units="mm", material=material["name"],
+    )
+    geometry["mesh_maxh_mm"] = 5.0
+    domain = mesh_setup["domain_regions"][0]
+    geometry["domain_selections"] = [{
+        "id": "dc-current-source",
+        "name": "DC current source",
+        "domain_ids": [domain["id"]],
+        "domain_tags": [domain["domain_tag"]],
+        "dc_current_density_a_per_m2": [0.0, 0.0, 1e6],
+    }]
+
+    manifest, output_dir = _run_packaged_solver_model(
+        project, assets, tmp_path, "small-dc-current-density"
+    )
+    configuration = manifest["solver_configuration"]
+    assert manifest["physics"] == "Static/DC magnetics"
+    assert configuration["dc_current_density_by_domain"][
+        f"{geometry['id']}:{domain['domain_tag']}"
+    ] == [0.0, 0.0, 1e6]
+    field_path = next(
+        output_dir / name for name in manifest["fields"] if "gfBDC" in name
+    )
+    with field_path.open("rb") as stream:
+        flux_density = pickle.load(stream)
+    mesh = ngs.Mesh(str(output_dir / "mesh.vol"))
+    # Sample just outside the +X face, where the right-hand rule predicts +Y.
+    measured = np.asarray(flux_density(mesh(0.012, 0.005, 0.005)), dtype=float)
+    assert np.isfinite(measured).all()
+    assert measured[1] > 1e-6
+    assert abs(measured[1]) > 5 * max(abs(measured[0]), abs(measured[2]))
+    print(json.dumps({
+        "reference": "right-hand rule for +Z current density",
+        "Jz_a_per_m2": 1e6,
+        "sample_xyz_m": [0.012, 0.005, 0.005],
+        "measured_B_t": measured.tolist(),
+        "tetrahedra": manifest["mesh"]["elements"],
+    }, sort_keys=True))

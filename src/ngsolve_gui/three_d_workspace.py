@@ -544,7 +544,7 @@ class ThreeDWorkspace(Div):
         em_source_mode = study.get("em_source_mode", "wire_trace")
         compatible_conditions = (
             {"magnetic_potential_zero"}
-            if physics == "harmonic_em"
+            if physics in {"harmonic_em", "magnetostatic_dc"}
             else {
                 "mechanical_fixed",
                 "mechanical_prescribed_displacement",
@@ -577,6 +577,16 @@ class ThreeDWorkspace(Div):
                     if (
                         "current_density_amplitude_a_per_m2" in selection
                         and not selection.get("current_density_suppressed", False)
+                    )
+                )
+            if physics == "magnetostatic_dc":
+                active_selections.extend(
+                    ("domain", selection)
+                    for selection in geometry.get("domain_selections", [])
+                    if (
+                        "dc_current_density_a_per_m2" in selection
+                        and not selection.get("dc_current_density_suppressed", False)
+                        and has_nonzero(selection.get("dc_current_density_a_per_m2", []))
                     )
                 )
             if physics == "harmonic_mechanical":
@@ -627,10 +637,20 @@ class ThreeDWorkspace(Div):
         )
         wire_source_ready = False
         for trace_set in self.project.get("wire_trace_sets", []):
-            source_value = trace_set.get("target_gradient")
-            if source_value is None:
-                source_value = trace_set.get("current", 1.0)
-            if has_nonzero([source_value]):
+            source_value = (
+                trace_set.get("current", 1.0)
+                if physics == "magnetostatic_dc"
+                else trace_set.get("target_gradient")
+                if trace_set.get("target_gradient") is not None
+                else trace_set.get("current", 1.0)
+            )
+            scale_values = [
+                trace.get("current_scale", 1.0)
+                for trace in trace_set.get("traces", [])
+            ]
+            if has_nonzero([source_value]) and (
+                physics != "magnetostatic_dc" or has_nonzero(scale_values)
+            ):
                 wire_source_ready = True
                 break
         current_density_ready = any(
@@ -639,6 +659,13 @@ class ThreeDWorkspace(Div):
             for geometry in self.project.get("geometries", [])
             for selection in geometry.get("domain_selections", [])
         )
+        dc_current_density_ready = any(
+            not selection.get("dc_current_density_suppressed", False)
+            and has_nonzero(selection.get("dc_current_density_a_per_m2", []))
+            for geometry in self.project.get("geometries", [])
+            for selection in geometry.get("domain_selections", [])
+        )
+        dc_applied_field_ready = has_nonzero(study.get("dc_background_field_t", []))
         try:
             mechanical_load_ready = physics != "harmonic_mechanical" or (
                 global_load or domain_load or prescribed_load
@@ -650,14 +677,19 @@ class ThreeDWorkspace(Div):
         ) or (
             em_source_mode == "domain_current_density" and current_density_ready
         )
+        dc_source_ready = (
+            dc_applied_field_ready or dc_current_density_ready or wire_source_ready
+        )
+        study_source_ready = (
+            em_source_ready if physics == "harmonic_em"
+            else dc_source_ready if physics == "magnetostatic_dc"
+            else True
+        )
         if hasattr(self, "_run_study_button"):
             self._run_study_button.ui_disable = (
                 running
                 or not self.project.get("geometries")
-                or (
-                    physics == "harmonic_em"
-                    and not em_source_ready
-                )
+                or not study_source_ready
                 or not self._has_resolved_study_materials()
                 or not assignments_ready
                 or not mechanical_load_ready
@@ -1018,7 +1050,7 @@ class ThreeDWorkspace(Div):
     def _set_study_physics(self, event):
         value = str(getattr(event, "value", event) or "")
         if value not in SUPPORTED_3D_STUDIES:
-            self._set_status("Choose a supported 3D harmonic study.", error=True)
+            self._set_status("Choose a supported 3D study.", error=True)
             return False
         study = self.project.setdefault("study", {})
         old_value = study.get("physics", "harmonic_em")
@@ -1146,6 +1178,15 @@ class ThreeDWorkspace(Div):
         return True
 
     def _add_domain_assignment(self, selection, kind):
+        if kind == "dc_current_density":
+            selection["dc_current_density_a_per_m2"] = [0.0, 0.0, 0.0]
+            selection["dc_current_density_suppressed"] = False
+            self._mark_changed()
+            self._rebuild_items()
+            self._rebuild_properties()
+            self._update_study_controls()
+            self._set_status("DC current-density source added. Enter its real X, Y and Z components.")
+            return
         if kind == "current_density":
             amplitude_key = "current_density_amplitude_a_per_m2"
             phase_key = "current_density_phase_deg"
@@ -1164,11 +1205,12 @@ class ThreeDWorkspace(Div):
         self._set_status("Domain assignment added. Enter its vector components and phases.")
 
     def _remove_domain_assignment(self, selection, kind):
-        keys = (
-            ("current_density_amplitude_a_per_m2", "current_density_phase_deg", "current_density_suppressed")
-            if kind == "current_density"
-            else ("mechanical_body_force_n_m3", "mechanical_body_force_phase_deg", "mechanical_body_force_suppressed")
-        )
+        if kind == "dc_current_density":
+            keys = ("dc_current_density_a_per_m2", "dc_current_density_suppressed")
+        elif kind == "current_density":
+            keys = ("current_density_amplitude_a_per_m2", "current_density_phase_deg", "current_density_suppressed")
+        else:
+            keys = ("mechanical_body_force_n_m3", "mechanical_body_force_phase_deg", "mechanical_body_force_suppressed")
         for key in keys:
             selection.pop(key, None)
         self._mark_changed()
@@ -1554,6 +1596,8 @@ class ThreeDWorkspace(Div):
             assignment_badges = []
             if "current_density_amplitude_a_per_m2" in selection:
                 assignment_badges.append("J source")
+            if "dc_current_density_a_per_m2" in selection:
+                assignment_badges.append("DC J")
             if "mechanical_body_force_n_m3" in selection:
                 assignment_badges.append("Body force")
             selection_badge = " + ".join(assignment_badges) or "Domain"
@@ -1561,6 +1605,7 @@ class ThreeDWorkspace(Div):
                 selection.get(key, False)
                 for key in (
                     "current_density_suppressed",
+                    "dc_current_density_suppressed",
                     "mechanical_body_force_suppressed",
                 )
             )
@@ -1754,18 +1799,20 @@ class ThreeDWorkspace(Div):
             + ("background:var(--accent-subtle); color:var(--accent);" if selected_project else "")
         )
         selected_study = self._selection == ("study", None)
+        study_physics = self.project.get("study", {}).get("physics", "harmonic_em")
+        study_title = {
+            "harmonic_em": "Time-harmonic EM",
+            "harmonic_mechanical": "Time-harmonic mechanics",
+            "magnetostatic_dc": "Static/DC magnetics",
+        }.get(study_physics, "3D study")
         self._study_node.ui_children = [
             QIcon(
-                ui_name="mdi-waveform",
+                ui_name="mdi-magnet" if study_physics == "magnetostatic_dc" else "mdi-waveform",
                 ui_size="15px",
                 ui_color="primary" if selected_study else "grey-7",
             ),
             Div(
-                (
-                    "Time-harmonic EM"
-                    if self.project.get("study", {}).get("physics", "harmonic_em") == "harmonic_em"
-                    else "Time-harmonic mechanics"
-                ),
+                study_title,
                 ui_style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px;",
             ),
         ]
@@ -3067,6 +3114,51 @@ class ThreeDWorkspace(Div):
                                     lambda *_args, obj=selection: self._remove_domain_assignment(obj, "current_density"),
                                 ),
                             ])
+                    if active_physics == "magnetostatic_dc":
+                        amplitude_key = "dc_current_density_a_per_m2"
+                        suppressed_key = "dc_current_density_suppressed"
+                        if amplitude_key not in selection:
+                            children.append(_button(
+                                "Add DC current-density source",
+                                "mdi-lightning-bolt-outline",
+                                lambda *_args, obj=selection: self._add_domain_assignment(
+                                    obj, "dc_current_density"
+                                ),
+                                color="primary",
+                            ))
+                        else:
+                            children.append(Div(
+                                "Static current density",
+                                ui_style="font-size:12px; font-weight:600; padding-top:8px;",
+                            ))
+                            for index, axis in enumerate("xyz"):
+                                children.append(_input(
+                                    f"J{axis.upper()} (A/m²)",
+                                    selection[amplitude_key][index],
+                                    lambda event, obj=selection, key=amplitude_key, i=index: self._set_assignment_vector_component(
+                                        obj, key, i, event,
+                                        label="DC current density", limit=1e15,
+                                    ),
+                                    number=True,
+                                    width="100%",
+                                ))
+                            children.append(Div(
+                                "Real, steady current density in global model axes.",
+                                ui_class="cb-muted",
+                                ui_style="font-size:10px; line-height:1.4;",
+                            ))
+                            children.extend([
+                                _button(
+                                    "Resume source" if selection.get(suppressed_key, False) else "Suppress source",
+                                    "mdi-pause-circle-outline" if not selection.get(suppressed_key, False) else "mdi-play-circle-outline",
+                                    lambda *_args, obj=selection, key=suppressed_key: self._toggle_assignment_suppressed(obj, key),
+                                ),
+                                _button(
+                                    "Remove source",
+                                    "mdi-delete-outline",
+                                    lambda *_args, obj=selection: self._remove_domain_assignment(obj, "dc_current_density"),
+                                ),
+                            ])
                     if active_physics == "harmonic_mechanical":
                         amplitude_key = "mechanical_body_force_n_m3"
                         phase_key = "mechanical_body_force_phase_deg"
@@ -3143,7 +3235,7 @@ class ThreeDWorkspace(Div):
                                 else "This condition is for the other physics study and is inactive for the current study."
                                 if selection_condition
                                 and (
-                                    (active_physics == "harmonic_em" and selection_condition != "magnetic_potential_zero")
+                                    (active_physics in {"harmonic_em", "magnetostatic_dc"} and selection_condition != "magnetic_potential_zero")
                                     or (active_physics == "harmonic_mechanical" and selection_condition == "magnetic_potential_zero")
                                 )
                                 else "Sets magnetic vector potential A = 0 on these faces."
@@ -3420,6 +3512,8 @@ class ThreeDWorkspace(Div):
             required = (
                 {"relative_permeability", "electrical_conductivity"}
                 if active_physics == "harmonic_em"
+                else {"relative_permeability"}
+                if active_physics == "magnetostatic_dc"
                 else {"youngs_modulus", "poissons_ratio", "density"}
             )
             fields = (
@@ -3451,7 +3545,7 @@ class ThreeDWorkspace(Div):
                     ui_style="font-size:15px; font-weight:600; overflow-wrap:anywhere;",
                 ))
             children.append(Div(
-                "EM requires μr and conductivity. Mechanics requires Young's modulus, Poisson's ratio and density.",
+                "Time-harmonic EM requires μr and conductivity. Static/DC magnetics requires μr. Mechanics requires Young's modulus, Poisson's ratio and density.",
                 ui_class="cb-muted",
                 ui_style="font-size:10px; line-height:1.4;",
             ))
@@ -3523,31 +3617,46 @@ class ThreeDWorkspace(Div):
                 lambda event, obj=item: self._set_value(obj, "direction", event),
                 [{"label": name.upper(), "value": name} for name in "xyz"],
             )
+            dc_study = self.project.get("study", {}).get("physics") == "magnetostatic_dc"
             children.extend([
                 Div("Wire trace set", ui_style="font-size:13px; font-weight:650;"),
                 _input("Name", item["name"], lambda event, obj=item: self._set_value(obj, "name", event), width="100%"),
-                self._select_options(
-                    "Material reference", item.get("material", "Air"),
-                    lambda event, obj=item: self._set_trace_material(obj, event),
-                    self._material_options(item.get("material", "Air")),
-                ),
-                self._material_note(),
+                *([] if dc_study else [
+                    self._select_options(
+                        "Material reference", item.get("material", "Air"),
+                        lambda event, obj=item: self._set_trace_material(obj, event),
+                        self._material_options(item.get("material", "Air")),
+                    ),
+                    self._material_note(),
+                ]),
                 _input("Current (A)", item.get("current", 1.0), lambda event, obj=item: self._set_number(obj, "current", event), number=True, width="100%"),
-                _input(
-                    "Current phase (°)", item.get("current_phase_deg", 0.0),
-                    lambda event, obj=item: self._set_wire_current_phase(obj, event),
-                    number=True, width="100%",
-                ),
-                _input("Target gradient (T/m)", item.get("target_gradient", ""), lambda event, obj=item: self._set_optional_number(obj, "target_gradient", event), number=True, width="100%"),
-                _input("DSV (m)", item.get("dsv", 0.4), lambda event, obj=item: self._set_number(obj, "dsv", event), number=True, width="100%"),
-                direction,
+                *([] if dc_study else [
+                    _input(
+                        "Current phase (°)", item.get("current_phase_deg", 0.0),
+                        lambda event, obj=item: self._set_wire_current_phase(obj, event),
+                        number=True, width="100%",
+                    ),
+                    _input("Target gradient (T/m)", item.get("target_gradient", ""), lambda event, obj=item: self._set_optional_number(obj, "target_gradient", event), number=True, width="100%"),
+                    _input("DSV (m)", item.get("dsv", 0.4), lambda event, obj=item: self._set_number(obj, "dsv", event), number=True, width="100%"),
+                    direction,
+                ]),
                 Div(f"{trace.get('points', 0):,} points · source: {trace.get('name', item['name'])}", ui_class="cb-muted", ui_style="font-size:11px; overflow-wrap:anywhere;"),
+                *([Div(
+                    "Used as a real DC current. Harmonic phase and gradient settings are inactive.",
+                    ui_class="cb-muted",
+                    ui_style="font-size:10px; line-height:1.4;",
+                )] if dc_study else []),
             ])
         elif kind == "study":
             study = self.project.setdefault("study", {})
             physics = study.get("physics", "harmonic_em")
+            title = {
+                "harmonic_em": "Time-harmonic electromagnetic study",
+                "harmonic_mechanical": "Time-harmonic mechanics study",
+                "magnetostatic_dc": "Static/DC magnetic study",
+            }.get(physics, "3D study")
             children.extend([
-                Div("Harmonic study", ui_style="font-size:13px; font-weight:650;"),
+                Div(title, ui_style="font-size:13px; font-weight:650;"),
                 self._select_options(
                     "Physics",
                     physics,
@@ -3557,11 +3666,13 @@ class ThreeDWorkspace(Div):
                         for value, label in SUPPORTED_3D_STUDIES.items()
                     ],
                 ),
-                _input(
-                    "Frequency (Hz)", study.get("frequency_hz", 500.0),
-                    lambda event: self._set_study_value("frequency_hz", event, number=True),
-                    number=True, width="100%",
-                ),
+                *([] if physics == "magnetostatic_dc" else [
+                    _input(
+                        "Frequency (Hz)", study.get("frequency_hz", 500.0),
+                        lambda event: self._set_study_value("frequency_hz", event, number=True),
+                        number=True, width="100%",
+                    ),
+                ]),
                 self._select_options(
                     "Finite-element order", study.get("polynomial_order", 1),
                     lambda event: self._set_study_value("polynomial_order", event),
@@ -3569,7 +3680,32 @@ class ThreeDWorkspace(Div):
                      for order in (1, 2, 3, 4)],
                 ),
             ])
-            if physics == "harmonic_em":
+            if physics == "magnetostatic_dc":
+                background = study.get("dc_background_field_t", [0.0, 0.0, 0.0])
+                for index, axis in enumerate("xyz"):
+                    children.append(_input(
+                        f"Applied B{axis.upper()} (T)",
+                        background[index],
+                        lambda event, i=index: self._set_study_vector_component(
+                            "dc_background_field_t", i, event,
+                            label="Applied DC magnetic field", limit=1e6,
+                        ),
+                        number=True,
+                        width="100%",
+                    ))
+                children.extend([
+                    _input(
+                        "Air-region padding (model spans)", study.get("air_padding", 2.0),
+                        lambda event: self._set_study_value("air_padding", event, number=True),
+                        number=True, width="100%",
+                    ),
+                    Div(
+                        "Applies the uniform DC field at the outer air boundary. Add real domain current density or wire-trace currents as required; the solved B field is saved for later coupled studies.",
+                        ui_class="cb-muted",
+                        ui_style="font-size:10px; line-height:1.45; padding:8px; background:var(--panel-header); border-radius:5px;",
+                    ),
+                ])
+            elif physics == "harmonic_em":
                 source_mode = study.get("em_source_mode", "wire_trace")
                 children.extend([
                     self._select_options(
