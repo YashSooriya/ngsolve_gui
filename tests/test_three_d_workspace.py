@@ -1064,7 +1064,13 @@ def test_plot_mesh_face_click_selects_boundary_region_and_visibility_controls(mo
     assert workspace._selection_draft["region_ids"] == [1]
     assert workspace._active_boundary_region_ids(geometry["id"]) == [1]
     assert item_rebuilds == []
-    assert property_rebuilds == [True]
+    # The geometry item is already active. Update its existing controls in
+    # place rather than rebuilding the whole properties panel for each face.
+    assert property_rebuilds == []
+    assert workspace._selection_region_select.ui_model_value == [1]
+    assert workspace._selection_region_summary.ui_children == [
+        "1 region selected: Boundary 2 · 1 surface triangles"
+    ]
     assert overlay_updates == [{"update_selection_style": False}]
     updates = workspace._style_preview_figure(figure)
     assert figure.data[0].visible is True
@@ -1075,7 +1081,7 @@ def test_plot_mesh_face_click_selects_boundary_region_and_visibility_controls(mo
     workspace._on_preview_plotly_click(0, 0, 1)
     assert workspace._selection == ("geometry", geometry["id"])
     assert item_rebuilds == [True]
-    assert property_rebuilds == [True, True]
+    assert property_rebuilds == [True]
     assert overlay_updates[-1] == {"update_selection_style": True}
 
     workspace.toggle_mesh_edges()

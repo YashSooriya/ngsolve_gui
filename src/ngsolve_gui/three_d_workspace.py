@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import copy
+import json
+import logging
 import math
+import os
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -2329,6 +2333,9 @@ class ThreeDWorkspace(Div):
         self._update_boundary_overlay()
 
     def _on_preview_plotly_click(self, figure_index, curve_number, point_number=None):
+        profile_selection = os.environ.get("MMFEM_PROFILE_SELECTION_TIMING") == "1"
+        callback_started = time.perf_counter() if profile_selection else None
+        timings = {}
         if figure_index != 0 or not self._preview._figures:
             return
         traces = self._preview._figures[0].data
@@ -2392,13 +2399,50 @@ class ThreeDWorkspace(Div):
                 )
                 selection_changed = self._selection != previous_selection
                 if selection_changed:
+                    stage_started = time.perf_counter() if profile_selection else None
                     self._rebuild_items()
+                    if profile_selection:
+                        timings["model_tree_ms"] = (
+                            time.perf_counter() - stage_started
+                        ) * 1000
+                    stage_started = time.perf_counter() if profile_selection else None
                     self._rebuild_properties()
+                    if profile_selection:
+                        timings["properties_ms"] = (
+                            time.perf_counter() - stage_started
+                        ) * 1000
                 else:
+                    stage_started = time.perf_counter() if profile_selection else None
                     self._update_selection_region_controls()
+                    if profile_selection:
+                        timings["selection_summary_ms"] = (
+                            time.perf_counter() - stage_started
+                        ) * 1000
+                stage_started = time.perf_counter() if profile_selection else None
                 self._update_boundary_overlay(
                     update_selection_style=selection_changed
                 )
+                if profile_selection:
+                    timings["boundary_overlay_ms"] = (
+                        time.perf_counter() - stage_started
+                    ) * 1000
+                if profile_selection:
+                    logging.getLogger(__name__).warning(
+                        "MMFEM_SELECTION_PROFILE %s",
+                        json.dumps({
+                            "figure_index": figure_index,
+                            "curve_number": curve_number,
+                            "point_number": point_number,
+                            "mesh_boundary_region_count": len(region_ids),
+                            "selected_region_count": len(draft_ids),
+                            "selection_changed": selection_changed,
+                            "trace_count": len(traces),
+                            **timings,
+                            "python_callback_ms": (
+                                time.perf_counter() - callback_started
+                            ) * 1000,
+                        }, sort_keys=True),
+                    )
                 return
         exists = any(
             item.get("id") == item_id

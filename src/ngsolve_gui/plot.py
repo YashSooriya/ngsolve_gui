@@ -24,6 +24,7 @@ const bridge = {
     graph,
     dispatch,
     lastHover: null,
+    lastCanvasClickAt: null,
     lastPlotlyClick: -1,
     pointerDown: null,
     pointerDragged: false,
@@ -91,6 +92,9 @@ bridge.onCanvasClick = event => {
         || performance.now() < bridge.suppressClickUntil) return;
     const point = bridge.lastHover;
     const clickedAt = performance.now();
+    // A lightweight page-local timestamp lets packaged desktop profiling
+    // separate native pointer dispatch from the server-to-visible-UI path.
+    bridge.lastCanvasClickAt = clickedAt;
     if (!point || clickedAt - point.at > 750) return;
     if (Number.isFinite(point.x) && Math.abs(event.clientX - point.x) > 10) return;
     if (Number.isFinite(point.y) && Math.abs(event.clientY - point.y) > 10) return;
