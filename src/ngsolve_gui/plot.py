@@ -26,6 +26,15 @@ const bridge = {
     lastHover: null,
     lastCanvasClickAt: null,
     lastPlotlyClick: -1,
+    pendingCanvasClicks: [],
+    clickStats: {
+        canvasClicks: 0,
+        plotlyClicks: 0,
+        fallbackDispatches: 0,
+        plotlyDispatches: 0,
+        dispatches: 0,
+        duplicateEventsSuppressed: 0,
+    },
     pointerDown: null,
     pointerDragged: false,
     suppressClickUntil: 0,
@@ -47,9 +56,47 @@ bridge.onHover = event => {
 bridge.onPlotlyClick = event => {
     const clickedAt = performance.now();
     bridge.lastPlotlyClick = clickedAt;
+    bridge.clickStats.plotlyClicks += 1;
     if (bridge.pointerDragged || clickedAt < bridge.suppressClickUntil) return;
     const points = event && event.points;
-    if (!points) return;
+    if (!points || !points.length) return;
+    const point = points[0];
+    const curveNumber = Number(point.curveNumber);
+    const pointNumber = Number(point.pointNumber);
+    bridge.pendingCanvasClicks = bridge.pendingCanvasClicks.filter(record =>
+        clickedAt - record.at <= 1500);
+    const samePoint = record => record.curveNumber === curveNumber
+        && record.pointNumber === pointNumber;
+    const nativeEventTime = Number(event.event && event.event.timeStamp);
+    let record = Number.isFinite(nativeEventTime)
+        ? bridge.pendingCanvasClicks.find(candidate => samePoint(candidate)
+            && Number.isFinite(candidate.eventTimeStamp)
+            && Math.abs(candidate.eventTimeStamp - nativeEventTime) < 1)
+        : null;
+    if (!record) {
+        record = bridge.pendingCanvasClicks.find(candidate =>
+            samePoint(candidate) && !candidate.plotlyClickSeen);
+    }
+    if (record) {
+        if (record.plotlyClickSeen) {
+            bridge.clickStats.duplicateEventsSuppressed += 1;
+            return;
+        }
+        record.plotlyClickSeen = true;
+        if (record.fallbackDispatched) {
+            bridge.clickStats.duplicateEventsSuppressed += 1;
+            return;
+        }
+    } else if (bridge.pendingCanvasClicks.some(candidate =>
+        samePoint(candidate) && (candidate.plotlyClickSeen
+            || candidate.fallbackDispatched))) {
+        // Plotly can emit its click after the canvas fallback. Keep that late
+        // event from toggling the same CAD face a second time.
+        bridge.clickStats.duplicateEventsSuppressed += 1;
+        return;
+    }
+    bridge.clickStats.plotlyDispatches += 1;
+    bridge.clickStats.dispatches += 1;
     bridge.dispatch({points: points.map(point => ({
         curveNumber: Number(point.curveNumber),
         pointNumber: Number(point.pointNumber),
@@ -98,11 +145,27 @@ bridge.onCanvasClick = event => {
     if (!point || clickedAt - point.at > 750) return;
     if (Number.isFinite(point.x) && Math.abs(event.clientX - point.x) > 10) return;
     if (Number.isFinite(point.y) && Math.abs(event.clientY - point.y) > 10) return;
+    bridge.clickStats.canvasClicks += 1;
+    bridge.pendingCanvasClicks = bridge.pendingCanvasClicks.filter(record =>
+        clickedAt - record.at <= 1500);
+    const record = {
+        at: clickedAt,
+        eventTimeStamp: Number(event.timeStamp),
+        curveNumber: Number(point.curveNumber),
+        pointNumber: Number(point.pointNumber),
+        plotlyClickSeen: false,
+        fallbackDispatched: false,
+    };
+    bridge.pendingCanvasClicks.push(record);
     // Let Plotly's native click handler run first. Mesh3d often emits no
     // plotly_click, while other traces may emit one and must not toggle twice.
     setTimeout(() => {
-        if (bridge.cancelled || bridge.lastPlotlyClick >= clickedAt) return;
+        if (bridge.cancelled || record.plotlyClickSeen
+            || record.fallbackDispatched) return;
+        record.fallbackDispatched = true;
         bridge.lastPlotlyClick = performance.now();
+        bridge.clickStats.fallbackDispatches += 1;
+        bridge.clickStats.dispatches += 1;
         bridge.dispatch({points: [{
             curveNumber: point.curveNumber,
             pointNumber: point.pointNumber,
@@ -123,6 +186,7 @@ bridge.dispose = () => {
     }
     if (graph._mmfemPickBridge === bridge) graph._mmfemPickBridge = null;
     bridge.lastHover = null;
+    bridge.pendingCanvasClicks = [];
 };
 bridge.bind = () => {
     if (bridge.cancelled || bridge.bound) return;
