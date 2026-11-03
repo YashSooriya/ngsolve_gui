@@ -20,6 +20,13 @@ No solver algorithms, numerical dependencies, project formats, or Mike-variant f
 
 The failure diagnosis was reproduced before the fix: the recovered page had `.cb-app-root { display: block }` and a 0 px viewport height, with no JavaScript or resource errors. After the fix, `.cb-app-root` returned to `display:flex`; the maximized recovered viewport measured 1368 × 801 CSS pixels and contained the 3D canvas and both geometry traces. The native screenshot confirms the mesh is visible.
 
+## Implementation source references
+
+- `ngsolve-ui/coupled_solver/release/native_windows/gui_host.py` — replacement-window selection, recovery handshake, stylesheet restoration and window identity.
+- `ngsolve-ui/coupled_solver/release/native_windows/tests/test_packaged_desktop.py` — packaged desktop recovery diagnostics and regression assertions.
+- `ngsolve-ui/tests/test_desktop_renderer_recovery.py` — focused renderer lifecycle and recovery tests.
+- `ngsolve_gui/docs/development-roadmap.md` — living milestone plan and carried-forward risks.
+
 ## Verification evidence
 
 ### Axisymmetric workspace
@@ -33,7 +40,7 @@ The failure diagnosis was reproduced before the fix: the recovered page had `.cb
 - The packaged app imported `magnet_shield_4k.step` and generated a bounded mesh of 22,132 volume elements and 14,588 surface triangles. No solver was launched.
 - Three native interaction cycles included nine face clicks, clear-selection actions, mesh/geometry display switches, model rotation and property-editor scrolling. Two distinct boundary regions were selected and saved.
 - Across seven measured click-to-editor updates, p50 was 444 ms and p95 was 646 ms. The overall native click response median was 658 ms.
-- Chromium process-tree RSS rose by 99 MB from the first sample, with a 206 MB peak increase; page JavaScript heap rose by 27 MB at the final sample. DOM node count and Plotly trace count stayed stable. GPU memory was not measurable through this harness, so the numbers are a bounded trend check, not proof that no native/GPU leak exists.
+- Chromium process-tree RSS rose by 99 MB from the first sample, with a 206 MB peak increase; page JavaScript heap rose by 27 MB at the final sample. DOM node count and Plotly trace count stayed stable at three; the selection bridge remained bound after stress, and boundary-overlay updates took about 3–41 ms. The harness does not expose a complete JavaScript event-listener count. GPU memory was not measurable, so this is a bounded trend check, not proof that no native/GPU leak exists.
 
 ### Renderer recovery
 
