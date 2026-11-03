@@ -301,7 +301,8 @@ def test_3d_material_library_create_edit_and_validation(monkeypatch):
     workspace._set_material_draft_value(
         "electrical_conductivity", SimpleNamespace(value="2.4e6")
     )
-    assert workspace._save_material_draft() is True
+    # ngapp dispatches the native button callback with an event argument.
+    assert workspace._save_material_draft(SimpleNamespace()) is True
 
     material = next(item for item in library.materials if item["id"] == material_id)
     assert material["name"] == "Cryogenic alloy"

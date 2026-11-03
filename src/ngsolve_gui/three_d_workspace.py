@@ -771,7 +771,7 @@ class ThreeDWorkspace(Div):
         self._rebuild_items()
         self._rebuild_properties()
 
-    def _save_material_draft(self, *, save_to_library=False):
+    def _save_material_draft(self, *_args, save_to_library=False):
         draft = self._material_draft
         if draft is None:
             return False
