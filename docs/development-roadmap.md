@@ -1,9 +1,9 @@
 # MagMechSim: Forward Development Roadmap
 
-**Planning baseline:** 3 November 2026 (updated after Phase C)
+**Planning baseline:** 3 November 2026 (Phase D1 active)
 **Status:** Living plan, not an immutable implementation contract  
 **Primary users:** Engineers familiar with industrial CAE tools  
-**Primary immediate scope:** Integrate the verified 3D DC background field into supported coupled magneto-mechanics
+**Primary immediate scope:** Integrate the verified 3D DC background field into the existing coupled 3D magneto-mechanics solver (Phase D1)
 **Out of scope for now:** New results visualisation or a post-processing redesign (but existing Solve/Results navigation must remain fully functional)
 
 ## 1. Product objective and working agreement
@@ -234,11 +234,11 @@ One fresh packaged launch produced a white native frame at the first screenshot 
 
 **Supported-scope limitations:** The current material model is linear, isotropic relative permeability; nonlinear B–H curves, hysteresis and permanent-magnet constitutive models are not exposed. DC wire-trace source assembly has focused backend tests but was not used in the packaged solver run. The stored DC field is prepared for later coupling, but Phase C does not yet provide a coupled-study UI or downstream reuse controls. The sphere result is a coarse bounded model, p=1, with only one h-refinement step. A deprecation warning for NGSolve H(curl) keyword flags remains in the existing backend. These limitations do not prevent review of Phase C; resolve coupled field consumption and validation sequencing in Phase D.
 
-#### Next milestone: Phase D. Fully coupled 3D magneto-mechanical harmonic analysis
+#### Active milestone: Phase D1. Fully coupled 3D magneto-mechanical solver integration
 
-Integrate the verified static background, harmonic EM and harmonic mechanical response through the supported coupling sequence. Include convergence-aware job state and validate bounded coupling against trusted reference cases. Keep Phase C's field provenance and invalidation guarantees; do not add ROM or unrelated physics controls as part of that work.
+Integrate the verified static background, harmonic EM and harmonic mechanical response through the existing 3D block Gauss-Seidel sequence. The repository already has 3D block solves, Anderson acceleration, normalized field-change residuals, a bounded 3D manufactured coupled case and stale-checked H(div) background-field storage. The GUI currently submits one single-physics mode at a time; D1 connects a combined study to that established solver, reuses only a matching saved DC field, and reports convergence distinctly from process completion. D2 remains reserved for deeper diagnostics and workflow refinement; do not add ROM or unrelated physics controls in D1.
 
-### Phase D. Fully coupled 3D magneto-mechanical harmonic analysis
+### Phase D. Fully coupled 3D magneto-mechanical harmonic analysis (D1 active)
 
 **Outcome:** Engineers can configure and execute the existing supported coupled model through the GUI, with understandable convergence/solver feedback.
 
@@ -247,6 +247,8 @@ Integrate the verified static background, harmonic EM and harmonic mechanical re
 - Detect and report nonconvergence separately from a successful process exit; preserve solver evidence and job state correctly. Validate the actual coupled response with existing trusted problems, p/h refinement or independently verified comparisons.
 
 **Gate:** Bounded real coupled study works end-to-end, numerical checks pass, and failure/partial-convergence handling is correct.
+
+**D1 status (3 November 2026):** Active. The Phase C code and roadmap are committed and pushed. Initial architecture inspection confirmed that `time_harmonic_solver_3D` already performs sequential AC and mechanical block solves, updates the H(div) DC field between coupled subsystems, uses Anderson acceleration, and records normalized A/displacement residuals. The current GUI runner supports DC-only or harmonic-only jobs but does not yet pass a DC field into a coupled GUI job. Phase D1 will retain this numerical formulation and focus on the project inputs, valid field reuse, solver/job-state integration, and bounded reference verification.
 
 ### Phase E. ROM, study flexibility and advanced numerical settings
 
@@ -301,7 +303,7 @@ Phase B2: supported 3D boundary conditions, sources and loads — complete
 Phase C: 3D DC background-field study — complete for tested scope
                       |
                       v
-NEXT: Coupled 3D harmonic workflow (Phase D)
+Phase D1: 3D coupled solver integration — active
                       |
                       v
             ROM / studies / advanced options (Phase E)
@@ -332,7 +334,7 @@ Release, packaging and comprehensive quality gates occur throughout, with final 
 |---|---|---|
 | 3D face selection and renderer stability | Phase A's repeated native picking/recovery passed on a capped 22,132-element mesh. Phase B1 additionally verified a visible orange solid outline on a two-body 24-triangle preview; the historical OOM did not recur | Keep the Chromium memory concern monitored; include larger representative models and long-session memory in a later targeted gate. It does not block B2 |
 | Geometry identity ambiguity | Can silently change loads or supports | Continue safe invalidation, user-guided reassignment and verification |
-| Coupled 3D harmonic workflow | The core coupled workflow remains unavailable until Phase D | Phase C now provides a provenance-tracked DC field; Phase D must consume it in the validated static/harmonic sequence and classify convergence accurately |
+| Coupled 3D harmonic workflow | The core coupled workflow remains unavailable until Phase D1 passes its numerical and packaged-app gates | Phase C provides a provenance-tracked DC field; D1 must connect it to the existing fixed-point solver and classify convergence accurately |
 | Axisymmetric display and geometry-tool regressions | The saved sketch and full-pane grid now render on first open at maximized and restored sizes; the earlier blank capture did not recur. Tangent-arc tool behavior and physical-GPU rendering were not specifically revalidated in this closeout | Retain first-open/grid checks and targeted geometry-tool regression coverage; investigate if a blank frame or geometry-editing defect recurs |
 | Menus expose irrelevant commands | Confusing and potentially hazardous workflow | Context-aware command taxonomy and capability checks |
 | Axisymmetric sketch/preview rendering | Saved regions, full-pane grid and the geometry-creation Plotly WebGL preview are visible in the packaged app; physical-GPU behavior is unverified | Keep representative sketch/preview regression coverage; reopen if blank frames or fidelity issues recur |
@@ -346,4 +348,4 @@ Release, packaging and comprehensive quality gates occur throughout, with final 
 
 Suggested repository home for this plan: a documented planning location under the GUI repository, chosen by Codex after inspecting existing conventions. Keep this file as the **single current roadmap**, with date, completed milestones, changed priorities and links to implementation reports. Historical roadmaps may remain archived but should not conflict with the current one.
 
-**Current action:** Phase A remains accepted for its tested workloads; historical Chromium memory growth is monitored. Phases B1, B2 and C are complete for the documented scopes. Phase C's report is [`docs/reviews/2026-11-03-phase-c.md`](reviews/2026-11-03-phase-c.md), with a standalone ZIP containing the prompt, source changes and full evidence. Stop for independent review. The next intended priority is Phase D, fully coupled 3D magneto-mechanical harmonic analysis; do not begin it automatically. Keep the packaged Win32 desktop harness and latest-full-app launcher as required milestone gates.
+**Current action:** Phase A remains accepted for its tested workloads; historical Chromium memory growth is monitored. Phases B1, B2 and C are complete for the documented scopes. Phase C's report is [`docs/reviews/2026-11-03-phase-c.md`](reviews/2026-11-03-phase-c.md), with a standalone ZIP containing the prompt, source changes and full evidence. Phase D1, integrating the Phase C DC field with the existing 3D coupled time-harmonic solver, is active. Keep the packaged Win32 desktop harness and latest-full-app launcher as required milestone gates; stop for independent review after D1 and do not start D2 automatically.
