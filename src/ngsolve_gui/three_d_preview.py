@@ -274,7 +274,7 @@ def boundary_overlay_edge_cache(triangles, boundary_region_ids):
 
 def boundary_overlay_trace(
     vertices, triangles, boundary_region_ids, selected_region_ids, *, geometry_id, name,
-    edge_cache=None,
+    edge_cache=None, outline_each_region=False,
 ):
     """Return a lightweight line trace outlining the selected mesh boundaries."""
     import numpy as np
@@ -289,13 +289,28 @@ def boundary_overlay_trace(
         edge_cache = edge_cache or boundary_overlay_edge_cache(triangles, region_ids)
         selected_edges = [edge_cache[region_id] for region_id in selected_ids if region_id in edge_cache]
         if selected_edges:
-            joined_edges = np.concatenate([edges for edges, _counts in selected_edges], axis=0)
-            joined_counts = np.concatenate([counts for _edges, counts in selected_edges])
-            unique_edges, inverse = np.unique(joined_edges, axis=0, return_inverse=True)
-            edge_counts = np.bincount(
-                inverse.reshape(-1), weights=joined_counts, minlength=len(unique_edges)
-            )
-            outline = unique_edges[edge_counts == 1]
+            if outline_each_region:
+                # A selected solid/domain is a closed shell: shared CAD-face
+                # edges occur twice across its boundary regions and would all
+                # cancel if the regions were unioned first. Keep each face's
+                # perimeter so the selected body remains visible in the 3D view.
+                region_outlines = [
+                    edges[counts == 1]
+                    for edges, counts in selected_edges
+                    if np.any(counts == 1)
+                ]
+                outline = (
+                    np.unique(np.concatenate(region_outlines, axis=0), axis=0)
+                    if region_outlines else np.empty((0, 2), dtype=np.int32)
+                )
+            else:
+                joined_edges = np.concatenate([edges for edges, _counts in selected_edges], axis=0)
+                joined_counts = np.concatenate([counts for _edges, counts in selected_edges])
+                unique_edges, inverse = np.unique(joined_edges, axis=0, return_inverse=True)
+                edge_counts = np.bincount(
+                    inverse.reshape(-1), weights=joined_counts, minlength=len(unique_edges)
+                )
+                outline = unique_edges[edge_counts == 1]
             if len(outline):
                 edge_coordinates = vertices[outline]
                 coordinates = np.empty((len(outline), 3, 3), dtype=object)

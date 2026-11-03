@@ -4,6 +4,7 @@ import pytest
 
 from ngsolve_gui.three_d_preview import (
     axisymmetric_preview_figure,
+    boundary_overlay_trace,
     preview_figure,
     project_preview_payload,
     tessellate_occ_feature_edges,
@@ -156,6 +157,32 @@ def test_selected_mesh_boundary_draws_an_outline_overlay_without_changing_the_su
     assert figure.data[1].line.color == "#f59e0b"
     assert len(figure.data[1].x) == 12
     assert figure.data[1].visible is True
+
+
+def test_closed_solid_selection_keeps_each_cad_face_outline_visible():
+    import numpy as np
+
+    vertices = np.asarray([
+        [0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1],
+    ], dtype=np.float32)
+    triangles = np.asarray([
+        [0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3],
+    ], dtype=np.int32)
+    boundary_region_ids = np.asarray([0, 1, 2, 3], dtype=np.int32)
+
+    outline = boundary_overlay_trace(
+        vertices,
+        triangles,
+        boundary_region_ids,
+        [0, 1, 2, 3],
+        geometry_id="geometry-1",
+        name="tetrahedron",
+        outline_each_region=True,
+    )
+
+    assert outline.visible is True
+    assert len(outline.x) > 0
+    assert outline.line.color == "#f59e0b"
 
 
 def test_generated_mesh_keeps_an_empty_boundary_overlay_trace():

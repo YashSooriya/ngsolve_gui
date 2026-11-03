@@ -3436,6 +3436,14 @@ class ThreeDWorkspace(Div):
                 geometry_id=geometry_id,
                 name=geometry.get("name", "Geometry"),
                 edge_cache=mesh_result.get("boundary_edge_cache"),
+                outline_each_region=(
+                    self._selection[0] == "solid"
+                    or (
+                        self._selection[0] == "named_selection"
+                        and (selection_context := self._find_named_selection(self._selection[1]))
+                        and selection_context[1] == "domain"
+                    )
+                ),
             )
             trace = figure.data[overlay_index]
             trace.x, trace.y, trace.z = overlay.x, overlay.y, overlay.z

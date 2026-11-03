@@ -738,6 +738,77 @@ def test_boundary_selection_updates_only_the_mesh_overlay_trace(monkeypatch):
     assert calls[0][1][1]["x"][0] == list(overlay.x)
 
 
+def test_solid_selection_updates_face_outline_in_viewport(monkeypatch):
+    import plotly.graph_objects as go
+    from ngsolve_gui.three_d_preview import boundary_overlay_trace
+
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+    workspace = ThreeDWorkspace(SimpleNamespace())
+    fixture = Path(__file__).parent / "fixtures" / "magnet_shield_4k.step"
+    project = new_3d_project("Solid selection highlight")
+    assets = {}
+    geometry = add_step_geometry(
+        project, assets, fixture.name, fixture.read_bytes(), units="mm"
+    )
+    tag = "MMFEM_SOLID_000000000000000000000001"
+    geometry["solid_names"] = {tag: "Highlighted body"}
+    workspace.project = project
+    workspace.assets = assets
+    workspace._mesh_results[geometry["id"]] = {
+        "status": "ready",
+        "vertices_mm": np.asarray([
+            [0, 0, 0], [1000, 0, 0], [0, 1000, 0], [0, 0, 1000],
+        ], dtype=np.float32),
+        "triangles": np.asarray([
+            [0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3],
+        ], dtype=np.int32),
+        "boundary_region_ids": np.asarray([0, 1, 2, 3], dtype=np.int32),
+        "boundary_regions": [
+            {"id": index, "domain_tag": tag, "boundary_tag": f"face-{index}"}
+            for index in range(4)
+        ],
+        "domain_regions": [{"id": 0, "domain_tag": tag, "elements": 1}],
+    }
+    overlay = boundary_overlay_trace(
+        workspace._mesh_results[geometry["id"]]["vertices_mm"] * 0.001,
+        workspace._mesh_results[geometry["id"]]["triangles"],
+        workspace._mesh_results[geometry["id"]]["boundary_region_ids"],
+        [],
+        geometry_id=geometry["id"],
+        name=geometry["name"],
+    )
+    figure = go.Figure([go.Mesh3d(
+        x=[0, 1, 0, 0], y=[0, 0, 1, 0], z=[0, 0, 0, 1],
+        i=[0], j=[2], k=[1],
+    ), overlay])
+    calls = []
+
+    class FakePlotly:
+        def _call_method_ignore_return(self, method, args):
+            calls.append((method, args))
+
+    class FakePlot:
+        _plotly = FakePlotly()
+        _js_component = object()
+
+    workspace._preview._figures = [figure]
+    workspace._preview._plots = [FakePlot()]
+    workspace.select_item("solid", (geometry["id"], tag))
+
+    overlay = figure.data[1]
+    assert overlay.visible is True
+    assert len(overlay.x) > 0
+    overlay_calls = [
+        call for call in calls
+        if call[0] == "restyle" and call[1][2] == [1]
+    ]
+    assert overlay_calls
+    assert any(
+        call[1][1].get("x", [None])[0] == list(overlay.x)
+        for call in overlay_calls
+    )
+
+
 def _workspace_with_test_mesh(monkeypatch):
     monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
     workspace = ThreeDWorkspace(SimpleNamespace())
