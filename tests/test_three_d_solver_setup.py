@@ -52,6 +52,60 @@ def _study_project():
     return project
 
 
+def _run_packaged_solver_model(project, assets, tmp_path, name):
+    gui_root = Path(__file__).resolve().parents[1]
+    solver_candidates = []
+    configured_root = os.environ.get("COUPLED_SOLVER_ROOT")
+    if configured_root:
+        solver_candidates.append(Path(configured_root).expanduser())
+    solver_candidates.extend([
+        gui_root / "coupled_solver",
+        gui_root.parent / "ngsolve-ui" / "coupled_solver",
+        Path.cwd() / "coupled_solver",
+    ])
+    solver_root = next(
+        root.resolve()
+        for root in solver_candidates
+        if (root / "main.py").is_file()
+        and (root / "scripts" / "run_gui_3d_model.py").is_file()
+    )
+    model_path = tmp_path / f"{name}.mmfem3d"
+    model_path.write_bytes(package_3d_project(project, assets))
+    output_dir = tmp_path / f"{name}-output"
+    environment = os.environ.copy()
+    environment.pop("COUPLED_SOLVER_OUTPUT_DIR", None)
+    environment.pop("COUPLED_SOLVER_SHARED_FILES_DIR", None)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(gui_root / "src"), *filter(None, [environment.get("PYTHONPATH")])]
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(solver_root / "scripts" / "run_gui_3d_model.py"),
+            "--model", str(model_path),
+            "--output-dir", str(output_dir),
+        ],
+        cwd=solver_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=90,
+        env=environment,
+        check=False,
+    )
+    solver_output = re.sub(
+        re.escape(str(tmp_path)), "<temporary-run>",
+        f"{completed.stdout}\n{completed.stderr}", flags=re.IGNORECASE,
+    )
+    assert completed.returncode == 0, solver_output[-5000:]
+    manifest = json.loads(
+        (output_dir / "run_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "complete", solver_output[-5000:]
+    return manifest, output_dir
+
+
 def test_study_setup_uses_project_material_snapshots_and_single_frequency():
     project = _study_project()
 
@@ -222,6 +276,147 @@ def test_mechanical_builder_sets_structural_sources_supports_and_no_air_domain(t
     assert problem["dirkeysMech"].startswith("DirMech_G0_MMFEM_FACE_")
     assert set(problem["dirconditionMech"]) == set(problem["dirkeysMech"].split("|"))
     assert inputs["mechanical_body_force_n_m3"] == [1e8, 0.0, 0.0]
+
+
+def test_mechanical_builder_maps_domain_force_displacement_and_spring_values(tmp_path):
+    from netgen.occ import Box, OCCGeometry, Pnt
+    from ngsolve_gui.three_d_project import step_geometry_tags
+
+    step_path = tmp_path / "scoped_mechanical_assignments.step"
+    Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).WriteStep(str(step_path))
+    solids = list(OCCGeometry(str(step_path)).solids)
+    solid_tags, face_refs = step_geometry_tags(solids)
+    face_tags = [tag for tag, solid_tag, _face in face_refs if solid_tag == solid_tags[0]]
+    material = builtin_materials()[4]
+    project = new_3d_project("Scoped mechanical assignments")
+    project["study"].update(
+        physics="harmonic_mechanical",
+        frequency_hz=50.0,
+        mechanical_body_force_n_m3=[2e5, 0.0, 0.0],
+        mechanical_body_force_phase_deg=[0.0, 0.0, 0.0],
+    )
+    project["materials"] = [material]
+    assets = {}
+    geometry = add_step_geometry(
+        project, assets, step_path.name, step_path.read_bytes(),
+        units="mm", material=material["name"],
+    )
+    geometry["domain_selections"] = [{
+        "id": "domain-load",
+        "name": "Local force",
+        "domain_ids": [0],
+        "domain_tags": [solid_tags[0]],
+        "mechanical_body_force_n_m3": [0.0, 3e5, 0.0],
+        "mechanical_body_force_phase_deg": [90.0, 0.0, 0.0],
+    }]
+    geometry["boundary_selections"] = [
+        {
+            "id": "prescribed",
+            "name": "Driven face",
+            "boundary_ids": [0],
+            "boundary_tags": [face_tags[0]],
+            "boundary_condition": "mechanical_prescribed_displacement",
+            "prescribed_displacement_amplitude_m": [1e-6, 0.0, 0.0],
+            "prescribed_displacement_phase_deg": [90.0, 0.0, 0.0],
+        },
+        {
+            "id": "spring",
+            "name": "Compliant face",
+            "boundary_ids": [1],
+            "boundary_tags": [face_tags[1]],
+            "boundary_condition": "mechanical_spring_support",
+            "spring_normal_stiffness_n_per_m3": 2e8,
+            "spring_tangential_stiffness_n_per_m3": 5e7,
+        },
+    ]
+
+    inputs = build_time_harmonic_em_problem(project, {geometry["asset"]: step_path})
+    problem = inputs["problem"]
+    solid_key = f"_mmfem_g0_{solid_tags[0]}"
+    driven_key = f"DirMech_G0_{face_tags[0]}"
+    spring_key = f"RobinMech_G0_{face_tags[1]}"
+
+    assert isinstance(problem["srcMech"], dict)
+    assert set(problem["srcMech"]) == {solid_key}
+    assert driven_key in problem["dirconditionMech"]
+    assert problem["robin_bcs"] == [spring_key]
+    assert problem["robin_k_normal"][spring_key] == 2e8
+    assert problem["robin_k_tangential"][spring_key] == 5e7
+    local_force = problem["Aux"]["mechanical_body_force_by_domain"][
+        f"{geometry['id']}:{solid_tags[0]}"
+    ]
+    assert local_force[0] == pytest.approx([0.0, 0.0])
+    assert local_force[1] == pytest.approx([3e5, 0.0])
+    assert local_force[2] == pytest.approx([0.0, 0.0])
+    assert problem["Aux"]["boundary_assignments"][f"{geometry['id']}:{face_tags[0]}"]["value"][0] == [
+        pytest.approx(0.0), pytest.approx(1e-6)
+    ]
+
+
+def test_domain_current_density_mode_uses_only_selected_solid_without_wire_trace(tmp_path):
+    from netgen.occ import Box, OCCGeometry, Pnt
+    from ngsolve_gui.three_d_project import step_geometry_tags
+
+    step_path = tmp_path / "current_density_block.step"
+    Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).WriteStep(str(step_path))
+    solid_tags, _face_refs = step_geometry_tags(
+        list(OCCGeometry(str(step_path)).solids)
+    )
+    material = builtin_materials()[4]
+    project = new_3d_project("Domain current density")
+    project["study"].update(em_source_mode="domain_current_density")
+    project["materials"] = [material]
+    assets = {}
+    geometry = add_step_geometry(
+        project, assets, step_path.name, step_path.read_bytes(),
+        units="mm", material=material["name"],
+    )
+    geometry["domain_selections"] = [{
+        "id": "current-domain",
+        "name": "Driven solid",
+        "domain_ids": [0],
+        "domain_tags": [solid_tags[0]],
+        "current_density_amplitude_a_per_m2": [1e6, 1e6, -2e6],
+        "current_density_phase_deg": [0.0, 90.0, -45.0],
+    }]
+
+    validated = validate_time_harmonic_em_setup(project)
+    inputs = build_time_harmonic_em_problem(project, {geometry["asset"]: step_path})
+    problem = inputs["problem"]
+    solid_key = f"_mmfem_g0_{solid_tags[0]}"
+
+    assert validated["em_source_mode"] == "domain_current_density"
+    assert inputs["em_source_mode"] == "domain_current_density"
+    assert project["wire_trace_sets"] == []
+    assert problem["current_source"] == "domain_current_density"
+    assert problem["wire_trace_sets"] == []
+    assert set(problem["srcdictAC"]) == set(problem["objects"])
+    current_y = problem["Aux"]["current_density_by_domain"][
+        f"{geometry['id']}:{solid_tags[0]}"
+    ][1]
+    assert current_y == pytest.approx([0.0, 1e6], abs=1e-9)
+
+
+def test_inactive_physics_assignments_do_not_require_irrelevant_sources_or_loads():
+    project = _study_project()
+    project["study"].update(
+        physics="harmonic_mechanical",
+        em_source_mode="domain_current_density",
+        mechanical_body_force_n_m3=[1e6, 0.0, 0.0],
+    )
+    project["wire_trace_sets"] = []
+    project["geometries"][0]["boundary_selections"] = [{
+        "id": "magnetic-only",
+        "name": "Inactive EM boundary",
+        "boundary_ids": [0],
+        "boundary_tags": ["MMFEM_FACE_000000000000000000000002"],
+        "boundary_condition": "magnetic_potential_zero",
+    }]
+
+    validated = validate_time_harmonic_em_setup(project)
+
+    assert validated["boundary_assignments"] == {}
+    assert validated["mechanical_body_force_n_m3"] == [1e6, 0.0, 0.0]
 
 
 @pytest.mark.parametrize("supported_solids", [0, 1, 2])
@@ -989,3 +1184,203 @@ def test_solver_rejects_active_order_based_boundary_references(tmp_path):
                 trace_set["traces"][0]["filename"]: trace_path,
             },
         )
+
+
+@pytest.mark.skipif(
+    not solver_checkout_available(),
+    reason=SOLVER_UNAVAILABLE_REASON,
+)
+def test_small_3d_domain_current_density_run_propagates_complex_source_and_scales_field(tmp_path):
+    import numpy as np
+    from netgen.occ import Box, Pnt
+
+    from ngsolve_gui.three_d_mesh import generate_step_mesh
+
+    step_path = tmp_path / "domain_current_block.step"
+    Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).WriteStep(str(step_path))
+    mesh_setup = generate_step_mesh(step_path.read_bytes(), maxh_mm=10.0)
+    assert 0 < mesh_setup["volume_elements"] < 50_000
+    material = builtin_materials()[4]
+    project = new_3d_project("Small domain current-density check")
+    project["study"].update(
+        em_source_mode="domain_current_density",
+        frequency_hz=50.0,
+        polynomial_order=1,
+        air_padding=0.25,
+    )
+    project["materials"] = [material]
+    assets = {}
+    geometry = add_step_geometry(
+        project, assets, step_path.name, step_path.read_bytes(),
+        units="mm", material=material["name"],
+    )
+    geometry["mesh_maxh_mm"] = 10.0
+    domain = mesh_setup["domain_regions"][0]
+    geometry["domain_selections"] = [{
+        "id": "current-source",
+        "name": "Applied current density",
+        "domain_ids": [domain["id"]],
+        "domain_tags": [domain["domain_tag"]],
+        "current_density_amplitude_a_per_m2": [0.0, 0.0, 1e6],
+        "current_density_phase_deg": [0.0, 0.0, 90.0],
+    }]
+
+    first_manifest, first_dir = _run_packaged_solver_model(
+        project, assets, tmp_path, "current-density-1x"
+    )
+    changed_project = copy.deepcopy(project)
+    changed_project["geometries"][0]["domain_selections"][0][
+        "current_density_amplitude_a_per_m2"
+    ][2] = 2e6
+    second_manifest, second_dir = _run_packaged_solver_model(
+        changed_project, assets, tmp_path, "current-density-2x"
+    )
+
+    assert first_manifest["em_source_mode"] == "domain_current_density"
+    assert second_manifest["solver_configuration"]["current_density_by_domain"][
+        f"{geometry['id']}:{domain['domain_tag']}"
+    ][2] == pytest.approx([0.0, 2e6], abs=1e-8)
+    import ngsolve as ngs
+
+    sample_points = [
+        (0.011, 0.004, 0.006),
+        (0.011, 0.006, 0.004),
+        (0.006, 0.011, 0.004),
+    ]
+    sampled_fields = []
+    for output_dir in (first_dir, second_dir):
+        manifest = json.loads(
+            (output_dir / "run_manifest.json").read_text(encoding="utf-8")
+        )
+        field_path = next(
+            output_dir / name for name in manifest["fields"] if "gfBAC" in name
+        )
+        solver_mesh = ngs.Mesh(str(output_dir / "mesh.vol"))
+        with field_path.open("rb") as stream:
+            flux_density = pickle.load(stream)
+        sampled_fields.append(
+            [
+                np.asarray(flux_density(solver_mesh(*point)), dtype=complex)
+                for point in sample_points
+            ]
+        )
+    response = max(float(np.linalg.norm(value)) for value in sampled_fields[0])
+    assert math.isfinite(response) and response > 1e-12
+    for baseline, doubled in zip(*sampled_fields):
+        if np.linalg.norm(baseline) > 1e-12:
+            relative_error = float(
+                np.linalg.norm(doubled - 2.0 * baseline)
+                / np.linalg.norm(2.0 * baseline)
+            )
+            # This is a proportionality check across separate native solver
+            # processes; parallel assembly introduces a few parts per million
+            # of repeat-to-repeat variation on the same mesh.
+            assert relative_error < 1e-5
+            break
+    else:
+        pytest.fail("No sampled point had a non-zero magnetic response to the current-density source")
+
+
+@pytest.mark.skipif(
+    not solver_checkout_available(),
+    reason=SOLVER_UNAVAILABLE_REASON,
+)
+def test_small_3d_mechanical_domain_load_prescribed_motion_and_spring_run(tmp_path):
+    import numpy as np
+    from netgen.occ import Box, Pnt
+
+    from ngsolve_gui.three_d_mesh import generate_step_mesh
+
+    step_path = tmp_path / "scoped_mechanical_block.step"
+    Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).WriteStep(str(step_path))
+    mesh_setup = generate_step_mesh(step_path.read_bytes(), maxh_mm=10.0)
+    assert 0 < mesh_setup["volume_elements"] < 50_000
+    material = builtin_materials()[4]
+    project = new_3d_project("Small scoped mechanical check")
+    project["study"].update(
+        physics="harmonic_mechanical",
+        frequency_hz=50.0,
+        polynomial_order=1,
+        mechanical_body_force_n_m3=[0.0, 0.0, 0.0],
+    )
+    project["materials"] = [material]
+    assets = {}
+    geometry = add_step_geometry(
+        project, assets, step_path.name, step_path.read_bytes(),
+        units="mm", material=material["name"],
+    )
+    geometry["mesh_maxh_mm"] = 10.0
+    domain = mesh_setup["domain_regions"][0]
+    geometry["domain_selections"] = [{
+        "id": "local-mechanical-load",
+        "name": "Oscillating load domain",
+        "domain_ids": [domain["id"]],
+        "domain_tags": [domain["domain_tag"]],
+        "mechanical_body_force_n_m3": [1e8, 0.0, 0.0],
+        "mechanical_body_force_phase_deg": [90.0, 0.0, 0.0],
+    }]
+    driven_face, spring_face, fixed_face = mesh_setup["boundary_regions"][:3]
+    geometry["boundary_selections"] = [
+        {
+            "id": "driven-face",
+            "name": "Prescribed displacement",
+            "boundary_ids": [driven_face["id"]],
+            "boundary_tags": [driven_face["boundary_tag"]],
+            "boundary_condition": "mechanical_prescribed_displacement",
+            "prescribed_displacement_amplitude_m": [1e-6, 0.0, 0.0],
+            "prescribed_displacement_phase_deg": [90.0, 0.0, 0.0],
+        },
+        {
+            "id": "spring-face",
+            "name": "Compliant support",
+            "boundary_ids": [spring_face["id"]],
+            "boundary_tags": [spring_face["boundary_tag"]],
+            "boundary_condition": "mechanical_spring_support",
+            "spring_normal_stiffness_n_per_m3": 2e8,
+            "spring_tangential_stiffness_n_per_m3": 5e7,
+        },
+        {
+            "id": "fixed-face",
+            "name": "Fixed support",
+            "boundary_ids": [fixed_face["id"]],
+            "boundary_tags": [fixed_face["boundary_tag"]],
+            "boundary_condition": "mechanical_fixed",
+        },
+    ]
+
+    manifest, output_dir = _run_packaged_solver_model(
+        project, assets, tmp_path, "scoped-mechanical"
+    )
+
+    assert manifest["physics"] == "Time-harmonic mechanics"
+    configuration = manifest["solver_configuration"]
+    assert configuration["mechanical_body_force_by_domain"][
+        f"{geometry['id']}:{domain['domain_tag']}"
+    ][0] == pytest.approx([0.0, 1e8], abs=1e-8)
+    boundary_assignments = configuration["boundary_assignments"]
+    assert boundary_assignments[f"{geometry['id']}:{driven_face['boundary_tag']}"]["value"][0] == pytest.approx(
+        [0.0, 1e-6], abs=1e-12
+    )
+    assert boundary_assignments[f"{geometry['id']}:{spring_face['boundary_tag']}"] == {
+        "type": "mechanical_spring_support",
+        "normal": 2e8,
+        "tangential": 5e7,
+    }
+    assert boundary_assignments[f"{geometry['id']}:{fixed_face['boundary_tag']}"] == {
+        "type": "mechanical_fixed"
+    }
+
+    displacement_path = next(
+        output_dir / name for name in manifest["fields"] if "gfuAC" in name
+    )
+    with displacement_path.open("rb") as stream:
+        displacement = pickle.load(stream)
+    free_dofs = displacement.space.FreeDofs()
+    constrained = [
+        index for index in range(displacement.space.ndof)
+        if not free_dofs[index]
+    ]
+    values = np.asarray(displacement.vec.FV().NumPy())[constrained]
+    assert constrained
+    assert float(np.abs(values.imag).max()) == pytest.approx(1e-6, rel=1e-6)
+    assert float(np.abs(values.real).max()) < 1e-12

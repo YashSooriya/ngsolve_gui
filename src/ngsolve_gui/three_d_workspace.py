@@ -27,6 +27,7 @@ from .three_d_project import (
     MIN_MESH_SIZE_MM,
     PROJECT_SUFFIX,
     SUPPORTED_3D_BOUNDARY_CONDITIONS,
+    SUPPORTED_3D_EM_SOURCE_MODES,
     SUPPORTED_3D_STUDIES,
     UNASSIGNED_MATERIAL,
     add_step_geometry,
@@ -528,17 +529,27 @@ class ThreeDWorkspace(Div):
 
     def _update_study_controls(self):
         running = bool(self._study_running)
-        physics = self.project.get("study", {}).get("physics", "harmonic_em")
-        compatible_condition = (
-            "mechanical_fixed" if physics == "harmonic_mechanical"
-            else "magnetic_potential_zero"
-        )
-        boundary_ready = all(
-            all(
-                selection.get("boundary_condition") in (None, compatible_condition)
-                for selection in geometry.get("boundary_selections", [])
-            )
-            for geometry in self.project.get("geometries", [])
+        study = self.project.get("study", {})
+
+        def has_nonzero(values):
+            try:
+                return any(
+                    math.isfinite(float(value)) and float(value) != 0
+                    for value in values
+                )
+            except (TypeError, ValueError, OverflowError):
+                return False
+
+        physics = study.get("physics", "harmonic_em")
+        em_source_mode = study.get("em_source_mode", "wire_trace")
+        compatible_conditions = (
+            {"magnetic_potential_zero"}
+            if physics == "harmonic_em"
+            else {
+                "mechanical_fixed",
+                "mechanical_prescribed_displacement",
+                "mechanical_spring_support",
+            }
         )
         assignments_ready = True
         for geometry in self.project.get("geometries", []):
@@ -553,7 +564,29 @@ class ThreeDWorkspace(Div):
             active_selections.extend(
                 ("boundary", selection)
                 for selection in geometry.get("boundary_selections", [])
-                if selection.get("boundary_condition")
+                if (
+                    selection.get("boundary_condition")
+                    and not selection.get("condition_suppressed", False)
+                    and selection.get("boundary_condition") in compatible_conditions
+                )
+            )
+            if physics == "harmonic_em" and em_source_mode == "domain_current_density":
+                active_selections.extend(
+                    ("domain", selection)
+                    for selection in geometry.get("domain_selections", [])
+                    if (
+                        "current_density_amplitude_a_per_m2" in selection
+                        and not selection.get("current_density_suppressed", False)
+                    )
+                )
+            if physics == "harmonic_mechanical":
+                active_selections.extend(
+                    ("domain", selection)
+                    for selection in geometry.get("domain_selections", [])
+                    if (
+                        "mechanical_body_force_n_m3" in selection
+                        and not selection.get("mechanical_body_force_suppressed", False)
+                    )
             )
             if any(
                 self._selection_recovery_message(
@@ -563,27 +596,69 @@ class ThreeDWorkspace(Div):
             ):
                 assignments_ready = False
                 break
-        body_force = self.project.get("study", {}).get(
-            "mechanical_body_force_n_m3", [0, 0, 0]
-        )
+        body_force = study.get("mechanical_body_force_n_m3", [0, 0, 0])
         try:
-            mechanical_load_ready = physics != "harmonic_mechanical" or (
+            body_force_phase = study.get(
+                "mechanical_body_force_phase_deg", [0, 0, 0]
+            )
+            global_load = (
                 len(body_force) == 3
+                and len(body_force_phase) == 3
                 and all(math.isfinite(float(component)) for component in body_force)
                 and any(float(component) != 0 for component in body_force)
             )
         except (TypeError, ValueError, OverflowError):
+            global_load = False
+        domain_load = any(
+            not selection.get("mechanical_body_force_suppressed", False)
+            and has_nonzero(selection.get("mechanical_body_force_n_m3", []))
+            for geometry in self.project.get("geometries", [])
+            for selection in geometry.get("domain_selections", [])
+        )
+        prescribed_load = any(
+            selection.get("boundary_condition")
+            == "mechanical_prescribed_displacement"
+            and not selection.get("condition_suppressed", False)
+            and has_nonzero(
+                selection.get("prescribed_displacement_amplitude_m", [0, 0, 0])
+            )
+            for geometry in self.project.get("geometries", [])
+            for selection in geometry.get("boundary_selections", [])
+        )
+        wire_source_ready = False
+        for trace_set in self.project.get("wire_trace_sets", []):
+            source_value = trace_set.get("target_gradient")
+            if source_value is None:
+                source_value = trace_set.get("current", 1.0)
+            if has_nonzero([source_value]):
+                wire_source_ready = True
+                break
+        current_density_ready = any(
+            not selection.get("current_density_suppressed", False)
+            and has_nonzero(selection.get("current_density_amplitude_a_per_m2", []))
+            for geometry in self.project.get("geometries", [])
+            for selection in geometry.get("domain_selections", [])
+        )
+        try:
+            mechanical_load_ready = physics != "harmonic_mechanical" or (
+                global_load or domain_load or prescribed_load
+            )
+        except (TypeError, ValueError, OverflowError):
             mechanical_load_ready = False
+        em_source_ready = (
+            em_source_mode == "wire_trace" and wire_source_ready
+        ) or (
+            em_source_mode == "domain_current_density" and current_density_ready
+        )
         if hasattr(self, "_run_study_button"):
             self._run_study_button.ui_disable = (
                 running
                 or not self.project.get("geometries")
                 or (
                     physics == "harmonic_em"
-                    and not self.project.get("wire_trace_sets")
+                    and not em_source_ready
                 )
                 or not self._has_resolved_study_materials()
-                or not boundary_ready
                 or not assignments_ready
                 or not mechanical_load_ready
             )
@@ -624,7 +699,11 @@ class ThreeDWorkspace(Div):
                 for selection in geometry.get("domain_selections", [])
             ):
                 return False
-        if physics == "harmonic_em":
+        if (
+            physics == "harmonic_em"
+            and self.project.get("study", {}).get("em_source_mode", "wire_trace")
+            == "wire_trace"
+        ):
             for trace_set in self.project.get("wire_trace_sets", []):
                 if not is_resolved(trace_set.get("material", "Air"), for_solid=False):
                     return False
@@ -959,27 +1038,182 @@ class ThreeDWorkspace(Div):
         return True
 
     def _set_mechanical_body_force(self, component, event):
+        return self._set_study_vector_component(
+            "mechanical_body_force_n_m3", component, event,
+            label="Mechanical body force", limit=1e15,
+        )
+
+    def _set_study_vector_component(self, key, component, event, *, label, limit):
         if component not in range(3):
             return False
         study = self.project.setdefault("study", {})
-        old_values = list(study.get("mechanical_body_force_n_m3", [0.0, 0.0, 0.0]))
-        value = getattr(event, "value", event)
+        old_values = list(study.get(key, [0.0, 0.0, 0.0]))
         try:
-            value = float(value)
-            if not math.isfinite(value) or abs(value) > 1e15:
-                raise ValueError("Body-force components must be finite and no larger than 1e15 N/m³.")
+            value = float(getattr(event, "value", event))
+            if not math.isfinite(value) or abs(value) > limit:
+                raise ValueError(f"{label} components must be finite and no larger than {limit:g}.")
             values = list(old_values)
             values[component] = value
-            study["mechanical_body_force_n_m3"] = values
+            study[key] = values
             validate_3d_project(self.project, self.assets)
         except (TypeError, ValueError, OverflowError, IndexError) as error:
-            study["mechanical_body_force_n_m3"] = old_values
+            study[key] = old_values
             self._set_status(str(error), error=True)
             self._rebuild_properties()
             return False
         self._mark_changed()
         self._update_study_controls()
-        self._set_status("Mechanical body force updated.")
+        self._set_status(f"{label} updated.")
+        return True
+
+    def _set_study_vector_phase(self, key, component, event, *, label):
+        if component not in range(3):
+            return False
+        study = self.project.setdefault("study", {})
+        old_values = list(study.get(key, [0.0, 0.0, 0.0]))
+        try:
+            value = float(getattr(event, "value", event))
+            if not math.isfinite(value) or abs(value) > 360_000:
+                raise ValueError(f"{label} phase must be finite and within ±360000°.")
+            values = list(old_values)
+            values[component] = value
+            study[key] = values
+            validate_3d_project(self.project, self.assets)
+        except (TypeError, ValueError, OverflowError, IndexError) as error:
+            study[key] = old_values
+            self._set_status(str(error), error=True)
+            self._rebuild_properties()
+            return False
+        self._mark_changed()
+        self._update_study_controls()
+        self._set_status(f"{label} phase updated.")
+        return True
+
+    def _set_em_source_mode(self, event):
+        value = str(getattr(event, "value", event) or "")
+        if value not in SUPPORTED_3D_EM_SOURCE_MODES:
+            self._set_status("Choose a supported 3D electromagnetic source mode.", error=True)
+            return False
+        self.project.setdefault("study", {})["em_source_mode"] = value
+        self._mark_changed()
+        self._update_study_controls()
+        self._rebuild_properties()
+        self._set_status(f"Electromagnetic excitation set to {SUPPORTED_3D_EM_SOURCE_MODES[value]}.")
+        return True
+
+    def _set_assignment_vector_component(
+        self, selection, key, component, event, *, label, limit
+    ):
+        if component not in range(3):
+            return False
+        old_values = list(selection.get(key, [0.0, 0.0, 0.0]))
+        try:
+            value = float(getattr(event, "value", event))
+            if not math.isfinite(value) or abs(value) > limit:
+                raise ValueError(f"{label} components must be finite and no larger than {limit:g}.")
+            values = list(old_values)
+            values[component] = value
+        except (TypeError, ValueError, OverflowError, IndexError) as error:
+            self._set_status(str(error), error=True)
+            self._rebuild_properties()
+            return False
+        selection[key] = values
+        self._mark_changed()
+        self._update_study_controls()
+        self._set_status(f"{label} updated.")
+        return True
+
+    def _set_assignment_phase_component(
+        self, selection, key, component, event, *, label
+    ):
+        if component not in range(3):
+            return False
+        old_values = list(selection.get(key, [0.0, 0.0, 0.0]))
+        try:
+            value = float(getattr(event, "value", event))
+            if not math.isfinite(value) or abs(value) > 360_000:
+                raise ValueError(f"{label} phase must be finite and within ±360000°.")
+            values = list(old_values)
+            values[component] = value
+        except (TypeError, ValueError, OverflowError, IndexError) as error:
+            self._set_status(str(error), error=True)
+            self._rebuild_properties()
+            return False
+        selection[key] = values
+        self._mark_changed()
+        self._update_study_controls()
+        self._set_status(f"{label} phase updated.")
+        return True
+
+    def _add_domain_assignment(self, selection, kind):
+        if kind == "current_density":
+            amplitude_key = "current_density_amplitude_a_per_m2"
+            phase_key = "current_density_phase_deg"
+            suppressed_key = "current_density_suppressed"
+        else:
+            amplitude_key = "mechanical_body_force_n_m3"
+            phase_key = "mechanical_body_force_phase_deg"
+            suppressed_key = "mechanical_body_force_suppressed"
+        selection[amplitude_key] = [0.0, 0.0, 0.0]
+        selection[phase_key] = [0.0, 0.0, 0.0]
+        selection[suppressed_key] = False
+        self._mark_changed()
+        self._rebuild_items()
+        self._rebuild_properties()
+        self._update_study_controls()
+        self._set_status("Domain assignment added. Enter its vector components and phases.")
+
+    def _remove_domain_assignment(self, selection, kind):
+        keys = (
+            ("current_density_amplitude_a_per_m2", "current_density_phase_deg", "current_density_suppressed")
+            if kind == "current_density"
+            else ("mechanical_body_force_n_m3", "mechanical_body_force_phase_deg", "mechanical_body_force_suppressed")
+        )
+        for key in keys:
+            selection.pop(key, None)
+        self._mark_changed()
+        self._rebuild_items()
+        self._rebuild_properties()
+        self._update_study_controls()
+        self._set_status("Domain assignment removed.")
+
+    def _set_assignment_scalar(self, selection, key, event, *, label, limit):
+        old_value = selection.get(key, 0.0)
+        try:
+            value = float(getattr(event, "value", event))
+            if not math.isfinite(value) or value < 0 or value > limit:
+                raise ValueError(f"{label} must be finite and between 0 and {limit:g}.")
+        except (TypeError, ValueError, OverflowError) as error:
+            selection[key] = old_value
+            self._set_status(str(error), error=True)
+            self._rebuild_properties()
+            return False
+        selection[key] = value
+        self._mark_changed()
+        self._update_study_controls()
+        self._set_status(f"{label} updated.")
+        return True
+
+    def _toggle_assignment_suppressed(self, selection, key):
+        selection[key] = not selection.get(key, False)
+        self._mark_changed()
+        self._rebuild_items()
+        self._rebuild_properties()
+        self._update_study_controls()
+
+    def _set_wire_current_phase(self, trace_set, event):
+        try:
+            value = float(getattr(event, "value", event))
+            if not math.isfinite(value) or abs(value) > 360_000:
+                raise ValueError("Wire-trace phase must be finite and within ±360000°.")
+        except (TypeError, ValueError, OverflowError) as error:
+            self._set_status(str(error), error=True)
+            self._rebuild_properties()
+            return False
+        trace_set["current_phase_deg"] = value
+        self._mark_changed()
+        self._update_study_controls()
+        self._set_status("Wire-trace current phase updated.")
         return True
 
     def _mark_changed(self):
@@ -1316,6 +1550,28 @@ class ThreeDWorkspace(Div):
         recovery_message = self._selection_recovery_message(
             geometry, kind, selection
         )
+        if kind == "domain":
+            assignment_badges = []
+            if "current_density_amplitude_a_per_m2" in selection:
+                assignment_badges.append("J source")
+            if "mechanical_body_force_n_m3" in selection:
+                assignment_badges.append("Body force")
+            selection_badge = " + ".join(assignment_badges) or "Domain"
+            assignment_suppressed = any(
+                selection.get(key, False)
+                for key in (
+                    "current_density_suppressed",
+                    "mechanical_body_force_suppressed",
+                )
+            )
+        else:
+            selection_badge = {
+                "magnetic_potential_zero": "A = 0",
+                "mechanical_fixed": "Fixed",
+                "mechanical_prescribed_displacement": "Prescribed u",
+                "mechanical_spring_support": "Spring",
+            }.get(selection.get("boundary_condition"), "Boundary")
+            assignment_suppressed = bool(selection.get("condition_suppressed", False))
         label = Div(
             selection["name"],
             ui_style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px;",
@@ -1329,15 +1585,17 @@ class ThreeDWorkspace(Div):
             ),
             label,
             Div(
-                "Domain"
-                if kind == "domain"
-                else (
-                    "A = 0"
-                    if selection.get("boundary_condition") == "magnetic_potential_zero"
-                    else "Boundary"
-                ),
+                selection_badge,
                 ui_class="cb-muted",
                 ui_style="font-size:9px; padding:1px 4px; border-radius:4px; background:var(--panel-header);",
+            ),
+            *(
+                [Div(
+                    "Suppressed",
+                    ui_class="cb-muted",
+                    ui_style="font-size:9px; padding:1px 4px; border-radius:4px; background:var(--panel-header); white-space:nowrap;",
+                )]
+                if assignment_suppressed else []
             ),
             *(
                 [Div(
@@ -1705,13 +1963,29 @@ class ThreeDWorkspace(Div):
         }
         active_domain_assignment = (
             is_domain
-            and (selection.get("material") or selection.get("mesh_maxh_mm") is not None)
+            and (
+                selection.get("material")
+                or selection.get("mesh_maxh_mm") is not None
+                or (
+                    "current_density_amplitude_a_per_m2" in selection
+                    and not selection.get("current_density_suppressed", False)
+                )
+                or (
+                    "mechanical_body_force_n_m3" in selection
+                    and not selection.get("mechanical_body_force_suppressed", False)
+                )
+            )
         )
         active_boundary_assignment = not is_domain and bool(
             selection.get("boundary_condition")
+            and not selection.get("condition_suppressed", False)
         )
         if not saved_tags and (active_domain_assignment or active_boundary_assignment):
-            purpose = "material or mesh control" if is_domain else "boundary condition"
+            purpose = (
+                "domain assignment"
+                if is_domain
+                else "boundary condition"
+            )
             return (
                 f"This {purpose} has no stable CAD mapping. Reassign the affected entities "
                 "from the current mesh."
@@ -1940,6 +2214,7 @@ class ThreeDWorkspace(Div):
 
         old_condition = selection.get("boundary_condition")
         old_tags = selection.get("boundary_tags")
+        old_suppressed = selection.get("condition_suppressed")
         if value != "default":
             result = self._mesh_results.get(geometry["id"], {})
             if result.get("status") != "ready":
@@ -1968,8 +2243,10 @@ class ThreeDWorkspace(Div):
 
         if value == "default":
             selection.pop("boundary_condition", None)
+            selection.pop("condition_suppressed", None)
         else:
             selection["boundary_condition"] = value
+            selection["condition_suppressed"] = False
         try:
             validate_3d_project(self.project, self.assets)
         except (TypeError, ValueError) as error:
@@ -1981,6 +2258,10 @@ class ThreeDWorkspace(Div):
                 selection.pop("boundary_tags", None)
             else:
                 selection["boundary_tags"] = old_tags
+            if old_suppressed is None:
+                selection.pop("condition_suppressed", None)
+            else:
+                selection["condition_suppressed"] = old_suppressed
             self._set_status(str(error), error=True)
             return False
         self._selection_draft["boundary_condition"] = value
@@ -2724,6 +3005,125 @@ class ThreeDWorkspace(Div):
                             ui_style="font-size:10px;",
                         ),
                     ])
+                    study = self.project.get("study", {})
+                    if (
+                        active_physics == "harmonic_em"
+                        and study.get("em_source_mode", "wire_trace")
+                        == "domain_current_density"
+                    ):
+                        amplitude_key = "current_density_amplitude_a_per_m2"
+                        phase_key = "current_density_phase_deg"
+                        suppressed_key = "current_density_suppressed"
+                        if amplitude_key not in selection:
+                            children.append(_button(
+                                "Add current-density source",
+                                "mdi-lightning-bolt-outline",
+                                lambda *_args, obj=selection: self._add_domain_assignment(
+                                    obj, "current_density"
+                                ),
+                                color="primary",
+                            ))
+                        else:
+                            children.append(Div(
+                                "Harmonic current density",
+                                ui_style="font-size:12px; font-weight:600; padding-top:8px;",
+                            ))
+                            for index, axis in enumerate("xyz"):
+                                children.append(_input(
+                                    f"J{axis.upper()} amplitude (A/m²)",
+                                    selection[amplitude_key][index],
+                                    lambda event, obj=selection, key=amplitude_key, i=index: self._set_assignment_vector_component(
+                                        obj, key, i, event,
+                                        label="Current density", limit=1e15,
+                                    ),
+                                    number=True,
+                                    width="100%",
+                                ))
+                            for index, axis in enumerate("xyz"):
+                                children.append(_input(
+                                    f"J{axis.upper()} phase (°)",
+                                    selection[phase_key][index],
+                                    lambda event, obj=selection, key=phase_key, i=index: self._set_assignment_phase_component(
+                                        obj, key, i, event,
+                                        label="Current density",
+                                    ),
+                                    number=True,
+                                    width="100%",
+                                ))
+                            children.append(Div(
+                                "Global X, Y and Z complex phasors, active when the study uses domain current density.",
+                                ui_class="cb-muted",
+                                ui_style="font-size:10px; line-height:1.4;",
+                            ))
+                            children.extend([
+                                _button(
+                                    "Resume source" if selection.get(suppressed_key, False) else "Suppress source",
+                                    "mdi-pause-circle-outline" if not selection.get(suppressed_key, False) else "mdi-play-circle-outline",
+                                    lambda *_args, obj=selection, key=suppressed_key: self._toggle_assignment_suppressed(obj, key),
+                                ),
+                                _button(
+                                    "Remove source",
+                                    "mdi-delete-outline",
+                                    lambda *_args, obj=selection: self._remove_domain_assignment(obj, "current_density"),
+                                ),
+                            ])
+                    if active_physics == "harmonic_mechanical":
+                        amplitude_key = "mechanical_body_force_n_m3"
+                        phase_key = "mechanical_body_force_phase_deg"
+                        suppressed_key = "mechanical_body_force_suppressed"
+                        if amplitude_key not in selection:
+                            children.append(_button(
+                                "Add body-force override",
+                                "mdi-weight",
+                                lambda *_args, obj=selection: self._add_domain_assignment(
+                                    obj, "mechanical_body_force"
+                                ),
+                                color="primary",
+                            ))
+                        else:
+                            children.append(Div(
+                                "Mechanical body-force override",
+                                ui_style="font-size:12px; font-weight:600; padding-top:8px;",
+                            ))
+                            for index, axis in enumerate("xyz"):
+                                children.append(_input(
+                                    f"Force {axis.upper()} (N/m³)",
+                                    selection[amplitude_key][index],
+                                    lambda event, obj=selection, key=amplitude_key, i=index: self._set_assignment_vector_component(
+                                        obj, key, i, event,
+                                        label="Mechanical body force", limit=1e15,
+                                    ),
+                                    number=True,
+                                    width="100%",
+                                ))
+                            for index, axis in enumerate("xyz"):
+                                children.append(_input(
+                                    f"Force phase {axis.upper()} (°)",
+                                    selection[phase_key][index],
+                                    lambda event, obj=selection, key=phase_key, i=index: self._set_assignment_phase_component(
+                                        obj, key, i, event,
+                                        label="Mechanical body force",
+                                    ),
+                                    number=True,
+                                    width="100%",
+                                ))
+                            children.append(Div(
+                                "Overrides the global-axis body force for these solid domains.",
+                                ui_class="cb-muted",
+                                ui_style="font-size:10px; line-height:1.4;",
+                            ))
+                            children.extend([
+                                _button(
+                                    "Resume load" if selection.get(suppressed_key, False) else "Suppress load",
+                                    "mdi-play-circle-outline" if selection.get(suppressed_key, False) else "mdi-pause-circle-outline",
+                                    lambda *_args, obj=selection, key=suppressed_key: self._toggle_assignment_suppressed(obj, key),
+                                ),
+                                _button(
+                                    "Remove override",
+                                    "mdi-delete-outline",
+                                    lambda *_args, obj=selection: self._remove_domain_assignment(obj, "mechanical_body_force"),
+                                ),
+                            ])
                 else:
                     boundary_condition = self._select_options(
                         "Boundary condition",
@@ -2738,22 +3138,97 @@ class ThreeDWorkspace(Div):
                         boundary_condition,
                         Div(
                             (
-                                "This condition belongs to another physics study. Switch study physics or choose the default condition."
+                                "This condition is suppressed and omitted from the solver input."
+                                if selection.get("condition_suppressed", False)
+                                else "This condition is for the other physics study and is inactive for the current study."
                                 if selection_condition
                                 and (
                                     (active_physics == "harmonic_em" and selection_condition != "magnetic_potential_zero")
-                                    or (active_physics == "harmonic_mechanical" and selection_condition != "mechanical_fixed")
+                                    or (active_physics == "harmonic_mechanical" and selection_condition == "magnetic_potential_zero")
                                 )
                                 else "Sets magnetic vector potential A = 0 on these faces."
                                 if selection_condition == "magnetic_potential_zero"
                                 else "Constrains all displacement components to zero on these faces."
                                 if selection_condition == "mechanical_fixed"
+                                else "Prescribes complex X, Y and Z displacement amplitudes on these faces."
+                                if selection_condition == "mechanical_prescribed_displacement"
+                                else "Applies normal and tangential spring stiffness on these faces."
+                                if selection_condition == "mechanical_spring_support"
                                 else "Leave unconstrained unless this boundary needs a supported study condition."
                             ),
                             ui_class="cb-muted",
                             ui_style="font-size:10px; line-height:1.4;",
                         ),
                     ])
+                    if selection_condition == "mechanical_prescribed_displacement":
+                        amplitude_key = "prescribed_displacement_amplitude_m"
+                        phase_key = "prescribed_displacement_phase_deg"
+                        children.append(Div(
+                            "Prescribed displacement · global model axes",
+                            ui_style="font-size:12px; font-weight:600; padding-top:8px;",
+                        ))
+                        for index, axis in enumerate("xyz"):
+                            children.append(_input(
+                                f"u{axis.upper()} amplitude (m)",
+                                selection[amplitude_key][index],
+                                lambda event, obj=selection, key=amplitude_key, i=index: self._set_assignment_vector_component(
+                                    obj, key, i, event,
+                                    label="Prescribed displacement", limit=1e3,
+                                ),
+                                number=True,
+                                width="100%",
+                            ))
+                        for index, axis in enumerate("xyz"):
+                            children.append(_input(
+                                f"u{axis.upper()} phase (°)",
+                                selection[phase_key][index],
+                                lambda event, obj=selection, key=phase_key, i=index: self._set_assignment_phase_component(
+                                    obj, key, i, event,
+                                    label="Prescribed displacement",
+                                ),
+                                number=True,
+                                width="100%",
+                            ))
+                    elif selection_condition == "mechanical_spring_support":
+                        children.append(Div(
+                            "Mechanical spring support",
+                            ui_style="font-size:12px; font-weight:600; padding-top:8px;",
+                        ))
+                        children.extend([
+                            _input(
+                                "Normal stiffness (N/m³)",
+                                selection["spring_normal_stiffness_n_per_m3"],
+                                lambda event, obj=selection: self._set_assignment_scalar(
+                                    obj, "spring_normal_stiffness_n_per_m3", event,
+                                    label="Normal spring stiffness", limit=1e18,
+                                ),
+                                number=True,
+                                width="100%",
+                            ),
+                            _input(
+                                "Tangential stiffness (N/m³)",
+                                selection["spring_tangential_stiffness_n_per_m3"],
+                                lambda event, obj=selection: self._set_assignment_scalar(
+                                    obj, "spring_tangential_stiffness_n_per_m3", event,
+                                    label="Tangential spring stiffness", limit=1e18,
+                                ),
+                                number=True,
+                                width="100%",
+                            ),
+                            Div(
+                                "Stiffness acts along the face normal and in its tangent plane.",
+                                ui_class="cb-muted",
+                                ui_style="font-size:10px; line-height:1.4;",
+                            ),
+                        ])
+                    if selection_condition:
+                        children.append(_button(
+                            "Resume condition" if selection.get("condition_suppressed", False) else "Suppress condition",
+                            "mdi-play-circle-outline" if selection.get("condition_suppressed", False) else "mdi-pause-circle-outline",
+                            lambda *_args, obj=selection: self._toggle_assignment_suppressed(
+                                obj, "condition_suppressed"
+                            ),
+                        ))
                 children.append(_button(
                     "Update selection",
                     "mdi-content-save-outline",
@@ -3058,6 +3533,11 @@ class ThreeDWorkspace(Div):
                 ),
                 self._material_note(),
                 _input("Current (A)", item.get("current", 1.0), lambda event, obj=item: self._set_number(obj, "current", event), number=True, width="100%"),
+                _input(
+                    "Current phase (°)", item.get("current_phase_deg", 0.0),
+                    lambda event, obj=item: self._set_wire_current_phase(obj, event),
+                    number=True, width="100%",
+                ),
                 _input("Target gradient (T/m)", item.get("target_gradient", ""), lambda event, obj=item: self._set_optional_number(obj, "target_gradient", event), number=True, width="100%"),
                 _input("DSV (m)", item.get("dsv", 0.4), lambda event, obj=item: self._set_number(obj, "dsv", event), number=True, width="100%"),
                 direction,
@@ -3090,14 +3570,28 @@ class ThreeDWorkspace(Div):
                 ),
             ])
             if physics == "harmonic_em":
+                source_mode = study.get("em_source_mode", "wire_trace")
                 children.extend([
+                    self._select_options(
+                        "Excitation source",
+                        source_mode,
+                        self._set_em_source_mode,
+                        [
+                            {"label": label, "value": value}
+                            for value, label in SUPPORTED_3D_EM_SOURCE_MODES.items()
+                        ],
+                    ),
                     _input(
                         "Air-region padding (model spans)", study.get("air_padding", 2.0),
                         lambda event: self._set_study_value("air_padding", event, number=True),
                         number=True, width="100%",
                     ),
                     Div(
-                        "Imports AC excitation from the project wire traces and solves the magnetic vector potential.",
+                        (
+                            "Uses the imported wire traces as the harmonic excitation. Current is a complex phasor; phase is in degrees."
+                            if source_mode == "wire_trace"
+                            else "Assigns a complex current-density vector (A/m²) to selected solid domains. This replaces wire-trace excitation for this study."
+                        ),
                         ui_class="cb-muted",
                         ui_style="font-size:10px; line-height:1.45; padding:8px; background:var(--panel-header); border-radius:5px;",
                     ),
@@ -3112,8 +3606,22 @@ class ThreeDWorkspace(Div):
                         number=True,
                         width="100%",
                     ))
+                body_force_phase = study.get(
+                    "mechanical_body_force_phase_deg", [0.0, 0.0, 0.0]
+                )
+                for index, axis in enumerate("xyz"):
+                    children.append(_input(
+                        f"Body-force phase {axis.upper()} (°)",
+                        body_force_phase[index],
+                        lambda event, i=index: self._set_study_vector_phase(
+                            "mechanical_body_force_phase_deg", i, event,
+                            label="Mechanical body force",
+                        ),
+                        number=True,
+                        width="100%",
+                    ))
                 children.append(Div(
-                    "Solves linear time-harmonic elasticity on all solid domains. Supports are optional at non-zero frequency; undamped resonance can make the system singular. Apply a non-zero body force. Materials need Young’s modulus, Poisson ratio and density.",
+                    "Solves linear time-harmonic elasticity on all solid domains. Global body force is inherited by each solid unless a named domain has an override. Supports include fixed, prescribed displacement and springs. External surface traction is not implemented. Materials need Young’s modulus, Poisson ratio and density.",
                     ui_class="cb-muted",
                     ui_style="font-size:10px; line-height:1.45; padding:8px; background:var(--panel-header); border-radius:5px;",
                 ))

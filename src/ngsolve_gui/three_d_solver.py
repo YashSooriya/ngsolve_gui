@@ -8,8 +8,10 @@ from pathlib import Path
 from .axisymmetric_model import builtin_materials
 from .three_d_project import (
     UNASSIGNED_MATERIAL,
+    SUPPORTED_3D_EM_SOURCE_MODES,
     SUPPORTED_3D_STUDIES,
     _LEGACY_DOMAIN_SELECTION_ERROR,
+    _LEGACY_STEP_FACE_TAG_PATTERN,
     build_3d_solver_inputs,
     build_wire_trace_sets,
     domain_material_overrides,
@@ -162,20 +164,172 @@ def _shape_bounds(shape):
     return _point_coordinates(bounds[0]), _point_coordinates(bounds[1])
 
 
+def _phasor_vector(amplitudes, phases_deg):
+    return tuple(
+        float(amplitude) * complex(
+            math.cos(math.radians(float(phase))),
+            math.sin(math.radians(float(phase))),
+        )
+        for amplitude, phase in zip(amplitudes, phases_deg)
+    )
+
+
+def _domain_phasor_assignments(
+    project, amplitude_key, phase_key, suppressed_key, description
+):
+    assignments = {}
+    for geometry in project.get("geometries", []):
+        geometry_id = geometry.get("id")
+        for selection in geometry.get("domain_selections", []):
+            if amplitude_key not in selection or selection.get(suppressed_key, False):
+                continue
+            tags = selection.get("domain_tags")
+            if not tags:
+                raise ValueError(
+                    f"{description} selection {selection.get('name', '')!r} has no stable STEP solid mapping. "
+                    "Reassign it from the current mesh."
+                )
+            amplitudes = selection[amplitude_key]
+            phases = selection.get(phase_key, [0.0, 0.0, 0.0])
+            if not isinstance(amplitudes, (list, tuple)) or len(amplitudes) != 3:
+                raise ValueError(f"{description} must have X, Y and Z components.")
+            if not isinstance(phases, (list, tuple)) or len(phases) != 3:
+                raise ValueError(f"{description} phase must have X, Y and Z components.")
+            try:
+                vector = _phasor_vector(amplitudes, phases)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(f"{description} needs finite amplitudes and phases.") from error
+            if not all(
+                math.isfinite(component.real) and math.isfinite(component.imag)
+                for component in vector
+            ):
+                raise ValueError(f"{description} needs finite amplitudes and phases.")
+            for tag in tags:
+                key = (geometry_id, tag)
+                existing = assignments.get(key)
+                if existing is not None and any(
+                    abs(previous - current)
+                    > 1e-12 * max(abs(previous), abs(current), 1e-30)
+                    for previous, current in zip(existing, vector)
+                ):
+                    raise ValueError(
+                        f"Overlapping domain selections assign conflicting {description.lower()} values to {tag}."
+                    )
+                assignments[key] = vector
+    return assignments
+
+
+def _active_boundary_assignments(project, physics):
+    assignments = {}
+    supported = (
+        {"magnetic_potential_zero"}
+        if physics == "harmonic_em"
+        else {
+            "mechanical_fixed",
+            "mechanical_prescribed_displacement",
+            "mechanical_spring_support",
+        }
+    )
+    for geometry in project.get("geometries", []):
+        geometry_id = geometry.get("id")
+        for selection in geometry.get("boundary_selections", []):
+            condition = selection.get("boundary_condition")
+            if (
+                condition not in supported
+                or selection.get("condition_suppressed", False)
+            ):
+                continue
+            tags = selection.get("boundary_tags")
+            if not tags:
+                raise ValueError(
+                    f"Boundary condition {selection.get('name', '')!r} has no stable STEP face mapping. "
+                    "Reassign it from the current mesh."
+                )
+            if any(
+                isinstance(tag, str) and _LEGACY_STEP_FACE_TAG_PATTERN.fullmatch(tag)
+                for tag in tags
+            ):
+                raise ValueError(
+                    "Active boundary selections use order-based STEP references. "
+                    "Reassign them from the current mesh before solving."
+                )
+            payload = {"type": condition}
+            if condition == "mechanical_prescribed_displacement":
+                try:
+                    amplitude = selection.get(
+                        "prescribed_displacement_amplitude_m", [0.0, 0.0, 0.0]
+                    )
+                    phase = selection.get(
+                        "prescribed_displacement_phase_deg", [0.0, 0.0, 0.0]
+                    )
+                    if len(amplitude) != 3 or len(phase) != 3:
+                        raise ValueError
+                    payload["value"] = _phasor_vector(amplitude, phase)
+                except (TypeError, ValueError, OverflowError) as error:
+                    raise ValueError(
+                        f"Prescribed displacement on {selection.get('name', '')!r} needs finite X, Y and Z amplitudes and phases."
+                    ) from error
+                if not all(
+                    math.isfinite(component.real) and math.isfinite(component.imag)
+                    for component in payload["value"]
+                ):
+                    raise ValueError(
+                        f"Prescribed displacement on {selection.get('name', '')!r} needs finite X, Y and Z amplitudes and phases."
+                    )
+            elif condition == "mechanical_spring_support":
+                try:
+                    normal = float(selection.get("spring_normal_stiffness_n_per_m3", 0.0))
+                    tangential = float(selection.get("spring_tangential_stiffness_n_per_m3", 0.0))
+                except (TypeError, ValueError, OverflowError) as error:
+                    raise ValueError("Spring support stiffness must be finite and non-negative.") from error
+                if (
+                    not math.isfinite(normal)
+                    or not math.isfinite(tangential)
+                    or normal < 0
+                    or tangential < 0
+                    or normal > 1e18
+                    or tangential > 1e18
+                ):
+                    raise ValueError("Spring support stiffness must be finite and between 0 and 1e18 N/m³.")
+                if normal == 0 and tangential == 0:
+                    raise ValueError(
+                        f"Spring support {selection.get('name', '')!r} needs a non-zero normal or tangential stiffness."
+                    )
+                payload.update({"normal": normal, "tangential": tangential})
+            for tag in tags:
+                key = (geometry_id, tag)
+                existing = assignments.get(key)
+                if existing is not None and existing != payload:
+                    raise ValueError(
+                        f"Overlapping boundary selections assign incompatible conditions to STEP face {tag}."
+                    )
+                assignments[key] = payload
+    return assignments
+
+
 def validate_time_harmonic_em_setup(project):
     """Validate supported 3D harmonic EM or mechanics inputs without NGSolve."""
     study = project.get("study", {})
     try:
         physics = study.get("physics", "harmonic_em")
+        em_source_mode = study.get("em_source_mode", "wire_trace")
         frequency_hz = float(study.get("frequency_hz", 500.0))
         polynomial_order = int(study.get("polynomial_order", 1))
         air_padding = float(study.get("air_padding", 2.0))
+        body_force = [float(value) for value in study.get(
+            "mechanical_body_force_n_m3", [0.0, 0.0, 0.0]
+        )]
+        body_force_phase = [float(value) for value in study.get(
+            "mechanical_body_force_phase_deg", [0.0, 0.0, 0.0]
+        )]
     except (TypeError, ValueError, OverflowError) as error:
         raise ValueError(f"Invalid 3D study settings: {error}") from error
     if not math.isfinite(frequency_hz) or frequency_hz <= 0:
         raise ValueError("The study frequency must be positive and finite.")
     if physics not in SUPPORTED_3D_STUDIES:
         raise ValueError("Choose a supported 3D harmonic study.")
+    if em_source_mode not in SUPPORTED_3D_EM_SOURCE_MODES:
+        raise ValueError("Choose a supported 3D electromagnetic excitation source.")
     electromagnetic = physics == "harmonic_em"
     mechanical = physics == "harmonic_mechanical"
     if polynomial_order not in {1, 2, 3, 4}:
@@ -184,18 +338,73 @@ def validate_time_harmonic_em_setup(project):
         raise ValueError("Air-domain padding must be between 0.25 and 20 model spans.")
     if not project.get("geometries"):
         raise ValueError("Import at least one closed STEP solid before running a study.")
-    if electromagnetic and not project.get("wire_trace_sets"):
-        raise ValueError("Import at least one wire trace before running a study.")
-    body_force = study.get("mechanical_body_force_n_m3", [0.0, 0.0, 0.0])
-    if mechanical:
-        try:
-            body_force = [float(value) for value in body_force]
-        except (TypeError, ValueError, OverflowError) as error:
-            raise ValueError("Enter a finite mechanical body-force vector in N/m³.") from error
-        if len(body_force) != 3 or not all(math.isfinite(value) for value in body_force):
-            raise ValueError("Enter finite X, Y and Z mechanical body-force components.")
-        if not any(value != 0 for value in body_force):
-            raise ValueError("Enter a non-zero body force to run a mechanical study.")
+    if (
+        len(body_force) != 3
+        or len(body_force_phase) != 3
+        or not all(math.isfinite(value) and abs(value) <= 1e15 for value in body_force)
+        or not all(math.isfinite(value) and abs(value) <= 360_000 for value in body_force_phase)
+    ):
+        raise ValueError("Enter finite X, Y and Z mechanical body-force amplitudes and phases.")
+    body_force_phasor = _phasor_vector(body_force, body_force_phase)
+    boundary_assignments = _active_boundary_assignments(project, physics)
+    mechanical_body_force_by_domain = _domain_phasor_assignments(
+        project,
+        "mechanical_body_force_n_m3",
+        "mechanical_body_force_phase_deg",
+        "mechanical_body_force_suppressed",
+        "Mechanical body force",
+    ) if mechanical else {}
+    current_density_by_domain = {}
+    if electromagnetic:
+        if em_source_mode == "wire_trace":
+            trace_sets = project.get("wire_trace_sets", [])
+            if not trace_sets:
+                raise ValueError("Import at least one wire trace or select domain current density.")
+            active_currents = []
+            for trace_set in trace_sets:
+                source_value = trace_set.get("target_gradient")
+                if source_value is None:
+                    source_value = trace_set.get("current", 1.0)
+                try:
+                    source_value = float(source_value)
+                    phase = float(trace_set.get("current_phase_deg", 0.0))
+                except (TypeError, ValueError, OverflowError) as error:
+                    raise ValueError("Wire-trace current and phase must be finite numbers.") from error
+                if not math.isfinite(source_value) or not math.isfinite(phase):
+                    raise ValueError("Wire-trace current and phase must be finite numbers.")
+                active_currents.append(source_value)
+            if not any(value != 0 for value in active_currents):
+                raise ValueError("Set a non-zero wire-trace current or target gradient before solving.")
+        else:
+            current_density_by_domain = _domain_phasor_assignments(
+                project,
+                "current_density_amplitude_a_per_m2",
+                "current_density_phase_deg",
+                "current_density_suppressed",
+                "Electromagnetic current density",
+            )
+            if not any(
+                abs(component) > 0
+                for vector in current_density_by_domain.values()
+                for component in vector
+            ):
+                raise ValueError(
+                    "Assign a non-zero current-density vector to at least one domain selection."
+                )
+    has_mechanical_body_force = any(abs(value) > 0 for value in body_force_phasor) or any(
+        abs(component) > 0
+        for vector in mechanical_body_force_by_domain.values()
+        for component in vector
+    )
+    has_prescribed_displacement = any(
+        condition["type"] == "mechanical_prescribed_displacement"
+        and any(abs(component) > 0 for component in condition["value"])
+        for condition in boundary_assignments.values()
+    )
+    if mechanical and not (has_mechanical_body_force or has_prescribed_displacement):
+        raise ValueError(
+            "Set a non-zero body force or prescribed displacement before solving a mechanical study."
+        )
 
     records = {item["name"].casefold(): item for item in builtin_materials()}
     records.update({item["name"].casefold(): item for item in project.get("materials", [])})
@@ -225,7 +434,7 @@ def validate_time_harmonic_em_setup(project):
                 )
         material_names.update(str(name).strip() for name in names if str(name).strip())
         solid_material_names.update(str(name).strip() for name in names if str(name).strip())
-    if electromagnetic:
+    if electromagnetic and em_source_mode == "wire_trace":
         for trace_set in project.get("wire_trace_sets", []):
             for trace in trace_set.get("traces", []):
                 material_names.add(str(trace.get("material", trace_set.get("material", "Air"))).strip())
@@ -251,10 +460,16 @@ def validate_time_harmonic_em_setup(project):
         resolved[record["name"]] = {"name": record["name"], **properties}
     return {
         "physics": physics,
+        "em_source_mode": em_source_mode,
         "frequency_hz": frequency_hz,
         "polynomial_order": polynomial_order,
         "air_padding": air_padding,
         "mechanical_body_force_n_m3": body_force,
+        "mechanical_body_force_phase_deg": body_force_phase,
+        "mechanical_body_force_phasor": body_force_phasor,
+        "mechanical_body_force_by_domain": mechanical_body_force_by_domain,
+        "current_density_by_domain": current_density_by_domain,
+        "boundary_assignments": boundary_assignments,
         "materials": resolved,
     }
 
@@ -314,6 +529,13 @@ def build_time_harmonic_em_problem(project, asset_paths):
     used_materials = {}
     dirichlet_boundary_names = []
     mechanical_boundary_names = []
+    dircondition_values = {}
+    robin_boundary_names = []
+    robin_normal_stiffness = {}
+    robin_tangential_stiffness = {}
+    mechanical_source_by_domain = {}
+    current_density_by_domain = {}
+    effective_mechanical_force = False
 
     for geometry_index, (geometry_input, geometry) in enumerate(
         zip(geometry_inputs, project["geometries"])
@@ -335,34 +557,12 @@ def build_time_harmonic_em_problem(project, asset_paths):
         # scale transform.
         solid_tags, face_refs = step_geometry_tags(source_solids)
 
-        selected_boundary_conditions = {}
-        for selection in geometry.get("boundary_selections", []):
-            condition = selection.get("boundary_condition")
-            if condition is None:
-                continue
-            if electromagnetic and condition != "magnetic_potential_zero":
-                raise ValueError(
-                    f"Boundary selection {selection.get('name', '')!r} is a mechanics condition. "
-                    "Choose the time-harmonic mechanics study or remove the condition."
-                )
-            if mechanical and condition != "mechanical_fixed":
-                raise ValueError(
-                    f"Boundary selection {selection.get('name', '')!r} is an electromagnetic condition. "
-                    "Choose the time-harmonic EM study or remove the condition."
-                )
-            tags = selection.get("boundary_tags")
-            if not tags:
-                raise ValueError(
-                    f"Boundary selection {selection.get('name', '')!r} has no saved STEP face mapping. "
-                    "Regenerate the mesh and save the selection again."
-                )
-            for tag in tags:
-                if tag.startswith("MMFEM_FACE_") and len(tag.rsplit("_", 1)[-1]) != 24:
-                    raise ValueError(
-                        f"Boundary selection {selection.get('name', '')!r} uses order-based "
-                        "STEP references. Recreate it from the current mesh before solving."
-                    )
-                selected_boundary_conditions.setdefault(tag, set()).add(condition)
+        selected_boundary_conditions = {
+            tag: condition
+            for (selection_geometry_id, tag), condition
+            in validated["boundary_assignments"].items()
+            if selection_geometry_id == geometry["id"]
+        }
 
         faces_by_tag = {
             tag: (solid_tag, face)
@@ -377,15 +577,30 @@ def build_time_harmonic_em_problem(project, asset_paths):
             )
 
         for tag, solid_tag, face in face_refs:
-            conditions = selected_boundary_conditions.get(tag, set()) if tag else set()
-            if electromagnetic and "magnetic_potential_zero" in conditions:
+            assignment = selected_boundary_conditions.get(tag, {}) if tag else {}
+            condition = assignment.get("type")
+            if electromagnetic and condition == "magnetic_potential_zero":
                 boundary_name = f"DirEM_G{geometry_index}_{tag}"
                 face.bc(boundary_name)
                 dirichlet_boundary_names.append(boundary_name)
-            elif mechanical and "mechanical_fixed" in conditions:
+            elif mechanical and condition in {
+                "mechanical_fixed", "mechanical_prescribed_displacement"
+            }:
                 boundary_name = f"DirMech_G{geometry_index}_{tag}"
                 face.bc(boundary_name)
                 mechanical_boundary_names.append(boundary_name)
+                value = (
+                    (0.0, 0.0, 0.0)
+                    if condition == "mechanical_fixed"
+                    else assignment["value"]
+                )
+                dircondition_values[boundary_name] = CoefficientFunction(value)
+            elif mechanical and condition == "mechanical_spring_support":
+                boundary_name = f"RobinMech_G{geometry_index}_{tag}"
+                face.bc(boundary_name)
+                robin_boundary_names.append(boundary_name)
+                robin_normal_stiffness[boundary_name] = assignment["normal"]
+                robin_tangential_stiffness[boundary_name] = assignment["tangential"]
             else:
                 face.bc("Transmission_Interface")
 
@@ -448,10 +663,34 @@ def build_time_harmonic_em_problem(project, asset_paths):
             solid_domain_keys.append(object_key)
             material_display_names[object_key] = material["name"]
             all_solids.append(solid)
+            domain_ref = (geometry["id"], solid_tag)
+            if mechanical:
+                body_force = validated["mechanical_body_force_by_domain"].get(
+                    domain_ref, validated["mechanical_body_force_phasor"]
+                )
+                effective_mechanical_force = effective_mechanical_force or any(
+                    abs(component) > 0 for component in body_force
+                )
+                mechanical_source_by_domain[object_key] = CoefficientFunction(body_force)
+            if electromagnetic:
+                current_density = validated["current_density_by_domain"].get(
+                    domain_ref, (0.0, 0.0, 0.0)
+                )
+                current_density_by_domain[object_key] = CoefficientFunction(current_density)
 
         lower, upper = _shape_bounds(shape)
         bounds_min = [min(a, b) for a, b in zip(bounds_min, lower)]
         bounds_max = [max(a, b) for a, b in zip(bounds_max, upper)]
+
+    prescribed_displacement = any(
+        assignment.get("type") == "mechanical_prescribed_displacement"
+        and any(abs(component) > 0 for component in assignment.get("value", ()))
+        for assignment in validated["boundary_assignments"].values()
+    )
+    if mechanical and not (effective_mechanical_force or prescribed_displacement):
+        raise ValueError(
+            "No non-zero mechanical body-force or prescribed-displacement input remains after domain overrides."
+        )
 
     span = max(upper - lower for lower, upper in zip(bounds_min, bounds_max))
     if not math.isfinite(span) or span <= 0:
@@ -474,14 +713,12 @@ def build_time_harmonic_em_problem(project, asset_paths):
         material_display_names[air_key] = air_record["name"]
 
     material_names = list(used_materials)
-    all_material_names = set(material_names)
-    if electromagnetic:
+    if electromagnetic and validated["em_source_mode"] == "wire_trace":
         for trace_set in project.get("wire_trace_sets", []):
             for trace in trace_set.get("traces", []):
                 trace_material = str(trace.get("material", trace_set.get("material", "Air"))).strip()
                 trace_record = resolve_material(trace_material)
                 used_materials.setdefault(trace_record["name"], trace_record)
-                all_material_names.add(trace_record["name"])
 
     material_data = {name: used_materials[name] for name in used_materials}
     zero_vector = CoefficientFunction((0, 0, 0))
@@ -513,16 +750,24 @@ def build_time_harmonic_em_problem(project, asset_paths):
         "cCoupCoef": 0,
         "kCoupCoef": 0,
         "epsilonReg": 1e-8,
-        "current_source": "wire_trace" if electromagnetic else "none",
-        "wire_trace_sets": build_wire_trace_sets(project, asset_paths) if electromagnetic else [],
-        "srcdictAC": {name: 0 for name in all_material_names},
+        "current_source": (
+            validated["em_source_mode"] if electromagnetic else "none"
+        ),
+        "wire_trace_sets": (
+            build_wire_trace_sets(project, asset_paths)
+            if electromagnetic and validated["em_source_mode"] == "wire_trace"
+            else []
+        ),
+        "srcdictAC": {
+            name: current_density_by_domain.get(name, zero_vector)
+            if validated["em_source_mode"] == "domain_current_density"
+            else 0
+            for name in material_names
+        },
         "srcdictDC": {name: 0 for name in material_names},
         "srcAAC": zero_vector,
         "srcADC": zero_vector,
-        "srcMech": CoefficientFunction(
-            tuple(validated["mechanical_body_force_n_m3"])
-            if mechanical else (0.0, 0.0, 0.0)
-        ),
+        "srcMech": mechanical_source_by_domain if mechanical else zero_vector,
         "murdict": {name: item["mur"] for name, item in material_data.items()},
         "sigmadict": {name: item["sigma"] for name, item in material_data.items()},
         "Edict": {name: item["youngs"] for name, item in material_data.items()},
@@ -549,10 +794,11 @@ def build_time_harmonic_em_problem(project, asset_paths):
         ),
         "dirconditionADC": {},
         "dirkeysADC": "",
-        "dirconditionMech": {
-            name: zero_vector for name in mechanical_boundary_names
-        },
+        "dirconditionMech": dircondition_values if mechanical else {},
         "dirkeysMech": "|".join(mechanical_boundary_names),
+        "robin_bcs": robin_boundary_names if mechanical else [],
+        "robin_k_normal": robin_normal_stiffness if mechanical else {},
+        "robin_k_tangential": robin_tangential_stiffness if mechanical else {},
         "dirconditionDC": {},
         "dirkeysDC": "",
         "quarter_domain": False,
@@ -567,6 +813,51 @@ def build_time_harmonic_em_problem(project, asset_paths):
             "frequency_hz": frequency_hz,
             "polynomial_order": polynomial_order,
             "mechanical_body_force_n_m3": validated["mechanical_body_force_n_m3"],
+            "mechanical_body_force_phase_deg": validated["mechanical_body_force_phase_deg"],
+            "em_source_mode": validated["em_source_mode"],
+            "wire_trace_sources": [
+                {
+                    "name": trace_set.get("name", "Wire trace"),
+                    "current_a": float(trace_set.get("current", 1.0)),
+                    "current_phase_deg": float(trace_set.get("current_phase_deg", 0.0)),
+                    "target_gradient_t_per_m": (
+                        float(trace_set["target_gradient"])
+                        if trace_set.get("target_gradient") is not None
+                        else None
+                    ),
+                }
+                for trace_set in (
+                    project.get("wire_trace_sets", [])
+                    if electromagnetic and validated["em_source_mode"] == "wire_trace"
+                    else []
+                )
+            ],
+            "current_density_by_domain": {
+                f"{geometry_id}:{domain_tag}": [
+                    [component.real, component.imag] for component in vector
+                ]
+                for (geometry_id, domain_tag), vector
+                in validated["current_density_by_domain"].items()
+            },
+            "mechanical_body_force_by_domain": {
+                f"{geometry_id}:{domain_tag}": [
+                    [component.real, component.imag] for component in vector
+                ]
+                for (geometry_id, domain_tag), vector
+                in validated["mechanical_body_force_by_domain"].items()
+            },
+            "boundary_assignments": {
+                f"{geometry_id}:{boundary_tag}": {
+                    key: (
+                        [[component.real, component.imag] for component in value]
+                        if key == "value"
+                        else value
+                    )
+                    for key, value in assignment.items()
+                }
+                for (geometry_id, boundary_tag), assignment
+                in validated["boundary_assignments"].items()
+            },
             "material_properties": {
                 name: {
                     "relative_permeability": item["mur"],
@@ -590,5 +881,6 @@ def build_time_harmonic_em_problem(project, asset_paths):
         "materials": material_data,
         "physics": physics,
         "mechanical_body_force_n_m3": validated["mechanical_body_force_n_m3"],
+        "em_source_mode": validated["em_source_mode"],
         "material_display_names": material_display_names,
     }

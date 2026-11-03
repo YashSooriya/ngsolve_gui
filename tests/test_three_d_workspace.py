@@ -161,6 +161,75 @@ def test_named_domain_mesh_size_invalidates_preview_mesh_and_persists(monkeypatc
     assert workspace.dirty is True
 
 
+def test_3d_physics_assignments_are_editable_suppressible_and_source_aware(monkeypatch):
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+    workspace = ThreeDWorkspace(SimpleNamespace())
+    step_bytes = (
+        b"ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n"
+        b"#1=(LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.));\n"
+        b"ENDSEC;\nEND-ISO-10303-21;\n"
+    )
+    project = new_3d_project("Scoped 3D loads")
+    project["study"]["em_source_mode"] = "domain_current_density"
+    assets = {}
+    geometry = add_step_geometry(
+        project, assets, "block.step", step_bytes, units="mm", material="Copper"
+    )
+    geometry["domain_selections"] = [{
+        "id": "domain-source",
+        "name": "Source domain",
+        "domain_ids": [0],
+        "domain_tags": ["MMFEM_SOLID_000000000000000000000001"],
+        "current_density_amplitude_a_per_m2": [0.0, 0.0, 0.0],
+        "current_density_phase_deg": [0.0, 0.0, 0.0],
+        "current_density_suppressed": False,
+    }]
+    geometry["boundary_selections"] = [{
+        "id": "prescribed",
+        "name": "Driven boundary",
+        "boundary_ids": [0],
+        "boundary_tags": ["MMFEM_FACE_000000000000000000000002"],
+        "boundary_condition": "mechanical_prescribed_displacement",
+        "prescribed_displacement_amplitude_m": [1e-6, 0.0, 0.0],
+        "prescribed_displacement_phase_deg": [0.0, 90.0, 0.0],
+    }]
+    workspace.project = project
+    workspace.assets = assets
+    workspace._rebuild_items()
+
+    source = geometry["domain_selections"][0]
+    workspace.select_item("named_selection", source["id"])
+    labels = {getattr(child, "ui_label", None) for child in workspace._properties.ui_children}
+    assert {"JX amplitude (A/m²)", "JY phase (°)", "Suppress source"} <= labels
+
+    assert workspace._set_assignment_vector_component(
+        source, "current_density_amplitude_a_per_m2", 0,
+        SimpleNamespace(value="1e6"), label="Current density", limit=1e15,
+    ) is True
+    assert workspace._run_study_button.ui_disable is False
+    workspace._toggle_assignment_suppressed(source, "current_density_suppressed")
+    assert workspace._run_study_button.ui_disable is True
+    workspace._toggle_assignment_suppressed(source, "current_density_suppressed")
+    assert workspace._run_study_button.ui_disable is False
+
+    boundary = geometry["boundary_selections"][0]
+    workspace.select_item("named_selection", boundary["id"])
+    labels = {getattr(child, "ui_label", None) for child in workspace._properties.ui_children}
+    assert {"uX amplitude (m)", "uY phase (°)", "Suppress condition"} <= labels
+    boundary_row = next(
+        row for row in workspace._geometry_items.ui_children
+        if any(
+            getattr(child, "ui_children", None) == ["Driven boundary"]
+            for child in getattr(row, "ui_children", [])
+        )
+    )
+    badge_text = [
+        text for child in boundary_row.ui_children
+        for text in getattr(child, "ui_children", [])
+    ]
+    assert "Prescribed u" in badge_text
+
+
 def test_named_domain_mesh_size_rejects_conflicting_overlapping_selections(monkeypatch):
     monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
     workspace = ThreeDWorkspace(SimpleNamespace())
@@ -1086,6 +1155,8 @@ def test_named_boundary_selection_assigns_only_supported_time_harmonic_condition
         "default",
         "magnetic_potential_zero",
         "mechanical_fixed",
+        "mechanical_prescribed_displacement",
+        "mechanical_spring_support",
     }
 
     assert workspace._set_named_selection_boundary_condition(
@@ -1131,7 +1202,7 @@ def test_mechanical_study_property_editor_exposes_only_relevant_configuration(mo
 
     geometry["boundary_selections"][0]["boundary_condition"] = "magnetic_potential_zero"
     workspace._update_study_controls()
-    assert workspace._run_study_button.ui_disable is True
+    assert workspace._run_study_button.ui_disable is False
 
 
 def test_invalidated_boundary_assignment_can_be_reassigned_from_current_mesh(monkeypatch):

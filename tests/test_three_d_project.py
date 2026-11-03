@@ -117,6 +117,53 @@ def test_project_round_trip_preserves_stable_solid_and_face_assignments():
     assert restored["geometries"][0]["boundary_selections"] == geometry["boundary_selections"]
 
 
+def test_project_round_trip_preserves_complex_3d_sources_and_mechanical_conditions():
+    project = new_3d_project("Harmonic assignments")
+    assets = {}
+    geometry = add_step_geometry(project, assets, "block.step", STEP, units="mm")
+    geometry["domain_selections"] = [{
+        "id": "coil-domain",
+        "name": "Excited domain",
+        "domain_ids": [0],
+        "domain_tags": ["MMFEM_SOLID_000000000000000000000001"],
+        "current_density_amplitude_a_per_m2": [1.0e6, 0.0, -2.0e6],
+        "current_density_phase_deg": [0.0, 90.0, -45.0],
+        "current_density_suppressed": False,
+        "mechanical_body_force_n_m3": [1.0e5, 0.0, 0.0],
+        "mechanical_body_force_phase_deg": [30.0, 0.0, 0.0],
+        "mechanical_body_force_suppressed": True,
+    }]
+    geometry["boundary_selections"] = [
+        {
+            "id": "prescribed",
+            "name": "Prescribed motion",
+            "boundary_ids": [0],
+            "boundary_tags": ["MMFEM_FACE_000000000000000000000002"],
+            "boundary_condition": "mechanical_prescribed_displacement",
+            "prescribed_displacement_amplitude_m": [1.0e-4, 0.0, 2.0e-4],
+            "prescribed_displacement_phase_deg": [0.0, 90.0, -30.0],
+        },
+        {
+            "id": "spring",
+            "name": "Flexible support",
+            "boundary_ids": [1],
+            "boundary_tags": ["MMFEM_FACE_000000000000000000000003"],
+            "boundary_condition": "mechanical_spring_support",
+            "spring_normal_stiffness_n_per_m3": 2.5e8,
+            "spring_tangential_stiffness_n_per_m3": 5.0e7,
+            "condition_suppressed": True,
+        },
+    ]
+    project["study"]["mechanical_body_force_phase_deg"] = [15.0, 0.0, 180.0]
+
+    restored, _assets = unpack_3d_project(package_3d_project(project, assets))
+
+    restored_geometry = restored["geometries"][0]
+    assert restored["study"]["mechanical_body_force_phase_deg"] == [15.0, 0.0, 180.0]
+    assert restored_geometry["domain_selections"] == geometry["domain_selections"]
+    assert restored_geometry["boundary_selections"] == geometry["boundary_selections"]
+
+
 def test_wire_trace_parser_converts_csv_and_whitespace_units_to_metres():
     assert parse_wire_trace("0, 0, 0\n10, 20, 30\n", "mm") == [
         (0.0, 0.0, 0.0),

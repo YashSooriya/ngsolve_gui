@@ -30,10 +30,16 @@ MAX_MESH_SIZE_MM = 100_000.0
 SUPPORTED_3D_BOUNDARY_CONDITIONS = {
     "magnetic_potential_zero": "Vector potential A = 0",
     "mechanical_fixed": "Fixed support (u = 0)",
+    "mechanical_prescribed_displacement": "Prescribed displacement",
+    "mechanical_spring_support": "Spring support",
 }
 SUPPORTED_3D_STUDIES = {
     "harmonic_em": "Time-harmonic electromagnetics",
     "harmonic_mechanical": "Time-harmonic mechanics",
+}
+SUPPORTED_3D_EM_SOURCE_MODES = {
+    "wire_trace": "Wire traces",
+    "domain_current_density": "Domain current density",
 }
 _STEP_FACE_TAG_PATTERN = re.compile(r"MMFEM_FACE_[0-9a-f]{24}\Z")
 _STEP_SOLID_TAG_PATTERN = re.compile(r"MMFEM_SOLID_[0-9a-f]{24}\Z")
@@ -78,12 +84,42 @@ def new_3d_project(name="Untitled 3D project"):
         "materials": [],
         "study": {
             "physics": "harmonic_em",
+            "em_source_mode": "wire_trace",
             "frequency_hz": 500.0,
             "polynomial_order": 1,
             "air_padding": 2.0,
             "mechanical_body_force_n_m3": [0.0, 0.0, 0.0],
+            "mechanical_body_force_phase_deg": [0.0, 0.0, 0.0],
         },
     }
+
+
+def _finite_vector(value, label, *, limit):
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"{label} must contain finite X, Y and Z components.")
+    try:
+        vector = [float(component) for component in value]
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{label} must contain finite X, Y and Z components.") from error
+    if not all(math.isfinite(component) and abs(component) <= limit for component in vector):
+        raise ValueError(f"{label} components must be finite and no larger than {limit:g}.")
+    return vector
+
+
+def _validate_optional_phasor(selection, amplitude_key, phase_key, label, *, limit):
+    if amplitude_key not in selection:
+        if phase_key in selection:
+            raise ValueError(f"{label} phase requires an assigned {label.lower()} vector.")
+        return
+    selection[amplitude_key] = _finite_vector(
+        selection[amplitude_key], label, limit=limit
+    )
+    phases = _finite_vector(
+        selection.get(phase_key, [0.0, 0.0, 0.0]),
+        f"{label} phase (degrees)",
+        limit=360_000.0,
+    )
+    selection[phase_key] = phases
 
 
 def snapshot_material(project, material):
@@ -341,6 +377,7 @@ def add_wire_trace(project, assets, filename, data, *, units="m", material="Air"
         "name": name,
         "direction": "x",
         "current": 1.0,
+        "current_phase_deg": 0.0,
         "epsilon": 0.001,
         "dsv": 0.4,
         "centre": [0.0, 0.0, 0.0],
@@ -456,9 +493,13 @@ def _validate_named_selections(geometry, key, region_key, label):
             ):
                 raise ValueError(
                     f"Unsupported 3D boundary condition {condition!r}. "
-                    "Only magnetic potential = 0 is currently available."
+                    "Choose a condition supported by the 3D time-harmonic solver."
                 )
-            if condition is not None and not tags:
+            if (
+                condition is not None
+                and not selection.get("condition_suppressed", False)
+                and not tags
+            ):
                 raise ValueError(
                     "A 3D boundary condition needs saved STEP face identifiers. "
                     "Regenerate the mesh and save the boundary selection again."
@@ -670,6 +711,9 @@ def validate_3d_project(project, assets):
     physics = study.get("physics", "harmonic_em")
     if physics not in SUPPORTED_3D_STUDIES:
         raise ValueError("Choose a supported 3D harmonic study.")
+    em_source_mode = study.get("em_source_mode", "wire_trace")
+    if em_source_mode not in SUPPORTED_3D_EM_SOURCE_MODES:
+        raise ValueError("Choose a supported 3D electromagnetic excitation source.")
     try:
         frequency_hz = float(study.get("frequency_hz", 500.0))
         polynomial_order = int(study.get("polynomial_order", 1))
@@ -681,19 +725,24 @@ def validate_3d_project(project, assets):
             raise ValueError("Polynomial order must be between 1 and 4.")
         if not math.isfinite(air_padding) or not 0.25 <= air_padding <= 20:
             raise ValueError("Air-domain padding must be between 0.25 and 20 model spans.")
-        if not isinstance(body_force, (list, tuple)) or len(body_force) != 3:
-            raise ValueError("Mechanical body force must have finite X, Y and Z components.")
-        body_force = [float(value) for value in body_force]
-        if not all(math.isfinite(value) and abs(value) <= 1e15 for value in body_force):
-            raise ValueError("Mechanical body-force components must be finite and no larger than 1e15 N/m³.")
+        body_force = _finite_vector(
+            body_force, "Mechanical body force (N/m³)", limit=1e15
+        )
+        body_force_phase = _finite_vector(
+            study.get("mechanical_body_force_phase_deg", [0.0, 0.0, 0.0]),
+            "Mechanical body-force phase (degrees)",
+            limit=360_000.0,
+        )
     except (TypeError, ValueError, OverflowError) as error:
         raise ValueError(f"Invalid 3D study settings: {error}") from error
     study.update({
         "physics": physics,
+        "em_source_mode": em_source_mode,
         "frequency_hz": frequency_hz,
         "polynomial_order": polynomial_order,
         "air_padding": air_padding,
         "mechanical_body_force_n_m3": body_force,
+        "mechanical_body_force_phase_deg": body_force_phase,
     })
 
     materials = project.setdefault("materials", [])
@@ -764,10 +813,75 @@ def validate_3d_project(project, assets):
                 not isinstance(assigned_material, str) or not assigned_material.strip()
             ):
                 raise ValueError("A domain material assignment must be a material name.")
+            _validate_optional_phasor(
+                selection,
+                "current_density_amplitude_a_per_m2",
+                "current_density_phase_deg",
+                "Current density (A/m²)",
+                limit=1e15,
+            )
+            _validate_optional_phasor(
+                selection,
+                "mechanical_body_force_n_m3",
+                "mechanical_body_force_phase_deg",
+                "Mechanical body force (N/m³)",
+                limit=1e15,
+            )
+            for suppression_key in (
+                "current_density_suppressed",
+                "mechanical_body_force_suppressed",
+            ):
+                if suppression_key in selection and not isinstance(
+                    selection[suppression_key], bool
+                ):
+                    raise ValueError(f"{suppression_key.replace('_', ' ').capitalize()} must be true or false.")
+            if any(
+                key in selection
+                for key in (
+                    "current_density_amplitude_a_per_m2",
+                    "mechanical_body_force_n_m3",
+                )
+            ) and not selection.get("domain_tags"):
+                raise ValueError(
+                    "A domain source or load needs stable STEP solid identifiers. "
+                    "Regenerate the mesh and save the named selection again."
+                )
         domain_mesh_size_overrides(geometry)
         _validate_named_selections(
             geometry, "boundary_selections", "boundary_ids", "boundary"
         )
+        for selection in geometry.get("boundary_selections", []):
+            if "condition_suppressed" in selection and not isinstance(
+                selection["condition_suppressed"], bool
+            ):
+                raise ValueError("Boundary-condition suppression must be true or false.")
+            condition = selection.get("boundary_condition")
+            if condition == "mechanical_prescribed_displacement":
+                selection["prescribed_displacement_amplitude_m"] = _finite_vector(
+                    selection.get("prescribed_displacement_amplitude_m", [0, 0, 0]),
+                    "Prescribed displacement amplitude (m)",
+                    limit=1e3,
+                )
+                selection["prescribed_displacement_phase_deg"] = _finite_vector(
+                    selection.get("prescribed_displacement_phase_deg", [0, 0, 0]),
+                    "Prescribed displacement phase (degrees)",
+                    limit=360_000.0,
+                )
+            if condition == "mechanical_spring_support":
+                try:
+                    normal = float(selection.get("spring_normal_stiffness_n_per_m3", 0.0))
+                    tangential = float(selection.get("spring_tangential_stiffness_n_per_m3", 0.0))
+                except (TypeError, ValueError, OverflowError) as error:
+                    raise ValueError("Spring stiffness values must be finite and non-negative.") from error
+                if (
+                    not math.isfinite(normal)
+                    or not math.isfinite(tangential)
+                    or not 0 <= normal <= 1e18
+                    or not 0 <= tangential <= 1e18
+                ):
+                    raise ValueError("Spring stiffness values must be finite and between 0 and 1e18 N/m³.")
+                selection["spring_normal_stiffness_n_per_m3"] = normal
+                selection["spring_tangential_stiffness_n_per_m3"] = tangential
         payload = _validate_asset_reference(geometry, assets, kind="geometry", extension=".step")
         validate_step_file(geometry.get("name", "geometry.step"), payload)
         referenced.add(geometry["asset"])
@@ -784,9 +898,16 @@ def validate_3d_project(project, assets):
             if direction not in {"x", "y", "z"}:
                 raise ValueError("Wire trace direction must be x, y, or z.")
             current = float(trace_set.get("current", 1.0))
+            current_phase = float(trace_set.get("current_phase_deg", 0.0))
             epsilon = float(trace_set.get("epsilon", 0.001))
-            if not math.isfinite(current) or not math.isfinite(epsilon) or epsilon <= 0:
-                raise ValueError("Wire trace current must be finite and epsilon must be positive.")
+            if (
+                not math.isfinite(current)
+                or not math.isfinite(current_phase)
+                or abs(current_phase) > 360_000
+                or not math.isfinite(epsilon)
+                or epsilon <= 0
+            ):
+                raise ValueError("Wire trace current and phase must be finite, and epsilon must be positive.")
             dsv = float(trace_set.get("dsv", 0.4))
             samples = int(trace_set.get("samples", 41))
             if not math.isfinite(dsv) or dsv <= 0 or samples < 2:
@@ -807,6 +928,7 @@ def validate_3d_project(project, assets):
             trace_set["samples"] = samples
             trace_set["direction"] = direction
             trace_set["current"] = current
+            trace_set["current_phase_deg"] = current_phase
             trace_set["epsilon"] = epsilon
         except (TypeError, ValueError, OverflowError) as error:
             raise ValueError(f"Invalid wire trace set {trace_set.get('name', '')!r}: {error}") from error
@@ -922,6 +1044,7 @@ def build_wire_trace_sets(project, asset_paths):
             "name": trace_set["name"],
             "direction": trace_set.get("direction", "x"),
             "current": float(trace_set.get("current", 1.0)),
+            "current_phase_deg": float(trace_set.get("current_phase_deg", 0.0)),
             "epsilon": float(trace_set.get("epsilon", 0.001)),
             "traces": [],
         }
