@@ -458,6 +458,87 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     }
     assert workspace._selection_draft["kind"] == "boundary"
 
+    # Orbiting the viewport must not turn the release after a drag into a
+    # boundary pick. Plotly's Mesh3d build can omit pointer coordinates from
+    # plotly_hover, so the bridge tracks the trusted pointer gesture itself.
+    selected_before_drag = list(workspace._selection_draft["region_ids"])
+    camera_before_drag = graph.evaluate(
+        "element => element.layout.scene.camera"
+    )
+    graph.evaluate("""element => {
+        element.__mmfemPointerGuardEvents = [];
+        for (const type of ['pointerdown', 'pointermove', 'pointerup', 'click']) {
+            element.addEventListener(type, event => {
+                element.__mmfemPointerGuardEvents.push({
+                    type, trusted: event.isTrusted, button: event.button,
+                    buttons: event.buttons, target: event.target.tagName,
+                    bridge: element._mmfemPickBridge && {
+                        pointerDown: element._mmfemPickBridge.pointerDown,
+                        pointerDragged: element._mmfemPickBridge.pointerDragged,
+                        suppressClickUntil:
+                            element._mmfemPickBridge.suppressClickUntil,
+                    },
+                });
+            }, true);
+        }
+    }""")
+    graph.evaluate("""element => {
+        element.__mmfemCameraRelayouts = [];
+        element.__mmfemCameraRelayoutHandler = event =>
+            element.__mmfemCameraRelayouts.push(event);
+        element.on('plotly_relayout', element.__mmfemCameraRelayoutHandler);
+    }""")
+    bounds = graph.bounding_box()
+    assert bounds is not None
+    drag_start = (
+        bounds["x"] + bounds["width"] * 0.48,
+        bounds["y"] + bounds["height"] * 0.47,
+    )
+    drag_end = (
+        bounds["x"] + bounds["width"] * 0.63,
+        bounds["y"] + bounds["height"] * 0.59,
+    )
+    page.mouse.move(*drag_start)
+    page.mouse.down()
+    page.mouse.move(*drag_end, steps=12)
+    page.mouse.up()
+    page.wait_for_function(
+        """() => {
+            const element = document.querySelector(
+                '.mmfem-3d-viewport .js-plotly-plot');
+            return element && (element.__mmfemCameraRelayouts || [])
+                .some(event => event['scene.camera']);
+        }""",
+        timeout=5_000,
+    )
+    camera_relayouts = graph.evaluate(
+        "element => element.__mmfemCameraRelayouts"
+    )
+    camera_after_drag = next(
+        event["scene.camera"]
+        for event in reversed(camera_relayouts)
+        if event.get("scene.camera")
+    )
+    assert camera_after_drag["eye"] != camera_before_drag.get("eye"), {
+        "before": camera_before_drag,
+        "relayouts": camera_relayouts,
+    }
+    assert workspace._selection_draft["region_ids"] == selected_before_drag, {
+        "selected_before_drag": selected_before_drag,
+        "selected_after_drag": workspace._selection_draft["region_ids"],
+        "camera_after_drag": camera_after_drag,
+        "pointer_guard_events": graph.evaluate(
+            "element => element.__mmfemPointerGuardEvents"
+        ),
+    }
+    graph.evaluate("""element => {
+        element.removeListener(
+            'plotly_relayout', element.__mmfemCameraRelayoutHandler);
+        delete element.__mmfemCameraRelayoutHandler;
+        delete element.__mmfemCameraRelayouts;
+        delete element.__mmfemPointerGuardEvents;
+    }""")
+
     # Repeated trusted mouse picks exercise the full Plotly -> OCC boundary
     # mapping -> property editor path and check that the live graph does not
     # accumulate canvases. CDP heap figures are useful evidence but do not

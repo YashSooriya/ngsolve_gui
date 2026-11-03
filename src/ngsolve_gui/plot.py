@@ -25,6 +25,9 @@ const bridge = {
     dispatch,
     lastHover: null,
     lastPlotlyClick: -1,
+    pointerDown: null,
+    pointerDragged: false,
+    suppressClickUntil: 0,
     cancelled: false,
     bound: false,
     attempts: 0,
@@ -41,7 +44,9 @@ bridge.onHover = event => {
     } : null;
 };
 bridge.onPlotlyClick = event => {
-    bridge.lastPlotlyClick = performance.now();
+    const clickedAt = performance.now();
+    bridge.lastPlotlyClick = clickedAt;
+    if (clickedAt < bridge.suppressClickUntil) return;
     const points = event && event.points;
     if (!points) return;
     bridge.dispatch({points: points.map(point => ({
@@ -49,9 +54,40 @@ bridge.onPlotlyClick = event => {
         pointNumber: Number(point.pointNumber),
     }))});
 };
+bridge.onPointerDown = event => {
+    if (!event || !event.isTrusted || event.button !== 0
+        || !event.target || event.target.tagName !== 'CANVAS') return;
+    bridge.pointerDown = {
+        id: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+    };
+    bridge.pointerDragged = false;
+    bridge.suppressClickUntil = 0;
+};
+bridge.onPointerMove = event => {
+    const start = bridge.pointerDown;
+    if (!start || !event || event.pointerId !== start.id
+        || !(event.buttons & 1)) return;
+    const dx = event.clientX - start.x;
+    const dy = event.clientY - start.y;
+    if (dx * dx + dy * dy > 25) bridge.pointerDragged = true;
+};
+bridge.onPointerUp = event => {
+    const start = bridge.pointerDown;
+    if (!start || !event || event.pointerId !== start.id) return;
+    if (bridge.pointerDragged) {
+        // Chromium may emit a trusted click after Plotly finishes an orbit
+        // drag. Suppress both Plotly and DOM click paths for this gesture.
+        bridge.suppressClickUntil = performance.now() + 750;
+    }
+    bridge.pointerDown = null;
+    bridge.pointerDragged = false;
+};
 bridge.onCanvasClick = event => {
     if (!event || !event.isTrusted || !event.target ||
         event.target.tagName !== 'CANVAS') return;
+    if (performance.now() < bridge.suppressClickUntil) return;
     const point = bridge.lastHover;
     const clickedAt = performance.now();
     if (!point || clickedAt - point.at > 750) return;
@@ -75,6 +111,10 @@ bridge.dispose = () => {
         try { graph.removeListener('plotly_hover', bridge.onHover); } catch (_) {}
         try { graph.removeListener('plotly_click', bridge.onPlotlyClick); } catch (_) {}
         try { graph.removeEventListener('click', bridge.onCanvasClick, true); } catch (_) {}
+        try { graph.removeEventListener('pointerdown', bridge.onPointerDown, true); } catch (_) {}
+        try { graph.removeEventListener('pointermove', bridge.onPointerMove, true); } catch (_) {}
+        try { graph.removeEventListener('pointerup', bridge.onPointerUp, true); } catch (_) {}
+        try { graph.removeEventListener('pointercancel', bridge.onPointerUp, true); } catch (_) {}
     }
     if (graph._mmfemPickBridge === bridge) graph._mmfemPickBridge = null;
     bridge.lastHover = null;
@@ -85,6 +125,10 @@ bridge.bind = () => {
         graph.on('plotly_hover', bridge.onHover);
         graph.on('plotly_click', bridge.onPlotlyClick);
         graph.addEventListener('click', bridge.onCanvasClick, true);
+        graph.addEventListener('pointerdown', bridge.onPointerDown, true);
+        graph.addEventListener('pointermove', bridge.onPointerMove, true);
+        graph.addEventListener('pointerup', bridge.onPointerUp, true);
+        graph.addEventListener('pointercancel', bridge.onPointerUp, true);
         bridge.bound = true;
         document.documentElement.setAttribute('data-mmfem-pick-bridge-status', 'bound');
         return;
