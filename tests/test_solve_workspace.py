@@ -4307,48 +4307,37 @@ def test_canvas_wheel_zooms_at_the_current_pointer(standalone_components):
     assert calls == [(pytest.approx(math.exp(0.18)), anchor, False), "schedule"]
 
 
-def test_wheel_zoom_coalesces_canvas_renders_until_input_settles(standalone_components, monkeypatch):
-    import ngsolve_gui.solve_workspace as solve_workspace_module
+def test_wheel_zoom_coalesces_canvas_renders_on_the_ui_loop(standalone_components):
+    import asyncio
+    from threading import get_ident
 
-    timers = []
-
-    class FakeTimer:
-        def __init__(self, interval, callback, args=()):
-            self.interval = interval
-            self.callback = callback
-            self.args = args
-            self.cancelled = False
-            timers.append(self)
-
-        def start(self):
-            pass
-
-        def cancel(self):
-            self.cancelled = True
-
-        def fire(self):
-            self.callback(*self.args)
-
-    monkeypatch.setattr(solve_workspace_module, "Timer", FakeTimer)
     workspace = SolveWorkspace()
     anchor = (740.0, 200.0)
     workspace._canvas_event_point = lambda event, refresh_transform=False: anchor
     renders = []
-    workspace.render_canvas = lambda: renders.append("render")
+    owner_thread = get_ident()
+    workspace.render_canvas = lambda: renders.append(
+        (workspace._canvas_zoom_generation, get_ident())
+    )
     initial_width = workspace._current_canvas_world_view()[1]
 
-    workspace._on_canvas_wheel(SimpleNamespace(value={"deltaY": 120.0}))
-    first_timer = timers[-1]
-    workspace._on_canvas_wheel(SimpleNamespace(value={"deltaY": -60.0}))
-    second_timer = timers[-1]
+    async def exercise_wheel_events():
+        workspace._on_canvas_wheel(SimpleNamespace(value={"deltaY": 120.0}))
+        first_handle = workspace._canvas_zoom_timer
+        workspace._on_canvas_wheel(SimpleNamespace(value={"deltaY": -60.0}))
+        second_handle = workspace._canvas_zoom_timer
 
-    assert first_timer.cancelled
-    assert renders == []
-    assert workspace._current_canvas_world_view()[1] == pytest.approx(
-        initial_width * math.exp(0.09)
-    )
-    second_timer.fire()
-    assert renders == ["render"]
+        assert first_handle.cancelled()
+        assert renders == []
+        assert workspace._current_canvas_world_view()[1] == pytest.approx(
+            initial_width * math.exp(0.09)
+        )
+        await asyncio.sleep(0.15)
+
+        assert renders == [(2, owner_thread)]
+        assert workspace._canvas_zoom_timer is None
+
+    asyncio.run(exercise_wheel_events())
 
 
 def test_grid_zoom_out_expands_without_a_fixed_view_boundary(standalone_components):

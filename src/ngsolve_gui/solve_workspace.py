@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 from functools import wraps
 import json
@@ -11,7 +12,7 @@ import re
 import time
 from contextlib import contextmanager
 from decimal import Decimal, ROUND_HALF_UP
-from threading import Lock, Timer, get_ident
+from threading import Lock, get_ident
 from pathlib import Path
 
 from ngapp.components import (
@@ -1855,10 +1856,21 @@ class SolveWorkspace(Div):
             generation = self._canvas_zoom_generation
             if self._canvas_zoom_timer is not None:
                 self._canvas_zoom_timer.cancel()
-            timer = Timer(0.12, self._flush_canvas_zoom_render, args=(generation,))
-            timer.daemon = True
-            self._canvas_zoom_timer = timer
-            timer.start()
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # Non-GUI callers have no event loop to schedule on. Flush in
+                # their current context instead of mutating UI components from
+                # a background Timer thread.
+                self._canvas_zoom_timer = None
+                flush_immediately = True
+            else:
+                self._canvas_zoom_timer = loop.call_later(
+                    0.12, self._flush_canvas_zoom_render, generation
+                )
+                flush_immediately = False
+        if flush_immediately:
+            self._flush_canvas_zoom_render(generation)
 
     def _cancel_canvas_zoom_render(self):
         with self._canvas_zoom_timer_lock:
@@ -1872,7 +1884,7 @@ class SolveWorkspace(Div):
             if generation != self._canvas_zoom_generation:
                 return
             self._canvas_zoom_timer = None
-        self.render_canvas()
+        self._render_canvas_after_interaction()
 
     def _pan_canvas_by_pixels(self, start, end):
         """Pan the meridian view by a drag measured in SVG canvas units."""
