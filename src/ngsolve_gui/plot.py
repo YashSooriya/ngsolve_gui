@@ -14,7 +14,6 @@ _PICK_BRIDGE_SETUP_JS = r"""
 (() => {
 const graph = document.querySelector('.mmfem-3d-viewport .js-plotly-plot');
 const dispatch = window[__CALLBACK_NAME__];
-const CANVAS_CLICK_OWNERSHIP_MS = 3000;
 document.documentElement.setAttribute(
     'data-mmfem-pick-bridge-bootstrap',
     graph ? (typeof dispatch === 'function' ? 'ready' : 'no-dispatch') : 'no-graph'
@@ -60,14 +59,26 @@ bridge.onPlotlyClick = event => {
     if (bridge.pointerDragged || clickedAt < bridge.suppressClickUntil) return;
     const points = event && event.points;
     if (!points || !points.length) return;
-    if (Number.isFinite(bridge.lastCanvasClickAt)
-        && clickedAt - bridge.lastCanvasClickAt < CANVAS_CLICK_OWNERSHIP_MS) {
-        // The trusted canvas click was already resolved from the most recent
-        // WebGL hover. Plotly may emit its own click event later (sometimes
-        // after the server has applied the first toggle), so the canvas path
-        // owns this interaction for a short window and prevents a second
-        // backend dispatch. A later independent Plotly click without a canvas
-        // event still uses the normal handler below.
+    const nativeEvent = event.event;
+    const hovered = bridge.lastHover;
+    const hoverIsFresh = hovered && clickedAt - hovered.at <= 750;
+    const sameFace = hoverIsFresh
+        && Number(points[0].curveNumber) === hovered.curveNumber
+        && Number(points[0].pointNumber) === hovered.pointNumber;
+    const samePosition = hoverIsFresh && nativeEvent
+        && Number.isFinite(Number(nativeEvent.clientX))
+        && Number.isFinite(Number(nativeEvent.clientY))
+        && Number.isFinite(hovered.x) && Number.isFinite(hovered.y)
+        && Math.abs(Number(nativeEvent.clientX) - hovered.x) <= 10
+        && Math.abs(Number(nativeEvent.clientY) - hovered.y) <= 10;
+    const canvasOrigin = nativeEvent && nativeEvent.target
+        && nativeEvent.target.tagName === 'CANVAS';
+    if ((canvasOrigin && (sameFace || samePosition))
+        || (!nativeEvent && sameFace)) {
+        // WebGL hover already provides the face index, and the trusted DOM
+        // canvas click handler below dispatches that face once. Do not also
+        // forward Plotly's click event for the same canvas gesture, regardless
+        // of whether Plotly emits it before or after the DOM click.
         bridge.clickStats.duplicateEventsSuppressed += 1;
         return;
     }
@@ -122,18 +133,16 @@ bridge.onCanvasClick = event => {
     // separate native pointer dispatch from the server-to-visible-UI path.
     bridge.lastCanvasClickAt = clickedAt;
     bridge.clickStats.canvasClicks += 1;
-    // Let the DOM click finish before using the hover-derived Mesh3d face.
-    // If Plotly emits a delayed plotly_click for this same canvas gesture,
-    // onPlotlyClick recognizes that the trusted canvas path already owns it.
+    const record = {
+        curveNumber: Number(point.curveNumber),
+        pointNumber: Number(point.pointNumber),
+    };
     setTimeout(() => {
         if (bridge.cancelled) return;
         bridge.lastPlotlyClick = performance.now();
         bridge.clickStats.fallbackDispatches += 1;
         bridge.clickStats.dispatches += 1;
-        bridge.dispatch({points: [{
-            curveNumber: point.curveNumber,
-            pointNumber: point.pointNumber,
-        }]});
+        bridge.dispatch({points: [record]});
     }, 0);
 };
 bridge.dispose = () => {
