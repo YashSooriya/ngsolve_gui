@@ -865,6 +865,10 @@ def test_solid_tree_selection_isolates_bodies_without_changing_solver_model(monk
     }
     assert "Show all solids" in property_actions
     assert "Isolate body" not in property_actions
+    assert sum(
+        getattr(child, "ui_label", None) == "Show all solids"
+        for child in workspace._properties.ui_children
+    ) == 1
     assert workspace._active_boundary_region_ids(geometry["id"]) == [3, 4, 5]
     workspace._toggle_solid_visibility(geometry, second_tag)
     assert workspace._active_boundary_region_ids(geometry["id"]) == []

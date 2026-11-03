@@ -2921,7 +2921,10 @@ class ThreeDWorkspace(Div):
                     tooltip="Change viewport visibility only; hidden solids remain in the solver model",
                 ),
             ])
-            if self._hidden_solid_tags.get(geometry["id"]):
+            if (
+                self._hidden_solid_tags.get(geometry["id"])
+                and self._isolated_solid != (geometry["id"], domain_tag)
+            ):
                 children.append(_button(
                     "Show all solids", "mdi-eye-outline",
                     lambda *_args, geom=geometry: self._show_all_solids(geom),
