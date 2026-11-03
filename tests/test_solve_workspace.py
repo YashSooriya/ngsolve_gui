@@ -629,6 +629,24 @@ def test_saved_run_history_recovers_manifest_and_marks_running_as_interrupted(tm
     }]
 
 
+def test_saved_run_history_preserves_nonconverged_scientific_status(tmp_path):
+    run_dir = tmp_path / "coupled_nonconverged"
+    run_dir.mkdir()
+    (run_dir / "run_manifest.json").write_text(json.dumps({
+        "schema": "mm-fem.run",
+        "kind": "study",
+        "status": "nonconverged",
+        "model_name": "Coupled diagnostic",
+        "created_utc": "2026-11-03T12:00:00+00:00",
+    }), encoding="utf-8")
+
+    runs = _load_saved_run_history(tmp_path)
+
+    assert len(runs) == 1
+    assert runs[0]["status"] == "Nonconverged"
+    assert runs[0]["name"] == "Study: Coupled diagnostic"
+
+
 def test_run_history_context_menu_hides_entry_and_preserves_output(standalone_components, tmp_path):
     run_dir = tmp_path / "study_result"
     run_dir.mkdir()

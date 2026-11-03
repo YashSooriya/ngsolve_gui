@@ -1220,6 +1220,7 @@ def test_mechanical_study_property_editor_exposes_only_relevant_configuration(mo
         "harmonic_em",
         "harmonic_mechanical",
         "magnetostatic_dc",
+        "coupled_magneto_mechanical",
     }
     assert {"Body force X (N/m³)", "Body force Y (N/m³)", "Body force Z (N/m³)"} <= set(controls)
     assert "Air-region padding (model spans)" not in controls
@@ -1255,6 +1256,7 @@ def test_static_dc_study_editor_exposes_real_field_sources_without_frequency(mon
     assert controls["Physics"].ui_model_value == "magnetostatic_dc"
     assert {option["value"] for option in controls["Physics"].ui_options} == {
         "harmonic_em", "harmonic_mechanical", "magnetostatic_dc",
+        "coupled_magneto_mechanical",
     }
     assert {"Applied BX (T)", "Applied BY (T)", "Applied BZ (T)"} <= set(controls)
     assert "Frequency (Hz)" not in controls
@@ -1310,6 +1312,53 @@ def test_static_dc_study_editor_exposes_real_field_sources_without_frequency(mon
         limit=1e15,
     ) is True
     assert domain["dc_current_density_a_per_m2"] == [100000.0, 0.0, 0.0]
+
+
+def test_coupled_study_editor_exposes_supported_physics_and_convergence_controls(monkeypatch):
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    geometry["material"] = "Stainless steel (4 K / OVC)"
+    geometry["domain_selections"].append({
+        "id": "ac-source",
+        "name": "AC coil domain",
+        "domain_ids": [0],
+        "domain_tags": ["MMFEM_SOLID_000000000000000000000001"],
+        "current_density_amplitude_a_per_m2": [1e6, 0.0, 0.0],
+        "current_density_phase_deg": [0.0, 0.0, 0.0],
+    })
+    geometry["boundary_selections"].append({
+        "id": "support",
+        "name": "Fixed support",
+        "boundary_ids": [0],
+        "boundary_tags": ["MMFEM_FACE_000000000000000000000000"],
+        "boundary_condition": "mechanical_fixed",
+    })
+    workspace.project["study"].update(
+        physics="coupled_magneto_mechanical",
+        em_source_mode="domain_current_density",
+        dc_background_field_t=[0.0, 0.0, 0.025],
+        coupling_max_iterations=12,
+        coupling_tolerance=2e-5,
+    )
+    workspace._rebuild_items()
+    workspace.select_item("study")
+
+    controls = {
+        getattr(child, "ui_label", None): child
+        for child in workspace._properties.ui_children
+    }
+    assert controls["Physics"].ui_model_value == "coupled_magneto_mechanical"
+    assert "Frequency (Hz)" in controls
+    assert {"Applied BX (T)", "Applied BY (T)", "Applied BZ (T)"} <= set(controls)
+    assert "Excitation source" in controls
+    assert "Maximum iterations" in controls
+    assert controls["Maximum iterations"].ui_model_value == 12
+    assert "Relative field-change tolerance" in controls
+    assert controls["Relative field-change tolerance"].ui_model_value == 2e-5
+    assert workspace._run_study_button.ui_disable is False
+
+    geometry["boundary_selections"].clear()
+    workspace._update_study_controls()
+    assert workspace._run_study_button.ui_disable is True
 
 def test_invalidated_boundary_assignment_can_be_reassigned_from_current_mesh(monkeypatch):
     workspace, geometry = _workspace_with_test_mesh(monkeypatch)

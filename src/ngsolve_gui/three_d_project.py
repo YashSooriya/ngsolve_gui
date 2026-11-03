@@ -37,6 +37,7 @@ SUPPORTED_3D_STUDIES = {
     "harmonic_em": "Time-harmonic electromagnetics",
     "harmonic_mechanical": "Time-harmonic mechanics",
     "magnetostatic_dc": "Static/DC magnetics",
+    "coupled_magneto_mechanical": "Fully coupled magneto-mechanics",
 }
 SUPPORTED_3D_EM_SOURCE_MODES = {
     "wire_trace": "Wire traces",
@@ -92,6 +93,8 @@ def new_3d_project(name="Untitled 3D project"):
             "dc_background_field_t": [0.0, 0.0, 0.0],
             "mechanical_body_force_n_m3": [0.0, 0.0, 0.0],
             "mechanical_body_force_phase_deg": [0.0, 0.0, 0.0],
+            "coupling_max_iterations": 15,
+            "coupling_tolerance": 1e-4,
         },
     }
 
@@ -733,9 +736,12 @@ def validate_3d_project(project, assets):
     if physics not in SUPPORTED_3D_STUDIES:
         raise ValueError("Choose a supported 3D study.")
     em_source_mode = study.get("em_source_mode", "wire_trace")
-    harmonic = physics in {"harmonic_em", "harmonic_mechanical"}
-    electromagnetic = physics in {"harmonic_em", "magnetostatic_dc"}
-    if physics == "harmonic_em" and em_source_mode not in SUPPORTED_3D_EM_SOURCE_MODES:
+    coupled = physics == "coupled_magneto_mechanical"
+    harmonic = physics in {"harmonic_em", "harmonic_mechanical"} or coupled
+    electromagnetic = physics in {"harmonic_em", "magnetostatic_dc"} or coupled
+    mechanical = physics in {"harmonic_mechanical"} or coupled
+    uses_dc = physics in {"magnetostatic_dc"} or coupled
+    if physics in {"harmonic_em", "coupled_magneto_mechanical"} and em_source_mode not in SUPPORTED_3D_EM_SOURCE_MODES:
         raise ValueError("Choose a supported 3D electromagnetic excitation source.")
     try:
         polynomial_order = int(study.get("polynomial_order", 1))
@@ -749,13 +755,13 @@ def validate_3d_project(project, assets):
             air_padding = float(study.get("air_padding", 2.0))
             if not math.isfinite(air_padding) or not 0.25 <= air_padding <= 20:
                 raise ValueError("Air-domain padding must be between 0.25 and 20 model spans.")
-        if physics == "magnetostatic_dc":
+        if uses_dc:
             dc_background_field = _finite_vector(
                 study.get("dc_background_field_t", [0.0, 0.0, 0.0]),
                 "Applied DC magnetic flux density (T)",
                 limit=1e6,
             )
-        if physics == "harmonic_mechanical":
+        if mechanical:
             body_force = _finite_vector(
                 study.get("mechanical_body_force_n_m3", [0.0, 0.0, 0.0]),
                 "Mechanical body force (N/m³)", limit=1e15,
@@ -764,21 +770,39 @@ def validate_3d_project(project, assets):
                 study.get("mechanical_body_force_phase_deg", [0.0, 0.0, 0.0]),
                 "Mechanical body-force phase (degrees)", limit=360_000.0,
             )
+        if coupled:
+            raw_max_iterations = study.get("coupling_max_iterations", 15)
+            if isinstance(raw_max_iterations, bool):
+                raise ValueError("Maximum coupling iterations must be an integer from 1 to 100.")
+            numeric_max_iterations = float(raw_max_iterations)
+            if (
+                not math.isfinite(numeric_max_iterations)
+                or not numeric_max_iterations.is_integer()
+                or not 1 <= numeric_max_iterations <= 100
+            ):
+                raise ValueError("Maximum coupling iterations must be an integer from 1 to 100.")
+            coupling_max_iterations = int(numeric_max_iterations)
+            coupling_tolerance = float(study.get("coupling_tolerance", 1e-4))
+            if not math.isfinite(coupling_tolerance) or not 1e-12 <= coupling_tolerance <= 0.1:
+                raise ValueError("Coupling tolerance must be between 1e-12 and 0.1.")
     except (TypeError, ValueError, OverflowError) as error:
         raise ValueError(f"Invalid 3D study settings: {error}") from error
     study["physics"] = physics
     study["polynomial_order"] = polynomial_order
-    if physics == "harmonic_em":
+    if physics in {"harmonic_em", "coupled_magneto_mechanical"}:
         study["em_source_mode"] = em_source_mode
     if electromagnetic:
         study["air_padding"] = air_padding
-    if physics == "magnetostatic_dc":
+    if uses_dc:
         study["dc_background_field_t"] = dc_background_field
     if harmonic:
         study["frequency_hz"] = frequency_hz
-    if physics == "harmonic_mechanical":
+    if mechanical:
         study["mechanical_body_force_n_m3"] = body_force
         study["mechanical_body_force_phase_deg"] = body_force_phase
+    if coupled:
+        study["coupling_max_iterations"] = coupling_max_iterations
+        study["coupling_tolerance"] = coupling_tolerance
 
     materials = project.setdefault("materials", [])
     if not isinstance(materials, list) or len(materials) > MAX_PROJECT_ITEMS:

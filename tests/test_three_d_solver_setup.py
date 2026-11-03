@@ -56,7 +56,7 @@ def _study_project():
     return project
 
 
-def _run_packaged_solver_model(project, assets, tmp_path, name):
+def _run_packaged_solver_model(project, assets, tmp_path, name, *, expected_status="complete"):
     gui_root = Path(__file__).resolve().parents[1]
     solver_candidates = []
     configured_root = os.environ.get("COUPLED_SOLVER_ROOT")
@@ -106,7 +106,7 @@ def _run_packaged_solver_model(project, assets, tmp_path, name):
     manifest = json.loads(
         (output_dir / "run_manifest.json").read_text(encoding="utf-8")
     )
-    assert manifest["status"] == "complete", solver_output[-5000:]
+    assert manifest["status"] == expected_status, solver_output[-5000:]
     return manifest, output_dir
 
 
@@ -262,6 +262,115 @@ def test_dc_fingerprint_tracks_only_inputs_that_change_the_background(tmp_path):
     project["materials"][0]["properties"]["relative_permeability"] = 2.2
     changed_material = dc_input_fingerprint_payload(project, paths)
     assert changed_material != first
+
+
+def test_coupled_validation_requires_dc_ac_and_mechanical_supports():
+    project = _study_project()
+    project["wire_trace_sets"] = []
+    project["study"].update(
+        physics="coupled_magneto_mechanical",
+        em_source_mode="domain_current_density",
+        dc_background_field_t=[0.0, 0.0, 0.025],
+    )
+    domain = project["geometries"][0]["domain_selections"][0]
+    domain["current_density_amplitude_a_per_m2"] = [1e6, 0.0, 0.0]
+    domain["current_density_phase_deg"] = [0.0, 0.0, 0.0]
+    project["geometries"][0]["boundary_selections"] = [{
+        "id": "support",
+        "name": "Fixed support",
+        "boundary_ids": [0],
+        "boundary_tags": ["MMFEM_FACE_000000000000000000000003"],
+        "boundary_condition": "mechanical_fixed",
+    }]
+
+    validated = validate_3d_study_setup(project)
+
+    assert validated["physics"] == "coupled_magneto_mechanical"
+    assert validated["frequency_hz"] == 500.0
+    assert validated["dc_background_field_t"] == [0.0, 0.0, 0.025]
+    assert validated["coupling_max_iterations"] == 15
+    assert validated["coupling_tolerance"] == 1e-4
+    assert validated["current_density_by_domain"]
+
+    project["geometries"][0]["boundary_selections"] = []
+    with pytest.raises(ValueError, match="fully restrained spring support"):
+        validate_3d_study_setup(project)
+
+    project["geometries"][0]["boundary_selections"] = [{
+        "id": "support",
+        "name": "Fixed support",
+        "boundary_ids": [0],
+        "boundary_tags": ["MMFEM_FACE_000000000000000000000003"],
+        "boundary_condition": "mechanical_fixed",
+    }]
+    project["study"]["dc_background_field_t"] = [0.0, 0.0, 0.0]
+    with pytest.raises(ValueError, match="non-zero DC current density"):
+        validate_3d_study_setup(project)
+
+
+def test_coupled_builder_configures_existing_solver_for_all_three_physics(tmp_path):
+    from netgen.occ import Box, OCCGeometry, Pnt
+    from ngsolve_gui.three_d_project import step_geometry_tags
+
+    step_path = tmp_path / "coupled_block.step"
+    Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).WriteStep(str(step_path))
+    solids = list(OCCGeometry(str(step_path)).solids)
+    solid_tags, face_refs = step_geometry_tags(solids)
+    support_tag = next(
+        tag for tag, solid_tag, _face in face_refs if solid_tag == solid_tags[0]
+    )
+    material = builtin_materials()[4]
+    project = new_3d_project("Coupled block")
+    project["materials"] = [material]
+    project["study"].update(
+        physics="coupled_magneto_mechanical",
+        em_source_mode="domain_current_density",
+        frequency_hz=50.0,
+        polynomial_order=1,
+        air_padding=0.25,
+        dc_background_field_t=[0.0, 0.0, 0.025],
+        coupling_max_iterations=12,
+        coupling_tolerance=2e-5,
+    )
+    assets = {}
+    geometry = add_step_geometry(
+        project, assets, step_path.name, step_path.read_bytes(),
+        units="mm", material=material["name"],
+    )
+    geometry["mesh_maxh_mm"] = 10.0
+    geometry["domain_selections"] = [{
+        "id": "ac-source",
+        "name": "AC current domain",
+        "domain_ids": [0],
+        "domain_tags": [solid_tags[0]],
+        "current_density_amplitude_a_per_m2": [1e6, 0.0, 0.0],
+        "current_density_phase_deg": [0.0, 90.0, 0.0],
+    }]
+    geometry["boundary_selections"] = [{
+        "id": "support",
+        "name": "Fixed support",
+        "boundary_ids": [0],
+        "boundary_tags": [support_tag],
+        "boundary_condition": "mechanical_fixed",
+    }]
+
+    inputs = build_3d_study_problem(project, {geometry["asset"]: step_path})
+    problem = inputs["problem"]
+    solid_key = f"_mmfem_g0_{solid_tags[0]}"
+
+    assert inputs["physics"] == "coupled_magneto_mechanical"
+    assert inputs["coupling_max_iterations"] == 12
+    assert inputs["coupling_tolerance"] == pytest.approx(2e-5)
+    assert problem["temp_disc"] == "time_harmonic"
+    assert problem["cACCoef"] == problem["kACCoef"] == 1
+    assert problem["kACCoefDC"] == 1
+    assert problem["mMechCoef"] == problem["kMechCoef"] == 1
+    assert problem["cCoupCoef"] == problem["kCoupCoef"] == 1
+    assert problem["current_source"] == "domain_current_density"
+    assert problem["dirkeysMech"]
+    assert problem["srcdictAC"][solid_key] != 0
+    assert problem["Aux"]["dc_input_fingerprint_payload"]["physics"] == "magnetostatic_dc"
+    assert inputs["dc_input_fingerprint_payload"]
 
 
 def test_mechanical_setup_accepts_body_force_without_electromagnetic_trace():
@@ -1145,6 +1254,149 @@ def test_small_3d_mechanical_solver_run_exports_nonzero_displacement(tmp_path):
     print(
         f"Bounded mechanical run: {manifest['mesh']['elements']} elements, "
         f"max |u|={float(abs(displacement_values).max()):.6g} m"
+    )
+
+
+@pytest.mark.skipif(
+    not solver_checkout_available(),
+    reason=SOLVER_UNAVAILABLE_REASON,
+)
+def test_bounded_coupled_solver_uses_dc_and_reuses_only_the_matching_mesh(tmp_path):
+    from netgen.occ import Box, OCCGeometry, Pnt
+    import numpy as np
+
+    from ngsolve_gui.three_d_project import step_geometry_tags
+
+    step_path = tmp_path / "bounded_coupled_block.step"
+    Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).WriteStep(str(step_path))
+    materials = {item["name"]: item for item in builtin_materials()}
+    material = materials["Stainless steel (4 K / OVC)"]
+    solid_tags, face_refs = step_geometry_tags(list(OCCGeometry(str(step_path)).solids))
+    support_tag = next(
+        tag for tag, solid_tag, _face in face_refs if solid_tag == solid_tags[0]
+    )
+
+    project = new_3d_project("Bounded coupled integration check")
+    project["materials"] = [material]
+    project["study"].update(
+        physics="coupled_magneto_mechanical",
+        em_source_mode="domain_current_density",
+        frequency_hz=50.0,
+        polynomial_order=1,
+        air_padding=0.25,
+        dc_background_field_t=[0.0, 0.0, 0.025],
+        coupling_max_iterations=12,
+        coupling_tolerance=1e-4,
+    )
+    assets = {}
+    geometry = add_step_geometry(
+        project, assets, step_path.name, step_path.read_bytes(),
+        units="mm", material=material["name"],
+    )
+    geometry["mesh_maxh_mm"] = 10.0
+    geometry["domain_selections"] = [{
+        "id": "ac-excitation",
+        "name": "AC current source",
+        "domain_ids": [0],
+        "domain_tags": [solid_tags[0]],
+        "current_density_amplitude_a_per_m2": [1e6, 0.0, 0.0],
+        "current_density_phase_deg": [0.0, 0.0, 0.0],
+    }]
+    geometry["boundary_selections"] = [{
+        "id": "mechanical-support",
+        "name": "Fixed support",
+        "boundary_ids": [0],
+        "boundary_tags": [support_tag],
+        "boundary_condition": "mechanical_fixed",
+    }]
+
+    first, first_dir = _run_packaged_solver_model(
+        project, assets, tmp_path, "bounded-coupled-first"
+    )
+    assert first["physics"] == "Fully coupled magneto-mechanics"
+    assert first["mesh"]["elements"] < 1_000
+    assert first["dc_background_field_source"] == "computed"
+    assert first["coupling_convergence"]["all_converged"] is True
+    convergence = first["coupling_convergence"]["frequencies"][0]
+    assert convergence["converged"] is True
+    assert 1 <= convergence["iterations"] <= 12
+    assert convergence["residual_A"] < 1e-4
+    assert convergence["residual_u"] < 1e-4
+    assert (first_dir / "dc_background_field.npz").is_file()
+    assert any("gfBDC" in path for path in first["fields"])
+    assert any("gfBAC" in path for path in first["fields"])
+    displacement_path = next(path for path in first["fields"] if "gfuAC" in path)
+    with (first_dir / displacement_path).open("rb") as stream:
+        displacement = pickle.load(stream)
+    displacement_values = displacement.vec.FV().NumPy()
+    assert np.isfinite(displacement_values).all()
+    first_displacement_magnitude = float(np.abs(displacement_values).max())
+    assert first_displacement_magnitude > 0
+
+    # Frequency is harmonic-only; the exact-mesh DC state remains valid.
+    project["study"]["frequency_hz"] = 60.0
+    second, second_dir = _run_packaged_solver_model(
+        project, assets, tmp_path, "bounded-coupled-second"
+    )
+    assert second["status"] == "complete"
+    assert second["dc_input_fingerprint"] == first["dc_input_fingerprint"]
+    assert second["dc_background_field_source"] == "reused"
+    assert Path(second["dc_background_field_reused_from"]).resolve() == first_dir.resolve()
+    assert second["mesh"]["elements"] == first["mesh"]["elements"]
+
+    # A DC-only input change invalidates that cache and affects the coupled
+    # mechanical response through the existing Lorentz/Maxwell load path.
+    project["study"].update(
+        dc_background_field_t=[0.0, 0.0, 0.05],
+        coupling_max_iterations=12,
+        coupling_tolerance=1e-4,
+    )
+    changed_dc, changed_dc_dir = _run_packaged_solver_model(
+        project, assets, tmp_path, "bounded-coupled-changed-dc"
+    )
+    assert changed_dc["status"] == "complete"
+    assert changed_dc["dc_input_fingerprint"] != first["dc_input_fingerprint"]
+    assert changed_dc["dc_background_field_source"] == "computed"
+    changed_displacement_path = next(
+        path for path in changed_dc["fields"] if "gfuAC" in path
+    )
+    with (changed_dc_dir / changed_displacement_path).open("rb") as stream:
+        changed_displacement = pickle.load(stream)
+    changed_displacement_magnitude = float(
+        np.abs(changed_displacement.vec.FV().NumPy()).max()
+    )
+    assert math.isfinite(changed_displacement_magnitude)
+    assert not math.isclose(
+        first_displacement_magnitude,
+        changed_displacement_magnitude,
+        rel_tol=1e-4,
+        abs_tol=1e-12,
+    )
+
+    # A strict, two-iteration limit verifies the separate diagnostic outcome.
+    project["study"].update(
+        coupling_max_iterations=2,
+        coupling_tolerance=1e-12,
+    )
+    nonconverged, _nonconverged_dir = _run_packaged_solver_model(
+        project, assets, tmp_path, "bounded-coupled-nonconverged",
+        expected_status="nonconverged",
+    )
+    assert nonconverged["scientific_status"] == "nonconverged_diagnostic_data"
+    assert nonconverged["coupling_convergence"]["all_converged"] is False
+    point = nonconverged["coupling_convergence"]["frequencies"][0]
+    assert point["iterations"] == 2
+    assert max(point["residual_A"], point["residual_u"]) >= 1e-12
+    print(
+        "Bounded coupled verification: "
+        f"{first['mesh']['elements']} elements; converged in "
+        f"{convergence['iterations']} iterations with residuals "
+        f"({convergence['residual_A']:.3e}, {convergence['residual_u']:.3e}); "
+        f"max |u|={first_displacement_magnitude:.6e} m; "
+        f"harmonic-only change DC cache={second['dc_background_field_source']}; "
+        f"changed DC source max |u|={changed_displacement_magnitude:.6e} m; "
+        f"bounded nonconvergence residuals=({point['residual_A']:.3e}, "
+        f"{point['residual_u']:.3e})"
     )
 
 

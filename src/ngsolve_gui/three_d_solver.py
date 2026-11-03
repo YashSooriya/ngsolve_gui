@@ -49,8 +49,13 @@ def material_properties_for_study(material, physics, *, for_solid=True):
     if physics not in SUPPORTED_3D_STUDIES:
         raise ValueError("Choose a supported 3D study.")
     name = str(material.get("name", "Material"))
-    is_em = physics in {"harmonic_em", "magnetostatic_dc"}
-    is_dc = physics == "magnetostatic_dc"
+    is_em = physics in {
+        "harmonic_em", "magnetostatic_dc", "coupled_magneto_mechanical"
+    }
+    is_dc = physics in {"magnetostatic_dc", "coupled_magneto_mechanical"}
+    is_mechanical = physics in {
+        "harmonic_mechanical", "coupled_magneto_mechanical"
+    }
     props = material.get("properties", {})
     defaults = {
         "relative_permeability": 1.0,
@@ -59,13 +64,18 @@ def material_properties_for_study(material, physics, *, for_solid=True):
         "poissons_ratio": 0.3,
         "density": 0.0,
     }
-    required = (
-        ("relative_permeability",)
-        if is_dc else
-        ("relative_permeability", "electrical_conductivity")
-        if is_em else
-        ("youngs_modulus", "poissons_ratio", "density")
-    )
+    if physics == "coupled_magneto_mechanical":
+        required = (
+            ("relative_permeability", "electrical_conductivity", "youngs_modulus", "poissons_ratio", "density")
+            if for_solid else
+            ("relative_permeability", "electrical_conductivity")
+        )
+    elif is_dc:
+        required = ("relative_permeability",)
+    elif physics == "harmonic_em":
+        required = ("relative_permeability", "electrical_conductivity")
+    else:
+        required = ("youngs_modulus", "poissons_ratio", "density")
     values = {}
     for key in required:
         value = _finite_material_property(material, key)
@@ -95,12 +105,12 @@ def material_properties_for_study(material, physics, *, for_solid=True):
         raise ValueError(
             f"Material {name!r} needs positive relative permeability for static/DC magnetics."
         )
-    if physics == "harmonic_em" and (mur <= 0 or sigma < 0):
+    if physics in {"harmonic_em", "coupled_magneto_mechanical"} and (mur <= 0 or sigma < 0):
         raise ValueError(
             f"Material {name!r} needs relative permeability > 0 and "
             "electrical conductivity ≥ 0 for time-harmonic EM."
         )
-    if physics == "harmonic_mechanical":
+    if is_mechanical and for_solid:
         if for_solid and name.strip().casefold() == "air":
             raise ValueError(
                 "Air cannot be assigned to a mechanics solid. Choose a material "
@@ -265,15 +275,17 @@ def _domain_dc_current_assignments(project):
 
 def _active_boundary_assignments(project, physics):
     assignments = {}
-    supported = (
-        {"magnetic_potential_zero"}
-        if physics in {"harmonic_em", "magnetostatic_dc"}
-        else {
+    supported = set()
+    if physics in {
+        "harmonic_em", "magnetostatic_dc", "coupled_magneto_mechanical"
+    }:
+        supported.add("magnetic_potential_zero")
+    if physics in {"harmonic_mechanical", "coupled_magneto_mechanical"}:
+        supported.update({
             "mechanical_fixed",
             "mechanical_prescribed_displacement",
             "mechanical_spring_support",
-        }
-    )
+        })
     for geometry in project.get("geometries", []):
         geometry_id = geometry.get("id")
         for selection in geometry.get("boundary_selections", []):
@@ -352,15 +364,17 @@ def _active_boundary_assignments(project, physics):
 
 
 def validate_3d_study_setup(project):
-    """Validate the configured 3D single-physics study without NGSolve."""
+    """Validate a configured 3D study without importing the numerical backend."""
     study = project.get("study", {})
     try:
         physics = study.get("physics", "harmonic_em")
         polynomial_order = int(study.get("polynomial_order", 1))
-        harmonic = physics in {"harmonic_em", "harmonic_mechanical"}
-        electromagnetic = physics in {"harmonic_em", "magnetostatic_dc"}
-        mechanical = physics == "harmonic_mechanical"
-        dc = physics == "magnetostatic_dc"
+        coupled = physics == "coupled_magneto_mechanical"
+        harmonic = physics in {"harmonic_em", "harmonic_mechanical"} or coupled
+        harmonic_em = physics in {"harmonic_em"} or coupled
+        electromagnetic = physics in {"harmonic_em", "magnetostatic_dc"} or coupled
+        mechanical = physics in {"harmonic_mechanical"} or coupled
+        dc = physics in {"magnetostatic_dc"} or coupled
         em_source_mode = study.get("em_source_mode", "wire_trace")
         frequency_hz = (
             float(study.get("frequency_hz", 500.0)) if harmonic else None
@@ -378,13 +392,16 @@ def validate_3d_study_setup(project):
         body_force_phase = [float(value) for value in study.get(
             "mechanical_body_force_phase_deg", [0.0, 0.0, 0.0]
         )] if mechanical else [0.0, 0.0, 0.0]
+        raw_coupling_max_iterations = study.get("coupling_max_iterations", 15)
+        coupling_max_iterations = float(raw_coupling_max_iterations) if coupled else 15
+        coupling_tolerance = float(study.get("coupling_tolerance", 1e-4)) if coupled else 1e-4
     except (TypeError, ValueError, OverflowError) as error:
         raise ValueError(f"Invalid 3D study settings: {error}") from error
     if physics not in SUPPORTED_3D_STUDIES:
         raise ValueError("Choose a supported 3D study.")
     if harmonic and (not math.isfinite(frequency_hz) or frequency_hz <= 0):
         raise ValueError("The study frequency must be positive and finite.")
-    if physics == "harmonic_em" and em_source_mode not in SUPPORTED_3D_EM_SOURCE_MODES:
+    if harmonic_em and em_source_mode not in SUPPORTED_3D_EM_SOURCE_MODES:
         raise ValueError("Choose a supported 3D electromagnetic excitation source.")
     if polynomial_order not in {1, 2, 3, 4}:
         raise ValueError("The finite-element order must be between 1 and 4.")
@@ -392,6 +409,20 @@ def validate_3d_study_setup(project):
         not math.isfinite(air_padding) or not 0.25 <= air_padding <= 20
     ):
         raise ValueError("Air-domain padding must be between 0.25 and 20 model spans.")
+    if coupled:
+        if (
+            isinstance(raw_coupling_max_iterations, bool)
+            or not math.isfinite(coupling_max_iterations)
+            or not coupling_max_iterations.is_integer()
+            or not 1 <= coupling_max_iterations <= 100
+        ):
+            raise ValueError("Maximum coupling iterations must be an integer from 1 to 100.")
+        coupling_max_iterations = int(coupling_max_iterations)
+    if coupled and (
+        not math.isfinite(coupling_tolerance)
+        or not 1e-12 <= coupling_tolerance <= 0.1
+    ):
+        raise ValueError("Coupling tolerance must be between 1e-12 and 0.1.")
     if not project.get("geometries"):
         raise ValueError("Import at least one closed STEP solid before running a study.")
     if mechanical and (
@@ -418,7 +449,7 @@ def validate_3d_study_setup(project):
     current_density_by_domain = {}
     dc_current_density_by_domain = {}
     if electromagnetic:
-        if physics == "harmonic_em" and em_source_mode == "wire_trace":
+        if harmonic_em and em_source_mode == "wire_trace":
             trace_sets = project.get("wire_trace_sets", [])
             if not trace_sets:
                 raise ValueError("Import at least one wire trace or select domain current density.")
@@ -437,7 +468,7 @@ def validate_3d_study_setup(project):
                 active_currents.append(source_value)
             if not any(value != 0 for value in active_currents):
                 raise ValueError("Set a non-zero wire-trace current or target gradient before solving.")
-        elif physics == "harmonic_em":
+        elif harmonic_em:
             current_density_by_domain = _domain_phasor_assignments(
                 project,
                 "current_density_amplitude_a_per_m2",
@@ -484,10 +515,28 @@ def validate_3d_study_setup(project):
         and any(abs(component) > 0 for component in condition["value"])
         for condition in boundary_assignments.values()
     )
-    if mechanical and not (has_mechanical_body_force or has_prescribed_displacement):
+    if physics == "harmonic_mechanical" and not (
+        has_mechanical_body_force or has_prescribed_displacement
+    ):
         raise ValueError(
             "Set a non-zero body force or prescribed displacement before solving a mechanical study."
         )
+    if coupled:
+        has_mechanical_support = any(
+            condition.get("type") in {
+                "mechanical_fixed", "mechanical_prescribed_displacement"
+            }
+            or (
+                condition.get("type") == "mechanical_spring_support"
+                and condition.get("normal", 0) > 0
+                and condition.get("tangential", 0) > 0
+            )
+            for condition in boundary_assignments.values()
+        )
+        if not has_mechanical_support:
+            raise ValueError(
+                "Assign a fixed support, prescribed displacement, or fully restrained spring support to prevent rigid-body motion in the coupled mechanical solve."
+            )
 
     records = {item["name"].casefold(): item for item in builtin_materials()}
     records.update({item["name"].casefold(): item for item in project.get("materials", [])})
@@ -517,7 +566,7 @@ def validate_3d_study_setup(project):
                 )
         material_names.update(str(name).strip() for name in names if str(name).strip())
         solid_material_names.update(str(name).strip() for name in names if str(name).strip())
-    if physics == "harmonic_em" and em_source_mode == "wire_trace":
+    if harmonic_em and em_source_mode == "wire_trace":
         for trace_set in project.get("wire_trace_sets", []):
             for trace in trace_set.get("traces", []):
                 material_names.add(str(trace.get("material", trace_set.get("material", "Air"))).strip())
@@ -543,7 +592,7 @@ def validate_3d_study_setup(project):
         resolved[record["name"]] = {"name": record["name"], **properties}
     return {
         "physics": physics,
-        "em_source_mode": em_source_mode if physics == "harmonic_em" else None,
+        "em_source_mode": em_source_mode if harmonic_em else None,
         "frequency_hz": frequency_hz,
         "polynomial_order": polynomial_order,
         "air_padding": air_padding,
@@ -552,6 +601,8 @@ def validate_3d_study_setup(project):
         "mechanical_body_force_phase_deg": body_force_phase,
         "mechanical_body_force_phasor": body_force_phasor,
         "mechanical_body_force_by_domain": mechanical_body_force_by_domain,
+        "coupling_max_iterations": coupling_max_iterations,
+        "coupling_tolerance": coupling_tolerance,
         "current_density_by_domain": current_density_by_domain,
         "dc_current_density_by_domain": dc_current_density_by_domain,
         "boundary_assignments": boundary_assignments,
@@ -643,16 +694,18 @@ def dc_input_fingerprint_payload(project, asset_paths, validated=None):
 
 
 def build_3d_study_problem(project, asset_paths):
-    """Translate a supported 3D single-physics study into the solver API."""
+    """Translate a supported 3D study into the established NGSolve input API."""
     validated = validate_3d_study_setup(project)
     from ngsolve import CoefficientFunction, Cross, x, y, z
     from netgen.occ import Box, Glue, OCCGeometry, Pnt
 
     physics = validated["physics"]
-    electromagnetic = physics in {"harmonic_em", "magnetostatic_dc"}
+    coupled = physics == "coupled_magneto_mechanical"
+    electromagnetic = physics in {"harmonic_em", "magnetostatic_dc"} or coupled
     magnetostatic = physics == "magnetostatic_dc"
-    harmonic_em = physics == "harmonic_em"
-    mechanical = physics == "harmonic_mechanical"
+    uses_dc = physics in {"magnetostatic_dc"} or coupled
+    harmonic_em = physics in {"harmonic_em"} or coupled
+    mechanical = physics in {"harmonic_mechanical"} or coupled
     frequency_hz = validated["frequency_hz"]
     polynomial_order = validated["polynomial_order"]
     air_padding = validated["air_padding"]
@@ -665,44 +718,16 @@ def build_3d_study_problem(project, asset_paths):
     }} for name, item in validated["materials"].items()}
     air_record = material_records.get("air") if electromagnetic else None
 
-    def resolve_material(name):
+    def resolve_material(name, *, for_solid=True):
         record = material_records.get(str(name).strip().casefold())
         if record is None:
             raise ValueError(
                 f"Material {name!r} is not embedded in this project. Choose it from the material library."
             )
-        properties = record.get("properties", {})
-        mur = _finite_material_property(record, "relative_permeability")
-        sigma = (
-            _finite_material_property(record, "electrical_conductivity")
-            if physics == "harmonic_em" else 0.0
+        properties = material_properties_for_study(
+            record, physics, for_solid=for_solid
         )
-        youngs = (
-            _finite_material_property(record, "youngs_modulus", default=0)
-            if mechanical else 0.0
-        )
-        poisson = (
-            _finite_material_property(record, "poissons_ratio", default=0.3)
-            if mechanical else 0.3
-        )
-        density = (
-            _finite_material_property(record, "density", default=0)
-            if mechanical else 0.0
-        )
-        if (
-            mur <= 0
-            or (physics == "harmonic_em" and sigma < 0)
-            or (mechanical and (youngs < 0 or density < 0 or not -0.99 < poisson < 0.5))
-        ):
-            raise ValueError(f"Material {name!r} has values outside the supported physical range.")
-        return {
-            "name": record["name"],
-            "mur": mur,
-            "sigma": sigma,
-            "youngs": youngs,
-            "poisson": poisson,
-            "density": density,
-        }
+        return {"name": record["name"], **properties}
 
     geometry_inputs = build_3d_solver_inputs(project, asset_paths)["geometries"]
     objects = {}
@@ -871,17 +896,16 @@ def build_3d_study_problem(project, asset_paths):
                     abs(component) > 0 for component in body_force
                 )
                 mechanical_source_by_domain[object_key] = CoefficientFunction(body_force)
-            if electromagnetic:
-                if physics == "harmonic_em":
-                    current_density = validated["current_density_by_domain"].get(
-                        domain_ref, (0.0, 0.0, 0.0)
-                    )
-                    current_density_by_domain[object_key] = CoefficientFunction(current_density)
-                else:
-                    dc_current = validated["dc_current_density_by_domain"].get(
-                        domain_ref, (0.0, 0.0, 0.0)
-                    )
-                    dc_current_density_by_domain[object_key] = CoefficientFunction(dc_current)
+            if harmonic_em:
+                current_density = validated["current_density_by_domain"].get(
+                    domain_ref, (0.0, 0.0, 0.0)
+                )
+                current_density_by_domain[object_key] = CoefficientFunction(current_density)
+            if uses_dc:
+                dc_current = validated["dc_current_density_by_domain"].get(
+                    domain_ref, (0.0, 0.0, 0.0)
+                )
+                dc_current_density_by_domain[object_key] = CoefficientFunction(dc_current)
 
         lower, upper = _shape_bounds(shape)
         bounds_min = [min(a, b) for a, b in zip(bounds_min, lower)]
@@ -892,7 +916,9 @@ def build_3d_study_problem(project, asset_paths):
         and any(abs(component) > 0 for component in assignment.get("value", ()))
         for assignment in validated["boundary_assignments"].values()
     )
-    if mechanical and not (effective_mechanical_force or prescribed_displacement):
+    if physics == "harmonic_mechanical" and not (
+        effective_mechanical_force or prescribed_displacement
+    ):
         raise ValueError(
             "No non-zero mechanical body-force or prescribed-displacement input remains after domain overrides."
         )
@@ -914,11 +940,13 @@ def build_3d_study_problem(project, asset_paths):
         air_key = "_mmfem_air"
         objects[air_key] = air_shape
         domain_maxh[air_key] = air_maxh
-        used_materials[air_key] = resolve_material(air_record["name"])
+        used_materials[air_key] = resolve_material(
+            air_record["name"], for_solid=False
+        )
         material_display_names[air_key] = air_record["name"]
 
     dc_wire_trace_sets = []
-    if magnetostatic:
+    if uses_dc:
         for trace_set in project.get("wire_trace_sets", []):
             dc_traces = []
             for trace in trace_set.get("traces", []):
@@ -941,7 +969,7 @@ def build_3d_study_problem(project, asset_paths):
         for trace_set in project.get("wire_trace_sets", []):
             for trace in trace_set.get("traces", []):
                 trace_material = str(trace.get("material", trace_set.get("material", "Air"))).strip()
-                trace_record = resolve_material(trace_material)
+                trace_record = resolve_material(trace_material, for_solid=False)
                 used_materials.setdefault(trace_record["name"], trace_record)
 
     material_data = {name: used_materials[name] for name in used_materials}
@@ -949,7 +977,7 @@ def build_3d_study_problem(project, asset_paths):
     study_type = physics
     dc_input_fingerprint = (
         dc_input_fingerprint_payload(project, asset_paths, validated)
-        if magnetostatic else None
+        if uses_dc else None
     )
     dc_background = validated["dc_background_field_t"]
     applied_vector_potential = 0.5 * Cross(
@@ -958,7 +986,7 @@ def build_3d_study_problem(project, asset_paths):
     dc_boundary_conditions = (
         {"DirEM": applied_vector_potential}
         | {name: zero_vector for name in dc_dirichlet_boundary_names}
-        if magnetostatic else {}
+        if uses_dc else {}
     )
     problem = {
         "prob_dom": "3D",
@@ -981,17 +1009,17 @@ def build_3d_study_problem(project, asset_paths):
         **({"omega": [2.0 * math.pi * frequency_hz]} if frequency_hz is not None else {}),
         "cACCoef": int(harmonic_em),
         "kACCoef": int(harmonic_em),
-        "kACCoefDC": int(magnetostatic),
+        "kACCoefDC": int(uses_dc),
         "mMechCoef": int(mechanical),
         "kMechCoef": int(mechanical),
         "dampingalpha": 0,
         "dampingbeta": 0,
-        "cCoupCoef": 0,
-        "kCoupCoef": 0,
+        "cCoupCoef": int(coupled),
+        "kCoupCoef": int(coupled),
         "epsilonReg": 1e-8,
         "current_source": (
             validated["em_source_mode"] if harmonic_em
-            else "dc_wire_trace" if magnetostatic and dc_wire_trace_sets
+            else "dc_wire_trace" if uses_dc and dc_wire_trace_sets
             else "none"
         ),
         "wire_trace_sets": (
@@ -1040,7 +1068,7 @@ def build_3d_study_problem(project, asset_paths):
         "dirconditionADC": dc_boundary_conditions,
         "dirkeysADC": (
             "|".join(["DirEM", *dc_dirichlet_boundary_names])
-            if magnetostatic else ""
+            if uses_dc else ""
         ),
         "dirconditionMech": dircondition_values if mechanical else {},
         "dirkeysMech": "|".join(mechanical_boundary_names),
@@ -1055,20 +1083,20 @@ def build_3d_study_problem(project, asset_paths):
         "solver_EMDC": "direct",
         "statCondEM": True,
         "statCondMech": False,
-        "statCond": magnetostatic,
+        "statCond": uses_dc,
         "electromagnetic_only": not mechanical,
         "reduced_ADC_space": True,
         "Aux": {
             "study_type": study_type,
             "polynomial_order": polynomial_order,
             **({"frequency_hz": frequency_hz} if frequency_hz is not None else {}),
-            **({"applied_dc_background_field_t": list(dc_background)} if magnetostatic else {}),
+            **({"applied_dc_background_field_t": list(dc_background)} if uses_dc else {}),
             **({
                 "mechanical_body_force_n_m3": validated["mechanical_body_force_n_m3"],
                 "mechanical_body_force_phase_deg": validated["mechanical_body_force_phase_deg"],
             } if mechanical else {}),
             **({"em_source_mode": validated["em_source_mode"]} if harmonic_em else {}),
-            **({"dc_input_fingerprint_payload": dc_input_fingerprint} if magnetostatic else {}),
+            **({"dc_input_fingerprint_payload": dc_input_fingerprint} if uses_dc else {}),
             **({
                 "dc_wire_trace_sources": [
                     {
@@ -1078,7 +1106,7 @@ def build_3d_study_problem(project, asset_paths):
                     }
                     for trace_set in project.get("wire_trace_sets", [])
                 ]
-            } if magnetostatic else {}),
+            } if uses_dc else {}),
             "wire_trace_sources": [
                 {
                     "name": trace_set.get("name", "Wire trace"),
@@ -1149,11 +1177,13 @@ def build_3d_study_problem(project, asset_paths):
         "domain_maxh": domain_maxh,
         "materials": material_data,
         "physics": physics,
-        "dc_background_field_t": list(dc_background) if magnetostatic else None,
+        "dc_background_field_t": list(dc_background) if uses_dc else None,
         "dc_input_fingerprint_payload": dc_input_fingerprint,
         "mechanical_body_force_n_m3": validated["mechanical_body_force_n_m3"],
         "em_source_mode": validated["em_source_mode"],
         "material_display_names": material_display_names,
+        "coupling_max_iterations": validated["coupling_max_iterations"],
+        "coupling_tolerance": validated["coupling_tolerance"],
     }
 
 

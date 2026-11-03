@@ -2966,6 +2966,32 @@ class NGSolveGui(App):
                     })
                     self._write_run_manifest(output_dir, manifest)
                     raise RuntimeError(detail)
+                elif manifest.get("status") == "nonconverged":
+                    manifest.update({
+                        "run_name": run_name,
+                        "solver_log": "solver.log",
+                    })
+                    self._write_run_manifest(output_dir, manifest)
+                    coupling = manifest.get("coupling_convergence", {})
+                    points = coupling.get("frequencies", [])
+                    point = points[0] if points else {}
+                    detail = (
+                        f" after {point['iterations']} iterations "
+                        f"(A residual {point['residual_A']:.3g}, "
+                        f"displacement residual {point['residual_u']:.3g})"
+                        if {"iterations", "residual_A", "residual_u"} <= point.keys()
+                        else ""
+                    )
+                    self._dispatch_to_ui(
+                        workspace._set_status,
+                        f"Coupled study did not converge{detail}. Diagnostic fields were saved to {output_dir}",
+                        error=True,
+                    )
+                    self._dispatch_to_ui(lambda: self._notify(
+                        f"3D {study_label} did not converge{detail}. Results are marked diagnostic only.",
+                        type="warning",
+                        timeout=9000,
+                    ))
                 else:
                     fields_dir = output_dir / "ngsolve_gui" / "fields"
                     field_files = list(fields_dir.glob("*.pkl")) if fields_dir.is_dir() else []

@@ -542,15 +542,15 @@ class ThreeDWorkspace(Div):
 
         physics = study.get("physics", "harmonic_em")
         em_source_mode = study.get("em_source_mode", "wire_trace")
-        compatible_conditions = (
-            {"magnetic_potential_zero"}
-            if physics in {"harmonic_em", "magnetostatic_dc"}
-            else {
+        compatible_conditions = set()
+        if physics in {"harmonic_em", "magnetostatic_dc", "coupled_magneto_mechanical"}:
+            compatible_conditions.add("magnetic_potential_zero")
+        if physics in {"harmonic_mechanical", "coupled_magneto_mechanical"}:
+            compatible_conditions.update({
                 "mechanical_fixed",
                 "mechanical_prescribed_displacement",
                 "mechanical_spring_support",
-            }
-        )
+            })
         assignments_ready = True
         for geometry in self.project.get("geometries", []):
             mesh_result = self._mesh_results.get(geometry.get("id"), {})
@@ -570,7 +570,7 @@ class ThreeDWorkspace(Div):
                     and selection.get("boundary_condition") in compatible_conditions
                 )
             )
-            if physics == "harmonic_em" and em_source_mode == "domain_current_density":
+            if physics in {"harmonic_em", "coupled_magneto_mechanical"} and em_source_mode == "domain_current_density":
                 active_selections.extend(
                     ("domain", selection)
                     for selection in geometry.get("domain_selections", [])
@@ -579,7 +579,7 @@ class ThreeDWorkspace(Div):
                         and not selection.get("current_density_suppressed", False)
                     )
                 )
-            if physics == "magnetostatic_dc":
+            if physics in {"magnetostatic_dc", "coupled_magneto_mechanical"}:
                 active_selections.extend(
                     ("domain", selection)
                     for selection in geometry.get("domain_selections", [])
@@ -589,7 +589,7 @@ class ThreeDWorkspace(Div):
                         and has_nonzero(selection.get("dc_current_density_a_per_m2", []))
                     )
                 )
-            if physics == "harmonic_mechanical":
+            if physics in {"harmonic_mechanical", "coupled_magneto_mechanical"}:
                 active_selections.extend(
                     ("domain", selection)
                     for selection in geometry.get("domain_selections", [])
@@ -636,6 +636,7 @@ class ThreeDWorkspace(Div):
             for selection in geometry.get("boundary_selections", [])
         )
         wire_source_ready = False
+        dc_wire_source_ready = False
         for trace_set in self.project.get("wire_trace_sets", []):
             source_value = (
                 trace_set.get("current", 1.0)
@@ -652,7 +653,12 @@ class ThreeDWorkspace(Div):
                 physics != "magnetostatic_dc" or has_nonzero(scale_values)
             ):
                 wire_source_ready = True
-                break
+            try:
+                dc_current = float(trace_set.get("current", 1.0))
+            except (TypeError, ValueError, OverflowError):
+                dc_current = 0.0
+            if math.isfinite(dc_current) and dc_current != 0 and has_nonzero(scale_values):
+                dc_wire_source_ready = True
         current_density_ready = any(
             not selection.get("current_density_suppressed", False)
             and has_nonzero(selection.get("current_density_amplitude_a_per_m2", []))
@@ -678,11 +684,34 @@ class ThreeDWorkspace(Div):
             em_source_mode == "domain_current_density" and current_density_ready
         )
         dc_source_ready = (
-            dc_applied_field_ready or dc_current_density_ready or wire_source_ready
+            dc_applied_field_ready or dc_current_density_ready or dc_wire_source_ready
+        )
+        def has_full_spring_support(selection):
+            try:
+                normal = float(selection.get("spring_normal_stiffness_n_per_m3", 0) or 0)
+                tangential = float(selection.get("spring_tangential_stiffness_n_per_m3", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            return normal > 0 and tangential > 0
+
+        mechanical_support_ready = physics != "coupled_magneto_mechanical" or any(
+            not selection.get("condition_suppressed", False)
+            and (
+                selection.get("boundary_condition")
+                in {"mechanical_fixed", "mechanical_prescribed_displacement"}
+                or (
+                    selection.get("boundary_condition") == "mechanical_spring_support"
+                    and has_full_spring_support(selection)
+                )
+            )
+            for geometry in self.project.get("geometries", [])
+            for selection in geometry.get("boundary_selections", [])
         )
         study_source_ready = (
             em_source_ready if physics == "harmonic_em"
             else dc_source_ready if physics == "magnetostatic_dc"
+            else em_source_ready and dc_source_ready
+            if physics == "coupled_magneto_mechanical"
             else True
         )
         if hasattr(self, "_run_study_button"):
@@ -693,6 +722,7 @@ class ThreeDWorkspace(Div):
                 or not self._has_resolved_study_materials()
                 or not assignments_ready
                 or not mechanical_load_ready
+                or not mechanical_support_ready
             )
         if hasattr(self, "_cancel_study_button"):
             self._cancel_study_button.ui_disable = not running
@@ -732,7 +762,7 @@ class ThreeDWorkspace(Div):
             ):
                 return False
         if (
-            physics == "harmonic_em"
+            physics in {"harmonic_em", "coupled_magneto_mechanical"}
             and self.project.get("study", {}).get("em_source_mode", "wire_trace")
             == "wire_trace"
         ):
@@ -1804,6 +1834,7 @@ class ThreeDWorkspace(Div):
             "harmonic_em": "Time-harmonic EM",
             "harmonic_mechanical": "Time-harmonic mechanics",
             "magnetostatic_dc": "Static/DC magnetics",
+            "coupled_magneto_mechanical": "Fully coupled magneto-mechanics",
         }.get(study_physics, "3D study")
         self._study_node.ui_children = [
             QIcon(
@@ -3054,7 +3085,7 @@ class ThreeDWorkspace(Div):
                     ])
                     study = self.project.get("study", {})
                     if (
-                        active_physics == "harmonic_em"
+                        active_physics in {"harmonic_em", "coupled_magneto_mechanical"}
                         and study.get("em_source_mode", "wire_trace")
                         == "domain_current_density"
                     ):
@@ -3114,7 +3145,7 @@ class ThreeDWorkspace(Div):
                                     lambda *_args, obj=selection: self._remove_domain_assignment(obj, "current_density"),
                                 ),
                             ])
-                    if active_physics == "magnetostatic_dc":
+                    if active_physics in {"magnetostatic_dc", "coupled_magneto_mechanical"}:
                         amplitude_key = "dc_current_density_a_per_m2"
                         suppressed_key = "dc_current_density_suppressed"
                         if amplitude_key not in selection:
@@ -3159,7 +3190,7 @@ class ThreeDWorkspace(Div):
                                     lambda *_args, obj=selection: self._remove_domain_assignment(obj, "dc_current_density"),
                                 ),
                             ])
-                    if active_physics == "harmonic_mechanical":
+                    if active_physics in {"harmonic_mechanical", "coupled_magneto_mechanical"}:
                         amplitude_key = "mechanical_body_force_n_m3"
                         phase_key = "mechanical_body_force_phase_deg"
                         suppressed_key = "mechanical_body_force_suppressed"
@@ -3509,13 +3540,17 @@ class ThreeDWorkspace(Div):
                 self._selection = ("project", None)
                 return self._rebuild_properties()
             active_physics = self.project.get("study", {}).get("physics", "harmonic_em")
-            required = (
-                {"relative_permeability", "electrical_conductivity"}
-                if active_physics == "harmonic_em"
-                else {"relative_permeability"}
-                if active_physics == "magnetostatic_dc"
-                else {"youngs_modulus", "poissons_ratio", "density"}
-            )
+            if active_physics == "coupled_magneto_mechanical":
+                required = {
+                    "relative_permeability", "electrical_conductivity",
+                    "youngs_modulus", "poissons_ratio", "density",
+                }
+            elif active_physics == "harmonic_em":
+                required = {"relative_permeability", "electrical_conductivity"}
+            elif active_physics == "magnetostatic_dc":
+                required = {"relative_permeability"}
+            else:
+                required = {"youngs_modulus", "poissons_ratio", "density"}
             fields = (
                 ("relative_permeability", "Relative permeability", None),
                 ("electrical_conductivity", "Electrical conductivity", "S/m"),
@@ -3654,6 +3689,7 @@ class ThreeDWorkspace(Div):
                 "harmonic_em": "Time-harmonic electromagnetic study",
                 "harmonic_mechanical": "Time-harmonic mechanics study",
                 "magnetostatic_dc": "Static/DC magnetic study",
+                "coupled_magneto_mechanical": "Fully coupled magneto-mechanical study",
             }.get(physics, "3D study")
             children.extend([
                 Div(title, ui_style="font-size:13px; font-weight:650;"),
@@ -3680,7 +3716,7 @@ class ThreeDWorkspace(Div):
                      for order in (1, 2, 3, 4)],
                 ),
             ])
-            if physics == "magnetostatic_dc":
+            if physics in {"magnetostatic_dc", "coupled_magneto_mechanical"}:
                 background = study.get("dc_background_field_t", [0.0, 0.0, 0.0])
                 for index, axis in enumerate("xyz"):
                     children.append(_input(
@@ -3694,18 +3730,22 @@ class ThreeDWorkspace(Div):
                         width="100%",
                     ))
                 children.extend([
-                    _input(
+                    *([_input(
                         "Air-region padding (model spans)", study.get("air_padding", 2.0),
                         lambda event: self._set_study_value("air_padding", event, number=True),
                         number=True, width="100%",
-                    ),
+                    )] if physics == "magnetostatic_dc" else []),
                     Div(
-                        "Applies the uniform DC field at the outer air boundary. Add real domain current density or wire-trace currents as required; the solved B field is saved for later coupled studies.",
+                        (
+                            "Applies the uniform DC field at the outer air boundary. Add DC domain current or wire-trace current as required."
+                            if physics == "magnetostatic_dc"
+                            else "The DC background is solved before the harmonic and mechanical response. A saved solution is reused only when its mesh, discretisation and DC inputs match."
+                        ),
                         ui_class="cb-muted",
                         ui_style="font-size:10px; line-height:1.45; padding:8px; background:var(--panel-header); border-radius:5px;",
                     ),
                 ])
-            elif physics == "harmonic_em":
+            if physics in {"harmonic_em", "coupled_magneto_mechanical"}:
                 source_mode = study.get("em_source_mode", "wire_trace")
                 children.extend([
                     self._select_options(
@@ -3732,7 +3772,7 @@ class ThreeDWorkspace(Div):
                         ui_style="font-size:10px; line-height:1.45; padding:8px; background:var(--panel-header); border-radius:5px;",
                     ),
                 ])
-            else:
+            if physics in {"harmonic_mechanical", "coupled_magneto_mechanical"}:
                 body_force = study.get("mechanical_body_force_n_m3", [0.0, 0.0, 0.0])
                 for index, axis in enumerate("xyz"):
                     children.append(_input(
@@ -3757,10 +3797,33 @@ class ThreeDWorkspace(Div):
                         width="100%",
                     ))
                 children.append(Div(
-                    "Solves linear time-harmonic elasticity on all solid domains. Global body force is inherited by each solid unless a named domain has an override. Supports include fixed, prescribed displacement and springs. External surface traction is not implemented. Materials need Young’s modulus, Poisson ratio and density.",
+                    (
+                        "Optional harmonic body force; magnetic Maxwell stress supplies the coupled load. Assign fixed supports, prescribed displacement or springs. Materials need permeability, conductivity, Young’s modulus, Poisson ratio and density."
+                        if physics == "coupled_magneto_mechanical"
+                        else "Solves linear time-harmonic elasticity on all solid domains. Global body force is inherited by each solid unless a named domain has an override. Supports include fixed, prescribed displacement and springs. External surface traction is not implemented. Materials need Young’s modulus, Poisson ratio and density."
+                    ),
                     ui_class="cb-muted",
                     ui_style="font-size:10px; line-height:1.45; padding:8px; background:var(--panel-header); border-radius:5px;",
                 ))
+            if physics == "coupled_magneto_mechanical":
+                children.extend([
+                    Div("Coupling convergence", ui_style="font-size:12px; font-weight:600; padding-top:6px;"),
+                    _input(
+                        "Maximum iterations", study.get("coupling_max_iterations", 15),
+                        lambda event: self._set_study_value("coupling_max_iterations", event, number=True),
+                        number=True, width="100%",
+                    ),
+                    _input(
+                        "Relative field-change tolerance", study.get("coupling_tolerance", 1e-4),
+                        lambda event: self._set_study_value("coupling_tolerance", event, number=True),
+                        number=True, width="100%",
+                    ),
+                    Div(
+                        "Uses the existing block Gauss–Seidel iteration with Anderson acceleration (depth 3). A run is marked converged only when both magnetic-potential and displacement relative changes meet the tolerance.",
+                        ui_class="cb-muted",
+                        ui_style="font-size:10px; line-height:1.45; padding:8px; background:var(--panel-header); border-radius:5px;",
+                    ),
+                ])
         else:
             children.extend([
                 Div("3D project", ui_style="font-size:13px; font-weight:650;"),

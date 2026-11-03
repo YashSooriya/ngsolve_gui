@@ -312,6 +312,50 @@ def test_older_geometry_without_named_selection_fields_remains_compatible():
     assert restored["geometries"][0]["boundary_selections"] == []
 
 
+def test_project_round_trip_preserves_coupled_study_settings():
+    project = new_3d_project("Coupled setup persistence")
+    project["study"].update(
+        physics="coupled_magneto_mechanical",
+        em_source_mode="domain_current_density",
+        frequency_hz=123.0,
+        dc_background_field_t=[0.0, 0.0, 0.018],
+        mechanical_body_force_n_m3=[1.0, 2.0, 3.0],
+        mechanical_body_force_phase_deg=[0.0, 90.0, 180.0],
+        coupling_max_iterations=27,
+        coupling_tolerance=4e-6,
+    )
+
+    restored, _assets = unpack_3d_project(package_3d_project(project, {}))
+
+    assert restored["study"]["physics"] == "coupled_magneto_mechanical"
+    assert restored["study"]["em_source_mode"] == "domain_current_density"
+    assert restored["study"]["frequency_hz"] == 123.0
+    assert restored["study"]["dc_background_field_t"] == [0.0, 0.0, 0.018]
+    assert restored["study"]["mechanical_body_force_n_m3"] == [1.0, 2.0, 3.0]
+    assert restored["study"]["mechanical_body_force_phase_deg"] == [0.0, 90.0, 180.0]
+    assert restored["study"]["coupling_max_iterations"] == 27
+    assert restored["study"]["coupling_tolerance"] == pytest.approx(4e-6)
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("coupling_max_iterations", 0, "iterations must be an integer"),
+        ("coupling_max_iterations", 2.5, "iterations must be an integer"),
+        ("coupling_max_iterations", 101, "iterations must be an integer"),
+        ("coupling_tolerance", 0, "tolerance must be between"),
+        ("coupling_tolerance", 0.2, "tolerance must be between"),
+    ],
+)
+def test_project_rejects_invalid_coupled_convergence_settings(key, value, message):
+    project = new_3d_project("Invalid coupled setup")
+    project["study"]["physics"] = "coupled_magneto_mechanical"
+    project["study"][key] = value
+
+    with pytest.raises(ValueError, match=message):
+        package_3d_project(project, {})
+
+
 @pytest.mark.parametrize(
     "key,selection,error",
     [
