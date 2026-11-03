@@ -519,17 +519,36 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
         for event in reversed(camera_relayouts)
         if event.get("scene.camera")
     )
+    pointer_guard_events = graph.evaluate(
+        "element => element.__mmfemPointerGuardEvents"
+    )
+    plotly_clicks_after_drag = graph.evaluate(
+        "element => element.__mmfemPhysicalClicks"
+    )
+    dom_clicks_after_drag = graph.evaluate(
+        "element => element.__mmfemDomClicks"
+    )
     assert camera_after_drag["eye"] != camera_before_drag.get("eye"), {
         "before": camera_before_drag,
         "relayouts": camera_relayouts,
     }
+    assert any(
+        event["type"] == "pointermove"
+        and event.get("bridge", {}).get("pointerDragged")
+        for event in pointer_guard_events
+    ), pointer_guard_events
+    assert any(
+        event["type"] == "pointerup"
+        and event.get("bridge", {}).get("suppressClickUntil", 0) > 0
+        for event in pointer_guard_events
+    ), pointer_guard_events
     assert workspace._selection_draft["region_ids"] == selected_before_drag, {
         "selected_before_drag": selected_before_drag,
         "selected_after_drag": workspace._selection_draft["region_ids"],
         "camera_after_drag": camera_after_drag,
-        "pointer_guard_events": graph.evaluate(
-            "element => element.__mmfemPointerGuardEvents"
-        ),
+        "pointer_guard_events": pointer_guard_events,
+        "plotly_clicks": plotly_clicks_after_drag,
+        "dom_clicks": dom_clicks_after_drag,
     }
     graph.evaluate("""element => {
         element.removeListener(

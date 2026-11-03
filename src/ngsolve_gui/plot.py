@@ -46,7 +46,7 @@ bridge.onHover = event => {
 bridge.onPlotlyClick = event => {
     const clickedAt = performance.now();
     bridge.lastPlotlyClick = clickedAt;
-    if (clickedAt < bridge.suppressClickUntil) return;
+    if (bridge.pointerDragged || clickedAt < bridge.suppressClickUntil) return;
     const points = event && event.points;
     if (!points) return;
     bridge.dispatch({points: points.map(point => ({
@@ -87,7 +87,8 @@ bridge.onPointerUp = event => {
 bridge.onCanvasClick = event => {
     if (!event || !event.isTrusted || !event.target ||
         event.target.tagName !== 'CANVAS') return;
-    if (performance.now() < bridge.suppressClickUntil) return;
+    if (bridge.pointerDragged
+        || performance.now() < bridge.suppressClickUntil) return;
     const point = bridge.lastHover;
     const clickedAt = performance.now();
     if (!point || clickedAt - point.at > 750) return;
