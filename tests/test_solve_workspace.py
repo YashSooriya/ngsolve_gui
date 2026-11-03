@@ -1631,6 +1631,18 @@ def test_canvas_mount_replays_nested_svg_layers_after_frontend_is_ready(
     assert slot_updates["scene"]
 
 
+def test_loading_axisymmetric_project_replays_sketch_svg_layers(standalone_components):
+    workspace = SolveWorkspace()
+    loaded_model = copy.deepcopy(workspace.model)
+    calls = []
+    workspace.render_canvas = lambda: calls.append("render")
+    workspace._refresh_canvas_svg_children = lambda: calls.append("replay")
+
+    workspace.set_model(loaded_model)
+
+    assert calls[-2:] == ["render", "replay"]
+
+
 
 def test_click_line_chain_waits_until_finish_and_then_commits_all_segments(standalone_components):
     workspace = SolveWorkspace()
