@@ -1,6 +1,6 @@
 # MagMechSim: Forward Development Roadmap
 
-**Planning baseline:** 3 November 2026 (updated after Phase B1)
+**Planning baseline:** 3 November 2026 (updated after Phase B2)
 **Status:** Living plan, not an immutable implementation contract  
 **Primary users:** Engineers familiar with industrial CAE tools  
 **Primary immediate scope:** Axisymmetric and 3D time-harmonic model preparation and execution, with 3D development prioritised  
@@ -18,15 +18,17 @@ MagMechSim should provide a complete, reliable and responsive workflow from geom
 
 ## 2. Current verified baseline and risks
 
-The bullets below retain historical baseline evidence where useful. The accepted Phase A closeout and completed Phase B1 status below supersede earlier open/blank/recovery findings.
+The bullets below retain historical baseline evidence where useful. The accepted Phase A closeout and completed Phase B1/B2 statuses below supersede earlier open/blank/recovery findings.
 
-**Latest verified status (3 November 2026):** Phase A was accepted complete for its tested workloads. Phase B1 has since completed bounded 3D geometry organisation, material definitions/assignments and safe CAD recovery in the packaged Windows app. The Phase A and B1 reports are [`docs/reviews/2026-11-03-phase-a-closeout.md`](reviews/2026-11-03-phase-a-closeout.md) and [`docs/reviews/2026-11-03-phase-b1.md`](reviews/2026-11-03-phase-b1.md); B1's review ZIP contains the actual desktop screenshots and test evidence.
+**Latest verified status (3 November 2026):** Phase A was accepted complete for its tested workloads. Phase B1 completed bounded 3D geometry organisation, materials and safe CAD recovery. Phase B2 now completes the tested supported 3D single-physics source, boundary-condition and load workflows. The maximized packaged app passed native CAD picking, save/reopen assignment checks, and renderer recovery; small real NGSolve EM and mechanics cases passed. The Phase A, B1 and B2 reports are [`docs/reviews/2026-11-03-phase-a-closeout.md`](reviews/2026-11-03-phase-a-closeout.md), [`docs/reviews/2026-11-03-phase-b1.md`](reviews/2026-11-03-phase-b1.md), and [`docs/reviews/2026-11-03-phase-b2.md`](reviews/2026-11-03-phase-b2.md). B2's report links to its review ZIP and full-resolution desktop screenshots.
 
 - The saved `Getting started - coupled coil` project rendered its square and circle regions in the first geometry-editor screenshot. The sketch grid filled the viewport at maximized and restored sizes with correct physical scaling. The earlier single blank capture was not reproduced; its cause remains unknown.
 - The axisymmetric geometry-creation 3D preview rendered both regions using Plotly WebGL. 3D STEP import, a 22,132-element bounded mesh, repeated native CAD selection, display switching, rotation and selection persistence all passed. The historical OOM did not reproduce; the test covered only three bounded cycles, so larger and longer sessions remain a risk.
 - A controlled renderer crash recovered in 16.5 s with one automatic attempt, preserved the saved model and selection, and restored a visible maximized viewport. Recovery now re-applies design-system and app styles that were lost with the crashed document.
 - The VM had moved to an SSD before these checks. Latest splash-to-ready times were 9.1 s axisymmetric and 7.3 s 3D; there is no controlled before/after comparison.
 - At Phase A closeout, no numerical run or solver-algorithm change occurred. Phase B1 later ran only bounded 3D EM/mechanics cases to verify model-to-solver propagation; no numerical algorithm or dependency changed.
+- Phase B2 ran actual NGSolve checks on 10 mm STEP blocks. Doubling a scoped domain-current source produced a magnetic-field proportionality error below `1e-5`; the 50 Hz mechanics case checked phasor body-force and prescribed-displacement loading plus fixed and spring supports. The 22,132-element STEP model used for desktop verification was restricted to preprocessing, selection and persistence checks and was not submitted to the solver.
+- Phase B2 desktop evidence was captured at full 1920×1094 resolution with MagMechSim maximized. The packaged checks exercised the axisymmetric editor and Plotly WebGL geometry preview, 3D STEP import/mesh, native face selection, condition editing, save/reopen and controlled renderer recovery. Isolated app processes were cleaned up.
 
 Historical baseline reviewed on 2 November:
 
@@ -177,7 +179,7 @@ The following findings are the initial status at that milestone, before the pack
 
 **Phase A exit:** stop for review after the Phase A evidence. Following the independent acceptance, bounded Phase B1 model-preparation work proceeded; DC background-field and coupled-physics work remain later phases.
 
-### Phase B. Complete the 3D model-preparation workflow (high priority; B1 complete, B2 next)
+### Phase B. Complete the 3D model-preparation workflow (B1 and B2 complete for their tested scopes; Phase C next)
 
 **Outcome:** Engineers can create, edit and validate all supported 3D inputs directly within the GUI, without editing Python.
 
@@ -197,9 +199,19 @@ The GUI adapter propagates these physical values to the existing NGSolve problem
 
 The desktop sample used two small STEP solids and a 24-triangle preview mesh; it is functional workflow evidence, not a representative large-model performance benchmark. The historical Chromium memory concern from Phase A remains monitored and is not a blocker.
 
-#### Next milestone: Phase B2. Supported 3D boundary conditions, sources and loads
+#### Phase B2. Supported 3D boundary conditions, sources and loads (complete for the tested scope)
 
-Complete the existing supported EM and mechanics configuration workflows through the UI: boundary/domain scoping, sources, vector direction, fixed support, body force and supported connections. Reuse stable named selections and material/geometry validation; verify that settings reach the existing solver. Do not add DC background-field, fully coupled magneto-mechanics or ROM controls as part of B2.
+The contextual inspector configures the supported single-physics 3D conditions against stable named geometry selections. EM supports the existing A=0 boundary condition, wire-trace excitation with complex current phase, and scoped complex current-density vectors on volume domains. Mechanics supports global and per-domain complex body forces, fixed supports, prescribed-displacement phasors, and boundary-scoped normal/tangential springs. Validation follows the active physics, validates region kind and required materials, and blocks unresolved or incompatible active assignments. Saved projects retain stable CAD IDs/tags, and changed STEP geometry cannot silently move a condition to another entity.
+
+Solver changes were limited to input/configuration assembly and provenance: body-force maps are converted to material coefficient functions, spring maps are applied on their selected boundaries, and wire-trace phase scales the existing complex source. No element formulation, numerical algorithm, dependency or project format changed. External mechanical surface traction, contact, nonlinear mechanics, fully coupled EM-mechanics, DC background-field and ROM workflows remain unsupported and are not exposed as available.
+
+Verification combined real packaged-app interaction and project save/reopen evidence with two small NGSolve runs. A 10 mm block EM case doubled a 1e6 A/m² current-density source to 2e6 A/m² and kept the sampled magnetic-field proportionality error below `1e-5`. A 50 Hz mechanics case checked a 1e8 N/m³ scoped load, 1e-6 m prescribed motion, spring and fixed supports; constrained DOFs had the expected imaginary amplitude and near-zero real component. Full evidence, test logs and limitations are in [`docs/reviews/2026-11-03-phase-b2.md`](reviews/2026-11-03-phase-b2.md).
+
+The broader Phase B backlog retains verification of discretisation/order distinctions and numerical-setting coverage where a future backend-capability review identifies a gap. That work is not an implicit promise to add unsupported controls and does not change the next priority stated for this milestone.
+
+#### Next milestone: Phase C. 3D DC magnetic background-field integration
+
+Expose and validate the existing backend-supported DC background-field configuration required for the subsequent coupled workflow. First map its inputs, dependencies and sequencing. Keep the 3D harmonic single-physics paths and axisymmetric workflow intact; do not add coupled or ROM controls before those stages are implemented and verified.
 
 ### Phase C. 3D DC magnetic background and static-field integration (dependency for the intended coupled workflows)
 
@@ -269,12 +281,9 @@ Phase A: accepted complete for tested workloads; historical Chromium memory risk
     |
 Phase B1: geometry organisation/materials/safe preparation — complete
     |
-NEXT: Phase B2 supported 3D boundary conditions, sources and loads
+Phase B2: supported 3D boundary conditions, sources and loads — complete
     |
-Complete supported 3D preprocessing (Phase B)
-                      |
-                      v
-            DC background configuration (Phase C)
+NEXT: DC background configuration (Phase C)
                       |
                       v
             Coupled 3D harmonic workflow (Phase D)
@@ -322,4 +331,4 @@ Release, packaging and comprehensive quality gates occur throughout, with final 
 
 Suggested repository home for this plan: a documented planning location under the GUI repository, chosen by Codex after inspecting existing conventions. Keep this file as the **single current roadmap**, with date, completed milestones, changed priorities and links to implementation reports. Historical roadmaps may remain archived but should not conflict with the current one.
 
-**Current action:** Phase A is accepted complete for tested workloads; its historical Chromium memory concern remains monitored. Phase B1 is complete and documented in [`docs/reviews/2026-11-03-phase-b1.md`](reviews/2026-11-03-phase-b1.md). Continue with Phase B2 boundary conditions, sources and loads only after independent review; do not proceed into Phase C or later automatically. Keep the packaged Win32 desktop harness and the latest-full-app launcher as required milestone gates.
+**Current action:** Phase A remains accepted for its tested workloads, with historical Chromium memory growth monitored. Phase B1 and Phase B2 are complete for their tested scopes and documented in [`docs/reviews/2026-11-03-phase-b1.md`](reviews/2026-11-03-phase-b1.md) and [`docs/reviews/2026-11-03-phase-b2.md`](reviews/2026-11-03-phase-b2.md). Stop for independent review. The next intended priority is Phase C (DC magnetic background-field integration); do not begin it automatically. Keep the packaged Win32 desktop harness and latest-full-app launcher as required milestone gates.
