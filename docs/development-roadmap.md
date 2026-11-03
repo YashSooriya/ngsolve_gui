@@ -18,7 +18,17 @@ MagMechSim should provide a complete, reliable and responsive workflow from geom
 
 ## 2. Current verified baseline and risks
 
-Based on `MagMechSim-Stage8B-Next-Milestone-Review-2026-11-02.zip` (the latest Codex review package inspected):
+The bullets below record the 2 November baseline. The 3 November Phase A closeout below supersedes any older open/blank/recovery findings.
+
+**Latest verified status (3 November 2026):** Phase A's axisymmetric display, bounded repeated 3D interaction and controlled renderer-recovery gate passed in the packaged Windows app. The full report and review evidence are in [`docs/reviews/2026-11-03-phase-a-closeout.md`](reviews/2026-11-03-phase-a-closeout.md) and `MagMechSim-PhaseA-Closeout-2026-11-03.zip`.
+
+- The saved `Getting started - coupled coil` project rendered its square and circle regions in the first geometry-editor screenshot. The sketch grid filled the viewport at maximized and restored sizes with correct physical scaling. The earlier single blank capture was not reproduced; its cause remains unknown.
+- The axisymmetric geometry-creation 3D preview rendered both regions using Plotly WebGL. 3D STEP import, a 22,132-element bounded mesh, repeated native CAD selection, display switching, rotation and selection persistence all passed. The historical OOM did not reproduce; the test covered only three bounded cycles, so larger and longer sessions remain a risk.
+- A controlled renderer crash recovered in 16.5 s with one automatic attempt, preserved the saved model and selection, and restored a visible maximized viewport. Recovery now re-applies design-system and app styles that were lost with the crashed document.
+- The VM had moved to an SSD before these checks. Latest splash-to-ready times were 9.1 s axisymmetric and 7.3 s 3D; there is no controlled before/after comparison.
+- No numerical solver run or solver-algorithm change occurred. Phase B has not started.
+
+Historical baseline reviewed on 2 November:
 
 - 3D and axisymmetric time-harmonic solver execution and focused regression checks have been demonstrated for selected cases. The latest 3D focused suite reported **63 passes** and axisymmetric model/revolution tests **41 passes, 2 deselected**. The full historical suite was *not* rerun; its last recorded baseline was **513 pass / 11 fail / 3 skip**.
 - 3D harmonic mechanics has manufactured-solution convergence evidence. Bounded nonzero-frequency free-body inertial tests at 50 and 100 Hz agreed with expected rigid translation; fixed-support enforcement was also checked. These do not constitute a full verification of coupled 3D magneto-mechanics.
@@ -122,7 +132,7 @@ Make the top-level application layout, commands, modal behaviour, branding and a
 
 These stages are **directional**, with dependencies and scopes to be refined by Codex after inspection. They need not be exactly one Codex prompt each.
 
-### Phase A. 3D interactive performance and preprocessing refinement (high priority, may run alongside later work)
+### Phase A. 3D interactive performance and preprocessing refinement (closeout complete; residual risk carried forward)
 
 **Outcome:** CAD picking, selection highlighting, property editing and model navigation feel immediate on realistic engineering geometry.
 
@@ -156,7 +166,16 @@ The following findings are the initial status at that milestone, before the pack
 - A historical renderer OOM and recovery failure is not fixed by these checks. It was not reproduced by the capped mesh or single native pick; higher-memory rendering, repeated native picks and recovery after a real renderer crash remain open Phase A work.
 - The `Launch-Latest-MagMechSim.cmd` launcher now targets the tested package folder. Each future handoff must keep the launcher pointed at the newest tested executable, record its SHA-256 and source revisions, and include the SSD/storage-change caveat when reporting timings.
 
-**Next Phase A gate:** diagnose and contain the native WebGL/Plotly renderer OOM, verify repeated native CAD picks and recovery after a renderer crash, and determine why the packaged example's editable 2D sketch canvas is empty. A single native CAD face selection and persistence path now passes. Do not start Phase B until the remaining gate passes or the limitations are explicitly accepted.
+**Phase A closeout (3 November 2026): Complete; Phase B not started.** The latest packaged executable was built from GUI revision `296e850300598aaa9ccf34d603a19cb9f566032d` and Windows package/recovery revision `4b4b4525` (preceded by focused recovery-focus commit `a68a6f78`). It passed **25 packaged-desktop checks** with 30 full-desktop captures and **14 focused tests plus 4 subtests**. The app was maximized on a 1920 × 1094 desktop. Win32 `SendInput` provided actual mouse, keyboard and wheel input; Pillow `ImageGrab` captured the desktop; Playwright over test-only loopback CDP provided read-only DOM inspection and timing. The evidence ZIP contains representative maximized screenshots, test JSON, diagnostics, build identity and logs.
+
+- Renderer recovery root cause: replacement documents did not receive the one-time `cerbsim_ngapp_style` and app-level CSS. Before the correction the recovered root computed to `display:block` and the 3D viewport was 0 px tall. Recovery now restores those styles and window identity before resending the component tree; the controlled native crash test recovered the saved model, named selection and visible 3D mesh in 16.5 s with one attempt.
+- In three bounded interaction cycles on a mesh capped at 25,000 volume elements, nine native face clicks selected two distinct boundary regions. Click-to-editor p50/p95 was 444/646 ms. Chromium RSS increased by 99 MB from the first sample and peaked 206 MB above it; JS heap ended 27 MB above its first sample. GPU memory was not measurable. These measurements do not prove absence of leaks or OOM on larger models.
+- The historical Chromium OOM did not reproduce. It remains a risk for larger models and long sessions, but does not block beginning bounded Phase B model-preparation work. Keep memory trends in acceptance checks and revisit if usage grows monotonically or an OOM recurs.
+- No solver algorithms, numerical dependencies or project formats changed, and no simulation was run. The separate Mike variant was not modified.
+- The full desktop harness also confirmed visible saved axisymmetric geometry on first capture, full-pane grid at maximized/restored sizes, an actual Plotly WebGL geometry preview, real STEP-face interaction and persistence. The earlier blank sketch frame was not reproduced; its original cause is unknown. Physical GPU behavior remains unverified.
+- Latest package: `0.2.8.dev216`, SHA-256 `c7c40e9bf975a8d3870ed6e082f271fdcbf8c2b5478d61bfdaca25e6f6cf5951`. `Launch-Latest-MagMechSim.cmd` points to this package. Current startup timings on the SSD-migrated VM are not controlled comparisons with earlier storage conditions.
+
+**Next step:** stop for review. After approval, begin Phase B with the supported 3D geometry hierarchy, materials and safe assignment validation. Do not begin DC background-field or coupled-physics work in this stage.
 
 ### Phase B. Complete the 3D model-preparation workflow (high priority)
 
@@ -270,14 +289,14 @@ Release, packaging and comprehensive quality gates occur throughout, with final 
 
 | Risk | Why it matters | Mitigation |
 |---|---|---|
-| 3D face selection and renderer stability | A native face pick and save now work on a 22,132-element mesh, but historical native WebGL/Plotly OOM and failed renderer recovery were not fixed or reproduced by the bounded test | Profile repeated real pointer hit-testing and memory/lifecycle behavior; keep synthetic timings separate; reproduce OOM and verify recovery before closing Phase A |
+| 3D face selection and renderer stability | Repeated native picking and controlled recovery now pass on a 22,132-element mesh; historical OOM did not reproduce in three bounded cycles | Carry the OOM risk into Phase B; monitor representative larger models, long-session memory and native/GPU allocations when measurable |
 | Geometry identity ambiguity | Can silently change loads or supports | Continue safe invalidation, user-guided reassignment and verification |
 | Coupling not exposed in 3D | Core product capability unavailable | Implement and verify DC prerequisite, then coupled pipeline, rather than unrelated UI controls |
-| Axisymmetric viewport/tangent errors | Foundational geometry UX and model validity | Fix now with scale/geometry tests |
+| Axisymmetric display and geometry-tool regressions | The saved sketch and full-pane grid now render on first open at maximized and restored sizes; the earlier blank capture did not recur. Tangent-arc tool behavior and physical-GPU rendering were not specifically revalidated in this closeout | Retain first-open/grid checks and targeted geometry-tool regression coverage; investigate if a blank frame or geometry-editing defect recurs |
 | Menus expose irrelevant commands | Confusing and potentially hazardous workflow | Context-aware command taxonomy and capability checks |
-| Axisymmetric sketch/preview rendering | The packaged geometry-creation 3D preview is confirmed visible through Plotly WebGL, but a “Getting started” project's 2D sketch SVG has no sketch-region elements | Investigate the blank 2D example canvas; verify editing and region fidelity with a project containing actual sketch primitives. Physical-GPU behavior remains unverified |
-| Reload after a renderer crash can leave a blank window | Users cannot return to the model without restarting the package UI service | Fix frontend/server recovery and verify cold launch, reload and restart lifecycle |
-| Startup performance baseline | Historical startup was ~16.3 s; packaged runs on the SSD-migrated VM ranged from 6.8 to 10.4 s across separate test runs | Profile stages; compare under controlled storage/hardware before attributing improvement |
+| Axisymmetric sketch/preview rendering | Saved regions, full-pane grid and the geometry-creation Plotly WebGL preview are visible in the packaged app; physical-GPU behavior is unverified | Keep representative sketch/preview regression coverage; reopen if blank frames or fidelity issues recur |
+| Reload after a renderer crash can leave a blank window | Controlled recovery now restores styles, project state and a rendered viewport | Retain one-attempt recovery guard and packaged crash regression; revisit if broader crash reports occur |
+| Startup performance baseline | Latest app reached ready in 7.3–9.1 s on the SSD-migrated VM | Profile stages and compare only under controlled storage/hardware before attributing improvement |
 | Documentation is linked to GitHub | Poor offline and packaged UX | Bundle local Sphinx HTML now; refresh/index in later documentation phase |
 | Broad CI has known failures | Can conceal regressions and waste iteration time | Keep focused gates, track known failures, schedule comprehensive checks |
 | Frequent rebuilds and tests | Slows development | Build/package once per milestone; use risk-based, cached focused tests |
@@ -286,4 +305,4 @@ Release, packaging and comprehensive quality gates occur throughout, with final 
 
 Suggested repository home for this plan: a documented planning location under the GUI repository, chosen by Codex after inspecting existing conventions. Keep this file as the **single current roadmap**, with date, completed milestones, changed priorities and links to implementation reports. Historical roadmaps may remain archived but should not conflict with the current one.
 
-**Current action:** continue the open Phase A renderer/recovery gate and investigate the blank axisymmetric example sketch canvas. The reusable packaged desktop harness is available for subsequent milestones. **Do not begin the next physics-development milestone** until these findings have been reviewed and prioritized.
+**Current action:** review [`docs/reviews/2026-11-03-phase-a-closeout.md`](reviews/2026-11-03-phase-a-closeout.md) and its evidence ZIP. Phase A is closed for bounded verification; the OOM risk is carried forward. The reusable packaged desktop harness is available for subsequent milestones. **Do not begin Phase B until the closeout has been reviewed.**
