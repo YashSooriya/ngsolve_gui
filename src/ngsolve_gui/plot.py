@@ -14,6 +14,7 @@ _PICK_BRIDGE_SETUP_JS = r"""
 (() => {
 const graph = document.querySelector('.mmfem-3d-viewport .js-plotly-plot');
 const dispatch = window[__CALLBACK_NAME__];
+const CANVAS_CLICK_OWNERSHIP_MS = 3000;
 document.documentElement.setAttribute(
     'data-mmfem-pick-bridge-bootstrap',
     graph ? (typeof dispatch === 'function' ? 'ready' : 'no-dispatch') : 'no-graph'
@@ -26,7 +27,6 @@ const bridge = {
     lastHover: null,
     lastCanvasClickAt: null,
     lastPlotlyClick: -1,
-    pendingCanvasClicks: [],
     clickStats: {
         canvasClicks: 0,
         plotlyClicks: 0,
@@ -60,38 +60,14 @@ bridge.onPlotlyClick = event => {
     if (bridge.pointerDragged || clickedAt < bridge.suppressClickUntil) return;
     const points = event && event.points;
     if (!points || !points.length) return;
-    const point = points[0];
-    const curveNumber = Number(point.curveNumber);
-    const pointNumber = Number(point.pointNumber);
-    bridge.pendingCanvasClicks = bridge.pendingCanvasClicks.filter(record =>
-        clickedAt - record.at <= 1500);
-    const samePoint = record => record.curveNumber === curveNumber
-        && record.pointNumber === pointNumber;
-    const nativeEventTime = Number(event.event && event.event.timeStamp);
-    let record = Number.isFinite(nativeEventTime)
-        ? bridge.pendingCanvasClicks.find(candidate => samePoint(candidate)
-            && Number.isFinite(candidate.eventTimeStamp)
-            && Math.abs(candidate.eventTimeStamp - nativeEventTime) < 1)
-        : null;
-    if (!record) {
-        record = bridge.pendingCanvasClicks.find(candidate =>
-            samePoint(candidate) && !candidate.plotlyClickSeen);
-    }
-    if (record) {
-        if (record.plotlyClickSeen) {
-            bridge.clickStats.duplicateEventsSuppressed += 1;
-            return;
-        }
-        record.plotlyClickSeen = true;
-        if (record.fallbackDispatched) {
-            bridge.clickStats.duplicateEventsSuppressed += 1;
-            return;
-        }
-    } else if (bridge.pendingCanvasClicks.some(candidate =>
-        samePoint(candidate) && (candidate.plotlyClickSeen
-            || candidate.fallbackDispatched))) {
-        // Plotly can emit its click after the canvas fallback. Keep that late
-        // event from toggling the same CAD face a second time.
+    if (Number.isFinite(bridge.lastCanvasClickAt)
+        && clickedAt - bridge.lastCanvasClickAt < CANVAS_CLICK_OWNERSHIP_MS) {
+        // The trusted canvas click was already resolved from the most recent
+        // WebGL hover. Plotly may emit its own click event later (sometimes
+        // after the server has applied the first toggle), so the canvas path
+        // owns this interaction for a short window and prevents a second
+        // backend dispatch. A later independent Plotly click without a canvas
+        // event still uses the normal handler below.
         bridge.clickStats.duplicateEventsSuppressed += 1;
         return;
     }
@@ -139,30 +115,18 @@ bridge.onCanvasClick = event => {
         || performance.now() < bridge.suppressClickUntil) return;
     const point = bridge.lastHover;
     const clickedAt = performance.now();
-    // A lightweight page-local timestamp lets packaged desktop profiling
-    // separate native pointer dispatch from the server-to-visible-UI path.
-    bridge.lastCanvasClickAt = clickedAt;
     if (!point || clickedAt - point.at > 750) return;
     if (Number.isFinite(point.x) && Math.abs(event.clientX - point.x) > 10) return;
     if (Number.isFinite(point.y) && Math.abs(event.clientY - point.y) > 10) return;
+    // A lightweight page-local timestamp lets packaged desktop profiling
+    // separate native pointer dispatch from the server-to-visible-UI path.
+    bridge.lastCanvasClickAt = clickedAt;
     bridge.clickStats.canvasClicks += 1;
-    bridge.pendingCanvasClicks = bridge.pendingCanvasClicks.filter(record =>
-        clickedAt - record.at <= 1500);
-    const record = {
-        at: clickedAt,
-        eventTimeStamp: Number(event.timeStamp),
-        curveNumber: Number(point.curveNumber),
-        pointNumber: Number(point.pointNumber),
-        plotlyClickSeen: false,
-        fallbackDispatched: false,
-    };
-    bridge.pendingCanvasClicks.push(record);
-    // Let Plotly's native click handler run first. Mesh3d often emits no
-    // plotly_click, while other traces may emit one and must not toggle twice.
+    // Let the DOM click finish before using the hover-derived Mesh3d face.
+    // If Plotly emits a delayed plotly_click for this same canvas gesture,
+    // onPlotlyClick recognizes that the trusted canvas path already owns it.
     setTimeout(() => {
-        if (bridge.cancelled || record.plotlyClickSeen
-            || record.fallbackDispatched) return;
-        record.fallbackDispatched = true;
+        if (bridge.cancelled) return;
         bridge.lastPlotlyClick = performance.now();
         bridge.clickStats.fallbackDispatches += 1;
         bridge.clickStats.dispatches += 1;
@@ -186,7 +150,6 @@ bridge.dispose = () => {
     }
     if (graph._mmfemPickBridge === bridge) graph._mmfemPickBridge = null;
     bridge.lastHover = null;
-    bridge.pendingCanvasClicks = [];
 };
 bridge.bind = () => {
     if (bridge.cancelled || bridge.bound) return;
