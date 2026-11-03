@@ -1,6 +1,6 @@
 # MagMechSim: Forward Development Roadmap
 
-**Planning baseline:** 1 November 2026  
+**Planning baseline:** 3 November 2026 (updated after Phase B1)
 **Status:** Living plan, not an immutable implementation contract  
 **Primary users:** Engineers familiar with industrial CAE tools  
 **Primary immediate scope:** Axisymmetric and 3D time-harmonic model preparation and execution, with 3D development prioritised  
@@ -18,15 +18,15 @@ MagMechSim should provide a complete, reliable and responsive workflow from geom
 
 ## 2. Current verified baseline and risks
 
-The bullets below record the 2 November baseline. The 3 November Phase A closeout below supersedes any older open/blank/recovery findings.
+The bullets below retain historical baseline evidence where useful. The accepted Phase A closeout and completed Phase B1 status below supersede earlier open/blank/recovery findings.
 
-**Latest verified status (3 November 2026):** Phase A's axisymmetric display, bounded repeated 3D interaction and controlled renderer-recovery gate passed in the packaged Windows app. The full report and review evidence are in [`docs/reviews/2026-11-03-phase-a-closeout.md`](reviews/2026-11-03-phase-a-closeout.md) and `MagMechSim-PhaseA-Closeout-2026-11-03.zip`.
+**Latest verified status (3 November 2026):** Phase A was accepted complete for its tested workloads. Phase B1 has since completed bounded 3D geometry organisation, material definitions/assignments and safe CAD recovery in the packaged Windows app. The Phase A and B1 reports are [`docs/reviews/2026-11-03-phase-a-closeout.md`](reviews/2026-11-03-phase-a-closeout.md) and [`docs/reviews/2026-11-03-phase-b1.md`](reviews/2026-11-03-phase-b1.md); B1's review ZIP contains the actual desktop screenshots and test evidence.
 
 - The saved `Getting started - coupled coil` project rendered its square and circle regions in the first geometry-editor screenshot. The sketch grid filled the viewport at maximized and restored sizes with correct physical scaling. The earlier single blank capture was not reproduced; its cause remains unknown.
 - The axisymmetric geometry-creation 3D preview rendered both regions using Plotly WebGL. 3D STEP import, a 22,132-element bounded mesh, repeated native CAD selection, display switching, rotation and selection persistence all passed. The historical OOM did not reproduce; the test covered only three bounded cycles, so larger and longer sessions remain a risk.
 - A controlled renderer crash recovered in 16.5 s with one automatic attempt, preserved the saved model and selection, and restored a visible maximized viewport. Recovery now re-applies design-system and app styles that were lost with the crashed document.
 - The VM had moved to an SSD before these checks. Latest splash-to-ready times were 9.1 s axisymmetric and 7.3 s 3D; there is no controlled before/after comparison.
-- No numerical solver run or solver-algorithm change occurred. Phase B has not started.
+- At Phase A closeout, no numerical run or solver-algorithm change occurred. Phase B1 later ran only bounded 3D EM/mechanics cases to verify model-to-solver propagation; no numerical algorithm or dependency changed.
 
 Historical baseline reviewed on 2 November:
 
@@ -41,11 +41,11 @@ Historical baseline reviewed on 2 November:
 
 **Do not re-do these completed milestones.** Build upon their evidence, and re-check only when changed code, a failed test or release-critical risk warrants it.
 
-## 3. Immediate milestone: application-wide UI coherence and targeted correctness fixes
+## 3. Completed milestone: application-wide UI coherence and targeted correctness fixes
 
 ### Goal
 
-Make the top-level application layout, commands, modal behaviour, branding and axisymmetric geometry workflow feel cohesive and predictable. Fix reported functional defects while preserving the stable 3D model/solver work. This is the **next Codex implementation milestone**, ahead of major new coupled-physics UI functionality.
+Make the top-level application layout, commands, modal behaviour, branding and axisymmetric geometry workflow feel cohesive and predictable. This milestone is complete; its status and evidence below are retained as the historical baseline for later 3D work.
 
 ### 3.1 Professional navigation and top-area architecture
 
@@ -128,7 +128,7 @@ Make the top-level application layout, commands, modal behaviour, branding and a
 - This earlier review depended on Codex Computer Use for interaction/capture. The reusable Win32 and desktop-capture harness described below now verifies the installed package independently; Computer Use availability is no longer a gate for future GUI milestones.
 - No numerical solver algorithms were changed. The VM's move to SSD is a performance confound; the prior 16.3 s startup and 2.49 s selection timing are not controlled same-hardware comparisons. The review package records the final executable identity, logs, screenshots, performance observations, and remaining preview limitation.
 
-## 4. Future phases, after the immediate milestone
+## 4. Roadmap phases and current status
 
 These stages are **directional**, with dependencies and scopes to be refined by Codex after inspection. They need not be exactly one Codex prompt each.
 
@@ -175,9 +175,9 @@ The following findings are the initial status at that milestone, before the pack
 - The full desktop harness also confirmed visible saved axisymmetric geometry on first capture, full-pane grid at maximized/restored sizes, an actual Plotly WebGL geometry preview, real STEP-face interaction and persistence. The earlier blank sketch frame was not reproduced; its original cause is unknown. Physical GPU behavior remains unverified.
 - Latest package: `0.2.8.dev216`, SHA-256 `c7c40e9bf975a8d3870ed6e082f271fdcbf8c2b5478d61bfdaca25e6f6cf5951`. `Launch-Latest-MagMechSim.cmd` points to this package. Current startup timings on the SSD-migrated VM are not controlled comparisons with earlier storage conditions.
 
-**Next step:** stop for review. After approval, begin Phase B with the supported 3D geometry hierarchy, materials and safe assignment validation. Do not begin DC background-field or coupled-physics work in this stage.
+**Phase A exit:** stop for review after the Phase A evidence. Following the independent acceptance, bounded Phase B1 model-preparation work proceeded; DC background-field and coupled-physics work remain later phases.
 
-### Phase B. Complete the 3D model-preparation workflow (high priority)
+### Phase B. Complete the 3D model-preparation workflow (high priority; B1 complete, B2 next)
 
 **Outcome:** Engineers can create, edit and validate all supported 3D inputs directly within the GUI, without editing Python.
 
@@ -188,6 +188,18 @@ The following findings are the initial status at that milestone, before the pack
 - Validate against the real backend capability matrix, not an aspirational generic FEM feature list. Avoid general-purpose contact/nonlinear UI where not implemented.
 
 **Gate:** Full model setup and solver execution for representative supported 3D EM-only and mechanics-only cases, including project save/reopen and invalid-input checks.
+
+#### Phase B1. Geometry organisation, materials and safe preparation (complete for the bounded milestone)
+
+The 3D model tree now exposes stable STEP solids with rename, visibility/isolation, material assignment and reusable named-domain selections. The material library edits the supported linear material properties (relative permeability, electrical conductivity, Young's modulus, Poisson ratio and density), validates the properties used by active physics and embeds project snapshots. Direct solid assignments use the existing named-domain selection and CAD identity/recovery format; no project schema migration was needed.
+
+The GUI adapter propagates these physical values to the existing NGSolve problem dictionaries. Zero conductivity maps to an insulating domain flag. A small EM solve and a mechanics-only solve verified real backend execution and material response. No solver algorithm or numerical dependency changed. Packaged native tests covered selection highlighting, body visibility, invalid material editing, save/reopen/remesh, and user-guided recovery after STEP topology changed. The 107 focused 3D tests, 43 axisymmetric geometry tests, three bounded solver checks and eight Windows builder tests passed. Full evidence, exact package identity, screenshots, performance observations and limitations are in [`docs/reviews/2026-11-03-phase-b1.md`](reviews/2026-11-03-phase-b1.md).
+
+The desktop sample used two small STEP solids and a 24-triangle preview mesh; it is functional workflow evidence, not a representative large-model performance benchmark. The historical Chromium memory concern from Phase A remains monitored and is not a blocker.
+
+#### Next milestone: Phase B2. Supported 3D boundary conditions, sources and loads
+
+Complete the existing supported EM and mechanics configuration workflows through the UI: boundary/domain scoping, sources, vector direction, fixed support, body force and supported connections. Reuse stable named selections and material/geometry validation; verify that settings reach the existing solver. Do not add DC background-field, fully coupled magneto-mechanics or ROM controls as part of B2.
 
 ### Phase C. 3D DC magnetic background and static-field integration (dependency for the intended coupled workflows)
 
@@ -253,8 +265,13 @@ The following findings are the initial status at that milestone, before the pack
 ## 5. Practical sequencing and dependencies
 
 ```text
-NEXT: Complete Phase A renderer/recovery and axisymmetric sketch-display gate
-    |------> Complete supported 3D preprocessing (Phase B)
+Phase A: accepted complete for tested workloads; historical Chromium memory risk monitored
+    |
+Phase B1: geometry organisation/materials/safe preparation — complete
+    |
+NEXT: Phase B2 supported 3D boundary conditions, sources and loads
+    |
+Complete supported 3D preprocessing (Phase B)
                       |
                       v
             DC background configuration (Phase C)
@@ -289,7 +306,7 @@ Release, packaging and comprehensive quality gates occur throughout, with final 
 
 | Risk | Why it matters | Mitigation |
 |---|---|---|
-| 3D face selection and renderer stability | Repeated native picking and controlled recovery now pass on a 22,132-element mesh; historical OOM did not reproduce in three bounded cycles | Carry the OOM risk into Phase B; monitor representative larger models, long-session memory and native/GPU allocations when measurable |
+| 3D face selection and renderer stability | Phase A's repeated native picking/recovery passed on a capped 22,132-element mesh. Phase B1 additionally verified a visible orange solid outline on a two-body 24-triangle preview; the historical OOM did not recur | Keep the Chromium memory concern monitored; include larger representative models and long-session memory in a later targeted gate. It does not block B2 |
 | Geometry identity ambiguity | Can silently change loads or supports | Continue safe invalidation, user-guided reassignment and verification |
 | Coupling not exposed in 3D | Core product capability unavailable | Implement and verify DC prerequisite, then coupled pipeline, rather than unrelated UI controls |
 | Axisymmetric display and geometry-tool regressions | The saved sketch and full-pane grid now render on first open at maximized and restored sizes; the earlier blank capture did not recur. Tangent-arc tool behavior and physical-GPU rendering were not specifically revalidated in this closeout | Retain first-open/grid checks and targeted geometry-tool regression coverage; investigate if a blank frame or geometry-editing defect recurs |
@@ -305,4 +322,4 @@ Release, packaging and comprehensive quality gates occur throughout, with final 
 
 Suggested repository home for this plan: a documented planning location under the GUI repository, chosen by Codex after inspecting existing conventions. Keep this file as the **single current roadmap**, with date, completed milestones, changed priorities and links to implementation reports. Historical roadmaps may remain archived but should not conflict with the current one.
 
-**Current action:** review [`docs/reviews/2026-11-03-phase-a-closeout.md`](reviews/2026-11-03-phase-a-closeout.md) and its evidence ZIP. Phase A is closed for bounded verification; the OOM risk is carried forward. The reusable packaged desktop harness is available for subsequent milestones. **Do not begin Phase B until the closeout has been reviewed.**
+**Current action:** Phase A is accepted complete for tested workloads; its historical Chromium memory concern remains monitored. Phase B1 is complete and documented in [`docs/reviews/2026-11-03-phase-b1.md`](reviews/2026-11-03-phase-b1.md). Continue with Phase B2 boundary conditions, sources and loads only after independent review; do not proceed into Phase C or later automatically. Keep the packaged Win32 desktop harness and the latest-full-app launcher as required milestone gates.
