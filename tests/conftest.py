@@ -190,8 +190,23 @@ def _isolate_ngapp_test_lifecycle(monkeypatch):
         PlotlyComponent._state = "none"
         PlotlyComponent._plotly = None
         PlotlyComponent._waiting = []
+        # The app host is restarted between tests inside the same pytest
+        # process, so its adapter-probe result must be isolated as well.
+        from ngsolve_gui.webgl_fallback import reset_webgpu_probe_state
+
+        reset_webgpu_probe_state()
+
+    def reset_meshing_preview_app():
+        # ``meshing_preview.install`` patches Netgen's GenerateMesh process-wide
+        # and retains the latest app in a module global. After an ngapp E2E
+        # test stops its host, a later solver-only test must not see that stale
+        # app and try to attach a preview to its closed browser.
+        import ngsolve_gui.meshing_preview as meshing_preview
+
+        meshing_preview._app = None
 
     reset_plotly_state()
+    reset_meshing_preview_app()
 
     config_dir = tempfile.mkdtemp(prefix="ngsolve_gui_test_cfg_")
     monkeypatch.setenv("XDG_CONFIG_HOME", config_dir)
@@ -449,6 +464,7 @@ def _isolate_ngapp_test_lifecycle(monkeypatch):
     yield
 
     reset_plotly_state()
+    reset_meshing_preview_app()
     shutil.rmtree(config_dir, ignore_errors=True)
 
     cleanup_errors = []

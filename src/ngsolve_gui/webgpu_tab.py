@@ -16,9 +16,14 @@ import copy
 import math
 
 from .pick_overlay import PickOverlay
-from .property_panel import PropertyPanelMixin
+from .property_panel import PropertyPanelMixin, section_key
 from .prop_widgets import Segmented
 from .undo import UndoStack
+from .webgl_fallback import (
+    AdaptiveWebgpuComponent,
+    geometry_figure,
+    mesh_figure,
+)
 from . import cerbsim_style as cb
 from .cerbsim_style import overlay_tr, VIEWPORT_CLEAR, VIEWPORT_TEXT
 
@@ -82,7 +87,10 @@ class WebgpuTab(PropertyPanelMixin, Div):
         self.name = name
         self.data = data
         self.app_data = app_data
-        self.wgpu = WebgpuComponent()
+        self._webgl_fallback_active = False
+        self._webgl_fallback_view = None
+        self._webgl_fallback_plot = None
+        self.wgpu = AdaptiveWebgpuComponent(self)
         self.wgpu.ui_class = "fit"
         self.icon = "mdi-vector-triangle"
 
@@ -166,6 +174,7 @@ class WebgpuTab(PropertyPanelMixin, Div):
             overlays.append(self._probe_preview)
             overlays.append(self._probe_panel)
         overlays.extend(self._build_additional_viewport_overlays())
+        self._viewport_components = list(overlays)
         if self._page_toolbar_enabled:
             viewport_overlays = self._viewport_overlays(overlays)
             self._viewport = Div(
@@ -186,6 +195,8 @@ class WebgpuTab(PropertyPanelMixin, Div):
             )
         else:
             super().__init__(*overlays, ui_class="relative-position fit")
+
+        self._fallback_container = self._viewport if self._page_toolbar_enabled else self
 
         self.draw()
         if self._camera_needs_fit:
@@ -263,6 +274,149 @@ class WebgpuTab(PropertyPanelMixin, Div):
     def _build_additional_viewport_overlays(self):
         """Extra overlays supplied by specialized viewport components."""
         return []
+
+    def _webgl_fallback_figure(self):
+        """Return this tab's display-only WebGL fallback figure."""
+        if hasattr(self, "geo"):
+            return geometry_figure(self.geo.shape)
+        if hasattr(self, "mesh"):
+            return mesh_figure(self.mesh)
+        raise RuntimeError("This view has no supported WebGL representation")
+
+    def property_summary(self):
+        if not self._webgl_fallback_active:
+            return None
+        return Div(
+            Div("3D WebGL fallback", ui_class="text-subtitle2 q-px-md q-pt-md"),
+            Div(
+                "The model is shown with WebGL. WebGPU selection, clipping and "
+                "advanced field overlays are unavailable.",
+                ui_class="text-caption q-px-md q-pb-md",
+            ),
+        )
+
+    def _refresh_fallback_property_panel(self):
+        """Rebuild the active property panel after hiding WebGPU-only options."""
+        try:
+            app = self.context.app
+            host = app.property_host
+            if self in host._panels:
+                host.discard(self)
+                host.show(self, self.build_property_panel)
+        except Exception as error:
+            print(f"Could not refresh fallback properties: {error}")
+
+    def _activate_webgl_fallback(self, reason=""):
+        """Replace the failed WebGPU canvas with a bounded 3D WebGL view."""
+        if self._webgl_fallback_active:
+            return
+
+        note = (
+            "WebGPU is unavailable on this machine. Showing a 3D WebGL fallback; "
+            "WebGPU-only selection, clipping, and interior field controls are disabled."
+        )
+        try:
+            figure = self._webgl_fallback_figure()
+        except Exception as error:
+            detail = str(error).strip().replace("\n", " ") or type(error).__name__
+            if hasattr(self, "mesh"):
+                try:
+                    figure = mesh_figure(self.mesh)
+                    note = (
+                        "The field could not be sampled for fallback rendering. "
+                        "Showing the 3D mesh instead. " + detail[:150]
+                    )
+                except Exception:
+                    figure = None
+            else:
+                figure = None
+            if figure is None:
+                try:
+                    import plotly.graph_objects as go
+
+                    figure = go.Figure()
+                    figure.update_layout(
+                        scene={"aspectmode": "data", "xaxis_title": "X", "yaxis_title": "Y", "zaxis_title": "Z"},
+                        annotations=[{"text": "3D WebGL preview is unavailable for this data", "xref": "paper", "yref": "paper", "showarrow": False, "x": 0.5, "y": 0.5}],
+                    )
+                except Exception:
+                    print(f"3D WebGL fallback could not be created: {detail}")
+
+        if figure is None:
+            print("3D WebGL fallback could not be created from this model")
+            return
+
+        if reason:
+            self._webgl_fallback_reason = str(reason)
+        try:
+            from ngapp.components.visualization import PlotlyComponent
+
+            identifier = "webgl_fallback_" + "".join(
+                character if character.isalnum() or character == "_" else "_"
+                for character in str(self.name)
+            )[:48]
+            self._webgl_fallback_plot = PlotlyComponent(
+                id=identifier + "_plot",
+                ui_class="full-width",
+                ui_style=(
+                    "width:100%; height:100%; min-width:0; min-height:0; "
+                    "flex:1 1 auto;"
+                ),
+            )
+            message = note
+            if reason:
+                message += " (" + str(reason).replace("\n", " ")[:120] + ")"
+            banner = Div(
+                message,
+                ui_class="q-px-md q-py-sm text-caption",
+                ui_style=(
+                    "flex:none; border-bottom:1px solid rgba(127,137,150,.28); "
+                    "color:var(--q-color-grey-8);"
+                ),
+            )
+            self._webgl_fallback_view = Div(
+                banner,
+                self._webgl_fallback_plot,
+                ui_class="column no-wrap",
+                ui_style=(
+                    "position:absolute; inset:0; display:flex; flex-direction:column; "
+                    "min-width:0; min-height:0; overflow:hidden; background:var(--q-page);"
+                ),
+                ui_hidden=True,
+            )
+            children = list(getattr(self._fallback_container, "ui_children", []) or [])
+            children.insert(1 if children else 0, self._webgl_fallback_view)
+            self._fallback_container.ui_children = children
+            self._webgl_fallback_plot.draw(figure)
+            self._webgl_fallback_view.ui_hidden = False
+        except Exception as error:
+            print(f"Could not mount 3D WebGL fallback: {error}")
+            return
+
+        self._webgl_fallback_active = True
+        self.hidden_sections = {
+            section_key(section)
+            for section in (getattr(self, "property_sections", ()) or ())
+        }
+        self.suppress_empty_property_message = True
+
+        # Hide controls that call WebGPU-only interaction paths. The engineering
+        # model, mesh, field data and numerical results remain untouched.
+        for overlay in self._viewport_components:
+            try:
+                overlay.ui_hidden = True
+            except Exception:
+                pass
+        self._refresh_fallback_property_panel()
+
+    def _refresh_webgl_fallback(self):
+        """Update the fallback after a display property changes, if supported."""
+        if not self._webgl_fallback_active or self._webgl_fallback_plot is None:
+            return
+        try:
+            self._webgl_fallback_plot.draw(self._webgl_fallback_figure())
+        except Exception as error:
+            print(f"Could not refresh 3D WebGL fallback: {error}")
 
     def _uses_page_toolbar(self):
         """Post-processing views use a labeled toolbar above the canvas."""
@@ -368,7 +522,10 @@ class WebgpuTab(PropertyPanelMixin, Div):
         self.scene.render()
 
     def redraw(self):
-        self.wgpu.scene.redraw()
+        if self._webgl_fallback_active:
+            self._refresh_webgl_fallback()
+        elif self.wgpu.scene is not None:
+            self.wgpu.scene.redraw()
 
     def _on_dblclick(self, ev):
         scene = self.scene

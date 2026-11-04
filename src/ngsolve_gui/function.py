@@ -4,6 +4,7 @@ from .webgpu_tab import WebgpuTab, _usersettings
 from .region_state import RegionState
 from . import cerbsim_style as cb
 from ._visualization import visualization_cf
+from .webgl_fallback import function_figure
 import ngsolve as ngs
 import math
 
@@ -89,6 +90,9 @@ def _fmt_value(v):
 
 
 class FunctionComponent(WebgpuTab):
+    def _webgl_fallback_figure(self):
+        return function_figure(self)
+
     def _resolve_deformation(self, deform, complex_part="real"):
         """Normalize the ``deformation`` Draw argument into a 3d displacement CF."""
         if deform is None or deform is False:
