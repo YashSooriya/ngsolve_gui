@@ -137,6 +137,26 @@ def test_axisymmetric_function_fallback_revolves_to_3d():
     assert max(surface.z) - min(surface.z) > 0
 
 
+def test_browser_probe_hook_uses_bridge_compatible_name():
+    appended = []
+
+    class Head:
+        def appendChild(self, script):
+            appended.append(script)
+
+    document = SimpleNamespace(
+        createElement=lambda _tag: SimpleNamespace(textContent=""), head=Head()
+    )
+    js = SimpleNamespace(document=document, mmfemProbeWebGPU=None)
+
+    fallback._install_verified_probe(js)
+
+    assert len(appended) == 1
+    assert "globalThis.mmfemProbeWebGPU" in appended[0].textContent
+    assert "__mmfemProbeWebGPU" not in appended[0].textContent
+    assert "5000" in appended[0].textContent
+
+
 def _fake_webgpu(monkeypatch, *, gpu=True, selected=None, selector_error=None):
     package = ModuleType("webgpu")
     utils = SimpleNamespace(_device=None, ensure_engine_js=lambda: True)
@@ -146,11 +166,11 @@ def _fake_webgpu(monkeypatch, *, gpu=True, selected=None, selector_error=None):
         webgpuSelectDevice=lambda *_args: None,
     )
     if selected is not None:
-        js.__mmfemProbeWebGPU = lambda canvas: selected
+        js.mmfemProbeWebGPU = lambda canvas: selected
     elif selector_error is not None:
         def fail(_canvas):
             raise selector_error
-        js.__mmfemProbeWebGPU = fail
+        js.mmfemProbeWebGPU = fail
     platform.js = js
     package.platform = platform
     package.utils = utils
@@ -192,6 +212,21 @@ def test_webgpu_probe_requires_successful_canvas_render(monkeypatch):
     assert device.handle is device_handle
     assert utils._device is device
     assert fallback.webgpu_is_unavailable() is False
+
+
+def test_preexisting_unverified_device_is_probed_before_reuse(monkeypatch):
+    selected = SimpleNamespace(
+        verdict="probed", device=object(), messages=["triangle probe passed"]
+    )
+    utils, _js, device_type = _fake_webgpu(monkeypatch, selected=selected)
+    stale_device = object()
+    utils._device = stale_device
+
+    device = fallback.ensure_webgpu_device(object())
+
+    assert isinstance(device, device_type)
+    assert device is utils._device
+    assert device is not stale_device
 
 
 def test_unverified_or_failed_probe_selects_fallback(monkeypatch):
@@ -268,20 +303,19 @@ def test_real_geometry_view_uses_webgl_when_browser_has_no_webgpu(
     mesh = make_mesh_3d()
     _draw(app, mesh, page=page, name="NoWebGPUMesh")
     mesh_component = app.tab_panel.comp
-    assert mesh_component._webgl_fallback_active
     page.wait_for_function(
         """() => Array.from(document.querySelectorAll('.js-plotly-plot'))
           .some(plot => plot.getBoundingClientRect().width > 0
             && plot.data?.some(trace => trace.type === 'mesh3d'))""",
         timeout=15000,
     )
+    assert mesh_component._webgl_fallback_active
 
     space = ngs.H1(mesh, order=1)
     field = ngs.GridFunction(space, name="No WebGPU field")
     field.Set(ngs.x + 2 * ngs.y + 3 * ngs.z)
     _draw(app, field, page=page, name="NoWebGPUField")
     field_component = app.tab_panel.comp
-    assert field_component._webgl_fallback_active
     page.wait_for_function(
         """() => Array.from(document.querySelectorAll('.js-plotly-plot'))
           .some(plot => plot.getBoundingClientRect().width > 0
@@ -289,7 +323,28 @@ def test_real_geometry_view_uses_webgl_when_browser_has_no_webgpu(
               && trace.intensity?.length > 0))""",
         timeout=15000,
     )
+    assert field_component._webgl_fallback_active
     page.screenshot(
         path=str(Path(__file__).parent / "output" / "webgl-fallback-field.png"),
         full_page=True,
     )
+
+
+
+@app_test("ngsolve_gui.appconfig")
+def test_hung_webgpu_adapter_probe_uses_fallback_within_bound(page: Page, app) -> None:
+    """A present-but-stalled WebGPU API must not leave the viewport waiting."""
+    page.evaluate(
+        """Object.defineProperty(navigator, 'gpu', {
+          value: {requestAdapter: () => new Promise(() => {})},
+          configurable: true
+        })"""
+    )
+    _draw(app, make_geometry(), page=page, name="StalledWebGPUProbe")
+    component = app.tab_panel.comp
+    page.wait_for_function(
+        "document.body.innerText.includes('adapter/render probe timed out')",
+        timeout=10000,
+    )
+    assert component._webgl_fallback_active
+    assert "timed out" in component._webgl_fallback_reason

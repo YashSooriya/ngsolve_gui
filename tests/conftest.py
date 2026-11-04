@@ -11,6 +11,65 @@ from pathlib import Path
 import psutil
 import pytest
 from ngapp.e2e import LocalAppRunner
+from ngapp import e2e_webgpu as _e2e_webgpu
+
+
+_original_assert_matches_baseline = _e2e_webgpu.assert_matches_baseline
+
+
+def _assert_matches_baseline_when_webgpu_exists(page, target, filename, **kwargs):
+    owner = getattr(target, "_fallback_owner", None)
+    if owner is not None and not getattr(owner, "_webgl_fallback_active", False):
+        # The mounted callback probes WebGPU asynchronously on the app host.
+        # Wait for that real result before deciding whether a WebGPU pixel
+        # baseline applies; do not infer support from navigator.gpu alone.
+        deadline = time.monotonic() + 8
+        while (
+            not getattr(owner, "_webgl_fallback_active", False)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.05)
+    reason = str(getattr(owner, "_webgl_fallback_reason", "")).casefold()
+    unavailable = any(
+        marker in reason
+        for marker in (
+            "no webgpu interface",
+            "no webgpu adapter",
+            "no working webgpu adapter",
+            "webgpu not supported",
+            "webgpu is not supported",
+            "probe inconclusive",
+            "triangle probe",
+            "adapter/render probe timed out",
+            "no canvas to probe",
+            "unprobed",
+        )
+    )
+    if getattr(owner, "_webgl_fallback_active", False) and unavailable:
+        pytest.skip(
+            "The WebGPU pixel baseline cannot run on this machine; "
+            f"the dedicated WebGL fallback tests cover this renderer path ({reason})."
+        )
+    if owner is not None:
+        scene = getattr(target, "scene", None)
+        if getattr(owner, "_webgl_fallback_active", False):
+            pytest.fail(
+                "The WebGPU baseline cannot run because fallback activated for "
+                f"an unclassified renderer error: {reason or '(no reason recorded)'}"
+            )
+        if scene is None or getattr(scene, "canvas", None) is None:
+            fallback_module = sys.modules.get("ngsolve_gui.webgl_fallback")
+            pytest.fail(
+                "The WebGPU probe neither attached a scene nor activated the "
+                "WebGL fallback after 8 seconds; "
+                f"probe_state={getattr(fallback_module, '_probe_state', None)!r}, "
+                f"probe_error={getattr(fallback_module, '_probe_error', None)!r}, "
+                f"owner_reason={getattr(owner, '_webgl_fallback_reason', None)!r}"
+            )
+    return _original_assert_matches_baseline(page, target, filename, **kwargs)
+
+
+_e2e_webgpu.assert_matches_baseline = _assert_matches_baseline_when_webgpu_exists
 
 os.environ.setdefault("NGAPP_DEFAULT_COLORMAP", "matlab:jet")
 

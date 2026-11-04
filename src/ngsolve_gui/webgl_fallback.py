@@ -19,21 +19,25 @@ class WebGPUUnavailable(RuntimeError):
 _probe_lock = threading.RLock()
 _probe_state: str | None = None
 _probe_error = ""
+_verified_device = None
+_WEBGPU_PROBE_TIMEOUT_MS = 5_000
 _MAX_FALLBACK_TRIANGLES = 100_000
 
 
 def reset_webgpu_probe_state() -> None:
     """Reset the process cache; used by isolated GUI tests."""
-    global _probe_state, _probe_error
+    global _probe_state, _probe_error, _verified_device
     with _probe_lock:
         _probe_state = None
         _probe_error = ""
+        _verified_device = None
 
 
 def _record_unavailable(error) -> None:
-    global _probe_state, _probe_error
+    global _probe_state, _probe_error, _verified_device
     _probe_state = "unavailable"
     _probe_error = _short_reason(error)
+    _verified_device = None
 
 
 def _short_reason(error, limit=180) -> str:
@@ -49,11 +53,11 @@ def _install_verified_probe(js) -> None:
     makes each new application process verify the current machine/canvas; the
     prior preference is restored if verification fails.
     """
-    if getattr(js, "__mmfemProbeWebGPU", None) is not None:
+    if getattr(js, "mmfemProbeWebGPU", None) is not None:
         return
     script = js.document.createElement("script")
     script.textContent = r"""
-      globalThis.__mmfemProbeWebGPU = async function(canvas) {
+      globalThis.mmfemProbeWebGPU = async function(canvas) {
         const key = 'webgpuPowerPreference';
         let previous = null;
         let hadPrevious = false;
@@ -63,17 +67,42 @@ def _install_verified_probe(js) -> None:
           localStorage.removeItem(key);
         } catch (_) {}
         let verified = false;
-        try {
-          const selected = await webgpuSelectDevice(canvas, null);
-          verified = selected.verdict === 'probed';
-          return selected;
-        } finally {
-          if (!verified && hadPrevious) {
+        let timedOut = false;
+        let timer = null;
+        const restorePreference = () => {
+          if (hadPrevious) {
             try { localStorage.setItem(key, previous); } catch (_) {}
           }
+        };
+        const probe = Promise.resolve().then(() => webgpuSelectDevice(canvas, null));
+        try {
+          const timeout = new Promise(resolve => {
+            timer = setTimeout(() => {
+              timedOut = true;
+              resolve({
+                verdict: 'unverified',
+                device: null,
+                messages: ['WebGPU adapter/render probe timed out after 5 seconds'],
+              });
+            }, __MMFEM_PROBE_TIMEOUT_MS__);
+          });
+          const selected = await Promise.race([probe, timeout]);
+          verified = selected.verdict === 'probed';
+          if (timedOut) {
+            // requestAdapter/requestDevice may never settle on a broken driver.
+            // If they eventually do, dispose the unused device; the page is
+            // already using the WebGL fallback by then.
+            probe.then(result => {
+              try { result.device?.destroy(); } catch (_) {}
+            }, () => {});
+          }
+          return selected;
+        } finally {
+          if (timer !== null) clearTimeout(timer);
+          if (!verified) restorePreference();
         }
       };
-    """
+    """.replace("__MMFEM_PROBE_TIMEOUT_MS__", str(_WEBGPU_PROBE_TIMEOUT_MS))
     js.document.head.appendChild(script)
 
 
@@ -85,15 +114,21 @@ def ensure_webgpu_device(html_canvas):
     used, but an unavailable or inconclusive adapter is reported as a normal
     application condition so the caller can switch renderers.
     """
-    global _probe_state
+    global _probe_state, _verified_device
     from webgpu import platform, utils
 
     with _probe_lock:
         if _probe_state == "unavailable":
             raise WebGPUUnavailable(_probe_error or "WebGPU is unavailable")
-        if utils._device is not None:
-            # Another view already completed this process' initialization.
-            _probe_state = "available"
+        if (
+            _probe_state == "available"
+            and utils._device is not None
+            and utils._device is _verified_device
+        ):
+            # The process-local device has already passed the real canvas
+            # triangle probe.  A device populated by another initializer is
+            # deliberately not trusted here: upstream can select one without
+            # a canvas and return it as "unprobed".
             return utils._device
 
         try:
@@ -105,7 +140,7 @@ def ensure_webgpu_device(html_canvas):
             ):
                 raise WebGPUUnavailable("The WebGPU renderer could not be loaded")
             _install_verified_probe(js)
-            selected = js.__mmfemProbeWebGPU(html_canvas)
+            selected = js.mmfemProbeWebGPU(html_canvas)
             verdict = str(selected.verdict)
             messages = [str(message) for message in selected.messages]
             if verdict != "probed":
@@ -121,9 +156,11 @@ def ensure_webgpu_device(html_canvas):
             from webgpu.webgpu_api import Device
 
             device = Device(selected.device)
-            # Match the device cache used by the upstream initializer so its
-            # following Canvas construction cannot trigger another fatal probe.
+            # Match the upstream cache so Canvas construction reuses the
+            # verified device.  If a previous initializer populated an
+            # unverified device, replace it before any view is attached.
             utils._device = device
+            _verified_device = device
             _probe_state = "available"
             return device
         except (Exception, SystemExit) as error:
