@@ -1091,6 +1091,44 @@ def test_small_3d_solver_run_completes_with_scoped_surface_condition(tmp_path):
     magnitude = math.sqrt(sum(abs(component) ** 2 for component in value))
     assert math.isfinite(magnitude) and magnitude > 1e-12
 
+    import numpy as np
+
+    em_sweep_differences = {}
+    for snapshot_index, frequency_hz in enumerate((50.0, 100.0)):
+        single_project = copy.deepcopy(project)
+        single_project["study"].update(
+            frequency_mode="single",
+            frequency_hz=frequency_hz,
+        )
+        single_manifest, single_dir = _run_packaged_solver_model(
+            single_project,
+            assets,
+            tmp_path,
+            f"em-single-{frequency_hz:g}-hz",
+        )
+        assert single_manifest["frequency_points_hz"] == [frequency_hz]
+        assert (single_dir / "mesh.vol").read_bytes() == (
+            output_dir / "mesh.vol"
+        ).read_bytes()
+        sweep_values = _load_snapshot_coefficients(
+            output_dir, manifest, "gfBAC", snapshot_index
+        )
+        single_values = _load_snapshot_coefficients(
+            single_dir, single_manifest, "gfBAC", 0
+        )
+        relative_l2 = np.linalg.norm(sweep_values - single_values) / np.linalg.norm(
+            single_values
+        )
+        assert relative_l2 < 1e-8
+        em_sweep_differences[frequency_hz] = relative_l2
+    print(
+        "EM sweep versus same-mesh single-frequency solves: "
+        + ", ".join(
+            f"{frequency:g} Hz relative L2={difference:.3e}"
+            for frequency, difference in em_sweep_differences.items()
+        )
+    )
+
     changed_project = copy.deepcopy(project)
     changed_project["study"].update(
         frequency_mode="single",
