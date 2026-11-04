@@ -126,6 +126,10 @@ class Navigator(Div):
 
     def refresh_run_history(self):
         """Refresh run/result entries when Post Process becomes active."""
+        previous_run_ids = {
+            str(run.get("id") or run.get("output_path"))
+            for run in self._run_history
+        }
         if callable(self._get_run_history):
             try:
                 runs = list(self._get_run_history() or [])
@@ -147,8 +151,17 @@ class Navigator(Div):
             del self._run_collapsed[stale]
         for run_id in run_ids:
             self._run_collapsed.setdefault(run_id, True)
-        if run_ids and not any(not self._run_collapsed[run_id] for run_id in run_ids):
-            self._run_collapsed[run_ids[-1]] = False
+        if run_ids:
+            newest_run_id = run_ids[-1]
+            if newest_run_id not in previous_run_ids:
+                # Surface the newest run's convergence or failure summary as
+                # soon as history refreshes. Otherwise a prior expanded run
+                # keeps the new diagnostics hidden behind a collapsed row.
+                for run_id in run_ids[:-1]:
+                    self._run_collapsed[run_id] = True
+                self._run_collapsed[newest_run_id] = False
+            elif not any(not self._run_collapsed[run_id] for run_id in run_ids):
+                self._run_collapsed[newest_run_id] = False
         self.update()
 
     def _toggle_run(self, run_id):
