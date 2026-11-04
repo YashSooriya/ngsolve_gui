@@ -2982,10 +2982,12 @@ class NGSolveGui(App):
                         if {"iterations", "residual_A", "residual_u"} <= point.keys()
                         else ""
                     )
+                    status_message = (
+                        f"Coupled study did not converge{detail}. "
+                        f"Diagnostic fields were saved to {output_dir}"
+                    )
                     self._dispatch_to_ui(
-                        workspace._set_status,
-                        f"Coupled study did not converge{detail}. Diagnostic fields were saved to {output_dir}",
-                        error=True,
+                        lambda: workspace._set_status(status_message, error=True)
                     )
                     self._dispatch_to_ui(lambda: self._notify(
                         f"3D {study_label} did not converge{detail}. Results are marked diagnostic only.",
