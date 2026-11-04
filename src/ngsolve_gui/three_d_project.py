@@ -9,6 +9,7 @@ import io
 import json
 import math
 import re
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import zipfile
 from pathlib import PurePosixPath
@@ -17,12 +18,14 @@ from uuid import uuid4
 
 PROJECT_SUFFIX = ".mmfem3d"
 PROJECT_SCHEMA = "mm-fem.3d-project"
-PROJECT_VERSION = 1
+PROJECT_VERSION = 2
 PROJECT_ENTRY = "project.json"
 UNASSIGNED_MATERIAL = "Unassigned"
 MAX_PROJECT_BYTES = 512_000_000
 MAX_ASSET_BYTES = 256_000_000
 MAX_PROJECT_ITEMS = 500
+MAX_3D_STUDY_FREQUENCIES = 50
+MAX_3D_FREQUENCY_HZ = 1e9
 MAX_NAMED_SELECTIONS = 500
 MAX_SELECTION_REGIONS = 100_000
 MIN_MESH_SIZE_MM = 0.01
@@ -87,7 +90,12 @@ def new_3d_project(name="Untitled 3D project"):
         "study": {
             "physics": "harmonic_em",
             "em_source_mode": "wire_trace",
+            "frequency_mode": "single",
             "frequency_hz": 500.0,
+            "frequency_points_hz": [],
+            "frequency_start_hz": 500.0,
+            "frequency_end_hz": 1000.0,
+            "frequency_step_hz": 500.0,
             "polynomial_order": 1,
             "air_padding": 2.0,
             "dc_background_field_t": [0.0, 0.0, 0.0],
@@ -109,6 +117,73 @@ def _finite_vector(value, label, *, limit):
     if not all(math.isfinite(component) and abs(component) <= limit for component in vector):
         raise ValueError(f"{label} components must be finite and no larger than {limit:g}.")
     return vector
+
+
+def study_frequency_points_hz(study):
+    """Return the validated harmonic frequency vector stored in study settings."""
+    if not isinstance(study, dict):
+        raise ValueError("The 3D study settings must be an object.")
+    mode = study.get("frequency_mode", "single")
+    if mode not in {"single", "points", "range"}:
+        raise ValueError("Choose a single frequency, explicit points or a range.")
+
+    def positive_frequency(value, label):
+        if isinstance(value, bool):
+            raise ValueError(f"{label} must be greater than 0 and no more than 1e9 Hz.")
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(f"{label} must be a numeric frequency in Hz.") from error
+        if not math.isfinite(number) or not 0 < number <= MAX_3D_FREQUENCY_HZ:
+            raise ValueError(f"{label} must be greater than 0 and no more than 1e9 Hz.")
+        return number
+
+    if mode == "single":
+        return [positive_frequency(study.get("frequency_hz", 500.0), "Study frequency")]
+
+    if mode == "points":
+        values = study.get("frequency_points_hz")
+        if not isinstance(values, (list, tuple)) or not 1 <= len(values) <= MAX_3D_STUDY_FREQUENCIES:
+            raise ValueError(
+                f"Enter between 1 and {MAX_3D_STUDY_FREQUENCIES} explicit frequency points."
+            )
+        points = [
+            positive_frequency(value, f"Frequency point {index + 1}")
+            for index, value in enumerate(values)
+        ]
+        if any(current <= previous for previous, current in zip(points, points[1:])):
+            raise ValueError("Explicit frequency points must be unique and in ascending order.")
+        return points
+
+    try:
+        raw_start = study.get("frequency_start_hz", 500.0)
+        raw_end = study.get("frequency_end_hz", 1000.0)
+        raw_step = study.get("frequency_step_hz", 500.0)
+        if any(isinstance(value, bool) for value in (raw_start, raw_end, raw_step)):
+            raise InvalidOperation
+        start = Decimal(str(raw_start))
+        end = Decimal(str(raw_end))
+        step = Decimal(str(raw_step))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError("Range start, end and step must be numeric frequencies in Hz.") from error
+    if not all(value.is_finite() for value in (start, end, step)):
+        raise ValueError("Range start, end and step must be finite.")
+    if start <= 0 or end <= 0 or step <= 0 or max(start, end) > Decimal("1e9"):
+        raise ValueError("Range frequencies must be greater than 0 and no more than 1e9 Hz.")
+    if end < start:
+        raise ValueError("Range end frequency must be greater than or equal to its start.")
+    intervals = (end - start) / step
+    if intervals != intervals.to_integral_value():
+        raise ValueError("Range end must fall exactly on a frequency step.")
+    if intervals > Decimal(MAX_3D_STUDY_FREQUENCIES - 1):
+        raise ValueError(
+            f"A 3D study can contain at most {MAX_3D_STUDY_FREQUENCIES} frequency points."
+        )
+    count = int(intervals) + 1
+    points = [float(start + step * index) for index in range(count)]
+    if not all(math.isfinite(value) and value > 0 for value in points):
+        raise ValueError("Range frequencies must be representable as positive finite Hz values.")
+    return points
 
 
 def _validate_optional_phasor(selection, amplitude_key, phase_key, label, *, limit):
@@ -720,7 +795,8 @@ def domain_material_overrides(geometry, *, require_stable_tags=False):
 def validate_3d_project(project, assets):
     if not isinstance(project, dict) or project.get("schema") != PROJECT_SCHEMA:
         raise ValueError("This is not a MagMechSim 3D project.")
-    if project.get("version") != PROJECT_VERSION:
+    project_version = project.get("version")
+    if isinstance(project_version, bool) or project_version not in {1, PROJECT_VERSION}:
         raise ValueError(f"Unsupported MagMechSim 3D project version: {project.get('version')}.")
     geometries = project.get("geometries")
     trace_sets = project.get("wire_trace_sets")
@@ -748,9 +824,16 @@ def validate_3d_project(project, assets):
         if polynomial_order not in {1, 2, 3, 4}:
             raise ValueError("Polynomial order must be between 1 and 4.")
         if harmonic:
-            frequency_hz = float(study.get("frequency_hz", 500.0))
-            if not math.isfinite(frequency_hz) or not 0 < frequency_hz <= 1e9:
-                raise ValueError("Frequency must be greater than 0 and no more than 1e9 Hz.")
+            frequency_mode = study.get("frequency_mode", "single")
+            frequencies_hz = study_frequency_points_hz(study)
+            study["frequency_mode"] = frequency_mode
+            if frequency_mode == "single":
+                frequency_hz = frequencies_hz[0]
+            elif frequency_mode == "points":
+                study["frequency_points_hz"] = frequencies_hz
+            else:
+                for key in ("frequency_start_hz", "frequency_end_hz", "frequency_step_hz"):
+                    study[key] = float(study[key])
         if electromagnetic:
             air_padding = float(study.get("air_padding", 2.0))
             if not math.isfinite(air_padding) or not 0.25 <= air_padding <= 20:
@@ -788,6 +871,7 @@ def validate_3d_project(project, assets):
     except (TypeError, ValueError, OverflowError) as error:
         raise ValueError(f"Invalid 3D study settings: {error}") from error
     study["physics"] = physics
+    project["version"] = PROJECT_VERSION
     study["polynomial_order"] = polynomial_order
     if physics in {"harmonic_em", "coupled_magneto_mechanical"}:
         study["em_source_mode"] = em_source_mode
@@ -795,7 +879,7 @@ def validate_3d_project(project, assets):
         study["air_padding"] = air_padding
     if uses_dc:
         study["dc_background_field_t"] = dc_background_field
-    if harmonic:
+    if harmonic and study.get("frequency_mode", "single") == "single":
         study["frequency_hz"] = frequency_hz
     if mechanical:
         study["mechanical_body_force_n_m3"] = body_force

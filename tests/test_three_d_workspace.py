@@ -1378,6 +1378,52 @@ def test_coupled_study_editor_exposes_commit_validated_convergence_controls(monk
     workspace._update_study_controls()
     assert workspace._run_study_button.ui_disable is True
 
+
+def test_3d_study_editor_configures_and_persists_frequency_sweeps(monkeypatch):
+    workspace, _geometry = _workspace_with_test_mesh(monkeypatch)
+    workspace.select_item("study")
+
+    assert workspace._set_frequency_mode(SimpleNamespace(value="points")) is True
+    assert workspace.project["study"]["frequency_points_hz"] == [500.0]
+    assert workspace._set_frequency_points(SimpleNamespace(value="50, 100, 250")) is True
+    controls = {
+        getattr(child, "ui_label", None): child
+        for child in workspace._properties.ui_children
+    }
+    assert controls["Frequency definition"].ui_model_value == "points"
+    assert controls["Frequency points (Hz)"].ui_model_value == "50, 100, 250"
+    assert any(
+        "3 frequency points · 50, 100, 250 Hz" in str(getattr(child, "ui_children", [""])[0])
+        for child in workspace._properties.ui_children
+        if getattr(child, "ui_class", "") == "cb-muted"
+    )
+
+    previous_points = list(workspace.project["study"]["frequency_points_hz"])
+    assert workspace._set_frequency_points(SimpleNamespace(value="50, 50")) is False
+    assert workspace.project["study"]["frequency_points_hz"] == previous_points
+
+    assert workspace._set_frequency_mode(SimpleNamespace(value="range")) is True
+    assert workspace._set_frequency_range_value(
+        "frequency_start_hz", SimpleNamespace(value="100")
+    ) is True
+    assert workspace._set_frequency_range_value(
+        "frequency_end_hz", SimpleNamespace(value="200")
+    ) is True
+    assert workspace._set_frequency_range_value(
+        "frequency_step_hz", SimpleNamespace(value="50")
+    ) is True
+    assert workspace.project["study"]["frequency_start_hz"] == 100.0
+    assert workspace.project["study"]["frequency_end_hz"] == 200.0
+    assert workspace.project["study"]["frequency_step_hz"] == 50.0
+
+    reopened, _assets = unpack_3d_project(
+        package_3d_project(workspace.project, workspace.assets)
+    )
+    assert reopened["study"]["frequency_mode"] == "range"
+    assert reopened["study"]["frequency_start_hz"] == 100.0
+    assert reopened["study"]["frequency_end_hz"] == 200.0
+    assert reopened["study"]["frequency_step_hz"] == 50.0
+
 def test_invalidated_boundary_assignment_can_be_reassigned_from_current_mesh(monkeypatch):
     workspace, geometry = _workspace_with_test_mesh(monkeypatch)
     selection = {

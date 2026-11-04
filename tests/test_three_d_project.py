@@ -15,6 +15,7 @@ from ngsolve_gui.three_d_project import (
     UNASSIGNED_MATERIAL,
     package_3d_project,
     parse_wire_trace,
+    study_frequency_points_hz,
     unpack_3d_project,
     step_unit_scale,
     validate_3d_project,
@@ -26,6 +27,68 @@ STEP = (
     b"#1=(LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.));\n"
     b"ENDSEC;\nEND-ISO-10303-21;\n"
 )
+
+
+def test_frequency_definitions_resolve_single_points_and_even_ranges():
+    project = new_3d_project()
+    study = project["study"]
+
+    assert study_frequency_points_hz(study) == [500.0]
+    study.update(frequency_mode="points", frequency_points_hz=[25, 50, 100])
+    assert study_frequency_points_hz(study) == [25.0, 50.0, 100.0]
+    study.update(
+        frequency_mode="range",
+        frequency_start_hz=20,
+        frequency_end_hz=100,
+        frequency_step_hz=20,
+    )
+    assert study_frequency_points_hz(study) == [20.0, 40.0, 60.0, 80.0, 100.0]
+
+
+@pytest.mark.parametrize(("mode", "values", "message"), [
+    ("points", [50, 50], "unique and in ascending order"),
+    ("points", [100, 50], "unique and in ascending order"),
+    ("points", [0], "greater than 0"),
+    ("range", {"frequency_start_hz": 50, "frequency_end_hz": 101, "frequency_step_hz": 25}, "fall exactly"),
+    ("range", {"frequency_start_hz": 50, "frequency_end_hz": 10, "frequency_step_hz": 5}, "greater than or equal"),
+    ("range", {"frequency_start_hz": 1, "frequency_end_hz": 100, "frequency_step_hz": 1}, "at most 50"),
+])
+def test_frequency_definitions_reject_invalid_or_excessive_values(mode, values, message):
+    study = new_3d_project()["study"]
+    study["frequency_mode"] = mode
+    study.update(values if isinstance(values, dict) else {"frequency_points_hz": values})
+
+    with pytest.raises(ValueError, match=message):
+        study_frequency_points_hz(study)
+
+
+def test_project_version_one_migrates_without_changing_legacy_frequency():
+    from ngsolve_gui.three_d_project import PROJECT_VERSION
+
+    project = new_3d_project("Legacy v1")
+    project["version"] = 1
+    project["study"].pop("frequency_mode")
+    project["study"]["frequency_hz"] = 123.0
+
+    validate_3d_project(project, {})
+
+    assert project["version"] == PROJECT_VERSION == 2
+    assert study_frequency_points_hz(project["study"]) == [123.0]
+
+
+def test_frequency_definition_round_trips_in_project_file():
+    project = new_3d_project("Sweep persistence")
+    project["study"].update(
+        frequency_mode="points",
+        frequency_points_hz=[25.0, 50.0, 75.0],
+    )
+
+    reopened, assets = unpack_3d_project(package_3d_project(project, {}))
+
+    assert assets == {}
+    assert reopened["version"] == 2
+    assert reopened["study"]["frequency_mode"] == "points"
+    assert study_frequency_points_hz(reopened["study"]) == [25.0, 50.0, 75.0]
 
 
 def test_step_import_does_not_assume_a_physical_material():

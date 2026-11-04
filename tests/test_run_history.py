@@ -185,3 +185,33 @@ def test_run_result_tree_keeps_nonconvergence_distinct_from_process_failure(tmp_
     assert tree["diagnostic_summary"].startswith(
         "Not converged · maximum iterations reached · diagnostic fields only · 2/2 iterations"
     )
+
+
+def test_run_result_tree_lists_each_sweep_point_status(tmp_path):
+    output = tmp_path / "sweep-run"
+    output.mkdir()
+    (output / "run_manifest.json").write_text(json.dumps({
+        "schema": "mm-fem.run",
+        "status": "complete",
+        "execution_status": "complete",
+        "scientific_status": "nonconverged",
+        "frequency_points_hz": [50.0, 100.0],
+        "frequency_points": [
+            {"index": 0, "frequency_hz": 50.0, "execution_status": "complete", "scientific_status": "converged", "iterations": 2},
+            {"index": 1, "frequency_hz": 100.0, "execution_status": "complete", "scientific_status": "nonconverged", "iterations": 12},
+        ],
+        "progress": {"completed_frequencies": 2, "total_frequencies": 2},
+        "coupling": {"maximum_iterations": 12},
+    }), encoding="utf-8")
+
+    tree = load_run_result_tree({
+        "id": "sweep-run",
+        "status": "Complete · not converged",
+        "output_path": str(output),
+    })
+
+    assert tree["scientific_status"] == "nonconverged"
+    assert tree["diagnostic_summary"] == (
+        "2/2 frequency points completed · 50 Hz: converged (2/12 iterations) · "
+        "100 Hz: not converged (12/12 iterations)"
+    )

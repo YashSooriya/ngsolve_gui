@@ -14,6 +14,8 @@ def test_study_info_section_shows_run_field_mesh_and_material_details():
         run_metadata={
             "schema": "mm-fem.run",
             "status": "complete",
+            "execution_status": "complete",
+            "scientific_status": "converged",
             "kind": "study",
             "model_name": "Copper coil",
             "physics": "time-harmonic electromagnetics",
@@ -29,7 +31,8 @@ def test_study_info_section_shows_run_field_mesh_and_material_details():
 
     assert rows["Model"] == "Copper coil"
     assert rows["Physics"] == "time-harmonic electromagnetics"
-    assert rows["Status"] == "Complete"
+    assert rows["Execution"] == "Complete"
+    assert rows["Numerical outcome"] == "Converged"
     assert rows["Field"] == "AC magnetic flux density [T]"
     assert rows["Frequency"] == "50 Hz"
     assert rows["FE order"] == "1"
@@ -51,6 +54,26 @@ def test_study_info_section_falls_back_to_mesh_material_names():
     )
 
     assert dict(StudyInfoSection._collect_rows(component))["Materials"] == "Steel, Air"
+
+
+def test_study_info_section_separates_execution_from_frequency_convergence():
+    component = SimpleNamespace(
+        mesh=SimpleNamespace(ne=12, nv=8, GetMaterials=lambda: []),
+        run_metadata={
+            "schema": "mm-fem.run",
+            "status": "complete",
+            "execution_status": "complete",
+            "scientific_status": "nonconverged",
+            "frequency_points_hz": [50, 100],
+        },
+        field_metadata=None,
+    )
+
+    rows = dict(StudyInfoSection._collect_rows(component))
+
+    assert rows["Execution"] == "Complete"
+    assert rows["Numerical outcome"] == "Not converged · diagnostic results only"
+    assert rows["Frequency"] == "50, 100 Hz"
 
 
 def test_study_info_section_displays_material_names_for_stable_solver_regions():

@@ -2810,6 +2810,7 @@ class NGSolveGui(App):
                 "schema": "mm-fem.run",
                 "schema_version": 1,
                 "status": "running",
+                "execution_status": "running",
                 "kind": "study",
                 "created_utc": _datetime.now(_timezone.utc).isoformat(),
                 "model_archive": model_path.name,
@@ -2823,8 +2824,25 @@ class NGSolveGui(App):
                     "native_crash_log": "native_crash.log",
                 },
             }
+            if setup["frequency_points_hz"]:
+                manifest["frequency_points_hz"] = setup["frequency_points_hz"]
+                manifest["frequency_points"] = [
+                    {
+                        "index": index,
+                        "frequency_hz": value,
+                        "execution_status": "pending",
+                        "scientific_status": "pending",
+                    }
+                    for index, value in enumerate(setup["frequency_points_hz"])
+                ]
+                manifest["progress"] = {
+                    "completed_frequencies": 0,
+                    "total_frequencies": len(setup["frequency_points_hz"]),
+                    "current_frequency_index": None,
+                }
+                if len(setup["frequency_points_hz"]) == 1:
+                    manifest["frequency_hz"] = setup["frequency_points_hz"][0]
             if setup["physics"] == "harmonic_em":
-                manifest["frequency_hz"] = setup["frequency_hz"]
                 manifest["air_padding"] = setup["air_padding"]
             elif setup["physics"] == "magnetostatic_dc":
                 manifest["air_padding"] = setup["air_padding"]
@@ -2850,8 +2868,8 @@ class NGSolveGui(App):
         self._set_application_menu_context(True)
         workspace._update_study_controls()
         run_description = (
-            f"{setup['frequency_hz']:g} Hz "
-            if setup["frequency_hz"] is not None else ""
+            ", ".join(f"{value:g}" for value in setup["frequency_points_hz"]) + " Hz "
+            if setup["frequency_points_hz"] else ""
         )
         workspace._set_status(
             f"Running {run_description}{study_label} in {output_dir}…"
@@ -2920,13 +2938,66 @@ class NGSolveGui(App):
                             if text.startswith("MM-FEM"):
                                 text = PRODUCT_NAME + text[len("MM-FEM"):]
                             self._dispatch_to_ui(workspace._set_status, text[:240])
+                        start_match = re.match(
+                            r"^FREQUENCY_START\s+index=(\d+)\s+Hz=([^\s]+)\s+total=(\d+)$",
+                            text,
+                        )
+                        if start_match:
+                            index, frequency, total = start_match.groups()
+                            self._dispatch_to_ui(
+                                workspace._set_status,
+                                f"Frequency {int(index) + 1} of {total} · {frequency} Hz · running",
+                            )
+                        checkpoint_match = re.match(
+                            r"^FREQUENCY_CHECKPOINT\s+index=(\d+)\s+Hz=([^\s]+)\s+converged=([^\s]+)\s+iterations=([^\s]+)$",
+                            text,
+                        )
+                        if checkpoint_match:
+                            index, frequency, converged, iterations = checkpoint_match.groups()
+                            point_state = (
+                                "converged" if converged.casefold() == "true"
+                                else "not converged" if converged.casefold() == "false"
+                                else "completed"
+                            )
+                            total = len(setup["frequency_points_hz"])
+                            self._dispatch_to_ui(
+                                workspace._set_status,
+                                f"Frequency {int(index) + 1} of {total} · {frequency} Hz · "
+                                f"{point_state} · {int(index) + 1}/{total} complete",
+                            )
                 return_code = process.wait()
                 manifest = self._read_run_manifest(output_dir)
                 with self._solver_job_lock:
                     cancelled = self._solver_cancel_requested and return_code != 0
                 if cancelled:
+                    points = manifest.get("frequency_points", [])
+                    progress = manifest.get("progress", {})
+                    active_index = progress.get("current_frequency_index")
+                    if not isinstance(active_index, int) or not 0 <= active_index < len(points):
+                        active_index = next((
+                            index for index, point in enumerate(points)
+                            if point.get("execution_status") in {"running", "pending"}
+                        ), None)
+                    if active_index is not None:
+                        points[active_index]["execution_status"] = "cancelled"
+                    for point in points:
+                        if point.get("execution_status") == "pending":
+                            point["execution_status"] = "not_started"
+                    manifest["progress"] = {
+                        **progress,
+                        "completed_frequencies": sum(
+                            point.get("execution_status") == "complete" for point in points
+                        ),
+                        "current_frequency_index": None,
+                    }
                     manifest.update({
                         "status": "cancelled",
+                        "execution_status": "cancelled",
+                        "scientific_status": (
+                            "partial" if any(
+                                point.get("execution_status") == "complete" for point in points
+                            ) else "unavailable"
+                        ),
                         "finished_utc": _datetime.now(_timezone.utc).isoformat(),
                     })
                     self._write_run_manifest(output_dir, manifest)
@@ -2938,40 +3009,49 @@ class NGSolveGui(App):
                     detail = manifest.get("error") or _solver_process_failure_detail(return_code)
                     manifest.update({
                         "status": "failed",
+                        "execution_status": "failed",
+                        "scientific_status": (
+                            "partial" if any(
+                                point.get("execution_status") == "complete"
+                                for point in manifest.get("frequency_points", [])
+                            ) else "unavailable"
+                        ),
                         "error": detail,
                         "finished_utc": _datetime.now(_timezone.utc).isoformat(),
                     })
                     self._write_run_manifest(output_dir, manifest)
                     raise RuntimeError(detail)
-                elif manifest.get("status") == "nonconverged":
+                elif manifest.get("scientific_status") == "nonconverged":
                     manifest.update({
+                        "status": "complete",
+                        "execution_status": "complete",
                         "run_name": run_name,
                         "solver_log": "solver.log",
                     })
                     self._write_run_manifest(output_dir, manifest)
                     self._dispatch_to_ui(workspace._set_dc_background_run_state, manifest)
-                    coupling = manifest.get("coupling_convergence", {})
-                    points = coupling.get("frequencies", [])
-                    point = points[0] if points else {}
-                    detail = (
-                        f" after {point['iterations']} iterations "
-                        f"(A residual {point['residual_A']:.3g}, "
-                        f"displacement residual {point['residual_u']:.3g})"
-                        if {"iterations", "residual_A", "residual_u"} <= point.keys()
-                        else ""
+                    points = manifest.get("frequency_points", [])
+                    failed_points = [
+                        point for point in points
+                        if point.get("scientific_status") == "nonconverged"
+                    ]
+                    failed_hz = ", ".join(
+                        f"{point['frequency_hz']:g}" for point in failed_points
                     )
+                    detail = f" at {failed_hz} Hz" if failed_hz else ""
                     status_message = (
-                        f"Coupled study did not converge{detail}. "
-                        f"Diagnostic fields were saved to {output_dir}"
+                        f"Execution complete · {len(failed_points)} of {len(points)} frequency points "
+                        f"did not converge{detail}. Saved fields are diagnostic only at {output_dir}"
                     )
                     dc_detail = dc_background_detail(manifest)
                     if dc_detail:
                         status_message += f" · {dc_detail}"
                     self._dispatch_to_ui(
-                        lambda: workspace._set_status(status_message, error=True)
+                        lambda: workspace._set_status(status_message)
                     )
                     self._dispatch_to_ui(lambda: self._notify(
-                        f"3D {study_label} did not converge{detail}. Results are marked diagnostic only.",
+                        f"3D {study_label}: {len(failed_points)} frequency points did not converge. "
+                        "Results are marked diagnostic only.",
                         type="warning",
                         timeout=9000,
                     ))
@@ -2982,6 +3062,7 @@ class NGSolveGui(App):
                         raise RuntimeError("The solver finished without exporting any GUI fields.")
                     manifest.update({
                         "status": "complete",
+                        "execution_status": "complete",
                         "finished_utc": _datetime.now(_timezone.utc).isoformat(),
                         "solver_log": "solver.log",
                     })
@@ -3010,6 +3091,13 @@ class NGSolveGui(App):
                 manifest = self._read_run_manifest(output_dir)
                 manifest.update({
                     "status": "failed",
+                    "execution_status": "failed",
+                    "scientific_status": (
+                        "partial" if any(
+                            point.get("execution_status") == "complete"
+                            for point in manifest.get("frequency_points", [])
+                        ) else "unavailable"
+                    ),
                     "error": f"{type(error).__name__}: {error}",
                     "finished_utc": _datetime.now(_timezone.utc).isoformat(),
                     "solver_log": "solver.log",
@@ -3029,6 +3117,7 @@ class NGSolveGui(App):
                         manifest = self._read_run_manifest(output_dir)
                         manifest.update({
                             "status": "failed",
+                            "execution_status": "failed",
                             "error": "Solver child process remained alive after terminate and kill.",
                             "process_cleanup_error": "Child process could not be reaped.",
                             "finished_utc": _datetime.now(_timezone.utc).isoformat(),

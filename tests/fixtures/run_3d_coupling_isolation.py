@@ -113,7 +113,11 @@ def main():
             compute_stress_strain=False,
             compute_energy=False,
             prevMechSol=False,
-            Nfixpoint=30,
+            # The rotated background-field case is more strongly coupled and
+            # did not consistently meet the same 1e-5 fixed-point tolerance
+            # within 30 iterations on this 79-element fixture. Keep the strict
+            # tolerance and give this bounded diagnostic run room to converge.
+            Nfixpoint=100,
             fp_tol=1e-5,
             noconv_cont=True,
             timeHarmonicApproach="FullyCoupled",

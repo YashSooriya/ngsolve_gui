@@ -1,9 +1,9 @@
 # MagMechSim: Forward Development Roadmap
 
-**Planning baseline:** 4 November 2026 (Phase D1 accepted; Phase D2 complete for bounded tested scope and ready for independent review)
+**Planning baseline:** 4 November 2026 (Phases D1 and D2 accepted for their verified scopes; Phase E1 active)
 **Status:** Living plan, not an immutable implementation contract  
 **Primary users:** Engineers familiar with industrial CAE tools  
-**Primary immediate scope:** Independent review of Phase D2; do not start Phase E until D2 is accepted
+**Primary immediate scope:** Phase E1 frequency sweeps and study management
 **Out of scope for now:** New results visualisation or a post-processing redesign (but existing Solve/Results navigation must remain fully functional)
 
 ## 1. Product objective and working agreement
@@ -20,7 +20,7 @@ MagMechSim should provide a complete, reliable and responsive workflow from geom
 
 The bullets below retain historical baseline evidence where useful. The accepted Phase A closeout and completed Phase B1/B2/C statuses below supersede earlier open/blank/recovery findings.
 
-**Latest verified status (4 November 2026):** Phase A remains accepted for its tested workloads; B1, B2, C and D1 are complete for their documented scopes. Phase D2 adds bounded two-way-coupling, complex-input, analytical-mechanics and h/p manufactured-solution evidence; fixes run-history visibility; and passes the packaged Windows workflow for converged/nonconverged execution and save/reopen. No numerical algorithms or solver dependencies changed. The tested package is `0.2.8.dev291` (SHA-256 `1a3ab51e3dda325839590b17ebed153bffd33d59e7906e0f7557a36812966c87`), built from GUI `8b8adf4dac6824238a0d2df7130774309ca1ccca` and solver/native package `38a6b1f550a26ac9c93b15806fad614e72acca43`. The newest-full-app launcher targets this package; its fresh-profile launch-to-home observation was 10.453 s on the SSD-migrated VM and is not a controlled code-only comparison. Phase D1 was accepted for its tested scope. Phase D2 is complete for the bounded tested scope and awaits independent review; do not start Phase E until it is accepted. The D2 report is [`docs/reviews/2026-11-04-phase-d2.md`](reviews/2026-11-04-phase-d2.md). Prior reports: [`docs/reviews/2026-11-04-phase-d1.md`](reviews/2026-11-04-phase-d1.md), [`docs/reviews/2026-11-03-phase-a-closeout.md`](reviews/2026-11-03-phase-a-closeout.md), [`docs/reviews/2026-11-03-phase-b1.md`](reviews/2026-11-03-phase-b1.md), [`docs/reviews/2026-11-03-phase-b2.md`](reviews/2026-11-03-phase-b2.md), and [`docs/reviews/2026-11-03-phase-c.md`](reviews/2026-11-03-phase-c.md).
+**Latest verified status (4 November 2026):** Phase A remains accepted for its tested workloads; B1, B2, C, D1 and D2 are accepted for their documented scopes. Phase D2 added bounded two-way-coupling, complex-input, analytical-mechanics and h/p manufactured-solution evidence; improved run-history visibility; and passed the packaged Windows workflow for converged/nonconverged execution and save/reopen. No numerical algorithms or solver dependencies changed. The tested package is `0.2.8.dev291` (SHA-256 `1a3ab51e3dda325839590b17ebed153bffd33d59e7906e0f7557a36812966c87`), built from GUI `8b8adf4dac6824238a0d2df7130774309ca1ccca` and solver/native package `38a6b1f550a26ac9c93b15806fad614e72acca43`. The newest-full-app launcher targets this package; its fresh-profile launch-to-home observation was 10.453 s on the SSD-migrated VM and is not a controlled code-only comparison. Phase E1 is now active. D2 evidence remains in [`docs/reviews/2026-11-04-phase-d2.md`](reviews/2026-11-04-phase-d2.md). Prior reports: [`docs/reviews/2026-11-04-phase-d1.md`](reviews/2026-11-04-phase-d1.md), [`docs/reviews/2026-11-03-phase-a-closeout.md`](reviews/2026-11-03-phase-a-closeout.md), [`docs/reviews/2026-11-03-phase-b1.md`](reviews/2026-11-03-phase-b1.md), [`docs/reviews/2026-11-03-phase-b2.md`](reviews/2026-11-03-phase-b2.md), and [`docs/reviews/2026-11-03-phase-c.md`](reviews/2026-11-03-phase-c.md).
 
 - The saved `Getting started - coupled coil` project rendered its square and circle regions in the first geometry-editor screenshot. The sketch grid filled the viewport at maximized and restored sizes with correct physical scaling. The earlier single blank capture was not reproduced; its cause remains unknown.
 - The axisymmetric geometry-creation 3D preview rendered both regions using Plotly WebGL. 3D STEP import, a 22,132-element bounded mesh, repeated native CAD selection, display switching, rotation and selection persistence all passed. The historical OOM did not reproduce; the test covered only three bounded cycles, so larger and longer sessions remain a risk.
@@ -238,7 +238,7 @@ One fresh packaged launch produced a white native frame at the first screenshot 
 
 Phase D1 connected the saved DC background, harmonic electromagnetic and mechanical response through the existing 3D block Gauss-Seidel sequence. The GUI now configures one supported coupled analysis, computes or reuses only a matching DC field, and reports convergence distinctly from process completion. The D1 implementation retained the existing solver and passed the bounded verification recorded below. Phase D2 is the next workflow and verification refinement after independent review; ROM and unrelated physics controls remain outside Phase D.
 
-### Phase D. Fully coupled 3D magneto-mechanical harmonic analysis (D1 accepted; D2 pending review)
+### Phase D. Fully coupled 3D magneto-mechanical harmonic analysis (D1 and D2 accepted for tested scope)
 
 **Outcome:** Engineers can configure and execute the existing supported coupled model through the GUI, with understandable convergence/solver feedback.
 
@@ -250,11 +250,11 @@ Phase D1 connected the saved DC background, harmonic electromagnetic and mechani
 
 **D1 status (4 November 2026):** Accepted for the tested scope. The existing 3D block Gauss-Seidel/Anderson method was retained. The GUI runner computes a DC field when needed or reuses a field only after its mesh, polynomial order and DC input fingerprint validate; it passes H(div) coefficients into the existing space and records converged and nonconverged outcomes distinctly. Phase D2 strengthened this with bounded coupling-isolation, phase/magnitude, analytical mechanics, mesh/order, persistence, failure and packaged desktop evidence. Details and limits are in the [D1 report](reviews/2026-11-04-phase-d1.md) and [D2 report](reviews/2026-11-04-phase-d2.md).
 
-#### Phase D2. Coupled workflow, diagnostics and verification refinement (complete for bounded tested scope; pending review)
+#### Phase D2. Coupled workflow, diagnostics and verification refinement (accepted for bounded tested scope; 4 November 2026)
 
 Completed: refined run-history diagnostics, bounded independent coupled-response and mesh/order evidence, and verified DC reuse/invalidation, convergence outcomes, and persistence. No solver equations were changed. Frequency sweeps remain deferred until the supported backend path and its verification are established.
 
-**Gate:** Complete for tested scope. The evidence and known limitations are recorded in the [Phase D2 closeout report](reviews/2026-11-04-phase-d2.md). Independent review remains; Phase E must not begin before acceptance.
+**Gate:** Accepted for tested scope. The evidence and known limitations are recorded in the [Phase D2 closeout report](reviews/2026-11-04-phase-d2.md).
 
 ### Phase E. ROM, study flexibility and advanced numerical settings
 
@@ -265,6 +265,12 @@ Completed: refined run-history diagnostics, bounded independent coupled-response
 - Extend time-integration and other study variants **only after** the relevant backend and project state are demonstrably ready, with appropriate controls and verification. Unsupported combinations remain unavailable.
 
 **Gate:** Each new method has an executable GUI-to-backend example, state persistence, numerical reference and error handling.
+
+#### Phase E1. Harmonic frequency sweeps and study management (active; 4 November 2026)
+
+Expose the existing 3D multi-frequency solver through the Study properties, preserving single-frequency project compatibility and mechanics-only studies. Validate single, explicit-point and evenly divisible start/end/step definitions with a bounded maximum point count. Record execution and scientific status independently per frequency, support cancellation and retain completed-point diagnostics where available. Verify sweep output against the equivalent individual-frequency solves for supported 3D modes and preserve exact DC-background compatibility/reuse for coupled runs. Clarify execution versus convergence in run history and result metadata. Keep ROM and new post-processing visualisation outside this milestone.
+
+The user-retired CPU-only 2D field viewer must remain removed. WebGPU availability is a separate environment constraint: the preferred route for the current guest is a supported host/GPU-PV configuration exposing a D3D12 adapter; a real interactive 3D WebGL results renderer is the future fallback if a supported WebGPU device cannot be provided. Do not use a flat 2D viewer as a substitute.
 
 ### Phase F. Axisymmetric and 3D UX unification, without loss of specialist capabilities
 
@@ -312,12 +318,12 @@ Phase C: 3D DC background-field study — complete for tested scope
 Phase D1: 3D coupled solver integration — accepted for tested scope
                       |
                       v
-Phase D2: coupled workflow and verification refinement — complete for bounded scope; review now
+Phase D2: coupled workflow and verification refinement — accepted for tested scope
                       |
                       v
                       |
                       v
-            ROM / studies / advanced options (Phase E)
+            Frequency sweeps and study management (Phase E1)
 
 Shared UX unification (Phase F) continues in small compatible increments.
 Local Sphinx access starts NOW; comprehensive docs and 5-result search follow in Phase G.
@@ -360,4 +366,4 @@ Release, packaging and comprehensive quality gates occur throughout, with final 
 
 Suggested repository home for this plan: a documented planning location under the GUI repository, chosen by Codex after inspecting existing conventions. Keep this file as the **single current roadmap**, with date, completed milestones, changed priorities and links to implementation reports. Historical roadmaps may remain archived but should not conflict with the current one.
 
-**Current action (4 November 2026):** Phase A remains accepted for its tested workloads; historical Chromium memory growth is monitored. Phases B1, B2, C and D1 are complete for their documented scopes; D1 was accepted. Phase D2 is complete for its bounded tested scope and awaits independent review; see [`docs/reviews/2026-11-04-phase-d2.md`](reviews/2026-11-04-phase-d2.md). Do not start Phase E until D2 is accepted. Keep requiring the packaged Win32 desktop harness, maximized full-desktop screenshots and newest-full-app launcher smoke in every milestone. Retired CPU-only 2D viewer: removed; do not use/reintroduce it. WebGPU/VirtualBox limitation and the supported D3D12 host/GPU-PV path are captured in the report and risk register.
+**Current action (4 November 2026):** Phases A, B1, B2, C, D1 and D2 are accepted for their documented scopes; Phase E1 frequency-sweep study management is active. Keep requiring the packaged Win32 desktop harness, maximized full-desktop screenshots and newest-full-app launcher smoke in every milestone. The CPU-only 2D field viewer is retired and must stay removed. WebGPU requires a supported D3D12-capable host/GPU-PV environment; any future fallback must be a real interactive 3D renderer, never a flat field view. Record E1 progress and final evidence in this single roadmap.

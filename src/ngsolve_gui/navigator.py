@@ -317,13 +317,17 @@ class Navigator(Div):
             collapsed = self._run_collapsed.get(run_id, True) and not (
                 query and matching_results and not run_matches
             )
-            icon = {
-                "Complete": "mdi-check-circle-outline",
-                "Nonconverged": "mdi-alert-outline",
-                "Failed": "mdi-alert-circle-outline",
-                "Cancelled": "mdi-stop-circle-outline",
-                "Interrupted": "mdi-progress-alert",
-            }.get(str(run.get("status", "")).title(), "mdi-progress-clock")
+            run_status = str(run.get("status", ""))
+            icon = (
+                "mdi-alert-outline" if "not converged" in run_status.casefold()
+                else {
+                    "Complete": "mdi-check-circle-outline",
+                    "Nonconverged": "mdi-alert-outline",
+                    "Failed": "mdi-alert-circle-outline",
+                    "Cancelled": "mdi-stop-circle-outline",
+                    "Interrupted": "mdi-progress-alert",
+                }.get(run_status.title(), "mdi-progress-clock")
+            )
             caret = "mdi-chevron-right" if collapsed else "mdi-chevron-down"
             run_label = str(run.get("name") or "Saved run")
             status = str(run.get("status") or "Unknown")

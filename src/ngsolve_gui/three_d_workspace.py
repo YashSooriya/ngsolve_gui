@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -38,6 +39,7 @@ from .three_d_project import (
     snapshot_material,
     update_material_references,
     step_unit_scale,
+    study_frequency_points_hz,
     _LEGACY_DOMAIN_SELECTION_ERROR,
     unpack_3d_project,
     validate_3d_project,
@@ -1084,6 +1086,98 @@ class ThreeDWorkspace(Div):
         self._mark_changed()
         self._set_status("3D study settings updated.")
         return True
+
+    def _set_frequency_mode(self, event):
+        study = self.project.setdefault("study", {})
+        value = str(getattr(event, "value", event) or "")
+        if value not in {"single", "points", "range"}:
+            self._set_status("Choose a single frequency, explicit points or a range.", error=True)
+            return False
+        old_mode = study.get("frequency_mode", "single")
+        old_points = study.get("frequency_points_hz", [])
+        study["frequency_mode"] = value
+        if value == "points" and not old_points:
+            study["frequency_points_hz"] = [float(study.get("frequency_hz", 500.0))]
+        try:
+            validate_3d_project(self.project, self.assets)
+        except (TypeError, ValueError, OverflowError) as error:
+            study["frequency_mode"] = old_mode
+            study["frequency_points_hz"] = old_points
+            self._set_status(str(error), error=True)
+            self._rebuild_properties()
+            return False
+        self._mark_changed()
+        self._rebuild_properties()
+        self._set_status("Frequency definition updated.")
+        return True
+
+    def _set_frequency_points(self, event):
+        study = self.project.setdefault("study", {})
+        old_points = study.get("frequency_points_hz", [])
+        raw_value = str(getattr(event, "value", event) or "").strip()
+        try:
+            tokens = [token for token in re.split(r"[,;\s]+", raw_value) if token]
+            if not tokens:
+                raise ValueError("Enter one or more frequency points in Hz.")
+            study["frequency_points_hz"] = [float(token) for token in tokens]
+            study_frequency_points_hz(study)
+            validate_3d_project(self.project, self.assets)
+        except (TypeError, ValueError, OverflowError) as error:
+            study["frequency_points_hz"] = old_points
+            self._set_status(str(error), error=True)
+            self._rebuild_properties()
+            return False
+        self._mark_changed()
+        self._rebuild_properties()
+        self._set_status("Frequency points updated.")
+        return True
+
+    def _set_frequency_range_value(self, key, event):
+        study = self.project.setdefault("study", {})
+        old_value = study.get(key)
+        value = getattr(event, "value", event)
+        try:
+            value = float(value)
+            if not math.isfinite(value) or not 0 < value <= 1e9:
+                raise ValueError("Range frequencies must be greater than 0 and no more than 1e9 Hz.")
+        except (TypeError, ValueError, OverflowError) as error:
+            self._set_status(str(error), error=True)
+            self._rebuild_properties()
+            return False
+        study[key] = value
+        self._mark_changed()
+        try:
+            study_frequency_points_hz(study)
+        except ValueError as error:
+            # A range is edited in three controls; allow temporary intermediate
+            # states, but the resolved point list and Run command remain gated
+            # by the full project validator.
+            self._set_status(str(error), error=True)
+        else:
+            self._set_status("Frequency range updated.")
+        self._rebuild_properties()
+        return True
+
+    def _frequency_points_summary(self, study):
+        try:
+            points = study_frequency_points_hz(study)
+        except (TypeError, ValueError, OverflowError) as error:
+            return Div(
+                str(error),
+                ui_style="font-size:10px; line-height:1.35; color:var(--negative); overflow-wrap:anywhere;",
+            )
+        if len(points) <= 10:
+            value = ", ".join(f"{point:g}" for point in points) + " Hz"
+        else:
+            value = (
+                f"{points[0]:g}, {points[1]:g}, {points[2]:g}, …, "
+                f"{points[-2]:g}, {points[-1]:g} Hz"
+            )
+        return Div(
+            f"{len(points)} frequency point{'s' if len(points) != 1 else ''} · {value}",
+            ui_class="cb-muted",
+            ui_style="font-size:10px; line-height:1.35; overflow-wrap:anywhere;",
+        )
 
     def _set_study_physics(self, event):
         value = str(getattr(event, "value", event) or "")
@@ -3760,11 +3854,54 @@ class ThreeDWorkspace(Div):
                     ],
                 ),
                 *([] if physics == "magnetostatic_dc" else [
-                    _input(
-                        "Frequency (Hz)", study.get("frequency_hz", 500.0),
-                        lambda event: self._set_study_value("frequency_hz", event, number=True),
-                        number=True, width="100%",
+                    self._select_options(
+                        "Frequency definition",
+                        study.get("frequency_mode", "single"),
+                        self._set_frequency_mode,
+                        [
+                            {"label": "Single point", "value": "single"},
+                            {"label": "Explicit points", "value": "points"},
+                            {"label": "Range", "value": "range"},
+                        ],
                     ),
+                    *(
+                        [_input(
+                            "Frequency (Hz)", study.get("frequency_hz", 500.0),
+                            lambda event: self._set_study_value("frequency_hz", event, number=True),
+                            number=True, width="100%",
+                        )]
+                        if study.get("frequency_mode", "single") == "single"
+                        else [
+                            _input(
+                                "Frequency points (Hz)",
+                                ", ".join(
+                                    f"{float(value):g}"
+                                    for value in study.get("frequency_points_hz", [])
+                                ),
+                                self._set_frequency_points,
+                                width="100%",
+                            )
+                        ]
+                        if study.get("frequency_mode", "single") == "points"
+                        else [
+                            _input(
+                                "Start (Hz)", study.get("frequency_start_hz", 500.0),
+                                lambda event: self._set_frequency_range_value("frequency_start_hz", event),
+                                number=True, width="100%",
+                            ),
+                            _input(
+                                "End (Hz)", study.get("frequency_end_hz", 1000.0),
+                                lambda event: self._set_frequency_range_value("frequency_end_hz", event),
+                                number=True, width="100%",
+                            ),
+                            _input(
+                                "Step (Hz)", study.get("frequency_step_hz", 500.0),
+                                lambda event: self._set_frequency_range_value("frequency_step_hz", event),
+                                number=True, width="100%",
+                            ),
+                        ]
+                    ),
+                    self._frequency_points_summary(study),
                 ]),
                 self._select_options(
                     "Finite-element order", study.get("polynomial_order", 1),

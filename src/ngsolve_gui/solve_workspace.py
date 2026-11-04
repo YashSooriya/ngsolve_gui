@@ -235,9 +235,21 @@ def _load_saved_run_history(root=None, limit=40):
             manifest = None
         if isinstance(manifest, dict) and manifest.get("schema") == "mm-fem.run":
             kind = str(manifest.get("kind", "study")).title()
-            status = str(manifest.get("status", "complete")).title()
+            execution_status = str(
+                manifest.get("execution_status", manifest.get("status", "complete"))
+            ).casefold()
+            status = execution_status.replace("_", " ").title()
             if status == "Running":
                 status = "Interrupted"
+            scientific_status = str(manifest.get("scientific_status", "")).casefold()
+            if status == "Complete" and scientific_status == "nonconverged":
+                status = "Complete · not converged"
+            try:
+                from .run_history import _diagnostic_summary
+
+                diagnostic_summary = _diagnostic_summary(manifest)
+            except (TypeError, ValueError, OverflowError):
+                diagnostic_summary = None
             name = str(manifest.get("run_name") or f"{kind}: {manifest.get('model_name', directory.name)}")
             finished = str(manifest.get("finished_utc") or manifest.get("created_utc") or "")
         else:
@@ -257,6 +269,12 @@ def _load_saved_run_history(root=None, limit=40):
             "status": status,
             "finished": finished,
             "output_path": str(directory),
+            **({
+                "scientific_status": manifest.get("scientific_status"),
+                "diagnostic_summary": diagnostic_summary,
+            } if isinstance(manifest, dict) and (
+                diagnostic_summary or manifest.get("scientific_status")
+            ) else {}),
         })
     return runs
 
@@ -11080,7 +11098,10 @@ class SolveWorkspace(Div):
             status = run.get("status", "Complete")
             status_color = (
                 "var(--negative)" if status == "Failed"
-                else "var(--warning)" if status in {"Cancelled", "Interrupted"}
+                else "var(--warning)" if (
+                    status in {"Cancelled", "Interrupted"}
+                    or "not converged" in str(status).casefold()
+                )
                 else "var(--positive)"
             )
             children.append(Div(
@@ -11090,6 +11111,10 @@ class SolveWorkspace(Div):
                     ui_style="display:flex; justify-content:space-between; gap:8px;",
                 ),
                 Div(run["finished"], ui_style="font-size:10px; color:var(--fg-muted); margin-top:4px;"),
+                *([Div(
+                    str(run["diagnostic_summary"]),
+                    ui_style="font-size:10px; line-height:1.35; color:var(--fg-muted); margin-top:4px; overflow-wrap:anywhere;",
+                )] if run.get("diagnostic_summary") else []),
                 Div(run["output_path"], ui_style="font-size:10px; line-height:1.35; color:var(--fg-muted); overflow-wrap:anywhere; margin-top:4px;"),
                 ui_style="padding:9px; border:1px solid var(--border); border-radius:6px;",
             ))

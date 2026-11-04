@@ -18,6 +18,7 @@ from .three_d_project import (
     build_wire_trace_sets,
     domain_material_overrides,
     domain_mesh_size_overrides,
+    study_frequency_points_hz,
     step_geometry_tags,
 )
 
@@ -376,8 +377,11 @@ def validate_3d_study_setup(project):
         mechanical = physics in {"harmonic_mechanical"} or coupled
         dc = physics in {"magnetostatic_dc"} or coupled
         em_source_mode = study.get("em_source_mode", "wire_trace")
+        frequency_points_hz = study_frequency_points_hz(study) if harmonic else []
         frequency_hz = (
-            float(study.get("frequency_hz", 500.0)) if harmonic else None
+            frequency_points_hz[0]
+            if harmonic and study.get("frequency_mode", "single") == "single"
+            else None
         )
         air_padding = (
             float(study.get("air_padding", 2.0)) if electromagnetic else None
@@ -399,8 +403,6 @@ def validate_3d_study_setup(project):
         raise ValueError(f"Invalid 3D study settings: {error}") from error
     if physics not in SUPPORTED_3D_STUDIES:
         raise ValueError("Choose a supported 3D study.")
-    if harmonic and (not math.isfinite(frequency_hz) or frequency_hz <= 0):
-        raise ValueError("The study frequency must be positive and finite.")
     if harmonic_em and em_source_mode not in SUPPORTED_3D_EM_SOURCE_MODES:
         raise ValueError("Choose a supported 3D electromagnetic excitation source.")
     if polynomial_order not in {1, 2, 3, 4}:
@@ -594,6 +596,8 @@ def validate_3d_study_setup(project):
         "physics": physics,
         "em_source_mode": em_source_mode if harmonic_em else None,
         "frequency_hz": frequency_hz,
+        "frequency_points_hz": frequency_points_hz,
+        "frequency_mode": study.get("frequency_mode", "single") if harmonic else None,
         "polynomial_order": polynomial_order,
         "air_padding": air_padding,
         "dc_background_field_t": dc_background_field,
@@ -707,6 +711,7 @@ def build_3d_study_problem(project, asset_paths):
     harmonic_em = physics in {"harmonic_em"} or coupled
     mechanical = physics in {"harmonic_mechanical"} or coupled
     frequency_hz = validated["frequency_hz"]
+    frequency_points_hz = validated["frequency_points_hz"]
     polynomial_order = validated["polynomial_order"]
     air_padding = validated["air_padding"]
     material_records = {name.casefold(): {"name": name, "properties": {
@@ -1003,10 +1008,9 @@ def build_3d_study_problem(project, asset_paths):
         "sigmaG": 0.3,
         "layer_tot_max": 0.0,
         "temp_disc": "static" if magnetostatic else "time_harmonic",
-        # The 3D harmonic driver consumes angular frequencies from the problem
-        # dictionary (it does not infer one from the GUI metadata).  Keep the
-        # single configured study frequency explicit at the solver boundary.
-        **({"omega": [2.0 * math.pi * frequency_hz]} if frequency_hz is not None else {}),
+        # The backend already iterates over this vector in one discretisation;
+        # frequency-dependent forms are assembled in its per-frequency loop.
+        **({"omega": [2.0 * math.pi * value for value in frequency_points_hz]} if frequency_points_hz else {}),
         "cACCoef": int(harmonic_em),
         "kACCoef": int(harmonic_em),
         "kACCoefDC": int(uses_dc),
@@ -1090,6 +1094,7 @@ def build_3d_study_problem(project, asset_paths):
             "study_type": study_type,
             "polynomial_order": polynomial_order,
             **({"frequency_hz": frequency_hz} if frequency_hz is not None else {}),
+            **({"frequency_points_hz": list(frequency_points_hz)} if frequency_points_hz else {}),
             **({"applied_dc_background_field_t": list(dc_background)} if uses_dc else {}),
             **({
                 "mechanical_body_force_n_m3": validated["mechanical_body_force_n_m3"],
@@ -1170,6 +1175,8 @@ def build_3d_study_problem(project, asset_paths):
     return {
         "problem": problem,
         "frequency_hz": frequency_hz,
+        "frequency_points_hz": list(frequency_points_hz),
+        "frequency_mode": validated["frequency_mode"],
         "polynomial_order": polynomial_order,
         "air_padding": air_padding,
         "h_global": max(domain_maxh.values()),

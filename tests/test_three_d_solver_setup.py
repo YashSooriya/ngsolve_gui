@@ -110,6 +110,16 @@ def _run_packaged_solver_model(project, assets, tmp_path, name, *, expected_stat
     return manifest, output_dir
 
 
+def _load_snapshot_coefficients(output_dir, manifest, field_key, snapshot_index):
+    import numpy as np
+
+    marker = f"snapshot_{snapshot_index:04d}_{field_key}"
+    field_path = next(path for path in manifest["fields"] if marker in path)
+    with (output_dir / field_path).open("rb") as stream:
+        field = pickle.load(stream)
+    return np.asarray(field.vec.FV().NumPy()).copy()
+
+
 def test_study_setup_uses_project_material_snapshots_and_single_frequency():
     project = _study_project()
 
@@ -359,6 +369,8 @@ def test_coupled_builder_configures_existing_solver_for_all_three_physics(tmp_pa
     solid_key = f"_mmfem_g0_{solid_tags[0]}"
 
     assert inputs["physics"] == "coupled_magneto_mechanical"
+    assert inputs["frequency_points_hz"] == [50.0]
+    assert problem["omega"] == pytest.approx([2 * math.pi * 50.0])
     assert inputs["coupling_max_iterations"] == 12
     assert inputs["coupling_tolerance"] == pytest.approx(2e-5)
     assert problem["temp_disc"] == "time_harmonic"
@@ -371,6 +383,16 @@ def test_coupled_builder_configures_existing_solver_for_all_three_physics(tmp_pa
     assert problem["srcdictAC"][solid_key] != 0
     assert problem["Aux"]["dc_input_fingerprint_payload"]["physics"] == "magnetostatic_dc"
     assert inputs["dc_input_fingerprint_payload"]
+
+    project["study"].update(
+        frequency_mode="points",
+        frequency_points_hz=[50.0, 100.0],
+    )
+    sweep = build_3d_study_problem(project, {geometry["asset"]: step_path})
+    assert sweep["frequency_hz"] is None
+    assert sweep["frequency_points_hz"] == [50.0, 100.0]
+    assert sweep["problem"]["omega"] == pytest.approx([100 * math.pi, 200 * math.pi])
+    assert sweep["problem"]["Aux"]["frequency_points_hz"] == [50.0, 100.0]
 
 
 def test_mechanical_setup_accepts_body_force_without_electromagnetic_trace():
@@ -983,7 +1005,8 @@ def test_small_3d_solver_run_completes_with_scoped_surface_condition(tmp_path):
     materials = builtin_materials()
     project = new_3d_project("Small scoped-boundary solver check")
     project["study"].update(
-        frequency_hz=50.0,
+        frequency_mode="points",
+        frequency_points_hz=[50.0, 100.0],
         polynomial_order=1,
         air_padding=0.25,
     )
@@ -1047,7 +1070,13 @@ def test_small_3d_solver_run_completes_with_scoped_surface_condition(tmp_path):
         print(solver_output.rstrip())
     manifest = json.loads((output_dir / "run_manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "complete"
-    assert manifest["frequency_hz"] == 50.0
+    assert manifest["execution_status"] == "complete"
+    assert manifest["frequency_points_hz"] == [50.0, 100.0]
+    assert all(
+        point["execution_status"] == "complete"
+        and point["scientific_status"] == "not_applicable"
+        for point in manifest["frequency_points"]
+    )
     assert manifest["polynomial_order"] == 1
     assert 0 < manifest["mesh"]["elements"] < 50_000
     assert manifest["fields"]
@@ -1063,6 +1092,10 @@ def test_small_3d_solver_run_completes_with_scoped_surface_condition(tmp_path):
     assert math.isfinite(magnitude) and magnitude > 1e-12
 
     changed_project = copy.deepcopy(project)
+    changed_project["study"].update(
+        frequency_mode="single",
+        frequency_hz=50.0,
+    )
     changed_material = copy.deepcopy(materials[4])
     changed_material["properties"]["electrical_conductivity"] = "0"
     changed_project["materials"] = [changed_material]
@@ -1147,6 +1180,8 @@ def test_small_3d_solver_run_completes_with_scoped_surface_condition(tmp_path):
     reason=SOLVER_UNAVAILABLE_REASON,
 )
 def test_small_3d_mechanical_solver_run_exports_nonzero_displacement(tmp_path):
+    import numpy as np
+
     from netgen.occ import Box, Pnt
 
     from ngsolve_gui.three_d_mesh import generate_step_mesh
@@ -1178,7 +1213,8 @@ def test_small_3d_mechanical_solver_run_exports_nonzero_displacement(tmp_path):
     project = new_3d_project("Small mechanical support check")
     project["study"].update(
         physics="harmonic_mechanical",
-        frequency_hz=50.0,
+        frequency_mode="points",
+        frequency_points_hz=[50.0, 100.0],
         polynomial_order=1,
         mechanical_body_force_n_m3=[1e8, 0.0, 0.0],
     )
@@ -1232,18 +1268,26 @@ def test_small_3d_mechanical_solver_run_exports_nonzero_displacement(tmp_path):
     assert completed.returncode == 0, solver_output[-5000:]
     manifest = json.loads((output_dir / "run_manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "complete"
+    assert manifest["frequency_points_hz"] == [50.0, 100.0]
+    assert all(
+        point["execution_status"] == "complete"
+        and point["scientific_status"] == "not_applicable"
+        for point in manifest["frequency_points"]
+    )
     assert manifest["physics"] == "Time-harmonic mechanics"
     assert manifest["mechanical_body_force_n_m3"] == [1e8, 0.0, 0.0]
     assert "air_padding" not in manifest
-    displacement_file = next(
-        field for field in manifest["fields"] if "gfuAC" in field
-    )
-    with (output_dir / displacement_file).open("rb") as stream:
+    with (output_dir / next(
+        field for field in manifest["fields"] if "snapshot_0000_gfuAC" in field
+    )).open("rb") as stream:
         displacement = pickle.load(stream)
     displacement_values = displacement.vec.FV().NumPy()
     assert displacement_values.size > 0
     assert all(math.isfinite(float(value.real)) for value in displacement_values)
     assert float(abs(displacement_values).max()) > 0
+    second_displacement = _load_snapshot_coefficients(output_dir, manifest, "gfuAC", 1)
+    assert second_displacement.size == displacement_values.size
+    assert float(abs(second_displacement).max()) > 0
     free_dofs = displacement.space.FreeDofs()
     constrained_dofs = [
         index for index in range(displacement.space.ndof)
@@ -1251,6 +1295,20 @@ def test_small_3d_mechanical_solver_run_exports_nonzero_displacement(tmp_path):
     ]
     assert constrained_dofs, "The selected mechanical support constrained no DOFs."
     assert float(abs(displacement_values[constrained_dofs]).max()) <= 1e-12
+    for snapshot_index, frequency_hz in enumerate((50.0, 100.0)):
+        project["study"].update(frequency_mode="single", frequency_hz=frequency_hz)
+        single_manifest, single_dir = _run_packaged_solver_model(
+            project, assets, tmp_path, f"mechanical-single-{frequency_hz:g}-hz"
+        )
+        assert (single_dir / "mesh.vol").read_bytes() == (output_dir / "mesh.vol").read_bytes()
+        sweep_values = _load_snapshot_coefficients(
+            output_dir, manifest, "gfuAC", snapshot_index
+        )
+        single_values = _load_snapshot_coefficients(
+            single_dir, single_manifest, "gfuAC", 0
+        )
+        relative_l2 = np.linalg.norm(sweep_values - single_values) / np.linalg.norm(single_values)
+        assert relative_l2 < 1e-8
     print(
         f"Bounded mechanical run: {manifest['mesh']['elements']} elements, "
         f"max |u|={float(abs(displacement_values).max()):.6g} m"
@@ -1347,16 +1405,54 @@ def test_bounded_coupled_solver_uses_dc_and_reuses_only_the_matching_mesh(tmp_pa
     assert first_displacement_magnitude > 0
 
     # Frequency is harmonic-only; the exact-mesh DC state remains valid.
-    project["study"]["frequency_hz"] = 60.0
+    project["study"].update(
+        frequency_mode="points",
+        frequency_points_hz=[50.0, 60.0],
+    )
     second, second_dir = _run_packaged_solver_model(
         project, assets, tmp_path, "bounded-coupled-second"
     )
     assert second["status"] == "complete"
+    assert second["frequency_points_hz"] == [50.0, 60.0]
+    assert [point["scientific_status"] for point in second["frequency_points"]] == [
+        "converged", "converged"
+    ]
     assert second["dc_input_fingerprint"] == first["dc_input_fingerprint"]
     assert second["dc_background_field_source"] == "reused"
     assert second["dc_background_field_reuse_check"]["status"] == "reused"
     assert Path(second["dc_background_field_reused_from"]).resolve() == first_dir.resolve()
     assert second["mesh"]["elements"] == first["mesh"]["elements"]
+    def assert_within_coupling_tolerance(reference, candidate):
+        relative_l2 = np.linalg.norm(candidate - reference) / np.linalg.norm(reference)
+        assert relative_l2 < project["study"]["coupling_tolerance"]
+        return relative_l2
+
+    first_frequency_differences = {}
+    for field_key in ("gfAAC", "gfBAC", "gfuAC"):
+        first_frequency_differences[field_key] = assert_within_coupling_tolerance(
+            _load_snapshot_coefficients(first_dir, first, field_key, 0),
+            _load_snapshot_coefficients(second_dir, second, field_key, 0),
+        )
+
+    project["study"].update(frequency_mode="single", frequency_hz=60.0)
+    single_60, single_60_dir = _run_packaged_solver_model(
+        project, assets, tmp_path, "bounded-coupled-60-hz-single"
+    )
+    assert single_60["dc_background_field_source"] == "reused"
+    second_frequency_differences = {}
+    for field_key in ("gfAAC", "gfBAC", "gfuAC"):
+        second_frequency_differences[field_key] = assert_within_coupling_tolerance(
+            _load_snapshot_coefficients(single_60_dir, single_60, field_key, 0),
+            _load_snapshot_coefficients(second_dir, second, field_key, 1),
+        )
+    print(
+        "Sweep versus separate coupled solves: "
+        "50 Hz relative L2="
+        + ", ".join(f"{key} {value:.3e}" for key, value in first_frequency_differences.items())
+        + "; "
+        "60 Hz relative L2="
+        + ", ".join(f"{key} {value:.3e}" for key, value in second_frequency_differences.items())
+    )
 
     # A DC-only input change invalidates that cache and affects the coupled
     # mechanical response through the existing Lorentz/Maxwell load path.
@@ -1398,9 +1494,10 @@ def test_bounded_coupled_solver_uses_dc_and_reuses_only_the_matching_mesh(tmp_pa
     )
     nonconverged, _nonconverged_dir = _run_packaged_solver_model(
         project, assets, tmp_path, "bounded-coupled-nonconverged",
-        expected_status="nonconverged",
+        expected_status="complete",
     )
-    assert nonconverged["scientific_status"] == "nonconverged_diagnostic_data"
+    assert nonconverged["execution_status"] == "complete"
+    assert nonconverged["scientific_status"] == "nonconverged"
     assert nonconverged["coupling_convergence"]["all_converged"] is False
     point = nonconverged["coupling_convergence"]["frequencies"][0]
     assert point["iterations"] == 2

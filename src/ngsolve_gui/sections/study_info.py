@@ -49,9 +49,15 @@ class StudyInfoSection(Section):
         rows = [
             ("Model", run.get("model_name")),
             ("Physics", cls._physics_label(run.get("physics"))),
-            ("Status", cls._label_value(run.get("status"))),
+            ("Execution", cls._execution_status(run)),
+            ("Numerical outcome", cls._scientific_status(run)),
             ("Field", (comp.field_metadata or {}).get("label")),
-            ("Frequency", cls._frequency(run.get("frequency_hz"))),
+            (
+                "Frequency",
+                cls._frequency(
+                    run.get("frequency_points_hz") or run.get("frequency_hz")
+                ),
+            ),
             ("FE order", cls._order(run.get("polynomial_order"))),
             (
                 "Mesh cells",
@@ -93,10 +99,44 @@ class StudyInfoSection(Section):
 
     @staticmethod
     def _frequency(value):
+        if isinstance(value, (list, tuple)):
+            try:
+                values = [f"{float(item):g}" for item in value]
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return (", ".join(values) + " Hz") if values else None
         try:
             return f"{float(value):g} Hz"
         except (TypeError, ValueError):
             return None
+
+    @classmethod
+    def _execution_status(cls, run):
+        status = run.get("execution_status")
+        if not status:
+            status = "complete" if run.get("status") == "nonconverged" else run.get("status")
+        return cls._label_value(status)
+
+    @staticmethod
+    def _scientific_status(run):
+        value = run.get("scientific_status")
+        if not isinstance(value, str) or not value.strip():
+            if run.get("status") == "nonconverged":
+                value = "nonconverged"
+            else:
+                return None
+        normalized = value.casefold()
+        if normalized == "not_applicable":
+            return "Not evaluated for this study type"
+        if normalized in {"nonconverged", "nonconverged_diagnostic_data"}:
+            return "Not converged · diagnostic results only"
+        if normalized in {"converged", "all_frequencies_converged"}:
+            return "Converged"
+        if normalized == "partial":
+            return "Partial results"
+        if normalized == "unavailable":
+            return "Unavailable"
+        return value.replace("_", " ").capitalize()
 
     @staticmethod
     def _order(value):

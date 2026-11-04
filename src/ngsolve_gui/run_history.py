@@ -28,6 +28,57 @@ def _output_file(output_root, base_directory, value):
 
 def _diagnostic_summary(manifest):
     """Build a compact, truthful run-history summary from persisted diagnostics."""
+    frequency_points = manifest.get("frequency_points")
+    if isinstance(frequency_points, list) and frequency_points:
+        labels = []
+        coupling = manifest.get("coupling")
+        if not isinstance(coupling, dict):
+            coupling = {}
+        for point in frequency_points:
+            if not isinstance(point, dict):
+                continue
+            frequency = point.get("frequency_hz")
+            try:
+                frequency_label = f"{float(frequency):g} Hz"
+            except (TypeError, ValueError, OverflowError):
+                frequency_label = f"Point {int(point.get('index', len(labels))) + 1}"
+            execution = str(point.get("execution_status", "pending")).casefold()
+            scientific = str(point.get("scientific_status", "pending")).casefold()
+            if execution == "complete" and scientific == "converged":
+                state = "converged"
+            elif execution == "complete" and scientific == "nonconverged":
+                state = "not converged"
+            elif execution in {"failed", "cancelled", "not_started", "running", "pending"}:
+                state = execution.replace("_", " ")
+            else:
+                state = "completed"
+            detail = ""
+            if isinstance(point.get("iterations"), int) and isinstance(
+                coupling.get("maximum_iterations"), int
+            ):
+                detail = f" ({point['iterations']}/{coupling['maximum_iterations']} iterations"
+                residual_a = point.get("residual_A")
+                residual_u = point.get("residual_u")
+                if isinstance(residual_a, (int, float)) and isinstance(residual_u, (int, float)):
+                    detail += f"; ΔA {residual_a:.2g}, Δu {residual_u:.2g}"
+                detail += ")"
+            elif state == "not converged" and isinstance(point.get("termination_reason"), str):
+                detail = f" ({point['termination_reason'].replace('_', ' ')})"
+            labels.append(f"{frequency_label}: {state}{detail}")
+        progress = manifest.get("progress", {})
+        completed = progress.get("completed_frequencies")
+        total = progress.get("total_frequencies", len(frequency_points))
+        count = (
+            f"{completed}/{total} frequency points completed · "
+            if isinstance(completed, int) and isinstance(total, int)
+            else ""
+        )
+        dc_source = manifest.get("dc_background_field_source")
+        dc_text = " · DC field reused" if dc_source == "reused" else (
+            " · DC field calculated" if dc_source == "computed" else ""
+        )
+        return count + " · ".join(labels) + dc_text
+
     convergence = manifest.get("coupling_convergence")
     if isinstance(convergence, dict):
         points = convergence.get("frequencies")
