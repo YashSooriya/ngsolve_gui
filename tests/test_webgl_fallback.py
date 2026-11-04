@@ -154,6 +154,7 @@ def test_browser_probe_hook_uses_bridge_compatible_name():
     assert len(appended) == 1
     assert "globalThis.mmfemProbeWebGPU" in appended[0].textContent
     assert "__mmfemProbeWebGPU" not in appended[0].textContent
+    assert ".catch(error => ({" in appended[0].textContent
     assert "5000" in appended[0].textContent
 
 
@@ -264,6 +265,37 @@ def test_adaptive_component_switches_owner_without_propagating_probe_error(monke
 
     assert calls == ["no adapter"]
     assert fallback.webgpu_is_unavailable()
+
+
+@app_test("ngsolve_gui.appconfig")
+def test_present_webgpu_interface_without_adapter_uses_fallback(
+    page: Page, app
+) -> None:
+    """A present API that cannot supply any adapter must fall back cleanly."""
+    from webgpu import utils
+
+    fallback.reset_webgpu_probe_state()
+    utils._device = None
+    page.evaluate(
+        """Object.defineProperty(navigator, 'gpu', {
+          value: {requestAdapter: async () => null}, configurable: true
+        })"""
+    )
+    assert page.evaluate("navigator.gpu !== undefined")
+
+    _draw(app, make_geometry(), page=page, name="NoAvailableAdapter")
+    component = app.tab_panel.comp
+    page.wait_for_function(
+        "document.body.innerText.includes('No working WebGPU adapter')",
+        timeout=10000,
+    )
+    assert component._webgl_fallback_active
+    assert "adapter" in component._webgl_fallback_reason.casefold()
+    page.wait_for_function(
+        """() => Array.from(document.querySelectorAll('.js-plotly-plot'))
+          .some(plot => plot.data?.some(trace => trace.type === 'mesh3d'))""",
+        timeout=15000,
+    )
 
 
 @app_test("ngsolve_gui.appconfig")

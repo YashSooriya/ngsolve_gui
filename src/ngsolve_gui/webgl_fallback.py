@@ -74,7 +74,18 @@ def _install_verified_probe(js) -> None:
             try { localStorage.setItem(key, previous); } catch (_) {}
           }
         };
-        const probe = Promise.resolve().then(() => webgpuSelectDevice(canvas, null));
+        // A missing adapter rejects the async JS call. The Python/WebSocket
+        // bridge reports rejected browser Promises as an unhandled console
+        // error instead of returning a Python exception, so normalize that
+        // result into the same data shape as an inconclusive probe. The
+        // Python caller can then select the fallback normally.
+        const probe = Promise.resolve()
+          .then(() => webgpuSelectDevice(canvas, null))
+          .catch(error => ({
+            verdict: 'unavailable',
+            device: null,
+            messages: [String(error?.message || error || 'WebGPU adapter unavailable')],
+          }));
         try {
           const timeout = new Promise(resolve => {
             timer = setTimeout(() => {
