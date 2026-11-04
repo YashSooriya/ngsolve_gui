@@ -1314,7 +1314,7 @@ def test_static_dc_study_editor_exposes_real_field_sources_without_frequency(mon
     assert domain["dc_current_density_a_per_m2"] == [100000.0, 0.0, 0.0]
 
 
-def test_coupled_study_editor_exposes_supported_physics_and_convergence_controls(monkeypatch):
+def test_coupled_study_editor_exposes_commit_validated_convergence_controls(monkeypatch):
     workspace, geometry = _workspace_with_test_mesh(monkeypatch)
     geometry["material"] = "Stainless steel (4 K / OVC)"
     geometry["domain_selections"].append({
@@ -1352,8 +1352,10 @@ def test_coupled_study_editor_exposes_supported_physics_and_convergence_controls
     assert "Excitation source" in controls
     assert "Maximum iterations" in controls
     assert controls["Maximum iterations"].ui_model_value == 12
+    assert controls["Maximum iterations"]._callbacks.get("change")
     assert "Relative field-change tolerance" in controls
     assert controls["Relative field-change tolerance"].ui_model_value == 2e-5
+    assert controls["Relative field-change tolerance"]._callbacks.get("change")
     assert workspace._run_study_button.ui_disable is False
 
     geometry["boundary_selections"].clear()

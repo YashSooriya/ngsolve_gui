@@ -94,7 +94,10 @@ def _button(label, icon, callback, *, color=None, tooltip=None):
     return button
 
 
-def _input(label, value, callback, *, number=False, width="118px", suffix=None):
+def _input(
+    label, value, callback, *, number=False, width="118px", suffix=None,
+    on_commit=False,
+):
     widget = QInput(
         ui_label=label,
         ui_suffix=suffix,
@@ -105,7 +108,10 @@ def _input(label, value, callback, *, number=False, width="118px", suffix=None):
         ui_hide_bottom_space=True,
         ui_style=f"width:{width};",
     )
-    widget.on_update_model_value(callback)
+    if on_commit:
+        widget.on_change(callback)
+    else:
+        widget.on_update_model_value(callback)
     return widget
 
 
@@ -3811,12 +3817,12 @@ class ThreeDWorkspace(Div):
                     _input(
                         "Maximum iterations", study.get("coupling_max_iterations", 15),
                         lambda event: self._set_study_value("coupling_max_iterations", event, number=True),
-                        number=True, width="100%",
+                        number=True, width="100%", on_commit=True,
                     ),
                     _input(
                         "Relative field-change tolerance", study.get("coupling_tolerance", 1e-4),
                         lambda event: self._set_study_value("coupling_tolerance", event, number=True),
-                        number=True, width="100%",
+                        number=True, width="100%", on_commit=True,
                     ),
                     Div(
                         "Uses the existing block Gauss–Seidel iteration with Anderson acceleration (depth 3). A run is marked converged only when both magnetic-potential and displacement relative changes meet the tolerance.",
