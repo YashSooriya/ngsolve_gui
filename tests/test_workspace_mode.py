@@ -160,25 +160,6 @@ def test_3d_context_hides_axisymmetric_commands_and_restores_them():
     assert buttons["Results"].ui_hidden is True
 
 
-def test_cpu_field_viewer_is_only_visible_for_packaged_axisymmetric_results(monkeypatch):
-    viewer = SimpleNamespace(ui_hidden=False)
-    app = SimpleNamespace(
-        _application_menu_buttons={},
-        _application_menu_items={"Results": {"Open CPU 2D field viewer...": viewer}},
-        _workspace_mode="post_process",
-        _active_project_type="axisymmetric",
-        tab_panel=SimpleNamespace(comp=object()),
-    )
-    monkeypatch.setenv("MMFEM_DESKTOP_SCRIPT", "desktop.py")
-
-    NGSolveGui._set_application_menu_context(app, False)
-    assert viewer.ui_hidden is False
-
-    app._active_project_type = "3d"
-    NGSolveGui._set_application_menu_context(app, True)
-    assert viewer.ui_hidden is True
-
-
 def test_results_menu_remains_available_when_a_solution_is_open_without_a_project():
     results = SimpleNamespace(ui_hidden=True)
     app = SimpleNamespace(

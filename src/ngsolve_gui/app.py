@@ -1706,7 +1706,6 @@ class NGSolveGui(App):
             ]),
             ("Results", [
                 ("Open solutions...", self.load_solutions_file, "mdi-folder-open-outline", None),
-                ("Open CPU 2D field viewer...", self._open_2d_field_viewer, "mdi-chart-areaspline", None),
                 None,
                 ("Field & colour options", lambda: self._open_postprocess_controls("Field"), "mdi-palette", None),
                 ("Display & view options", lambda: self._open_postprocess_controls("Display & view"), "mdi-cube-scan", None),
@@ -1811,15 +1810,6 @@ class NGSolveGui(App):
             "Toggle wireframe", "Toggle clipping", "Toggle probe",
         )
         hide("Results", result_commands, not has_result)
-        hide(
-            "Results",
-            ("Open CPU 2D field viewer...",),
-            not (
-                active_type == "axisymmetric"
-                and has_result
-                and bool(os.environ.get("MMFEM_DESKTOP_SCRIPT"))
-            ),
-        )
 
     def _quit_application(self, *args):
         return self._request_problem_replacement(self._close_application_now)
@@ -1967,32 +1957,6 @@ class NGSolveGui(App):
                 f"Could not open local documentation: {error}",
                 type="negative",
                 timeout=8000,
-            )
-            return False
-
-    def _open_2d_field_viewer(self, filename=None, *args):
-        script = os.environ.get("MMFEM_DESKTOP_SCRIPT")
-        if not script:
-            self._notify(
-                "The CPU 2D field viewer is available in the packaged desktop application.",
-                type="info",
-                timeout=5000,
-            )
-            return False
-        command = [sys.executable, script, "--viewer"]
-        if isinstance(filename, (str, os.PathLike)):
-            command.extend(["--field", str(filename)])
-        try:
-            subprocess.Popen(
-                command,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            return True
-        except Exception as error:
-            self._notify(
-                f"Could not open the CPU 2D field viewer: {error}",
-                type="negative",
-                timeout=7000,
             )
             return False
 
