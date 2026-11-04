@@ -149,6 +149,8 @@ class ThreeDWorkspace(Div):
         self._selection_region_summary = None
         self._selection_region_labels = {}
         self._study_running = False
+        self._dc_background_observation = None
+        self._dc_background_status_control = None
         self._preview_lock = threading.Lock()
         self._preview_running = False
         self._preview_pending = None
@@ -1296,9 +1298,57 @@ class ThreeDWorkspace(Div):
 
     def _mark_changed(self):
         self._saved = False
+        self._dc_background_observation = None
+        self._update_dc_background_status_control()
+
+    def _dc_background_status_text(self):
+        observation = self._dc_background_observation
+        if not observation:
+            return (
+                "Status: Not checked for the current model edits. The solver reuses a saved field only "
+                "when DC inputs, mesh and discretisation match; otherwise it calculates a fresh field."
+            )
+        source = observation.get("source")
+        check = observation.get("reuse_check", {})
+        if source == "reused":
+            source_run = observation.get("reused_from")
+            suffix = f" · {Path(source_run).name}" if source_run else ""
+            return f"Status: Compatible saved DC field reused{suffix}."
+        if source == "computed":
+            check_status = check.get("status")
+            if check_status == "missing":
+                reason = "no saved field was available"
+            elif check_status == "no_compatible_saved_field":
+                reason = "saved fields did not match the current DC inputs, mesh or order"
+            else:
+                reason = "a fresh field was calculated"
+            return f"Status: Fresh DC field calculated · {reason}."
+        return "Status: DC field compatibility will be checked when the study runs."
+
+    def _update_dc_background_status_control(self):
+        control = self._dc_background_status_control
+        if control is not None:
+            control.ui_children = [self._dc_background_status_text()]
+
+    def _set_dc_background_run_state(self, manifest):
+        if not isinstance(manifest, dict) or manifest.get("status") not in {
+            "complete", "nonconverged"
+        }:
+            self._dc_background_observation = None
+        elif manifest.get("dc_background_field_source") in {"computed", "reused"}:
+            self._dc_background_observation = {
+                "source": manifest.get("dc_background_field_source"),
+                "reused_from": manifest.get("dc_background_field_reused_from"),
+                "reuse_check": manifest.get("dc_background_field_reuse_check", {}),
+            }
+        else:
+            self._dc_background_observation = None
+        self._update_dc_background_status_control()
 
     def _reset_meshes(self):
         self._mesh_generation += 1
+        self._dc_background_observation = None
+        self._update_dc_background_status_control()
         self._mesh_job = None
         self._mesh_results = {}
         self._hidden_solid_tags = {}
@@ -2887,6 +2937,7 @@ class ThreeDWorkspace(Div):
         kind, item_id = self._selection
         children = []
         self._mesh_property_status = None
+        self._dc_background_status_control = None
         self._selection_region_select = None
         self._selection_region_summary = None
         self._selection_region_labels = {}
@@ -3745,12 +3796,19 @@ class ThreeDWorkspace(Div):
                         (
                             "Applies the uniform DC field at the outer air boundary. Add DC domain current or wire-trace current as required."
                             if physics == "magnetostatic_dc"
-                            else "The DC background is solved before the harmonic and mechanical response. A saved solution is reused only when its mesh, discretisation and DC inputs match."
+                            else "The DC background is solved before the harmonic and mechanical response. Saved fields are reused only after an exact DC-input, mesh and order check."
                         ),
                         ui_class="cb-muted",
                         ui_style="font-size:10px; line-height:1.45; padding:8px; background:var(--panel-header); border-radius:5px;",
                     ),
                 ])
+                if physics == "coupled_magneto_mechanical":
+                    self._dc_background_status_control = Div(
+                        self._dc_background_status_text(),
+                        ui_class="cb-muted",
+                        ui_style="font-size:10px; line-height:1.4; overflow-wrap:anywhere;",
+                    )
+                    children.append(self._dc_background_status_control)
             if physics in {"harmonic_em", "coupled_magneto_mechanical"}:
                 source_mode = study.get("em_source_mode", "wire_trace")
                 children.extend([

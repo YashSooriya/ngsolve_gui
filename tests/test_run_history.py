@@ -116,3 +116,72 @@ def test_run_result_tree_resolves_axisymmetric_mesh_beside_metadata(tmp_path):
         "Generated mesh",
     ]
     assert tree["results"][1]["path"] == str(mesh_path.resolve())
+
+
+def test_run_result_tree_exposes_coupled_convergence_and_dc_reuse(tmp_path):
+    output = tmp_path / "coupled-run"
+    output.mkdir()
+    (output / "run_manifest.json").write_text(json.dumps({
+        "schema": "mm-fem.run",
+        "status": "complete",
+        "scientific_status": "all_frequencies_converged",
+        "dc_background_field_source": "reused",
+        "coupling_convergence": {
+            "all_converged": True,
+            "maximum_iterations": 12,
+            "relative_tolerance": 1e-4,
+            "frequencies": [{
+                "converged": True,
+                "iterations": 3,
+                "residual_A": 2.3e-6,
+                "residual_u": 5.1e-7,
+                "relative_tolerance": 1e-4,
+            }],
+        },
+    }), encoding="utf-8")
+
+    tree = load_run_result_tree({
+        "id": "coupled-run",
+        "status": "Complete",
+        "output_path": str(output),
+    })
+
+    assert tree["scientific_status"] == "all_frequencies_converged"
+    assert tree["diagnostic_summary"] == (
+        "Converged · 3/12 iterations · ΔA 2.3e-06, Δu 5.1e-07 / tol 0.0001 · DC field reused"
+    )
+
+
+def test_run_result_tree_keeps_nonconvergence_distinct_from_process_failure(tmp_path):
+    output = tmp_path / "diagnostic-run"
+    output.mkdir()
+    (output / "run_manifest.json").write_text(json.dumps({
+        "schema": "mm-fem.run",
+        "status": "nonconverged",
+        "scientific_status": "nonconverged_diagnostic_data",
+        "coupling_convergence": {
+            "all_converged": False,
+            "maximum_iterations": 2,
+            "relative_tolerance": 1e-8,
+            "frequencies": [{
+                "converged": False,
+                "termination_reason": "maximum_iterations_reached",
+                "iterations": 2,
+                "residual_A": 1e-5,
+                "residual_u": 2e-5,
+                "relative_tolerance": 1e-8,
+            }],
+        },
+    }), encoding="utf-8")
+
+    tree = load_run_result_tree({
+        "id": "diagnostic-run",
+        "status": "Nonconverged",
+        "output_path": str(output),
+    })
+
+    assert tree["status"] == "Nonconverged"
+    assert tree["scientific_status"] == "nonconverged_diagnostic_data"
+    assert tree["diagnostic_summary"].startswith(
+        "Not converged · maximum iterations reached · diagnostic fields only · 2/2 iterations"
+    )

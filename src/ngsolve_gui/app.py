@@ -2893,6 +2893,19 @@ class NGSolveGui(App):
             f"Running {run_description}{study_label} in {output_dir}…"
         )
 
+        def dc_background_detail(run_manifest):
+            source = run_manifest.get("dc_background_field_source")
+            check = run_manifest.get("dc_background_field_reuse_check", {})
+            if source == "reused":
+                return "DC field reused"
+            if source == "computed" and check.get("status") == "missing":
+                return "DC field calculated · none was saved"
+            if source == "computed" and check.get("status") == "no_compatible_saved_field":
+                return "DC field recalculated · no compatible saved field"
+            if source == "computed":
+                return "DC field calculated"
+            return None
+
         def run_job():
             log_path = output_dir / "solver.log"
             process = None
@@ -2972,6 +2985,7 @@ class NGSolveGui(App):
                         "solver_log": "solver.log",
                     })
                     self._write_run_manifest(output_dir, manifest)
+                    self._dispatch_to_ui(workspace._set_dc_background_run_state, manifest)
                     coupling = manifest.get("coupling_convergence", {})
                     points = coupling.get("frequencies", [])
                     point = points[0] if points else {}
@@ -2986,6 +3000,9 @@ class NGSolveGui(App):
                         f"Coupled study did not converge{detail}. "
                         f"Diagnostic fields were saved to {output_dir}"
                     )
+                    dc_detail = dc_background_detail(manifest)
+                    if dc_detail:
+                        status_message += f" · {dc_detail}"
                     self._dispatch_to_ui(
                         lambda: workspace._set_status(status_message, error=True)
                     )
@@ -3005,12 +3022,19 @@ class NGSolveGui(App):
                         "solver_log": "solver.log",
                     })
                     self._write_run_manifest(output_dir, manifest)
+                    self._dispatch_to_ui(workspace._set_dc_background_run_state, manifest)
+                    dc_detail = dc_background_detail(manifest)
+                    completion_status = "Study complete"
+                    if dc_detail:
+                        completion_status += f" · {dc_detail}"
                     self._dispatch_to_ui(
                         workspace._set_status,
-                        f"Study complete · results saved to {output_dir}",
+                        f"{completion_status} · results saved to {output_dir}",
                     )
                     self._dispatch_to_ui(lambda: self._notify(
-                        f"3D {study_label} complete · {output_dir}",
+                        f"3D {study_label} complete"
+                        + (f" · {dc_detail}" if dc_detail else "")
+                        + f" · {output_dir}",
                         type="positive",
                         timeout=7000,
                     ))

@@ -173,6 +173,7 @@ class Navigator(Div):
                     str(run.get("id") or run.get("output_path")),
                     run.get("name"),
                     run.get("status"),
+                    run.get("diagnostic_summary"),
                     self._run_collapsed.get(
                         str(run.get("id") or run.get("output_path")), True
                     ),
@@ -305,6 +306,7 @@ class Navigator(Div):
             )
             icon = {
                 "Complete": "mdi-check-circle-outline",
+                "Nonconverged": "mdi-alert-outline",
                 "Failed": "mdi-alert-circle-outline",
                 "Cancelled": "mdi-stop-circle-outline",
                 "Interrupted": "mdi-progress-alert",
@@ -335,6 +337,16 @@ class Navigator(Div):
             children.append(header)
             if collapsed:
                 continue
+
+            diagnostic_summary = run.get("diagnostic_summary")
+            if diagnostic_summary:
+                children.append(Div(
+                    str(diagnostic_summary),
+                    ui_style=(
+                        "padding:4px 8px 6px 34px; font-size:10px; line-height:1.35; "
+                        "color:var(--fg-muted); overflow-wrap:anywhere;"
+                    ),
+                ))
 
             visible_results = results if run_matches else matching_results
             if not visible_results:

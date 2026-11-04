@@ -1356,6 +1356,22 @@ def test_coupled_study_editor_exposes_commit_validated_convergence_controls(monk
     assert "Relative field-change tolerance" in controls
     assert controls["Relative field-change tolerance"].ui_model_value == 2e-5
     assert controls["Relative field-change tolerance"]._callbacks.get("change")
+    assert workspace._dc_background_status_control in workspace._properties.ui_children
+    assert "Not checked for the current model edits" in (
+        workspace._dc_background_status_control.ui_children[0]
+    )
+    workspace._set_dc_background_run_state({
+        "status": "complete",
+        "dc_background_field_source": "reused",
+        "dc_background_field_reused_from": "C:/NGSolve_results/previous-run",
+    })
+    assert "Compatible saved DC field reused" in (
+        workspace._dc_background_status_control.ui_children[0]
+    )
+    workspace._mark_changed()
+    assert "Not checked for the current model edits" in (
+        workspace._dc_background_status_control.ui_children[0]
+    )
     assert workspace._run_study_button.ui_disable is False
 
     geometry["boundary_selections"].clear()

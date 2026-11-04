@@ -1257,26 +1257,26 @@ def test_small_3d_mechanical_solver_run_exports_nonzero_displacement(tmp_path):
     )
 
 
-@pytest.mark.skipif(
-    not solver_checkout_available(),
-    reason=SOLVER_UNAVAILABLE_REASON,
-)
-def test_bounded_coupled_solver_uses_dc_and_reuses_only_the_matching_mesh(tmp_path):
+def _bounded_coupled_project(
+    tmp_path,
+    name="Bounded coupled integration check",
+    *,
+    material_name="Stainless steel (4 K / OVC)",
+    mechanical_body_force_n_m3=(0.0, 0.0, 0.0),
+):
     from netgen.occ import Box, OCCGeometry, Pnt
-    import numpy as np
-
     from ngsolve_gui.three_d_project import step_geometry_tags
 
-    step_path = tmp_path / "bounded_coupled_block.step"
+    step_path = tmp_path / f"{name.replace(' ', '_').casefold()}_block.step"
     Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).WriteStep(str(step_path))
     materials = {item["name"]: item for item in builtin_materials()}
-    material = materials["Stainless steel (4 K / OVC)"]
+    material = materials[material_name]
     solid_tags, face_refs = step_geometry_tags(list(OCCGeometry(str(step_path)).solids))
     support_tag = next(
         tag for tag, solid_tag, _face in face_refs if solid_tag == solid_tags[0]
     )
 
-    project = new_3d_project("Bounded coupled integration check")
+    project = new_3d_project(name)
     project["materials"] = [material]
     project["study"].update(
         physics="coupled_magneto_mechanical",
@@ -1285,6 +1285,7 @@ def test_bounded_coupled_solver_uses_dc_and_reuses_only_the_matching_mesh(tmp_pa
         polynomial_order=1,
         air_padding=0.25,
         dc_background_field_t=[0.0, 0.0, 0.025],
+        mechanical_body_force_n_m3=list(mechanical_body_force_n_m3),
         coupling_max_iterations=12,
         coupling_tolerance=1e-4,
     )
@@ -1309,6 +1310,17 @@ def test_bounded_coupled_solver_uses_dc_and_reuses_only_the_matching_mesh(tmp_pa
         "boundary_tags": [support_tag],
         "boundary_condition": "mechanical_fixed",
     }]
+    return project, assets
+
+
+@pytest.mark.skipif(
+    not solver_checkout_available(),
+    reason=SOLVER_UNAVAILABLE_REASON,
+)
+def test_bounded_coupled_solver_uses_dc_and_reuses_only_the_matching_mesh(tmp_path):
+    import numpy as np
+
+    project, assets = _bounded_coupled_project(tmp_path)
 
     first, first_dir = _run_packaged_solver_model(
         project, assets, tmp_path, "bounded-coupled-first"
@@ -1316,6 +1328,7 @@ def test_bounded_coupled_solver_uses_dc_and_reuses_only_the_matching_mesh(tmp_pa
     assert first["physics"] == "Fully coupled magneto-mechanics"
     assert first["mesh"]["elements"] < 1_000
     assert first["dc_background_field_source"] == "computed"
+    assert first["dc_background_field_reuse_check"]["status"] == "missing"
     assert first["coupling_convergence"]["all_converged"] is True
     convergence = first["coupling_convergence"]["frequencies"][0]
     assert convergence["converged"] is True
@@ -1341,6 +1354,7 @@ def test_bounded_coupled_solver_uses_dc_and_reuses_only_the_matching_mesh(tmp_pa
     assert second["status"] == "complete"
     assert second["dc_input_fingerprint"] == first["dc_input_fingerprint"]
     assert second["dc_background_field_source"] == "reused"
+    assert second["dc_background_field_reuse_check"]["status"] == "reused"
     assert Path(second["dc_background_field_reused_from"]).resolve() == first_dir.resolve()
     assert second["mesh"]["elements"] == first["mesh"]["elements"]
 
@@ -1357,6 +1371,10 @@ def test_bounded_coupled_solver_uses_dc_and_reuses_only_the_matching_mesh(tmp_pa
     assert changed_dc["status"] == "complete"
     assert changed_dc["dc_input_fingerprint"] != first["dc_input_fingerprint"]
     assert changed_dc["dc_background_field_source"] == "computed"
+    assert (
+        changed_dc["dc_background_field_reuse_check"]["status"]
+        == "no_compatible_saved_field"
+    )
     changed_displacement_path = next(
         path for path in changed_dc["fields"] if "gfuAC" in path
     )
@@ -1397,6 +1415,123 @@ def test_bounded_coupled_solver_uses_dc_and_reuses_only_the_matching_mesh(tmp_pa
         f"changed DC source max |u|={changed_displacement_magnitude:.6e} m; "
         f"bounded nonconvergence residuals=({point['residual_A']:.3e}, "
         f"{point['residual_u']:.3e})"
+    )
+
+
+@pytest.mark.skipif(
+    not solver_checkout_available(),
+    reason=SOLVER_UNAVAILABLE_REASON,
+)
+def test_small_3d_model_isolates_both_coupling_terms_and_complex_response(tmp_path):
+    """Exercise the actual GUI-built problem with the two existing terms isolated."""
+    import copy
+
+    project, assets = _bounded_coupled_project(
+        tmp_path,
+        "Bounded coupling-term isolation",
+        material_name="Stainless steel (4 K / OVC)",
+    )
+    loaded_project = copy.deepcopy(project)
+    loaded_project["name"] = "Bounded coupling-term isolation with body force"
+    loaded_project["study"]["mechanical_body_force_n_m3"] = [0.0, 2e10, 0.0]
+    direction_project = copy.deepcopy(loaded_project)
+    direction_project["name"] = "Bounded coupling-term isolation with rotated DC field"
+    direction_project["study"]["dc_background_field_t"] = [0.025, 0.0, 0.0]
+    gui_root = Path(__file__).resolve().parents[1]
+    solver_candidates = []
+    configured_root = os.environ.get("COUPLED_SOLVER_ROOT")
+    if configured_root:
+        solver_candidates.append(Path(configured_root).expanduser())
+    solver_candidates.extend([
+        gui_root / "coupled_solver",
+        gui_root.parent / "ngsolve-ui" / "coupled_solver",
+        Path.cwd() / "coupled_solver",
+    ])
+    solver_root = next(
+        root.resolve()
+        for root in solver_candidates
+        if (root / "main.py").is_file()
+        and (root / "scripts" / "run_gui_3d_model.py").is_file()
+    )
+    model_path = tmp_path / "coupling-term-isolation.mmfem3d"
+    model_path.write_bytes(package_3d_project(project, assets))
+    loaded_model_path = tmp_path / "coupling-term-isolation-loaded.mmfem3d"
+    loaded_model_path.write_bytes(package_3d_project(loaded_project, assets))
+    direction_model_path = tmp_path / "coupling-term-isolation-rotated-dc.mmfem3d"
+    direction_model_path.write_bytes(package_3d_project(direction_project, assets))
+    report_path = tmp_path / "coupling-term-isolation.json"
+    helper = gui_root / "tests" / "fixtures" / "run_3d_coupling_isolation.py"
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(gui_root / "src"), *filter(None, [environment.get("PYTHONPATH")])]
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(helper),
+            "--solver-root", str(solver_root),
+            "--model", str(model_path),
+            "--loaded-model", str(loaded_model_path),
+            "--direction-model", str(direction_model_path),
+            "--output", str(report_path),
+        ],
+        cwd=solver_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+        env=environment,
+        check=False,
+    )
+    output = re.sub(
+        re.escape(str(tmp_path)), "<temporary-run>",
+        f"{completed.stdout}\n{completed.stderr}", flags=re.IGNORECASE,
+    )
+    assert completed.returncode == 0, output[-7000:]
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    variants = report["variants"]
+    comparisons = report["comparisons"]
+
+    assert report["mesh_elements"] < 1_000
+    assert report["ndof"] < 6_000
+    assert variants["em_to_mechanics"]["fixed_point_converged"] is True
+    assert variants["two_way"]["fixed_point_converged"] is True
+    assert variants["two_way_rotated_dc"]["fixed_point_converged"] is True
+    assert variants["two_way"]["max_abs_displacement_m"] > 0.0
+    assert variants["two_way"]["max_abs_lorentz_current"] > 0.0
+    assert variants["two_way_rotated_dc"]["dc_solution_mode"] == "computed"
+    assert variants["two_way"]["dc_solution_mode"] == "reused"
+
+    # Maxwell stress creates displacement, while the EM solution stays
+    # unchanged when the reverse Lorentz-current term is explicitly disabled.
+    assert comparisons["mechanics_from_maxwell_stress"] > 1e-6
+    assert comparisons["em_unchanged_when_mechanical_feedback_is_off"] < 1e-10
+    # Enabling displacement feedback changes the AC solution on the same mesh.
+    assert variants["one_way_loaded"]["max_abs_displacement_m"] > 1e-7
+    assert comparisons["two_way_feedback_changes_ac_field"] > 1e-8
+    # Rotating the imposed DC vector changes the solved H(div) background and
+    # its coupled AC/mechanical response, while the mesh and other inputs stay fixed.
+    assert comparisons["direction_changed_dc_field"] > 0.5
+    assert comparisons["direction_changed_ac_field"] > 1e-8
+    assert comparisons["direction_changed_displacement"] > 1e-8
+
+    # Linear phasor scaling checks complex-valued excitation propagation and
+    # the expected magnitude and 90-degree phase response with cCoupCoef=0.
+    assert comparisons["double_excitation_field_scaling_error"] < 1e-7
+    assert comparisons["double_excitation_displacement_scaling_error"] < 1e-7
+    assert comparisons["quadrature_field_phase_error"] < 1e-7
+    assert comparisons["quadrature_displacement_phase_error"] < 1e-7
+    assert all(
+        variants[name]["dc_coefficients_reused"]
+        for name in (
+            "em_to_mechanics", "two_way", "double_excitation",
+            "quadrature_excitation",
+        )
+    )
+    print(
+        f"Bounded coupled-term evidence: {report['mesh_elements']} elements, "
+        f"{report['ndof']} DOFs; {json.dumps(comparisons, sort_keys=True)}"
     )
 
 

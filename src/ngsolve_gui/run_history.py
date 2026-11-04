@@ -26,6 +26,60 @@ def _output_file(output_root, base_directory, value):
     return path if path.is_file() else None
 
 
+def _diagnostic_summary(manifest):
+    """Build a compact, truthful run-history summary from persisted diagnostics."""
+    convergence = manifest.get("coupling_convergence")
+    if isinstance(convergence, dict):
+        points = convergence.get("frequencies")
+        point = points[0] if isinstance(points, list) and points else {}
+        if not isinstance(point, dict):
+            point = {}
+        converged = point.get("converged") is True and convergence.get("all_converged") is True
+        if converged:
+            state = "Converged"
+        elif point.get("termination_reason") == "maximum_iterations_reached":
+            state = "Not converged · maximum iterations reached · diagnostic fields only"
+        else:
+            state = "Not converged · diagnostic fields only"
+        iteration_count = point.get("iterations")
+        maximum_iterations = convergence.get("maximum_iterations")
+        iteration_text = ""
+        if isinstance(iteration_count, int) and isinstance(maximum_iterations, int):
+            iteration_text = f" · {iteration_count}/{maximum_iterations} iterations"
+        residual_text = ""
+        residual_a = point.get("residual_A")
+        residual_u = point.get("residual_u")
+        tolerance = point.get("relative_tolerance", convergence.get("relative_tolerance"))
+        if all(isinstance(value, (int, float)) for value in (residual_a, residual_u, tolerance)):
+            residual_text = (
+                f" · ΔA {residual_a:.3g}, Δu {residual_u:.3g} / tol {tolerance:.3g}"
+            )
+        dc_source = manifest.get("dc_background_field_source")
+        dc_text = ""
+        if dc_source == "reused":
+            dc_text = " · DC field reused"
+        elif dc_source == "computed":
+            check = manifest.get("dc_background_field_reuse_check", {})
+            check_status = check.get("status") if isinstance(check, dict) else None
+            if check_status == "missing":
+                dc_text = " · DC field calculated (none saved)"
+            elif check_status == "no_compatible_saved_field":
+                dc_text = " · DC field recalculated (no compatible saved field)"
+            else:
+                dc_text = " · DC field calculated"
+        return state + iteration_text + residual_text + dc_text
+
+    status = str(manifest.get("status", "")).casefold()
+    if status == "failed":
+        error = str(manifest.get("error") or "Solver failed")
+        return f"Failure · {error[:180]}"
+    if status == "cancelled":
+        return "Cancelled · partial diagnostic files may be present"
+    if status == "interrupted":
+        return "Interrupted · inspect the solver log and process diagnostics"
+    return None
+
+
 def load_run_result_tree(run):
     """Return one history record enriched with its existing result files.
 
@@ -42,6 +96,7 @@ def load_run_result_tree(run):
     except (OSError, RuntimeError, TypeError, ValueError):
         return {**run, "default_path": None, "results": []}
     manifest = _read_json(output_root / "run_manifest.json")
+    diagnostic_summary = _diagnostic_summary(manifest)
     gui_directory = output_root / "ngsolve_gui"
     metadata = _read_json(gui_directory / "metadata.json")
 
@@ -161,4 +216,6 @@ def load_run_result_tree(run):
         **run,
         "default_path": str(default_path) if default_path is not None else None,
         "results": results,
+        "scientific_status": manifest.get("scientific_status"),
+        "diagnostic_summary": diagnostic_summary,
     }
