@@ -826,6 +826,7 @@ class SolveWorkspace(Div):
             self._canvas,
             self._canvas_context_menu,
             self._canvas_dimension_editor,
+            id="solve-sketch-canvas-host",
             ui_class="relative-position",
             ui_style="position:relative; display:flex; flex:1 1 0%; height:0; flex-direction:column; min-width:0; min-height:0; overflow:hidden;",
         )
@@ -2024,6 +2025,101 @@ class SolveWorkspace(Div):
         is beneath the pointer. Preview updates stay local; Python receives one
         compact event after release rather than the full stream of mouse moves.
         """
+        # The sketch SVG can be remounted while its workspace stays alive. Bind
+        # resize observation separately from the gesture listener's version
+        # guard so every mount points at the current, stable canvas host.
+        resize_script = r"""
+(() => {
+  const svgSelector = 'svg.solve-sketch-canvas';
+  const getSvg = () => document.querySelector(svgSelector);
+  const diagnostics = window.__ngsolveSketchResizeDiagnostics =
+    window.__ngsolveSketchResizeDiagnostics || {
+      observerCallbacks: 0, measurements: 0, dispatched: 0,
+      lastMeasured: null, lastDispatched: null, lastApplied: null,
+    };
+  const measure = () => {
+    window.__ngsolveSketchResizeFrame = 0;
+    diagnostics.measurements += 1;
+    const svg = getSvg();
+    if (!svg) {
+      window.__ngsolveSketchResizePending = true;
+      return;
+    }
+    const rect = svg.getBoundingClientRect();
+    const width = Math.round(rect.width);
+    const height = Math.round(rect.height);
+    const viewBox = svg.viewBox && svg.viewBox.baseVal;
+    diagnostics.lastMeasured = {
+      width, height,
+      viewBoxWidth: viewBox ? viewBox.width : null,
+      viewBoxHeight: viewBox ? viewBox.height : null,
+    };
+    if (width < 100 || height < 100) {
+      window.__ngsolveSketchResizePending = true;
+      return;
+    }
+    if (window.__ngsolveSketchGestureActive) {
+      window.__ngsolveSketchResizePending = true;
+      return;
+    }
+    const previous = window.__ngsolveSketchCanvasSize;
+    const viewBoxOutOfDate = viewBox
+      && (Math.abs(viewBox.width - width) >= 1
+        || Math.abs(viewBox.height - height) >= 1);
+    if (previous && previous[0] === width && previous[1] === height
+        && !viewBoxOutOfDate) {
+      window.__ngsolveSketchResizePending = false;
+      return;
+    }
+    window.__ngsolveSketchResizePending = false;
+    window.__ngsolveSketchCanvasSize = [width, height];
+    const event = new MouseEvent('mouseup', {
+      bubbles: true, cancelable: false, button: 0,
+    });
+    window.__ngsolveSketchPendingCanvasResize = {
+      timeStamp: event.timeStamp, width, height,
+    };
+    diagnostics.dispatched += 1;
+    diagnostics.lastDispatched = {width, height, timeStamp: event.timeStamp};
+    svg.dispatchEvent(event);
+  };
+  const schedule = () => {
+    if (window.__ngsolveSketchResizeFrame) return;
+    window.__ngsolveSketchResizeFrame = requestAnimationFrame(() => {
+      window.__ngsolveSketchResizeFrame = requestAnimationFrame(measure);
+    });
+  };
+  window.__ngsolveScheduleSketchCanvasResize = schedule;
+  if (!window.__ngsolveSketchWindowResizeInstalled) {
+    window.addEventListener('resize', () => {
+      window.__ngsolveSketchResizePending = true;
+      if (window.__ngsolveScheduleSketchCanvasResize) {
+        window.__ngsolveScheduleSketchCanvasResize();
+      }
+    });
+    window.__ngsolveSketchWindowResizeInstalled = true;
+  }
+  const host = document.getElementById('solve-sketch-canvas-host');
+  const previousObserver = window.__ngsolveSketchResizeObserver;
+  if (host && typeof ResizeObserver === 'function'
+      && (!previousObserver || previousObserver.__target !== host)) {
+    if (previousObserver && previousObserver.disconnect) previousObserver.disconnect();
+    const observer = new ResizeObserver(() => {
+      diagnostics.observerCallbacks += 1;
+      window.__ngsolveSketchResizePending = true;
+      if (window.__ngsolveScheduleSketchCanvasResize) {
+        window.__ngsolveScheduleSketchCanvasResize();
+      }
+    });
+    observer.__target = host;
+    observer.observe(host);
+    window.__ngsolveSketchResizeObserver = observer;
+    diagnostics.observedHostId = host.id;
+  }
+  window.__ngsolveSketchResizePending = true;
+  schedule();
+})()
+"""
         script = r"""
 (() => {
   window.__ngsolveSketchTool = '__SKETCH_TOOL__';
@@ -2051,9 +2147,6 @@ class SolveWorkspace(Div):
   let visualTranslateY = 0;
   let viewVersion = 0;
   let pendingViewResetToken = 0;
-  let resizePending = false;
-  let resizeFrame = 0;
-  let scheduleCanvasResize = null;
   const committedRegionOffsets = new Map();
   window.__ngsolveSketchViewTransform = [1, 0, 0, viewVersion];
   window.__ngsolveSketchCompletedGesture = null;
@@ -3277,7 +3370,10 @@ class SolveWorkspace(Div):
     active = false;
     activePointerId = null;
     window.__ngsolveSketchGestureActive = false;
-    if (resizePending && scheduleCanvasResize) scheduleCanvasResize();
+    if (window.__ngsolveSketchResizePending
+        && window.__ngsolveScheduleSketchCanvasResize) {
+      window.__ngsolveScheduleSketchCanvasResize();
+    }
     if (svg) svg.style.cursor = (window.__ngsolveSketchTool || 'select') === 'select' ? 'default' : 'crosshair';
     if (svg) requestAnimationFrame(() => {
       if (!active) svg.style.cursor = (window.__ngsolveSketchTool || 'select') === 'select' ? 'default' : 'crosshair';
@@ -3315,7 +3411,10 @@ class SolveWorkspace(Div):
     active = false;
     activePointerId = null;
     window.__ngsolveSketchGestureActive = false;
-    if (resizePending && scheduleCanvasResize) scheduleCanvasResize();
+    if (window.__ngsolveSketchResizePending
+        && window.__ngsolveScheduleSketchCanvasResize) {
+      window.__ngsolveScheduleSketchCanvasResize();
+    }
     clearPreview(svg, false, true);
     svg.style.cursor = (window.__ngsolveSketchTool || 'select') === 'select' ? 'default' : 'crosshair';
     if (wasActive && notifyPython) {
@@ -3586,68 +3685,14 @@ class SolveWorkspace(Div):
   document.addEventListener('mouseup', capture, true);
   document.addEventListener('click', capture, true);
   document.addEventListener('wheel', capture, {capture:true, passive:false});
-  const measureCanvasSize = () => {
-    resizeFrame = 0;
-    const svg = currentSvg();
-    if (!svg) {
-      resizePending = true;
-      return;
-    }
-    const rect = svg.getBoundingClientRect();
-    const width = Math.round(rect.width);
-    const height = Math.round(rect.height);
-    if (width < 100 || height < 100) {
-      resizePending = true;
-      return;
-    }
-    if (active || window.__ngsolveSketchGestureActive) {
-      resizePending = true;
-      return;
-    }
-    const previous = window.__ngsolveSketchCanvasSize;
-    if (previous && previous[0] === width && previous[1] === height) {
-      resizePending = false;
-      return;
-    }
-    resizePending = false;
-    window.__ngsolveSketchCanvasSize = [width, height];
-    const event = new MouseEvent('mouseup', {
-      bubbles: true, cancelable: false, button: 0,
-    });
-    window.__ngsolveSketchPendingCanvasResize = {
-      timeStamp: event.timeStamp, width, height,
-    };
-    svg.dispatchEvent(event);
-  };
-  scheduleCanvasResize = () => {
-    if (resizeFrame) return;
-    resizeFrame = requestAnimationFrame(() => {
-      resizeFrame = requestAnimationFrame(measureCanvasSize);
-    });
-  };
-  const previousResizeObserver = window.__ngsolveSketchResizeObserver;
-  if (previousResizeObserver && previousResizeObserver.disconnect) {
-    previousResizeObserver.disconnect();
-  }
-  if (typeof ResizeObserver === 'function') {
-    const observer = new ResizeObserver(() => {
-      resizePending = true;
-      scheduleCanvasResize();
-    });
-    const svg = currentSvg();
-    if (svg) observer.observe(svg);
-    window.__ngsolveSketchResizeObserver = observer;
-  }
-  window.addEventListener('resize', () => {
-    resizePending = true;
-    scheduleCanvasResize();
-  });
-  resizePending = true;
-  scheduleCanvasResize();
 })()
 """
         try:
-            self.js.eval(script.replace("__SKETCH_TOOL__", self.sketch_tool))
+            self.js.eval(
+                resize_script
+                + ";\n"
+                + script.replace("__SKETCH_TOOL__", self.sketch_tool)
+            )
             # The initial render can run before the browser JS bridge is ready.
             # Re-send settings after the mounted handler confirms that bridge.
             self._sync_canvas_interaction_settings()
@@ -3994,6 +4039,14 @@ class SolveWorkspace(Div):
                 resize = None
             if isinstance(resize, (list, tuple)) and len(resize) == 2:
                 self._apply_canvas_resize({"width": resize[0], "height": resize[1]})
+                try:
+                    self.js.eval(
+                        "if (window.__ngsolveSketchResizeDiagnostics) "
+                        "window.__ngsolveSketchResizeDiagnostics.lastApplied = "
+                        f"{{width:{int(resize[0])},height:{int(resize[1])}}}"
+                    )
+                except Exception:
+                    pass
                 return
         try:
             completed = self.js.eval(

@@ -4240,6 +4240,7 @@ def test_sketch_grid_has_five_snap_subdivisions_per_major_cell(standalone_compon
 
 def test_sketch_reprojects_to_resized_viewport_without_distorting_geometry(standalone_components):
     workspace = SolveWorkspace()
+    assert workspace._canvas_host._id == "solve-sketch-canvas-host"
     renders = []
     render = workspace._render_canvas_after_interaction
 
@@ -4261,6 +4262,12 @@ def test_sketch_reprojects_to_resized_viewport_without_distorting_geometry(stand
     radial_scale = (project((0.01, 0.0))[0] - project((0.0, 0.0))[0]) / 0.01
     axial_scale = (project((0.0, 0.01))[1] - project((0.0, 0.0))[1]) / 0.01
     assert radial_scale == pytest.approx(-axial_scale)
+    assert renders == ["render"]
+
+    workspace._apply_canvas_resize({"width": 1200, "height": 600})
+    workspace._apply_canvas_resize({"width": 80, "height": 600})
+    assert workspace._canvas_width == 1200
+    assert workspace._canvas_height == 600
     assert renders == ["render"]
 
 
