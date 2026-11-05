@@ -1,9 +1,9 @@
 # MagMechSim: Forward Development Roadmap
 
-**Planning baseline:** 5 November 2026 (Phase E2 accepted for its verified mechanical modal ROM scope)
+**Planning baseline:** 5 November 2026 (Phase E2 accepted; Phase E3 complete for tested scope and awaiting review)
 **Status:** Living plan, not an immutable implementation contract  
 **Primary users:** Engineers familiar with industrial CAE tools  
-**Primary immediate scope:** Independent review of the Phase E2 closeout; do not start Phase E3 before review
+**Primary immediate scope:** Independent review of the Phase E3 closeout; do not start Phase F before review
 **Out of scope for now:** New results visualisation or a post-processing redesign (but existing Solve/Results navigation must remain fully functional)
 
 ## 1. Product objective and working agreement
@@ -20,7 +20,7 @@ MagMechSim should provide a complete, reliable and responsive workflow from geom
 
 The bullets below retain historical baseline evidence where useful. The accepted Phase A closeout and completed Phase B1/B2/C statuses below supersede earlier open/blank/recovery findings.
 
-**Latest verified status (5 November 2026):** Phases A, B1, B2, C, D1, D2 and E1 remain accepted for their recorded scopes. Phase E2 now exposes the existing mechanical modal ROM through the 3D and axisymmetric study workflows where supported, with full-order comparison coverage, saved configuration, run diagnostics and native packaged-app verification. The final Windows package is `0.2.8.dev303` (executable SHA-256 `4e29a06de37679fc8f980dbc1bdf405480e1a09711bd62faac4df2fe1427df12`), built from GUI `39fdf7447a301d153f42d182923a2a86aca66854` and solver/native package `9c286b5577a6ce72b9bc5aa7c4a02e033cd48c4f`; the latest launcher targets that package. The focused GUI suite passed 450 tests; the ROM numerical set passed 7 tests, including full-order comparisons on 12-element 3D mechanical and 79-element coupled meshes plus a 302-element axisymmetric case. The full Phase E2 findings and evidence are in the [Phase E2 report](reviews/2026-11-05-phase-e2.md). The earlier E1 report and its numerical references remain available at [Phase E1](reviews/2026-11-04-phase-e1.md). Keep the CPU-only 2D field viewer retired and retain the tested WebGPU/WebGL fallback. Phase E2 does not change the numerical formulation or dependencies.
+**Latest verified status (5 November 2026):** Phases A, B1, B2, C, D1, D2, E1 and E2 remain accepted for their recorded scopes. Phase E3 adds independent 3D mesh geometry order, 3D Rayleigh damping and configurable coupled Anderson controls, with validation, saved project values, solver metadata, exact DC-cache invalidation and packaged Windows UI verification. Package `0.2.8.dev305` (executable SHA-256 `6de27c0ff2b48e4687333debab89fc0bb5c4115023153526c5f8321e4f1454e4`) was built from GUI `40ed39cb9cb5da68f9009849ba7d1366771ea476` and solver/native package `f1dd3c15ea5df42a2ef753d7f279d9b9c8bb3bba`; the latest launcher was tested against it. The focused GUI suite passed 166 tests (one existing pytest warning); solver/DC/axisymmetric ROM regressions passed 11 tests. Maximized packaged-app checks verified native settings edits, project save/reopen, startup and launcher behavior at 1920×1094. The VM is on an SSD; no controlled before/after comparison was made. The [Phase E3 report](reviews/2026-11-05-phase-e3.md) contains the configuration matrix, numerical response, ROM measurements and limitations. The [Phase E2 report](reviews/2026-11-05-phase-e2.md) retains its accepted-scope evidence. The CPU-only 2D field viewer remains retired and the tested WebGPU/WebGL fallback remains in place. Phase E3 did not change the numerical formulation or add dependencies.
 
 - The saved `Getting started - coupled coil` project rendered its square and circle regions in the first geometry-editor screenshot. The sketch grid filled the viewport at maximized and restored sizes with correct physical scaling. The earlier single blank capture was not reproduced; its cause remains unknown.
 - The axisymmetric geometry-creation 3D preview rendered both regions using Plotly WebGL. 3D STEP import, a 22,132-element bounded mesh, repeated native CAD selection, display switching, rotation and selection persistence all passed. The historical OOM did not reproduce; the test covered only three bounded cycles, so larger and longer sessions remain a risk.
@@ -260,7 +260,7 @@ Completed: refined run-history diagnostics, bounded independent coupled-response
 
 **Outcome:** Supported research-grade numerical features become approachable through professional study/property configuration.
 
-- Expose validated reduced-order model creation/reuse and its prerequisites; clearly distinguish full-order vs reduced-order solves.
+- Expose supported mechanical modal reduction and its prerequisites; reuse the basis within a study run, and add persistent cross-run basis artifacts only if measured workloads justify their storage and validation lifecycle.
 - Improve frequency sweeps, multiple studies and job/resource controls where implemented; ensure correct complex-valued inputs and units.
 - Extend time-integration and other study variants **only after** the relevant backend and project state are demonstrably ready, with appropriate controls and verification. Unsupported combinations remain unavailable.
 
@@ -285,6 +285,20 @@ Same-mesh reference comparisons passed: on a 12-tetrahedron 3D mechanical block,
 The maximized packaged Windows app (`0.2.8.dev303`) completed a genuine 3D ROM run and exposed the axisymmetric ROM controls. Native UI automation saved the axisymmetric configuration to JSON, reopened that file through File > Open in a fresh app process, and read the selected ROM method and mode count back from the property editor. The 450-test focused GUI suite and seven focused ROM numerical tests passed. E1 frequency-sweep references and regression tests remain in the repositories. The package launcher points at the tested E2 build. The 2D field viewer remains removed; the WebGPU-to-WebGL fallback remains in the product.
 
 **Scope boundary:** The underlying implementation is a mechanical modal reduction, not a general electromagnetic or parametric ROM. It has no offline training-frequency selection, saved reusable basis, ROM-file validity fingerprint, or cross-run model cache. The current interface does not imply those capabilities. Any future reusable/offline ROM work must add input fingerprints and held-out range verification before it exposes loading, reuse or stale-model controls.
+
+#### Phase E3. Advanced numerical configuration and ROM performance assessment (complete for tested scope; 5 November 2026)
+
+The 3D Study editor now separates finite-element approximation order from curved mesh geometry order. Geometry order can explicitly follow the FE order (preserving legacy project behavior) or be selected from 1–6. Mechanics-only and coupled studies expose Rayleigh mass- and stiffness-proportional damping with correct units. Coupled studies expose Anderson depth (0 disables acceleration) and relaxation alongside the existing iteration limit and convergence tolerance. Values are range-checked, serialized in existing `.mmfem3d` projects, propagated to mesh/solver settings and recorded in run metadata. DC cache fingerprints now include geometry order because it changes the mesh and H(div) coefficient space; damping and Anderson controls do not invalidate an unrelated DC field. The axisymmetric mesh and numerical workflow remains specialized and unchanged.
+
+The numerical capability inventory found that 3D FE order (p=1–4), per-domain target mesh size, sweep configuration, coupled convergence settings and ROM/PINVIT settings were already available. Axisymmetric order (p=1–6), independent curved order, hp layers and its existing solver controls remain available in its mature editor. The 3D adapter selects formulation-specific FE spaces and direct sparse solve policy internally; lower-level iterative/preconditioner code is not a selectable, verified end-to-end GUI path. Static-condensation policy and quadrature are fixed by formulation. Automatic adaptive h/p refinement, user-selectable 3D mesh-quality algorithms and CPU-thread controls are not available in the packaged 3D workflow. These internal options were not exposed speculatively. See the Phase E3 report for the complete matrix and source references.
+
+Real NGSolve response checks verified that custom geometry order 4 improved a curved sphere's computed volume from `4.74507572e-7 m³` at p1 geometry to `5.23601691e-7 m³`, against the analytic `5.23598776e-7 m³`, and that nonzero Rayleigh stiffness damping reduced a supported small-block displacement norm to `0.954028` of its undamped value. A bounded coupled regression exercised nondefault Anderson depth and recorded the actual solver-returned settings. The 166-test GUI/project/solver setup group passed with one existing `PytestAssertRewriteWarning`; 11 DC-runner and axisymmetric ROM regression tests passed.
+
+The bounded ROM measurement used 378 tetrahedra, 130 vertices, 315 free mechanical DOFs, six modes and three frequencies. Full-order solve wall time was `0.867 s`; ROM runs took `0.338 s` first and `0.581 s` on repeat, with basis construction `0.049/0.037 s` and online harmonic solve `0.142 s`. Six-mode displacement error was approximately `5.54%` across 50–150 Hz. Process RSS was `176.9 MB` full order and `183.0–183.1 MB` with ROM; these are whole-process measurements, not basis-only memory. At this size, basis construction is under 50 ms and run timings vary, so the evidence does not justify a persistent ROM artifact or establish a general speedup/break-even point. Keep per-run basis construction and within-sweep reuse. Reconsider persistent bases only if repeated larger-model studies show material setup cost, with exact stiffness/mass/constraint fingerprints and held-out frequency/parameter verification.
+
+Packaged desktop tests verified these controls in the maximized `0.2.8.dev305` application, save and fresh-process reopen, and the newest-app launcher. Full-desktop screenshots and test logs are in the [Phase E3 review package](reviews/2026-11-05-phase-e3.md). A known white first Chromium frame after the startup probe remains unresolved; native navigation then rendered the imported 3D solid and property editor. No solver formulation or dependency changed, and neither the separate Mike variant nor the retired 2D field viewer was modified or restored.
+
+**Gate:** Complete for the verified configuration and ROM-assessment scope; stop for independent review before Phase F.
 
 ### Phase F. Axisymmetric and 3D UX unification, without loss of specialist capabilities
 
@@ -335,17 +349,17 @@ Phase D1: 3D coupled solver integration — accepted for tested scope
 Phase D2: coupled workflow and verification refinement — accepted for tested scope
                       |
                       v
-                      |
-                      v
             Frequency sweeps and study management (Phase E1 — complete)
                       |
                       v
             Mechanical modal ROM workflow (Phase E2 — complete for verified scope)
                       |
                       v
-            Phase E3 reusable/offline ROM and validity (candidate after review)
+            Advanced numerical settings and ROM assessment (Phase E3 — complete for tested scope)
+                      |
+                      v
+            Shared UX unification (Phase F — next after E3 review)
 
-Shared UX unification (Phase F) continues in small compatible increments.
 Local Sphinx access starts NOW; comprehensive docs and 5-result search follow in Phase G.
 Release, packaging and comprehensive quality gates occur throughout, with final signoff in Phase H.
 ```
@@ -386,4 +400,4 @@ Release, packaging and comprehensive quality gates occur throughout, with final 
 
 Suggested repository home for this plan: a documented planning location under the GUI repository, chosen by Codex after inspecting existing conventions. Keep this file as the **single current roadmap**, with date, completed milestones, changed priorities and links to implementation reports. Historical roadmaps may remain archived but should not conflict with the current one.
 
-**Current action (5 November 2026):** Phase E2 is complete for its documented mechanical modal ROM scope. Stop for independent review before starting Phase E3. The recommended next work is to design a reusable/offline reduction lifecycle only if measured workloads justify it, including dependency fingerprints and held-out frequency/parameter validation; keep the current per-run modal method explicit and supported. Require the packaged Win32 desktop harness, maximized full-desktop screenshots and newest-full-app launcher smoke in every milestone. Keep the CPU-only 2D field viewer retired, preserve the tested WebGPU-to-WebGL fallback, and continue retaining E1 sweep tests/references. Record future progress in this single roadmap.
+**Current action (5 November 2026):** Phase E3 is complete for its tested advanced numerical controls and ROM performance-assessment scope. Stop for independent review before starting Phase F. Persistent/offline ROM storage is not justified by the bounded E3 workload; keep the current per-run basis generation and reuse within frequency sweeps, and revisit cross-run persistence only after larger repeated-model studies establish a meaningful setup-time benefit. The next planned milestone after E3 acceptance is Phase F's incremental shared UX and workflow consistency, without losing axisymmetric specialist capabilities. Require the packaged Win32 desktop harness, maximized full-desktop screenshots and newest-full-app launcher smoke in every milestone. Keep the CPU-only 2D field viewer retired, preserve the tested WebGPU-to-WebGL fallback, and retain E1 sweep tests/references. The VM's SSD move is a known confounder for performance comparisons. Record future progress in this single roadmap.
