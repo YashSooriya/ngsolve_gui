@@ -1,9 +1,9 @@
 # MagMechSim: Forward Development Roadmap
 
-**Planning baseline:** 5 November 2026 (Phase E2 accepted; Phase E3 complete for tested scope and awaiting review)
+**Planning baseline:** 5 November 2026 (Phase E3 accepted; Phase F1 active)
 **Status:** Living plan, not an immutable implementation contract  
 **Primary users:** Engineers familiar with industrial CAE tools  
-**Primary immediate scope:** Independent review of the Phase E3 closeout; do not start Phase F before review
+**Primary immediate scope:** Phase F1 cross-workspace UX consistency and native startup reliability
 **Out of scope for now:** New results visualisation or a post-processing redesign (but existing Solve/Results navigation must remain fully functional)
 
 ## 1. Product objective and working agreement
@@ -20,7 +20,7 @@ MagMechSim should provide a complete, reliable and responsive workflow from geom
 
 The bullets below retain historical baseline evidence where useful. The accepted Phase A closeout and completed Phase B1/B2/C statuses below supersede earlier open/blank/recovery findings.
 
-**Latest verified status (5 November 2026):** Phases A, B1, B2, C, D1, D2, E1 and E2 remain accepted for their recorded scopes. Phase E3 adds independent 3D mesh geometry order, 3D Rayleigh damping and configurable coupled Anderson controls, with validation, saved project values, solver metadata, exact DC-cache invalidation and packaged Windows UI verification. Package `0.2.8.dev305` (executable SHA-256 `6de27c0ff2b48e4687333debab89fc0bb5c4115023153526c5f8321e4f1454e4`) was built from GUI `40ed39cb9cb5da68f9009849ba7d1366771ea476` and solver/native package `f1dd3c15ea5df42a2ef753d7f279d9b9c8bb3bba`; the latest launcher was tested against it. The focused GUI suite passed 166 tests (one existing pytest warning); solver/DC/axisymmetric ROM regressions passed 11 tests. Maximized packaged-app checks verified native settings edits, project save/reopen, startup and launcher behavior at 1920×1094. The VM is on an SSD; no controlled before/after comparison was made. The [Phase E3 report](reviews/2026-11-05-phase-e3.md) contains the configuration matrix, numerical response, ROM measurements and limitations. The [Phase E2 report](reviews/2026-11-05-phase-e2.md) retains its accepted-scope evidence. The CPU-only 2D field viewer remains retired and the tested WebGPU/WebGL fallback remains in place. Phase E3 did not change the numerical formulation or add dependencies.
+**Latest verified status (5 November 2026):** Phases A, B1, B2, C, D1, D2, E1, E2 and E3 are accepted for their recorded scopes. Phase E3 adds independent 3D mesh geometry order, Rayleigh damping and configurable coupled Anderson controls; its package, numerical evidence and ROM assessment remain documented in the [Phase E3 report](reviews/2026-11-05-phase-e3.md). Persistent/offline ROM remains deferred. Phase F1 is active: it is correcting the native splash-to-first-frame handoff and applying small shared-shell and model-tree usability refinements. The previous maximized package `0.2.8.dev305` (SHA-256 `6de27c0ff2b48e4687333debab89fc0bb5c4115023153526c5f8321e4f1454e4`) and its E3 checks are a baseline only; their first launch included a white frame. This VM is on an SSD, and no controlled before/after performance comparison has been made. The CPU-only 2D field viewer remains retired and the tested WebGPU/WebGL fallback remains in place.
 
 - The saved `Getting started - coupled coil` project rendered its square and circle regions in the first geometry-editor screenshot. The sketch grid filled the viewport at maximized and restored sizes with correct physical scaling. The earlier single blank capture was not reproduced; its cause remains unknown.
 - The axisymmetric geometry-creation 3D preview rendered both regions using Plotly WebGL. 3D STEP import, a 22,132-element bounded mesh, repeated native CAD selection, display switching, rotation and selection persistence all passed. The historical OOM did not reproduce; the test covered only three bounded cycles, so larger and longer sessions remain a risk.
@@ -296,9 +296,9 @@ Real NGSolve response checks verified that custom geometry order 4 improved a cu
 
 The bounded ROM measurement used 378 tetrahedra, 130 vertices, 315 free mechanical DOFs, six modes and three frequencies. Full-order solve wall time was `0.867 s`; ROM runs took `0.338 s` first and `0.581 s` on repeat, with basis construction `0.049/0.037 s` and online harmonic solve `0.142 s`. Six-mode displacement error was approximately `5.54%` across 50–150 Hz. Process RSS was `176.9 MB` full order and `183.0–183.1 MB` with ROM; these are whole-process measurements, not basis-only memory. At this size, basis construction is under 50 ms and run timings vary, so the evidence does not justify a persistent ROM artifact or establish a general speedup/break-even point. Keep per-run basis construction and within-sweep reuse. Reconsider persistent bases only if repeated larger-model studies show material setup cost, with exact stiffness/mass/constraint fingerprints and held-out frequency/parameter verification.
 
-Packaged desktop tests verified these controls in the maximized `0.2.8.dev305` application, save and fresh-process reopen, and the newest-app launcher. Full-desktop screenshots and test logs are in the [Phase E3 review package](reviews/2026-11-05-phase-e3.md). A known white first Chromium frame after the startup probe remains unresolved; native navigation then rendered the imported 3D solid and property editor. No solver formulation or dependency changed, and neither the separate Mike variant nor the retired 2D field viewer was modified or restored.
+Packaged desktop tests verified these controls in the maximized `0.2.8.dev305` application, save and fresh-process reopen, and the newest-app launcher. Full-desktop screenshots and test logs are in the [Phase E3 review package](reviews/2026-11-05-phase-e3.md). At E3 closeout, one cold first frame was blank after the splash had been dismissed; the underlying launcher only required the window to be maximized and could not prove that Windows had foregrounded or painted its contents. Phase F1 addresses that exact handoff, rather than attributing the improvement to the SSD move. No numerical formulation or dependency change is part of F1, and neither the separate Mike variant nor the retired 2D field viewer is being modified or restored.
 
-**Gate:** Complete for the verified configuration and ROM-assessment scope; stop for independent review before Phase F.
+**Gate:** Accepted for the verified configuration and ROM-assessment scope; persistent/offline ROM remains deferred unless representative repeated-model benchmarks show a worthwhile benefit.
 
 ### Phase F. Axisymmetric and 3D UX unification, without loss of specialist capabilities
 
@@ -308,7 +308,23 @@ Packaged desktop tests verified these controls in the maximized `0.2.8.dev305` a
 - Preserve axisymmetric sketching, arcs, lines, region behaviour, hp-layer controls and dedicated numerical semantics.
 - Remove duplicated infrastructure only where justified by maintainability or user benefit; avoid large numerical code migrations for visual uniformity alone.
 
-**Gate:** Engineers can move between formulations without relearning basic actions, and existing axisymmetric regression examples still pass.
+#### Phase F1. Cross-workspace cohesion and startup reliability (active; 5 November 2026)
+
+- Keep one shared application shell and command hierarchy while retaining distinct axisymmetric sketch and OCC CAD toolbars.
+- Compact the shared top navigation modestly; make long 3D assignment labels discoverable in the model tree; preserve contextual menus, quick actions and Model/Results navigation.
+- Verify fresh packaged launches on the real desktop: the target window must be maximized and foregrounded, and native pixels must show the application before the splash is removed. Do not use a fixed launch delay as a proxy for paint.
+- Exercise actual native input in both workflows: recent-project tiles, 3D geometry/property navigation, axisymmetric sketch selection and its 3D geometry-creation preview. Capture maximized full-desktop screenshots.
+- Preserve all specialist geometry, mesh and solver paths; avoid numerical refactoring.
+
+**F1 gate:** Repeatable unassisted splash handoff with a painted native frame; both interfaces navigable and responsive at full desktop size; relevant source and packaged tests pass. Stop for independent review after this stage.
+
+#### Phase F2. Follow-on UI refinement (planned; not started)
+
+- Review remaining property grouping, toolbar/context-menu duplication, model-tree naming and scroll/splitter behavior using F1 evidence.
+- Continue removing only redundant helper prose; keep units, constraints, compatibility warnings and destructive-action context.
+- Add further cross-workspace interaction refinements only where F1 desktop inspection identifies a specific usability issue.
+
+**Gate:** Improvements are grounded in real packaged workflows, preserve specialized tools, and do not rebuild expensive viewports during ordinary property or panel changes.
 
 ### Phase G. Sphinx documentation, in-app help and documentation search
 
@@ -358,7 +374,10 @@ Phase D2: coupled workflow and verification refinement — accepted for tested s
             Advanced numerical settings and ROM assessment (Phase E3 — complete for tested scope)
                       |
                       v
-            Shared UX unification (Phase F — next after E3 review)
+            Cross-workspace cohesion and startup reliability (Phase F1 — active)
+                      |
+                      v
+            Follow-on UX refinement (Phase F2 — after F1 review)
 
 Local Sphinx access starts NOW; comprehensive docs and 5-result search follow in Phase G.
 Release, packaging and comprehensive quality gates occur throughout, with final signoff in Phase H.
@@ -400,4 +419,4 @@ Release, packaging and comprehensive quality gates occur throughout, with final 
 
 Suggested repository home for this plan: a documented planning location under the GUI repository, chosen by Codex after inspecting existing conventions. Keep this file as the **single current roadmap**, with date, completed milestones, changed priorities and links to implementation reports. Historical roadmaps may remain archived but should not conflict with the current one.
 
-**Current action (5 November 2026):** Phase E3 is complete for its tested advanced numerical controls and ROM performance-assessment scope. Stop for independent review before starting Phase F. Persistent/offline ROM storage is not justified by the bounded E3 workload; keep the current per-run basis generation and reuse within frequency sweeps, and revisit cross-run persistence only after larger repeated-model studies establish a meaningful setup-time benefit. The next planned milestone after E3 acceptance is Phase F's incremental shared UX and workflow consistency, without losing axisymmetric specialist capabilities. Require the packaged Win32 desktop harness, maximized full-desktop screenshots and newest-full-app launcher smoke in every milestone. Keep the CPU-only 2D field viewer retired, preserve the tested WebGPU-to-WebGL fallback, and retain E1 sweep tests/references. The VM's SSD move is a known confounder for performance comparisons. Record future progress in this single roadmap.
+**Current action (5 November 2026):** Phase E3 is accepted for its tested advanced numerical controls and ROM performance assessment. Persistent/offline ROM remains deferred; keep per-run basis construction and within-sweep reuse until larger repeated-model benchmarks establish a worthwhile benefit. Phase F1 is the active milestone. Require the packaged Win32 desktop harness, maximized screenshots, verified foreground HWND, an actual pre-splash-dismissal paint signal, and newest-full-app launcher smoke. Keep the CPU-only 2D viewer retired, preserve the WebGPU-to-WebGL fallback and E1 sweep references, and do not change the separate Mike variant. The VM's SSD move is a performance confounder, not a code improvement. Update this single roadmap with Phase F1 evidence, then stop for independent review before Phase F2.

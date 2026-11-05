@@ -1807,14 +1807,17 @@ class ThreeDWorkspace(Div):
             label_node,
         ]
         if material:
-            children.append(Div(
+            material_badge = Div(
                 material,
                 ui_class="cb-muted",
                 ui_style=(
                     "max-width:76px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; "
                     "font-size:10px; padding:1px 4px; border-radius:4px; background:var(--panel-header);"
                 ),
-            ))
+            )
+            material_badge._props["title"] = f"Material: {material}"
+            material_badge._props["aria-label"] = f"Material: {material}"
+            children.append(material_badge)
         if mesh_status:
             if mesh_status == "Meshed":
                 status_icon = QIcon(
@@ -1995,6 +1998,13 @@ class ThreeDWorkspace(Div):
         visibility._props["aria-label"] = (
             ("Show solid " if hidden else "Hide solid ") + name
         )
+        material_badge = Div(
+            material_name,
+            ui_class="cb-muted",
+            ui_style="max-width:78px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:9px; padding:1px 4px; border-radius:4px; background:var(--panel-header);",
+        )
+        material_badge._props["title"] = f"Material: {material_name}"
+        material_badge._props["aria-label"] = f"Material: {material_name}"
         row = Div(
             QIcon(
                 ui_name="mdi-cube-outline",
@@ -2002,11 +2012,7 @@ class ThreeDWorkspace(Div):
                 ui_color="primary" if selected else "grey-7",
             ),
             label,
-            Div(
-                material_name,
-                ui_class="cb-muted",
-                ui_style="max-width:78px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:9px; padding:1px 4px; border-radius:4px; background:var(--panel-header);",
-            ),
+            material_badge,
             visibility,
             ui_style=(
                 "display:flex; align-items:center; gap:5px; min-width:0; padding:3px 5px 3px 30px; "

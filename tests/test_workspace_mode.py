@@ -2,7 +2,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from ngsolve_gui.app import NGSolveGui, WorkspaceModeToggle
+from ngsolve_gui.app import (
+    APP_HEADER_HEIGHT,
+    APP_MENU_BAR_HEIGHT,
+    NGSolveGui,
+    WorkspaceModeToggle,
+)
+
+
+def test_shared_application_shell_keeps_a_compact_workspace_header():
+    assert APP_MENU_BAR_HEIGHT == 32
+    assert APP_HEADER_HEIGHT == 50
 
 
 def test_workspace_mode_toggle_updates_selection_and_notifies(monkeypatch):

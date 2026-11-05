@@ -47,6 +47,10 @@ from .result_files import (
 )
 
 
+APP_MENU_BAR_HEIGHT = 32
+APP_HEADER_HEIGHT = 50
+
+
 def _solver_process_failure_detail(return_code):
     """Describe an exited solver process without hiding native status codes."""
     status = int(return_code)
@@ -857,7 +861,10 @@ class NGSolveGui(App):
             QSpace(),
             *([self.system_monitor, Div(ui_class=cb.tb_sep)] if self.system_monitor is not None else []),
             ui_class=str(cb.app_bar) + " mmfem-compact-app-bar",
-            ui_style="height:54px; min-height:54px;",
+            ui_style=(
+                f"height:{APP_HEADER_HEIGHT}px; "
+                f"min-height:{APP_HEADER_HEIGHT}px;"
+            ),
         )
 
         # Three-column layout using flex
@@ -1732,7 +1739,8 @@ class NGSolveGui(App):
             ui_class="mmfem-app-menu-bar",
             ui_style=(
                 "display:flex; align-items:center; gap:2px; flex:0 0 auto; "
-                "min-height:36px; padding:0 12px; box-sizing:border-box; "
+                f"min-height:{APP_MENU_BAR_HEIGHT}px; "
+                "padding:0 12px; box-sizing:border-box; "
                 "background:var(--panel-header); border-bottom:1px solid var(--border);"
             ),
         )

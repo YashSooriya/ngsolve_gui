@@ -124,8 +124,37 @@ def test_three_d_tree_selection_updates_the_properties_panel(monkeypatch):
     assert workspace._selection == ("geometry", "geometry-1")
     assert workspace._properties.ui_children[0].ui_children == ["Geometry model"]
     assert workspace._geometry_items.ui_children[0].ui_children[1].ui_children == ["shield.step"]
+    material_badge = workspace._geometry_items.ui_children[0].ui_children[2]
+    assert material_badge._props["title"] == "Material: Shield"
+    assert material_badge._props["aria-label"] == "Material: Shield"
     labels = {getattr(child, "ui_label", None) for child in workspace._properties.ui_children}
     assert {"Default material", "Length units", "Maximum element size (mm)"} <= labels
+
+
+def test_3d_solid_tree_material_badge_exposes_its_full_name(monkeypatch):
+    monkeypatch.setattr(Component, "_update_frontend", lambda *_args, **_kwargs: None)
+    workspace = ThreeDWorkspace(SimpleNamespace())
+    geometry = {
+        "id": "geometry-1",
+        "name": "shield.step",
+        "material": "Long stainless-steel material name",
+        "solid_names": {},
+    }
+    row = workspace._solid_tree_item(
+        geometry,
+        {
+            "id": 0,
+            "domain_tag": "MMFEM_SOLID_000000000000000000000001",
+            "name": "Shield solid",
+            "elements": 12,
+        },
+    )
+
+    material_badge = row.ui_children[2]
+    assert material_badge._props["title"] == (
+        "Material: Long stainless-steel material name"
+    )
+    assert material_badge._props["aria-label"] == material_badge._props["title"]
 
 
 def test_named_domain_mesh_size_invalidates_preview_mesh_and_persists(monkeypatch):
