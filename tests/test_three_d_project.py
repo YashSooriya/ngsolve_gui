@@ -63,7 +63,10 @@ def test_frequency_definitions_reject_invalid_or_excessive_values(mode, values, 
 
 
 def test_project_version_one_migrates_without_changing_legacy_frequency():
-    from ngsolve_gui.three_d_project import PROJECT_VERSION
+    from ngsolve_gui.three_d_project import (
+        MESH_GEOMETRY_ORDER_MATCH_FE,
+        PROJECT_VERSION,
+    )
 
     project = new_3d_project("Legacy v1")
     project["version"] = 1
@@ -74,6 +77,52 @@ def test_project_version_one_migrates_without_changing_legacy_frequency():
 
     assert project["version"] == PROJECT_VERSION == 2
     assert study_frequency_points_hz(project["study"]) == [123.0]
+    assert project["study"]["mesh_geometry_order"] == MESH_GEOMETRY_ORDER_MATCH_FE
+
+
+def test_advanced_3d_numerical_settings_persist_through_project_round_trip():
+    project = new_3d_project("Advanced numerical settings")
+    project["study"].update(
+        polynomial_order=2,
+        mesh_geometry_order=5,
+        mechanical_rayleigh_alpha=2.5,
+        mechanical_rayleigh_beta=0.0005,
+        coupling_max_iterations=12,
+        coupling_anderson_depth=4,
+        coupling_anderson_relaxation=0.65,
+    )
+
+    reopened, assets = unpack_3d_project(package_3d_project(project, {}))
+
+    assert assets == {}
+    assert reopened["study"]["polynomial_order"] == 2
+    assert reopened["study"]["mesh_geometry_order"] == 5
+    assert reopened["study"]["mechanical_rayleigh_alpha"] == 2.5
+    assert reopened["study"]["mechanical_rayleigh_beta"] == 0.0005
+    assert reopened["study"]["coupling_anderson_depth"] == 4
+    assert reopened["study"]["coupling_anderson_relaxation"] == 0.65
+
+
+@pytest.mark.parametrize(
+    ("setting", "value", "message"),
+    [
+        ("mesh_geometry_order", 0, "Mesh geometry order"),
+        ("mesh_geometry_order", 7, "Mesh geometry order"),
+        ("mesh_geometry_order", 1.5, "Mesh geometry order"),
+        ("mechanical_rayleigh_alpha", -1.0, "Mass-proportional damping"),
+        ("mechanical_rayleigh_beta", float("nan"), "Stiffness-proportional damping"),
+        ("coupling_anderson_depth", -1, "Anderson depth"),
+        ("coupling_anderson_depth", 1.5, "Anderson depth"),
+        ("coupling_anderson_relaxation", 0.0, "Anderson relaxation"),
+        ("coupling_anderson_relaxation", 1.1, "Anderson relaxation"),
+    ],
+)
+def test_advanced_3d_numerical_settings_reject_invalid_values(setting, value, message):
+    project = new_3d_project("Invalid advanced settings")
+    project["study"][setting] = value
+
+    with pytest.raises(ValueError, match=message):
+        validate_3d_project(project, {})
 
 
 def test_frequency_definition_round_trips_in_project_file():

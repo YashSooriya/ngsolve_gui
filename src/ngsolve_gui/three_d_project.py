@@ -35,6 +35,8 @@ MAX_NAMED_SELECTIONS = 500
 MAX_SELECTION_REGIONS = 100_000
 MIN_MESH_SIZE_MM = 0.01
 MAX_MESH_SIZE_MM = 100_000.0
+MAX_3D_MESH_GEOMETRY_ORDER = 6
+MESH_GEOMETRY_ORDER_MATCH_FE = "match_finite_element"
 SUPPORTED_3D_BOUNDARY_CONDITIONS = {
     "magnetic_potential_zero": "Vector potential A = 0",
     "mechanical_fixed": "Fixed support (u = 0)",
@@ -102,12 +104,19 @@ def new_3d_project(name="Untitled 3D project"):
             "frequency_end_hz": 1000.0,
             "frequency_step_hz": 500.0,
             "polynomial_order": 1,
+            # Match the historical behaviour until the user chooses an
+            # independent curved-CAD approximation order.
+            "mesh_geometry_order": "match_finite_element",
             "air_padding": 2.0,
             "dc_background_field_t": [0.0, 0.0, 0.0],
             "mechanical_body_force_n_m3": [0.0, 0.0, 0.0],
             "mechanical_body_force_phase_deg": [0.0, 0.0, 0.0],
+            "mechanical_rayleigh_alpha": 0.0,
+            "mechanical_rayleigh_beta": 0.0,
             "coupling_max_iterations": 15,
             "coupling_tolerance": 1e-4,
+            "coupling_anderson_depth": 3,
+            "coupling_anderson_relaxation": 1.0,
             "mechanical_solution_method": "full_order",
             "mechanical_rom": dict(DEFAULT_MECHANICAL_ROM),
         },
@@ -799,6 +808,139 @@ def domain_material_overrides(geometry, *, require_stable_tags=False):
     return overrides
 
 
+def normalize_3d_numerical_settings(study, *, physics):
+    """Validate and normalize advanced 3D settings shared by project and solver."""
+    raw_order = study.get("polynomial_order", 1)
+    if isinstance(raw_order, bool):
+        raise ValueError("Finite-element approximation order must be an integer from 1 to 4.")
+    try:
+        numeric_order = float(raw_order)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Finite-element approximation order must be an integer from 1 to 4.") from error
+    if not math.isfinite(numeric_order) or not numeric_order.is_integer() or not 1 <= numeric_order <= 4:
+        raise ValueError("Finite-element approximation order must be an integer from 1 to 4.")
+    polynomial_order = int(numeric_order)
+
+    raw_geometry_order = study.get(
+        "mesh_geometry_order", MESH_GEOMETRY_ORDER_MATCH_FE
+    )
+    if raw_geometry_order in (None, MESH_GEOMETRY_ORDER_MATCH_FE):
+        mesh_geometry_order_mode = MESH_GEOMETRY_ORDER_MATCH_FE
+        mesh_geometry_order = polynomial_order
+        stored_geometry_order = MESH_GEOMETRY_ORDER_MATCH_FE
+    else:
+        if isinstance(raw_geometry_order, bool):
+            raise ValueError(
+                "Mesh geometry order must match the finite-element order or be an integer from 1 to 6."
+            )
+        try:
+            numeric_geometry_order = float(raw_geometry_order)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                "Mesh geometry order must match the finite-element order or be an integer from 1 to 6."
+            ) from error
+        if (
+            not math.isfinite(numeric_geometry_order)
+            or not numeric_geometry_order.is_integer()
+            or not 1 <= numeric_geometry_order <= MAX_3D_MESH_GEOMETRY_ORDER
+        ):
+            raise ValueError(
+                f"Mesh geometry order must be an integer from 1 to {MAX_3D_MESH_GEOMETRY_ORDER}, or match the finite-element order."
+            )
+        mesh_geometry_order_mode = "custom"
+        mesh_geometry_order = int(numeric_geometry_order)
+        stored_geometry_order = mesh_geometry_order
+
+    def finite_nonnegative_setting(key, label):
+        raw_value = study.get(key, 0.0)
+        if isinstance(raw_value, bool):
+            raise ValueError(f"{label} must be a finite value from 0 to 1e12.")
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(f"{label} must be a finite value from 0 to 1e12.") from error
+        if not math.isfinite(value) or not 0.0 <= value <= 1e12:
+            raise ValueError(f"{label} must be a finite value from 0 to 1e12.")
+        return value
+
+    rayleigh_alpha = finite_nonnegative_setting(
+        "mechanical_rayleigh_alpha", "Mass-proportional damping coefficient (1/s)"
+    )
+    rayleigh_beta = finite_nonnegative_setting(
+        "mechanical_rayleigh_beta", "Stiffness-proportional damping coefficient (s)"
+    )
+
+    raw_max_iterations = study.get("coupling_max_iterations", 15)
+    if isinstance(raw_max_iterations, bool):
+        raise ValueError("Maximum coupling iterations must be an integer from 1 to 100.")
+    try:
+        numeric_max_iterations = float(raw_max_iterations)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Maximum coupling iterations must be an integer from 1 to 100.") from error
+    if (
+        not math.isfinite(numeric_max_iterations)
+        or not numeric_max_iterations.is_integer()
+        or not 1 <= numeric_max_iterations <= 100
+    ):
+        raise ValueError("Maximum coupling iterations must be an integer from 1 to 100.")
+    coupling_max_iterations = int(numeric_max_iterations)
+
+    try:
+        coupling_tolerance = float(study.get("coupling_tolerance", 1e-4))
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Coupling tolerance must be between 1e-12 and 0.1.") from error
+    if not math.isfinite(coupling_tolerance) or not 1e-12 <= coupling_tolerance <= 0.1:
+        raise ValueError("Coupling tolerance must be between 1e-12 and 0.1.")
+
+    raw_anderson_depth = study.get("coupling_anderson_depth", 3)
+    if isinstance(raw_anderson_depth, bool):
+        raise ValueError("Anderson depth must be an integer from 0 to 100; 0 disables acceleration.")
+    try:
+        numeric_anderson_depth = float(raw_anderson_depth)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Anderson depth must be an integer from 0 to 100; 0 disables acceleration.") from error
+    if (
+        not math.isfinite(numeric_anderson_depth)
+        or not numeric_anderson_depth.is_integer()
+        or not 0 <= numeric_anderson_depth <= 100
+    ):
+        raise ValueError("Anderson depth must be an integer from 0 to 100; 0 disables acceleration.")
+    coupling_anderson_depth = int(numeric_anderson_depth)
+
+    try:
+        coupling_anderson_relaxation = float(
+            study.get("coupling_anderson_relaxation", 1.0)
+        )
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Anderson relaxation must be greater than 0 and at most 1.") from error
+    if (
+        not math.isfinite(coupling_anderson_relaxation)
+        or not 0.0 < coupling_anderson_relaxation <= 1.0
+    ):
+        raise ValueError("Anderson relaxation must be greater than 0 and at most 1.")
+    if (
+        physics == "coupled_magneto_mechanical"
+        and coupling_anderson_depth > 0
+        and coupling_max_iterations < 2
+    ):
+        raise ValueError(
+            "Anderson acceleration requires at least 2 maximum coupling iterations; set its depth to 0 to disable it."
+        )
+
+    return {
+        "polynomial_order": polynomial_order,
+        "mesh_geometry_order": mesh_geometry_order,
+        "mesh_geometry_order_mode": mesh_geometry_order_mode,
+        "stored_mesh_geometry_order": stored_geometry_order,
+        "mechanical_rayleigh_alpha": rayleigh_alpha,
+        "mechanical_rayleigh_beta": rayleigh_beta,
+        "coupling_max_iterations": coupling_max_iterations,
+        "coupling_tolerance": coupling_tolerance,
+        "coupling_anderson_depth": coupling_anderson_depth,
+        "coupling_anderson_relaxation": coupling_anderson_relaxation,
+    }
+
+
 def validate_3d_project(project, assets):
     if not isinstance(project, dict) or project.get("schema") != PROJECT_SCHEMA:
         raise ValueError("This is not a MagMechSim 3D project.")
@@ -827,9 +969,8 @@ def validate_3d_project(project, assets):
     if physics in {"harmonic_em", "coupled_magneto_mechanical"} and em_source_mode not in SUPPORTED_3D_EM_SOURCE_MODES:
         raise ValueError("Choose a supported 3D electromagnetic excitation source.")
     try:
-        polynomial_order = int(study.get("polynomial_order", 1))
-        if polynomial_order not in {1, 2, 3, 4}:
-            raise ValueError("Polynomial order must be between 1 and 4.")
+        numerical_settings = normalize_3d_numerical_settings(study, physics=physics)
+        polynomial_order = numerical_settings["polynomial_order"]
         if harmonic:
             frequency_mode = study.get("frequency_mode", "single")
             frequencies_hz = study_frequency_points_hz(study)
@@ -861,20 +1002,8 @@ def validate_3d_project(project, assets):
                 "Mechanical body-force phase (degrees)", limit=360_000.0,
             )
         if coupled:
-            raw_max_iterations = study.get("coupling_max_iterations", 15)
-            if isinstance(raw_max_iterations, bool):
-                raise ValueError("Maximum coupling iterations must be an integer from 1 to 100.")
-            numeric_max_iterations = float(raw_max_iterations)
-            if (
-                not math.isfinite(numeric_max_iterations)
-                or not numeric_max_iterations.is_integer()
-                or not 1 <= numeric_max_iterations <= 100
-            ):
-                raise ValueError("Maximum coupling iterations must be an integer from 1 to 100.")
-            coupling_max_iterations = int(numeric_max_iterations)
-            coupling_tolerance = float(study.get("coupling_tolerance", 1e-4))
-            if not math.isfinite(coupling_tolerance) or not 1e-12 <= coupling_tolerance <= 0.1:
-                raise ValueError("Coupling tolerance must be between 1e-12 and 0.1.")
+            coupling_max_iterations = numerical_settings["coupling_max_iterations"]
+            coupling_tolerance = numerical_settings["coupling_tolerance"]
         mechanical_solution_method, mechanical_rom = validate_mechanical_solution(
             study.get("mechanical_solution_method", "full_order"),
             study.get("mechanical_rom", DEFAULT_MECHANICAL_ROM),
@@ -885,6 +1014,11 @@ def validate_3d_project(project, assets):
     study["physics"] = physics
     project["version"] = PROJECT_VERSION
     study["polynomial_order"] = polynomial_order
+    study["mesh_geometry_order"] = numerical_settings["stored_mesh_geometry_order"]
+    study["mechanical_rayleigh_alpha"] = numerical_settings["mechanical_rayleigh_alpha"]
+    study["mechanical_rayleigh_beta"] = numerical_settings["mechanical_rayleigh_beta"]
+    study["coupling_anderson_depth"] = numerical_settings["coupling_anderson_depth"]
+    study["coupling_anderson_relaxation"] = numerical_settings["coupling_anderson_relaxation"]
     if physics in {"harmonic_em", "coupled_magneto_mechanical"}:
         study["em_source_mode"] = em_source_mode
     if electromagnetic:

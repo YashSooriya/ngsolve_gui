@@ -25,6 +25,7 @@ from .material_library import MaterialLibrary
 from .three_d_mesh import generate_step_mesh
 from .three_d_project import (
     LENGTH_UNITS,
+    MESH_GEOMETRY_ORDER_MATCH_FE,
     MAX_MESH_SIZE_MM,
     MIN_MESH_SIZE_MM,
     PROJECT_SUFFIX,
@@ -99,7 +100,7 @@ def _button(label, icon, callback, *, color=None, tooltip=None):
 
 def _input(
     label, value, callback, *, number=False, width="118px", suffix=None,
-    on_commit=False,
+    on_commit=False, disabled=False,
 ):
     widget = QInput(
         ui_label=label,
@@ -110,6 +111,7 @@ def _input(
         ui_filled=True,
         ui_hide_bottom_space=True,
         ui_style=f"width:{width};",
+        ui_disable=disabled,
     )
     if on_commit:
         widget.on_change(callback)
@@ -1085,7 +1087,32 @@ class ThreeDWorkspace(Div):
             self._rebuild_properties()
             return False
         self._mark_changed()
+        if key == "coupling_anderson_depth":
+            self._rebuild_properties()
         self._set_status("3D study settings updated.")
+        return True
+
+    def _set_mesh_geometry_order(self, event):
+        study = self.project.setdefault("study", {})
+        old_value = study.get(
+            "mesh_geometry_order", MESH_GEOMETRY_ORDER_MATCH_FE
+        )
+        value = getattr(event, "value", event)
+        try:
+            value = (
+                MESH_GEOMETRY_ORDER_MATCH_FE
+                if value in {"match_finite_element", "match_fe"}
+                else int(value)
+            )
+            study["mesh_geometry_order"] = value
+            validate_3d_project(self.project, self.assets)
+        except (TypeError, ValueError, OverflowError) as error:
+            study["mesh_geometry_order"] = old_value
+            self._set_status(str(error), error=True)
+            self._rebuild_properties()
+            return False
+        self._mark_changed()
+        self._set_status("3D mesh geometry order updated.")
         return True
 
     def _set_mechanical_solution_method(self, event):
@@ -3956,10 +3983,27 @@ class ThreeDWorkspace(Div):
                     self._frequency_points_summary(study),
                 ]),
                 self._select_options(
-                    "Finite-element order", study.get("polynomial_order", 1),
+                    "Finite-element approximation order", study.get("polynomial_order", 1),
                     lambda event: self._set_study_value("polynomial_order", event),
                     [{"label": f"{order} · {'linear' if order == 1 else 'quadratic' if order == 2 else 'order ' + str(order)}", "value": order}
                      for order in (1, 2, 3, 4)],
+                ),
+                self._select_options(
+                    "Mesh geometry order",
+                    str(study.get("mesh_geometry_order", MESH_GEOMETRY_ORDER_MATCH_FE)),
+                    self._set_mesh_geometry_order,
+                    [
+                        {"label": "Match FE approximation order", "value": MESH_GEOMETRY_ORDER_MATCH_FE},
+                        *[
+                            {"label": str(order), "value": str(order)}
+                            for order in range(1, 7)
+                        ],
+                    ],
+                ),
+                Div(
+                    "Curved CAD boundary accuracy for the solver mesh; independent of FE approximation order.",
+                    ui_class="cb-muted",
+                    ui_style="font-size:10px; line-height:1.4;",
                 ),
             ])
             if physics in {"harmonic_mechanical", "coupled_magneto_mechanical"}:
@@ -4130,6 +4174,29 @@ class ThreeDWorkspace(Div):
                         number=True,
                         width="100%",
                     ))
+                children.extend([
+                    Div("Rayleigh damping", ui_style="font-size:12px; font-weight:600; padding-top:6px;"),
+                    _input(
+                        "Mass coefficient (α)",
+                        study.get("mechanical_rayleigh_alpha", 0.0),
+                        lambda event: self._set_study_value(
+                            "mechanical_rayleigh_alpha", event, number=True
+                        ),
+                        number=True,
+                        suffix="1/s",
+                        width="100%",
+                    ),
+                    _input(
+                        "Stiffness coefficient (β)",
+                        study.get("mechanical_rayleigh_beta", 0.0),
+                        lambda event: self._set_study_value(
+                            "mechanical_rayleigh_beta", event, number=True
+                        ),
+                        number=True,
+                        suffix="s",
+                        width="100%",
+                    ),
+                ])
                 children.append(Div(
                     (
                         "Optional harmonic body force; magnetic Maxwell stress supplies the coupled load. Assign fixed supports, prescribed displacement or springs. Materials need permeability, conductivity, Young’s modulus, Poisson ratio and density."
@@ -4152,8 +4219,34 @@ class ThreeDWorkspace(Div):
                         lambda event: self._set_study_value("coupling_tolerance", event, number=True),
                         number=True, width="100%", on_commit=True,
                     ),
+                    _input(
+                        "Anderson depth (0 disables)",
+                        study.get("coupling_anderson_depth", 3),
+                        lambda event: self._set_study_value(
+                            "coupling_anderson_depth", event, number=True
+                        ),
+                        number=True, width="100%", on_commit=True,
+                    ),
+                    _input(
+                        "Anderson relaxation",
+                        study.get("coupling_anderson_relaxation", 1.0),
+                        lambda event: self._set_study_value(
+                            "coupling_anderson_relaxation", event, number=True
+                        ),
+                        number=True, width="100%", on_commit=True,
+                        disabled=study.get("coupling_anderson_depth", 3) == 0,
+                    ),
                     Div(
-                        "Uses the existing block Gauss–Seidel iteration with Anderson acceleration (depth 3). A run is marked converged only when both magnetic-potential and displacement relative changes meet the tolerance.",
+                        (
+                            "Uses block Gauss–Seidel with Anderson acceleration "
+                            f"(depth {study.get('coupling_anderson_depth', 3)}, "
+                            f"relaxation {study.get('coupling_anderson_relaxation', 1.0):g}). "
+                            "Set depth to 0 to disable acceleration. Convergence requires "
+                            "both magnetic-potential and displacement changes to meet tolerance."
+                            if study.get("coupling_anderson_depth", 3) > 0
+                            else "Uses block Gauss–Seidel without acceleration. Convergence requires "
+                            "both magnetic-potential and displacement changes to meet tolerance."
+                        ),
                         ui_class="cb-muted",
                         ui_style="font-size:10px; line-height:1.45; padding:8px; background:var(--panel-header); border-radius:5px;",
                     ),

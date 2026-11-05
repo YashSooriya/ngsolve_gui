@@ -56,7 +56,9 @@ def _study_project():
     return project
 
 
-def _run_packaged_solver_model(project, assets, tmp_path, name, *, expected_status="complete"):
+def _run_packaged_solver_model(
+    project, assets, tmp_path, name, *, expected_status="complete", measure_peak_rss=False
+):
     gui_root = Path(__file__).resolve().parents[1]
     solver_candidates = []
     configured_root = os.environ.get("COUPLED_SOLVER_ROOT")
@@ -82,22 +84,72 @@ def _run_packaged_solver_model(project, assets, tmp_path, name, *, expected_stat
     environment["PYTHONPATH"] = os.pathsep.join(
         [str(gui_root / "src"), *filter(None, [environment.get("PYTHONPATH")])]
     )
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(solver_root / "scripts" / "run_gui_3d_model.py"),
-            "--model", str(model_path),
-            "--output-dir", str(output_dir),
-        ],
-        cwd=solver_root,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=90,
-        env=environment,
-        check=False,
-    )
+    command = [
+        sys.executable,
+        str(solver_root / "scripts" / "run_gui_3d_model.py"),
+        "--model", str(model_path),
+        "--output-dir", str(output_dir),
+    ]
+    peak_rss_bytes = None
+    if measure_peak_rss:
+        import threading
+        import time
+
+        import psutil
+
+        process = subprocess.Popen(
+            command,
+            cwd=solver_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=environment,
+        )
+        process_output = []
+
+        def collect_output():
+            process_output.extend(process.communicate())
+
+        reader = threading.Thread(target=collect_output, daemon=True)
+        reader.start()
+        deadline = time.monotonic() + 90
+        peak_rss_bytes = 0
+        measured_process = psutil.Process(process.pid)
+        while process.poll() is None:
+            try:
+                peak_rss_bytes = max(
+                    peak_rss_bytes, measured_process.memory_info().rss
+                )
+            except psutil.NoSuchProcess:
+                break
+            except psutil.AccessDenied:
+                pass
+            if time.monotonic() >= deadline:
+                process.kill()
+                reader.join(timeout=5)
+                raise subprocess.TimeoutExpired(command, 90)
+            time.sleep(0.02)
+        reader.join(timeout=5)
+        completed = subprocess.CompletedProcess(
+            command,
+            process.returncode,
+            process_output[0] if process_output else "",
+            process_output[1] if len(process_output) > 1 else "",
+        )
+    else:
+        completed = subprocess.run(
+            command,
+            cwd=solver_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=90,
+            env=environment,
+            check=False,
+        )
     solver_output = re.sub(
         re.escape(str(tmp_path)), "<temporary-run>",
         f"{completed.stdout}\n{completed.stderr}", flags=re.IGNORECASE,
@@ -107,6 +159,8 @@ def _run_packaged_solver_model(project, assets, tmp_path, name, *, expected_stat
         (output_dir / "run_manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["status"] == expected_status, solver_output[-5000:]
+    if measure_peak_rss:
+        manifest["_test_peak_rss_bytes"] = peak_rss_bytes
     return manifest, output_dir
 
 
@@ -300,8 +354,12 @@ def test_dc_fingerprint_tracks_only_inputs_that_change_the_background(tmp_path):
     first = dc_input_fingerprint_payload(project, paths)
     project["study"]["frequency_hz"] = 1e99
     project["study"]["mechanical_body_force_n_m3"] = [8e8, 0.0, 0.0]
+    project["study"]["mechanical_rayleigh_beta"] = 0.001
     unrelated = dc_input_fingerprint_payload(project, paths)
     assert first == unrelated
+    project["study"]["mesh_geometry_order"] = 4
+    changed_geometry_order = dc_input_fingerprint_payload(project, paths)
+    assert changed_geometry_order != first
     project["materials"][0]["properties"]["relative_permeability"] = 2.2
     changed_material = dc_input_fingerprint_payload(project, paths)
     assert changed_material != first
@@ -351,6 +409,173 @@ def test_coupled_validation_requires_dc_ac_and_mechanical_supports():
         validate_3d_study_setup(project)
 
 
+def test_coupled_numerical_settings_validate_anderson_requirements():
+    project = _study_project()
+    project["wire_trace_sets"] = []
+    project["study"].update(
+        physics="coupled_magneto_mechanical",
+        em_source_mode="domain_current_density",
+        dc_background_field_t=[0.0, 0.0, 0.025],
+    )
+    domain = project["geometries"][0]["domain_selections"][0]
+    domain["current_density_amplitude_a_per_m2"] = [1e6, 0.0, 0.0]
+    domain["current_density_phase_deg"] = [0.0, 0.0, 0.0]
+    project["geometries"][0]["boundary_selections"] = [{
+        "id": "support",
+        "name": "Fixed support",
+        "boundary_ids": [0],
+        "boundary_tags": ["MMFEM_FACE_000000000000000000000003"],
+        "boundary_condition": "mechanical_fixed",
+    }]
+
+    project["study"].update(coupling_max_iterations=1, coupling_anderson_depth=3)
+    with pytest.raises(ValueError, match="Anderson acceleration requires at least 2"):
+        validate_3d_study_setup(project)
+
+    project["study"].update(coupling_anderson_depth=0)
+    validated = validate_3d_study_setup(project)
+    assert validated["coupling_anderson_depth"] == 0
+    assert validated["coupling_anderson_relaxation"] == 1.0
+
+
+@pytest.mark.skipif(
+    not solver_checkout_available(),
+    reason=SOLVER_UNAVAILABLE_REASON,
+)
+def test_mesh_geometry_order_and_rayleigh_damping_reach_a_real_3d_solve(tmp_path):
+    import numpy as np
+    import ngsolve as ngs
+    from netgen.occ import Box, OCCGeometry, Pnt, Sphere
+    from ngsolve_gui.three_d_project import step_geometry_tags
+
+    step_path = tmp_path / "curved_mechanical_sphere.step"
+    Sphere(Pnt(0, 0, 0), 5).WriteStep(str(step_path))
+    solid_tags, face_refs = step_geometry_tags(
+        list(OCCGeometry(str(step_path)).solids)
+    )
+    support_tag = next(
+        tag for tag, solid_tag, _face in face_refs if solid_tag == solid_tags[0]
+    )
+
+    material = builtin_materials()[4]
+    project = new_3d_project("Curved mesh and damping verification")
+    project["materials"] = [material]
+    project["study"].update(
+        physics="harmonic_mechanical",
+        frequency_hz=50.0,
+        polynomial_order=1,
+        mechanical_body_force_n_m3=[1e8, 0.0, 0.0],
+    )
+    assets = {}
+    geometry = add_step_geometry(
+        project,
+        assets,
+        step_path.name,
+        step_path.read_bytes(),
+        units="mm",
+        material=material["name"],
+    )
+    geometry["mesh_maxh_mm"] = 10.0
+    geometry["boundary_selections"] = [{
+        "id": "fixed-sphere-boundary",
+        "name": "Fixed support",
+        "boundary_ids": [0],
+        "boundary_tags": [support_tag],
+        "boundary_condition": "mechanical_fixed",
+    }]
+
+    linear_project = copy.deepcopy(project)
+    curved_project = copy.deepcopy(project)
+    curved_project["study"]["mesh_geometry_order"] = 4
+    linear_manifest, linear_dir = _run_packaged_solver_model(
+        linear_project, assets, tmp_path, "sphere-geometry-order-1"
+    )
+    curved_manifest, curved_dir = _run_packaged_solver_model(
+        curved_project, assets, tmp_path, "sphere-geometry-order-4"
+    )
+
+    # Use a block for damping: unlike a STEP sphere's single topological face,
+    # a box gives us a local support face and free displacement degrees of
+    # freedom on the remaining faces.
+    block_path = tmp_path / "supported_mechanical_block.step"
+    Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).WriteStep(str(block_path))
+    _block_tags, block_faces = step_geometry_tags(
+        list(OCCGeometry(str(block_path)).solids)
+    )
+    block_support_tag = next(
+        tag for tag, solid_tag, _face in block_faces if solid_tag == _block_tags[0]
+    )
+    damped_project = new_3d_project("Rayleigh damping verification")
+    damped_project["materials"] = [material]
+    damped_project["study"].update(
+        physics="harmonic_mechanical",
+        frequency_hz=50.0,
+        polynomial_order=1,
+        mechanical_body_force_n_m3=[1e8, 0.0, 0.0],
+    )
+    damped_assets = {}
+    block_geometry = add_step_geometry(
+        damped_project,
+        damped_assets,
+        block_path.name,
+        block_path.read_bytes(),
+        units="mm",
+        material=material["name"],
+    )
+    block_geometry["mesh_maxh_mm"] = 10.0
+    block_geometry["boundary_selections"] = [{
+        "id": "fixed-block-face",
+        "name": "Fixed support",
+        "boundary_ids": [0],
+        "boundary_tags": [block_support_tag],
+        "boundary_condition": "mechanical_fixed",
+    }]
+    damped_project["study"]["mechanical_rayleigh_beta"] = 0.001
+    undamped_project = copy.deepcopy(damped_project)
+    undamped_project["study"]["mechanical_rayleigh_beta"] = 0.0
+    undamped_manifest, undamped_dir = _run_packaged_solver_model(
+        undamped_project, damped_assets, tmp_path, "block-rayleigh-undamped"
+    )
+    damped_manifest, damped_dir = _run_packaged_solver_model(
+        damped_project, damped_assets, tmp_path, "block-rayleigh-damped"
+    )
+
+    linear_mesh = ngs.Mesh(str(linear_dir / "mesh.vol"))
+    curved_mesh = ngs.Mesh(str(curved_dir / "mesh.vol"))
+    assert linear_manifest["mesh_geometry_order"] == linear_mesh.GetCurveOrder() == 1
+    assert curved_manifest["mesh_geometry_order"] == curved_mesh.GetCurveOrder() == 4
+    exact_sphere_volume = (4.0 / 3.0) * math.pi * 0.005**3
+    linear_volume = float(ngs.Integrate(1, linear_mesh))
+    curved_volume = float(ngs.Integrate(1, curved_mesh))
+    assert abs(curved_volume - exact_sphere_volume) < abs(
+        linear_volume - exact_sphere_volume
+    ), (linear_volume, curved_volume, exact_sphere_volume)
+
+    reference_displacement = _load_snapshot_coefficients(
+        undamped_dir, undamped_manifest, "gfuAC", 0
+    )
+    damped_displacement = _load_snapshot_coefficients(
+        damped_dir, damped_manifest, "gfuAC", 0
+    )
+    response_ratio = float(
+        np.linalg.norm(damped_displacement) / np.linalg.norm(reference_displacement)
+    )
+    assert np.isfinite([np.linalg.norm(reference_displacement), np.linalg.norm(damped_displacement)]).all()
+    assert np.linalg.norm(reference_displacement) > 0
+    assert 0 < response_ratio < 1.0
+    assert np.linalg.norm(damped_displacement.imag) > 0
+    assert damped_manifest["rayleigh_damping"] == {
+        "mass_coefficient_per_second": 0.0,
+        "stiffness_coefficient_seconds": 0.001,
+    }
+    print(
+        "Curved sphere numerical check: volume order 1/4 "
+        f"{linear_volume:.8e}/{curved_volume:.8e} m³ vs "
+        f"{exact_sphere_volume:.8e} m³; beta=0.001 s reduced displacement "
+        f"to {response_ratio:.6f} of the undamped value."
+    )
+
+
 def test_coupled_builder_configures_existing_solver_for_all_three_physics(tmp_path):
     from netgen.occ import Box, OCCGeometry, Pnt
     from ngsolve_gui.three_d_project import step_geometry_tags
@@ -370,10 +595,15 @@ def test_coupled_builder_configures_existing_solver_for_all_three_physics(tmp_pa
         em_source_mode="domain_current_density",
         frequency_hz=50.0,
         polynomial_order=1,
+        mesh_geometry_order=4,
         air_padding=0.25,
         dc_background_field_t=[0.0, 0.0, 0.025],
         coupling_max_iterations=12,
         coupling_tolerance=2e-5,
+        coupling_anderson_depth=2,
+        coupling_anderson_relaxation=0.7,
+        mechanical_rayleigh_alpha=1.25,
+        mechanical_rayleigh_beta=0.00025,
     )
     assets = {}
     geometry = add_step_geometry(
@@ -406,6 +636,24 @@ def test_coupled_builder_configures_existing_solver_for_all_three_physics(tmp_pa
     assert problem["omega"] == pytest.approx([2 * math.pi * 50.0])
     assert inputs["coupling_max_iterations"] == 12
     assert inputs["coupling_tolerance"] == pytest.approx(2e-5)
+    assert inputs["coupling_anderson_depth"] == 2
+    assert inputs["coupling_anderson_relaxation"] == pytest.approx(0.7)
+    assert inputs["mesh_geometry_order"] == 4
+    assert problem["mesh_curve_order"] == 4
+    assert problem["dampingalpha"] == pytest.approx(1.25)
+    assert problem["dampingbeta"] == pytest.approx(0.00025)
+    assert problem["Aux"]["rayleigh_damping"] == {
+        "mass_coefficient_per_second": 1.25,
+        "stiffness_coefficient_seconds": 0.00025,
+    }
+    assert problem["Aux"]["coupling_iteration"] == {
+        "method": "block_gauss_seidel",
+        "acceleration": "anderson",
+        "anderson_depth": 2,
+        "anderson_relaxation": 0.7,
+        "maximum_iterations": 12,
+        "relative_tolerance": pytest.approx(2e-5),
+    }
     assert problem["temp_disc"] == "time_harmonic"
     assert problem["cACCoef"] == problem["kACCoef"] == 1
     assert problem["kACCoefDC"] == 1
@@ -1518,6 +1766,137 @@ def test_small_3d_modal_rom_reduces_mechanics_and_matches_full_order_sweep(tmp_p
     )
 
 
+@pytest.mark.skipif(
+    not solver_checkout_available(),
+    reason=SOLVER_UNAVAILABLE_REASON,
+)
+def test_bounded_mid_size_3d_rom_repeated_sweep_resource_benchmark(tmp_path):
+    """Measure a few-hundred-element model without treating timings as a gate."""
+    import numpy as np
+    from netgen.occ import Box, OCCGeometry, Pnt
+
+    from ngsolve_gui.three_d_project import step_geometry_tags
+
+    step_path = tmp_path / "mid_size_rom_block.step"
+    Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).WriteStep(str(step_path))
+    solid_tags, face_refs = step_geometry_tags(
+        list(OCCGeometry(str(step_path)).solids)
+    )
+    support_tag = next(
+        tag for tag, solid_tag, _face in face_refs if solid_tag == solid_tags[0]
+    )
+    material = builtin_materials()[4]
+    project = new_3d_project("Bounded mid-size ROM performance check")
+    project["materials"] = [material]
+    project["study"].update(
+        physics="harmonic_mechanical",
+        frequency_mode="points",
+        frequency_points_hz=[50.0, 100.0, 150.0],
+        polynomial_order=1,
+        mechanical_body_force_n_m3=[1e8, 0.0, 0.0],
+    )
+    assets = {}
+    geometry = add_step_geometry(
+        project,
+        assets,
+        step_path.name,
+        step_path.read_bytes(),
+        units="mm",
+        material=material["name"],
+    )
+    geometry["mesh_maxh_mm"] = 2.5
+    geometry["boundary_selections"] = [{
+        "id": "fixed-benchmark-face",
+        "name": "Fixed support",
+        "boundary_ids": [0],
+        "boundary_tags": [support_tag],
+        "boundary_condition": "mechanical_fixed",
+    }]
+
+    full, full_dir = _run_packaged_solver_model(
+        project, assets, tmp_path, "mid-size-rom-full-order", measure_peak_rss=True
+    )
+    project["study"].update(
+        mechanical_solution_method="modal_rom",
+        mechanical_rom={
+            "modes": 6,
+            "eigen_solver": "scipy",
+            "pinvit_max_iterations": 80,
+            "pinvit_tolerance": 1e-8,
+            "pinvit_residual_tolerance": 1e-4,
+            "static_enrichment": True,
+        },
+    )
+    first_rom, first_rom_dir = _run_packaged_solver_model(
+        project, assets, tmp_path, "mid-size-rom-first-run", measure_peak_rss=True
+    )
+    repeated_rom, repeated_rom_dir = _run_packaged_solver_model(
+        project, assets, tmp_path, "mid-size-rom-repeated-run", measure_peak_rss=True
+    )
+
+    assert 100 <= full["mesh"]["elements"] < 2_000
+    _assert_solver_meshes_equivalent(full_dir, first_rom_dir)
+    _assert_solver_meshes_equivalent(full_dir, repeated_rom_dir)
+    assert len(full["frequency_points"]) == 3
+    assert first_rom["mechanical_rom"]["enabled"] is True
+    assert repeated_rom["mechanical_rom"]["basis_lifecycle"].startswith(
+        "built at run start"
+    )
+    for run in (full, first_rom, repeated_rom):
+        assert run["_test_peak_rss_bytes"] > 0
+        assert run["performance"]["solver_wall_seconds"] > 0
+    for run in (first_rom, repeated_rom):
+        assert run["rom_diagnostics"]["basis_construction_seconds"] > 0
+        assert run["rom_diagnostics"]["online_harmonic_solve_seconds"] > 0
+        assert len(run["frequency_points"]) == 3
+
+    frequency_errors = []
+    for index, frequency_hz in enumerate((50.0, 100.0, 150.0)):
+        full_values = _load_snapshot_coefficients(full_dir, full, "gfuAC", index)
+        rom_values = _load_snapshot_coefficients(first_rom_dir, first_rom, "gfuAC", index)
+        relative_error = float(
+            np.linalg.norm(rom_values - full_values) / np.linalg.norm(full_values)
+        )
+        assert np.isfinite(relative_error)
+        frequency_errors.append({
+            "frequency_hz": frequency_hz,
+            "rom_relative_displacement_error": relative_error,
+        })
+
+    free_dofs = first_rom["rom_diagnostics"]["free_mechanical_dofs"]
+    actual_modes = first_rom["rom_diagnostics"]["actual_modes"]
+    dense_basis_storage_estimate = free_dofs * actual_modes * 8
+    evidence = {
+        "mesh_elements": full["mesh"]["elements"],
+        "mesh_vertices": full["mesh"]["vertices"],
+        "polynomial_order": full["polynomial_order"],
+        "frequencies_hz": [50.0, 100.0, 150.0],
+        "full_order_solver_wall_seconds": full["performance"]["solver_wall_seconds"],
+        "rom_first_solver_wall_seconds": first_rom["performance"]["solver_wall_seconds"],
+        "rom_repeat_solver_wall_seconds": repeated_rom["performance"]["solver_wall_seconds"],
+        "rom_basis_build_seconds": first_rom["rom_diagnostics"]["basis_construction_seconds"],
+        "rom_repeat_basis_build_seconds": repeated_rom["rom_diagnostics"]["basis_construction_seconds"],
+        "rom_online_harmonic_solve_seconds": first_rom["rom_diagnostics"]["online_harmonic_solve_seconds"],
+        "free_mechanical_dofs": free_dofs,
+        "actual_modes": actual_modes,
+        "dense_basis_storage_estimate_bytes_float64": dense_basis_storage_estimate,
+        "peak_rss_bytes_full_order": full["_test_peak_rss_bytes"],
+        "peak_rss_bytes_rom_first": first_rom["_test_peak_rss_bytes"],
+        "peak_rss_bytes_rom_repeat": repeated_rom["_test_peak_rss_bytes"],
+        "frequency_displacement_errors": frequency_errors,
+        "basis_persisted_between_runs": False,
+    }
+    benchmark_path = Path(
+        os.environ.get(
+            "MAGMECHSIM_ROM_BENCHMARK_REPORT",
+            str(tmp_path / "rom_resource_benchmark.json"),
+        )
+    )
+    benchmark_path.parent.mkdir(parents=True, exist_ok=True)
+    benchmark_path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+    print("Bounded mid-size ROM resource benchmark: " + json.dumps(evidence, sort_keys=True))
+
+
 def _bounded_coupled_project(
     tmp_path,
     name="Bounded coupled integration check",
@@ -1677,6 +2056,10 @@ def test_bounded_coupled_solver_uses_dc_and_reuses_only_the_matching_mesh(tmp_pa
     import numpy as np
 
     project, assets = _bounded_coupled_project(tmp_path)
+    project["study"].update(
+        coupling_anderson_depth=2,
+        coupling_anderson_relaxation=0.75,
+    )
 
     first, first_dir = _run_packaged_solver_model(
         project, assets, tmp_path, "bounded-coupled-first"
@@ -1686,6 +2069,12 @@ def test_bounded_coupled_solver_uses_dc_and_reuses_only_the_matching_mesh(tmp_pa
     assert first["dc_background_field_source"] == "computed"
     assert first["dc_background_field_reuse_check"]["status"] == "missing"
     assert first["coupling_convergence"]["all_converged"] is True
+    assert first["coupling"]["acceleration"] == "anderson"
+    assert first["coupling"]["anderson_depth"] == 2
+    assert first["coupling"]["anderson_relaxation"] == 0.75
+    assert first["coupling_convergence"]["anderson_depth"] == 2
+    assert first["coupling_convergence"]["anderson_relaxation"] == 0.75
+    assert first["solver_configuration"]["coupling_iteration"]["anderson_depth"] == 2
     convergence = first["coupling_convergence"]["frequencies"][0]
     assert convergence["converged"] is True
     assert 1 <= convergence["iterations"] <= 12

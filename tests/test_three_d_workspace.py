@@ -1274,6 +1274,77 @@ def test_mechanical_study_property_editor_exposes_only_relevant_configuration(mo
     assert workspace._run_study_button.ui_disable is False
 
 
+def test_advanced_three_d_numerical_controls_are_editable_and_validated(monkeypatch):
+    from ngsolve_gui.three_d_project import MESH_GEOMETRY_ORDER_MATCH_FE
+
+    workspace, geometry = _workspace_with_test_mesh(monkeypatch)
+    geometry["material"] = "Stainless steel (4 K / OVC)"
+    workspace.select_item("study")
+    assert workspace._set_study_physics(
+        SimpleNamespace(value="coupled_magneto_mechanical")
+    ) is True
+
+    controls = {
+        getattr(child, "ui_label", None): child
+        for child in workspace._properties.ui_children
+    }
+    assert {
+        "Finite-element approximation order",
+        "Mesh geometry order",
+        "Mass coefficient (α)",
+        "Stiffness coefficient (β)",
+        "Anderson depth (0 disables)",
+        "Anderson relaxation",
+    } <= set(controls)
+    assert MESH_GEOMETRY_ORDER_MATCH_FE in {
+        option["value"] for option in controls["Mesh geometry order"].ui_options
+    }
+
+    assert workspace._set_mesh_geometry_order(SimpleNamespace(value="4")) is True
+    assert workspace._set_study_value(
+        "mechanical_rayleigh_alpha", SimpleNamespace(value="2.5"), number=True
+    ) is True
+    assert workspace._set_study_value(
+        "mechanical_rayleigh_beta", SimpleNamespace(value="0.0005"), number=True
+    ) is True
+    assert workspace._set_study_value(
+        "coupling_anderson_depth", SimpleNamespace(value="5"), number=True
+    ) is True
+    assert workspace._set_study_value(
+        "coupling_anderson_relaxation", SimpleNamespace(value="0.6"), number=True
+    ) is True
+    assert workspace._set_study_value(
+        "mechanical_rayleigh_beta", SimpleNamespace(value="-1"), number=True
+    ) is False
+
+    study = workspace.project["study"]
+    assert study["mesh_geometry_order"] == 4
+    assert study["mechanical_rayleigh_alpha"] == 2.5
+    assert study["mechanical_rayleigh_beta"] == 0.0005
+    assert study["coupling_anderson_depth"] == 5
+    assert study["coupling_anderson_relaxation"] == 0.6
+
+    workspace._rebuild_properties()
+    controls = {
+        getattr(child, "ui_label", None): child
+        for child in workspace._properties.ui_children
+    }
+    assert controls["Mesh geometry order"].ui_model_value == "4"
+    assert controls["Mass coefficient (α)"].ui_model_value == 2.5
+    assert controls["Stiffness coefficient (β)"].ui_model_value == 0.0005
+    assert controls["Anderson depth (0 disables)"].ui_model_value == 5.0
+    assert controls["Anderson relaxation"].ui_model_value == 0.6
+
+    assert workspace._set_study_value(
+        "coupling_anderson_depth", SimpleNamespace(value="0"), number=True
+    ) is True
+    controls = {
+        getattr(child, "ui_label", None): child
+        for child in workspace._properties.ui_children
+    }
+    assert controls["Anderson relaxation"].ui_disable is True
+
+
 def test_static_dc_study_editor_exposes_real_field_sources_without_frequency(monkeypatch):
     workspace, geometry = _workspace_with_test_mesh(monkeypatch)
     geometry["material"] = "Copper"

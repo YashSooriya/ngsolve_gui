@@ -16,6 +16,7 @@ from .three_d_project import (
     UNASSIGNED_MATERIAL,
     SUPPORTED_3D_EM_SOURCE_MODES,
     SUPPORTED_3D_STUDIES,
+    normalize_3d_numerical_settings,
     _LEGACY_DOMAIN_SELECTION_ERROR,
     _LEGACY_STEP_FACE_TAG_PATTERN,
     build_3d_solver_inputs,
@@ -373,7 +374,10 @@ def validate_3d_study_setup(project):
     study = project.get("study", {})
     try:
         physics = study.get("physics", "harmonic_em")
-        polynomial_order = int(study.get("polynomial_order", 1))
+        numerical_settings = normalize_3d_numerical_settings(study, physics=physics)
+        polynomial_order = numerical_settings["polynomial_order"]
+        mesh_geometry_order = numerical_settings["mesh_geometry_order"]
+        mesh_geometry_order_mode = numerical_settings["mesh_geometry_order_mode"]
         coupled = physics == "coupled_magneto_mechanical"
         harmonic = physics in {"harmonic_em", "harmonic_mechanical"} or coupled
         harmonic_em = physics in {"harmonic_em"} or coupled
@@ -405,34 +409,19 @@ def validate_3d_study_setup(project):
             study.get("mechanical_rom", DEFAULT_MECHANICAL_ROM),
             mechanics_active=mechanical,
         )
-        raw_coupling_max_iterations = study.get("coupling_max_iterations", 15)
-        coupling_max_iterations = float(raw_coupling_max_iterations) if coupled else 15
-        coupling_tolerance = float(study.get("coupling_tolerance", 1e-4)) if coupled else 1e-4
+        coupling_max_iterations = numerical_settings["coupling_max_iterations"] if coupled else 15
+        coupling_tolerance = numerical_settings["coupling_tolerance"] if coupled else 1e-4
     except (TypeError, ValueError, OverflowError) as error:
         raise ValueError(f"Invalid 3D study settings: {error}") from error
     if physics not in SUPPORTED_3D_STUDIES:
         raise ValueError("Choose a supported 3D study.")
     if harmonic_em and em_source_mode not in SUPPORTED_3D_EM_SOURCE_MODES:
         raise ValueError("Choose a supported 3D electromagnetic excitation source.")
-    if polynomial_order not in {1, 2, 3, 4}:
-        raise ValueError("The finite-element order must be between 1 and 4.")
     if electromagnetic and (
         not math.isfinite(air_padding) or not 0.25 <= air_padding <= 20
     ):
         raise ValueError("Air-domain padding must be between 0.25 and 20 model spans.")
-    if coupled:
-        if (
-            isinstance(raw_coupling_max_iterations, bool)
-            or not math.isfinite(coupling_max_iterations)
-            or not coupling_max_iterations.is_integer()
-            or not 1 <= coupling_max_iterations <= 100
-        ):
-            raise ValueError("Maximum coupling iterations must be an integer from 1 to 100.")
-        coupling_max_iterations = int(coupling_max_iterations)
-    if coupled and (
-        not math.isfinite(coupling_tolerance)
-        or not 1e-12 <= coupling_tolerance <= 0.1
-    ):
+    if coupled and not 1e-12 <= coupling_tolerance <= 0.1:
         raise ValueError("Coupling tolerance must be between 1e-12 and 0.1.")
     if not project.get("geometries"):
         raise ValueError("Import at least one closed STEP solid before running a study.")
@@ -608,14 +597,20 @@ def validate_3d_study_setup(project):
         "frequency_points_hz": frequency_points_hz,
         "frequency_mode": study.get("frequency_mode", "single") if harmonic else None,
         "polynomial_order": polynomial_order,
+        "mesh_geometry_order": mesh_geometry_order,
+        "mesh_geometry_order_mode": mesh_geometry_order_mode,
         "air_padding": air_padding,
         "dc_background_field_t": dc_background_field,
         "mechanical_body_force_n_m3": body_force,
         "mechanical_body_force_phase_deg": body_force_phase,
         "mechanical_body_force_phasor": body_force_phasor,
         "mechanical_body_force_by_domain": mechanical_body_force_by_domain,
+        "mechanical_rayleigh_alpha": numerical_settings["mechanical_rayleigh_alpha"],
+        "mechanical_rayleigh_beta": numerical_settings["mechanical_rayleigh_beta"],
         "coupling_max_iterations": coupling_max_iterations,
         "coupling_tolerance": coupling_tolerance,
+        "coupling_anderson_depth": numerical_settings["coupling_anderson_depth"],
+        "coupling_anderson_relaxation": numerical_settings["coupling_anderson_relaxation"],
         "mechanical_solution_method": mechanical_solution_method,
         "mechanical_rom": {
             **mechanical_rom,
@@ -695,13 +690,14 @@ def dc_input_fingerprint_payload(project, asset_paths, validated=None):
     }
     return {
         "schema": "magmechsim.dc-background-inputs",
-        "schema_version": 1,
+        "schema_version": 2,
         "physics": "magnetostatic_dc",
         "geometry": geometry_inputs,
         "relative_permeability_by_material": dict(sorted(material_mur.items())),
         "applied_background_field_t": list(validated["dc_background_field_t"]),
         "wire_trace_sets": trace_sets,
         "polynomial_order": validated["polynomial_order"],
+        "mesh_geometry_order": validated["mesh_geometry_order"],
         "air_padding_model_spans": validated["air_padding"],
         "solver": {
             "name": "direct",
@@ -727,6 +723,7 @@ def build_3d_study_problem(project, asset_paths):
     frequency_hz = validated["frequency_hz"]
     frequency_points_hz = validated["frequency_points_hz"]
     polynomial_order = validated["polynomial_order"]
+    mesh_geometry_order = validated["mesh_geometry_order"]
     air_padding = validated["air_padding"]
     material_records = {name.casefold(): {"name": name, "properties": {
         "relative_permeability": item["mur"],
@@ -1012,7 +1009,7 @@ def build_3d_study_problem(project, asset_paths):
         "geometry": OCCGeometry(Glue(list(objects.values()))),
         "objects": objects,
         "domain_maxh": domain_maxh,
-        "mesh_curve_order": polynomial_order,
+        "mesh_curve_order": mesh_geometry_order,
         "p": polynomial_order,
         "HpLayers": 0,
         "hp_doms": [],
@@ -1030,8 +1027,8 @@ def build_3d_study_problem(project, asset_paths):
         "kACCoefDC": int(uses_dc),
         "mMechCoef": int(mechanical),
         "kMechCoef": int(mechanical),
-        "dampingalpha": 0,
-        "dampingbeta": 0,
+        "dampingalpha": validated["mechanical_rayleigh_alpha"] if mechanical else 0.0,
+        "dampingbeta": validated["mechanical_rayleigh_beta"] if mechanical else 0.0,
         "cCoupCoef": int(coupled),
         "kCoupCoef": int(coupled),
         "epsilonReg": 1e-8,
@@ -1107,6 +1104,27 @@ def build_3d_study_problem(project, asset_paths):
         "Aux": {
             "study_type": study_type,
             "polynomial_order": polynomial_order,
+            "finite_element_approximation_order": polynomial_order,
+            "mesh_geometry_order": mesh_geometry_order,
+            "mesh_geometry_order_mode": validated["mesh_geometry_order_mode"],
+            **({
+                "rayleigh_damping": {
+                    "mass_coefficient_per_second": validated["mechanical_rayleigh_alpha"],
+                    "stiffness_coefficient_seconds": validated["mechanical_rayleigh_beta"],
+                }
+            } if mechanical else {}),
+            **({
+                "coupling_iteration": {
+                    "method": "block_gauss_seidel",
+                    "acceleration": (
+                        "anderson" if validated["coupling_anderson_depth"] > 0 else "none"
+                    ),
+                    "anderson_depth": validated["coupling_anderson_depth"],
+                    "anderson_relaxation": validated["coupling_anderson_relaxation"],
+                    "maximum_iterations": validated["coupling_max_iterations"],
+                    "relative_tolerance": validated["coupling_tolerance"],
+                }
+            } if coupled else {}),
             "mechanical_rom": {
                 **validated["mechanical_rom"],
                 "solution_method": validated["mechanical_solution_method"],
@@ -1200,19 +1218,25 @@ def build_3d_study_problem(project, asset_paths):
         "frequency_points_hz": list(frequency_points_hz),
         "frequency_mode": validated["frequency_mode"],
         "polynomial_order": polynomial_order,
+        "mesh_geometry_order": mesh_geometry_order,
+        "mesh_geometry_order_mode": validated["mesh_geometry_order_mode"],
         "air_padding": air_padding,
         "h_global": max(domain_maxh.values()),
-        "mesh_curve_order": max(1, min(polynomial_order, 3)),
+        "mesh_curve_order": mesh_geometry_order,
         "domain_maxh": domain_maxh,
         "materials": material_data,
         "physics": physics,
         "dc_background_field_t": list(dc_background) if uses_dc else None,
         "dc_input_fingerprint_payload": dc_input_fingerprint,
         "mechanical_body_force_n_m3": validated["mechanical_body_force_n_m3"],
+        "mechanical_rayleigh_alpha": validated["mechanical_rayleigh_alpha"],
+        "mechanical_rayleigh_beta": validated["mechanical_rayleigh_beta"],
         "em_source_mode": validated["em_source_mode"],
         "material_display_names": material_display_names,
         "coupling_max_iterations": validated["coupling_max_iterations"],
         "coupling_tolerance": validated["coupling_tolerance"],
+        "coupling_anderson_depth": validated["coupling_anderson_depth"],
+        "coupling_anderson_relaxation": validated["coupling_anderson_relaxation"],
         "mechanical_solution_method": validated["mechanical_solution_method"],
         "mechanical_rom": validated["mechanical_rom"],
     }
