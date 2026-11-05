@@ -120,6 +120,39 @@ def _load_snapshot_coefficients(output_dir, manifest, field_key, snapshot_index)
     return np.asarray(field.vec.FV().NumPy()).copy()
 
 
+def _assert_solver_meshes_equivalent(left_output, right_output):
+    """Compare the discrete meshes, not Netgen's serialized OCC metadata."""
+    import numpy as np
+    import ngsolve
+
+    left = ngsolve.Mesh(str(left_output / "mesh.vol"))
+    right = ngsolve.Mesh(str(right_output / "mesh.vol"))
+    assert (left.nv, left.ne) == (right.nv, right.ne)
+    assert tuple(left.GetBoundaries()) == tuple(right.GetBoundaries())
+    assert tuple(left.GetMaterials()) == tuple(right.GetMaterials())
+
+    left_points = np.asarray(
+        [tuple(float(value) for value in point) for point in left.ngmesh.Points()]
+    )
+    right_points = np.asarray(
+        [tuple(float(value) for value in point) for point in right.ngmesh.Points()]
+    )
+    np.testing.assert_allclose(left_points, right_points, rtol=0.0, atol=1e-12)
+
+    def element_signature(mesh, elements):
+        return tuple(
+            (int(element.index), tuple(int(vertex.nr) for vertex in element.vertices))
+            for element in elements(mesh.ngmesh)
+        )
+
+    assert element_signature(left, lambda mesh: mesh.Elements3D()) == element_signature(
+        right, lambda mesh: mesh.Elements3D()
+    )
+    assert element_signature(left, lambda mesh: mesh.Elements2D()) == element_signature(
+        right, lambda mesh: mesh.Elements2D()
+    )
+
+
 def test_study_setup_uses_project_material_snapshots_and_single_frequency():
     project = _study_project()
 
@@ -1353,6 +1386,138 @@ def test_small_3d_mechanical_solver_run_exports_nonzero_displacement(tmp_path):
     )
 
 
+@pytest.mark.skipif(
+    not solver_checkout_available(),
+    reason=SOLVER_UNAVAILABLE_REASON,
+)
+def test_small_3d_modal_rom_reduces_mechanics_and_matches_full_order_sweep(tmp_path):
+    import numpy as np
+    from netgen.occ import Box, Pnt
+
+    from ngsolve_gui.three_d_mesh import generate_step_mesh
+
+    step_path = tmp_path / "small_rom_mechanical_block.step"
+    Box(Pnt(0, 0, 0), Pnt(10, 10, 10)).WriteStep(str(step_path))
+    mesh_setup = generate_step_mesh(step_path.read_bytes(), maxh_mm=10.0)
+    assert 0 < mesh_setup["volume_elements"] < 1_000
+
+    material = builtin_materials()[4]
+    project = new_3d_project("Small full-order versus mechanical ROM")
+    project["study"].update(
+        physics="harmonic_mechanical",
+        frequency_mode="points",
+        frequency_points_hz=[50.0, 100.0],
+        polynomial_order=1,
+        mechanical_body_force_n_m3=[1e8, 0.0, 0.0],
+    )
+    project["materials"] = [material]
+    assets = {}
+    geometry = add_step_geometry(
+        project, assets, step_path.name, step_path.read_bytes(),
+        units="mm", material=material["name"],
+    )
+    geometry["mesh_maxh_mm"] = 10.0
+    support_face = mesh_setup["boundary_regions"][0]
+    geometry["boundary_selections"] = [{
+        "id": "fixed-face",
+        "name": "Fixed support",
+        "boundary_ids": [support_face["id"]],
+        "boundary_tags": [support_face["boundary_tag"]],
+        "boundary_condition": "mechanical_fixed",
+    }]
+
+    full, full_dir = _run_packaged_solver_model(
+        project, assets, tmp_path, "small-rom-full-order"
+    )
+    project["study"].update(
+        mechanical_solution_method="modal_rom",
+        mechanical_rom={
+            "modes": 6,
+            "eigen_solver": "scipy",
+            "pinvit_max_iterations": 80,
+            "pinvit_tolerance": 1e-8,
+            "pinvit_residual_tolerance": 1e-4,
+            "static_enrichment": True,
+        },
+    )
+    reduced_6, reduced_6_dir = _run_packaged_solver_model(
+        project, assets, tmp_path, "small-rom-6-modes"
+    )
+    project["study"]["mechanical_rom"]["modes"] = 13
+    reduced_13, reduced_13_dir = _run_packaged_solver_model(
+        project, assets, tmp_path, "small-rom-13-modes"
+    )
+    pinvit_project = copy.deepcopy(project)
+    pinvit_project["study"]["mechanical_rom"].update(
+        modes=3,
+        eigen_solver="pinvit",
+        pinvit_max_iterations=100,
+        pinvit_tolerance=1e-8,
+        pinvit_residual_tolerance=1e-4,
+        static_enrichment=True,
+    )
+    pinvit, pinvit_dir = _run_packaged_solver_model(
+        pinvit_project, assets, tmp_path, "small-rom-pinvit"
+    )
+
+    _assert_solver_meshes_equivalent(full_dir, reduced_6_dir)
+    _assert_solver_meshes_equivalent(full_dir, reduced_13_dir)
+    _assert_solver_meshes_equivalent(full_dir, pinvit_dir)
+    assert full["mechanical_rom"]["enabled"] is False
+    assert reduced_6["mechanical_rom"]["enabled"] is True
+    assert reduced_6["mechanical_rom"]["basis_lifecycle"].startswith("built at run start")
+    assert reduced_6["rom_diagnostics"]["method"] == "mechanical_modal"
+    assert reduced_6["rom_diagnostics"]["actual_modes"] == 6
+    assert reduced_6["rom_diagnostics"]["static_enrichment"] is True
+    assert reduced_13["rom_diagnostics"]["actual_modes"] == 13
+    assert reduced_13["rom_diagnostics"]["free_mechanical_dofs"] > 13
+    assert reduced_6["rom_diagnostics"]["online_harmonic_solve_seconds"] > 0
+    assert reduced_13["rom_diagnostics"]["online_harmonic_solve_seconds"] > 0
+    assert pinvit["mechanical_rom"]["eigen_solver"] == "pinvit"
+    assert pinvit["rom_diagnostics"]["actual_modes"] == 3
+    assert pinvit["rom_diagnostics"]["pinvit"]["converged"] is True
+    assert pinvit["rom_diagnostics"]["pinvit"]["iterations"] >= 1
+    assert len(reduced_6["frequency_points"]) == len(reduced_13["frequency_points"]) == 2
+
+    errors_by_modes = {6: {}, 13: {}}
+    for index, frequency_hz in enumerate((50.0, 100.0)):
+        full_values = _load_snapshot_coefficients(full_dir, full, "gfuAC", index)
+        for modes, run_manifest, run_dir in (
+            (6, reduced_6, reduced_6_dir),
+            (13, reduced_13, reduced_13_dir),
+        ):
+            reduced_values = _load_snapshot_coefficients(run_dir, run_manifest, "gfuAC", index)
+            errors_by_modes[modes][frequency_hz] = float(
+                np.linalg.norm(reduced_values - full_values) / np.linalg.norm(full_values)
+            )
+        assert errors_by_modes[13][frequency_hz] < errors_by_modes[6][frequency_hz]
+
+    assert reduced_6["performance"]["solver_wall_seconds"] > reduced_6["rom_diagnostics"]["basis_construction_seconds"]
+    assert reduced_13["performance"]["solver_wall_seconds"] > reduced_13["rom_diagnostics"]["basis_construction_seconds"]
+
+    from ngsolve_gui.three_d_project import unpack_3d_project
+
+    saved_project, _ = unpack_3d_project(
+        (reduced_13_dir / reduced_13["project_snapshot"]).read_bytes()
+    )
+    assert saved_project["study"]["mechanical_solution_method"] == "modal_rom"
+    assert saved_project["study"]["mechanical_rom"]["modes"] == 13
+    print(
+        "Small 3D mechanical ROM convergence: "
+        f"{reduced_13['mesh']['elements']} elements, basis setup "
+        f"6 modes {reduced_6['rom_diagnostics']['basis_construction_seconds']:.3f} s / "
+        f"13 modes {reduced_13['rom_diagnostics']['basis_construction_seconds']:.3f} s, "
+        f"solver wall full {full['performance']['solver_wall_seconds']:.3f} s / "
+        f"ROM 6 {reduced_6['performance']['solver_wall_seconds']:.3f} s / "
+        f"ROM 13 {reduced_13['performance']['solver_wall_seconds']:.3f} s; "
+        + "; ".join(
+            f"{frequency:g} Hz error 6 modes={errors_by_modes[6][frequency]:.3e}, "
+            f"13 modes={errors_by_modes[13][frequency]:.3e}"
+            for frequency in errors_by_modes[6]
+        )
+    )
+
+
 def _bounded_coupled_project(
     tmp_path,
     name="Bounded coupled integration check",
@@ -1407,6 +1572,101 @@ def _bounded_coupled_project(
         "boundary_condition": "mechanical_fixed",
     }]
     return project, assets
+
+
+@pytest.mark.skipif(
+    not solver_checkout_available(),
+    reason=SOLVER_UNAVAILABLE_REASON,
+)
+def test_small_coupled_rom_reduces_only_mechanics_and_retains_converged_feedback(tmp_path):
+    import numpy as np
+
+    project, assets = _bounded_coupled_project(
+        tmp_path, "Bounded coupled ROM comparison"
+    )
+    full, full_dir = _run_packaged_solver_model(
+        project, assets, tmp_path, "bounded-coupled-rom-full-order"
+    )
+    # Reuse the just-computed DC background so the full-order timing is
+    # comparable with the later ROM runs, which also reuse that field.
+    full_reused, full_reused_dir = _run_packaged_solver_model(
+        project, assets, tmp_path, "bounded-coupled-rom-full-order-reused-dc"
+    )
+    project["study"].update(
+        mechanical_solution_method="modal_rom",
+        mechanical_rom={
+            "modes": 6,
+            "eigen_solver": "scipy",
+            "pinvit_max_iterations": 80,
+            "pinvit_tolerance": 1e-8,
+            "pinvit_residual_tolerance": 1e-4,
+            "static_enrichment": True,
+        },
+    )
+    reduced_6, reduced_6_dir = _run_packaged_solver_model(
+        project, assets, tmp_path, "bounded-coupled-rom-6-modes"
+    )
+    project["study"]["mechanical_rom"]["modes"] = 13
+    reduced_13, reduced_13_dir = _run_packaged_solver_model(
+        project, assets, tmp_path, "bounded-coupled-rom-13-modes"
+    )
+
+    for reduced in (reduced_6, reduced_13):
+        assert reduced["dc_input_fingerprint"] == full["dc_input_fingerprint"]
+        assert reduced["dc_background_field_source"] == "reused"
+        assert reduced["mechanical_rom"]["enabled"] is True
+        assert reduced["mechanical_rom"]["scope"] == (
+            "mechanics block only; electromagnetics remains full order"
+        )
+        assert reduced["coupling_convergence"]["all_converged"] is True
+    assert full_reused["dc_input_fingerprint"] == full["dc_input_fingerprint"]
+    assert full_reused["dc_background_field_source"] == "reused"
+    assert full_reused["coupling_convergence"]["all_converged"] is True
+    assert reduced_6["rom_diagnostics"]["actual_modes"] == 6
+    assert reduced_13["rom_diagnostics"]["actual_modes"] == 13
+    _assert_solver_meshes_equivalent(full_dir, full_reused_dir)
+    _assert_solver_meshes_equivalent(full_dir, reduced_6_dir)
+    _assert_solver_meshes_equivalent(full_dir, reduced_13_dir)
+
+    relative_errors = {6: {}, 13: {}}
+    for field_key in ("gfAAC", "gfBAC", "gfuAC"):
+        full_values = _load_snapshot_coefficients(
+            full_reused_dir, full_reused, field_key, 0
+        )
+        for modes, run_manifest, run_dir in (
+            (6, reduced_6, reduced_6_dir),
+            (13, reduced_13, reduced_13_dir),
+        ):
+            reduced_values = _load_snapshot_coefficients(run_dir, run_manifest, field_key, 0)
+            relative_errors[modes][field_key] = float(
+                np.linalg.norm(reduced_values - full_values) / np.linalg.norm(full_values)
+            )
+    assert relative_errors[13]["gfuAC"] < relative_errors[6]["gfuAC"]
+    # The EM block stays full order. Its coupled changes should remain within
+    # the configured fixed-point tolerance, but need not improve monotonically
+    # as the mechanical basis grows once differences are near solver noise.
+    for field_key in ("gfAAC", "gfBAC"):
+        assert max(relative_errors[6][field_key], relative_errors[13][field_key]) < (
+            project["study"]["coupling_tolerance"]
+        )
+    error_summary = "; ".join(
+        f"{key} error 6={relative_errors[6][key]:.3e}, "
+        f"13={relative_errors[13][key]:.3e}"
+        for key in relative_errors[6]
+    )
+    print(
+        "Bounded coupled ROM: "
+        f"{reduced_13['mesh']['elements']} elements, "
+        f"{reduced_6['coupling_convergence']['frequencies'][0]['iterations']}/"
+        f"{reduced_13['coupling_convergence']['frequencies'][0]['iterations']} iterations, "
+        f"basis setup 6/13 modes "
+        f"{reduced_6['rom_diagnostics']['basis_construction_seconds']:.3f}/"
+        f"{reduced_13['rom_diagnostics']['basis_construction_seconds']:.3f} s; "
+        f"{error_summary}; solver wall full reused-DC "
+        f"{full_reused['performance']['solver_wall_seconds']:.3f} s / "
+        f"ROM 6 {reduced_6['performance']['solver_wall_seconds']:.3f} s / "
+        f"ROM 13 {reduced_13['performance']['solver_wall_seconds']:.3f} s"
+    )
 
 
 @pytest.mark.skipif(

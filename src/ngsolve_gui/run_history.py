@@ -28,6 +28,40 @@ def _output_file(output_root, base_directory, value):
 
 def _diagnostic_summary(manifest):
     """Build a compact, truthful run-history summary from persisted diagnostics."""
+    rom_settings = manifest.get("mechanical_rom")
+    rom_diagnostics = manifest.get("rom_diagnostics")
+    rom_text = ""
+    if isinstance(rom_settings, dict) and rom_settings.get("enabled") is True:
+        requested = rom_settings.get("modes")
+        actual = rom_diagnostics.get("actual_modes") if isinstance(rom_diagnostics, dict) else None
+        count = (
+            f"{actual}/{requested} modes"
+            if isinstance(actual, int) and isinstance(requested, int)
+            else f"{requested} requested modes"
+            if isinstance(requested, int)
+            else "modal basis"
+        )
+        rom_text = f"Mechanical modal ROM · {count}"
+        setup_time = rom_diagnostics.get("basis_construction_seconds") if isinstance(rom_diagnostics, dict) else None
+        if isinstance(setup_time, (int, float)) and setup_time >= 0:
+            rom_text += f" · basis {setup_time:.2f} s"
+        online_time = (
+            rom_diagnostics.get("online_harmonic_solve_seconds")
+            if isinstance(rom_diagnostics, dict) else None
+        )
+        if isinstance(online_time, (int, float)) and online_time >= 0:
+            rom_text += f" · harmonic solve {online_time:.2f} s"
+        pinvit = rom_diagnostics.get("pinvit") if isinstance(rom_diagnostics, dict) else None
+        if isinstance(pinvit, dict):
+            iterations = pinvit.get("iterations")
+            if pinvit.get("converged") is True and isinstance(iterations, int):
+                rom_text += f" · PINVIT converged in {iterations} iterations"
+            elif pinvit.get("converged") is False:
+                rom_text += " · PINVIT did not converge"
+
+    def with_rom_summary(summary):
+        return f"{rom_text} · {summary}" if rom_text and summary else rom_text or summary
+
     frequency_points = manifest.get("frequency_points")
     if isinstance(frequency_points, list) and frequency_points:
         labels = []
@@ -77,7 +111,7 @@ def _diagnostic_summary(manifest):
         dc_text = " · DC field reused" if dc_source == "reused" else (
             " · DC field calculated" if dc_source == "computed" else ""
         )
-        return count + " · ".join(labels) + dc_text
+        return with_rom_summary(count + " · ".join(labels) + dc_text)
 
     convergence = manifest.get("coupling_convergence")
     if isinstance(convergence, dict):
@@ -118,17 +152,17 @@ def _diagnostic_summary(manifest):
                 dc_text = " · DC field recalculated (no compatible saved field)"
             else:
                 dc_text = " · DC field calculated"
-        return state + iteration_text + residual_text + dc_text
+        return with_rom_summary(state + iteration_text + residual_text + dc_text)
 
     status = str(manifest.get("status", "")).casefold()
     if status == "failed":
         error = str(manifest.get("error") or "Solver failed")
-        return f"Failure · {error[:180]}"
+        return with_rom_summary(f"Failure · {error[:180]}")
     if status == "cancelled":
-        return "Cancelled · partial diagnostic files may be present"
+        return with_rom_summary("Cancelled · partial diagnostic files may be present")
     if status == "interrupted":
-        return "Interrupted · inspect the solver log and process diagnostics"
-    return None
+        return with_rom_summary("Interrupted · inspect the solver log and process diagnostics")
+    return rom_text or None
 
 
 def load_run_result_tree(run):

@@ -400,6 +400,65 @@ def test_project_round_trip_preserves_coupled_study_settings():
     assert restored["study"]["coupling_tolerance"] == pytest.approx(4e-6)
 
 
+def test_project_round_trip_preserves_mechanical_rom_configuration():
+    project = new_3d_project("Mechanical modal basis")
+    project["study"].update(
+        physics="harmonic_mechanical",
+        mechanical_solution_method="modal_rom",
+        mechanical_rom={
+            "modes": 5,
+            "eigen_solver": "pinvit",
+            "pinvit_max_iterations": 120,
+            "pinvit_tolerance": 2e-8,
+            "pinvit_residual_tolerance": 3e-4,
+            "static_enrichment": False,
+        },
+    )
+
+    restored, _assets = unpack_3d_project(package_3d_project(project, {}))
+
+    assert restored["study"]["mechanical_solution_method"] == "modal_rom"
+    assert restored["study"]["mechanical_rom"] == {
+        "modes": 5,
+        "eigen_solver": "pinvit",
+        "pinvit_max_iterations": 120,
+        "pinvit_tolerance": pytest.approx(2e-8),
+        "pinvit_residual_tolerance": pytest.approx(3e-4),
+        "static_enrichment": False,
+    }
+
+
+def test_project_rejects_mechanical_rom_when_mechanics_is_not_active():
+    project = new_3d_project("Unsupported electromagnetic ROM")
+    project["study"]["mechanical_solution_method"] = "modal_rom"
+
+    with pytest.raises(ValueError, match="requires a time-harmonic mechanics study"):
+        package_3d_project(project, {})
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("modes", 0, "Number of mechanical modes must be an integer"),
+        ("modes", 2.5, "Number of mechanical modes must be an integer"),
+        ("eigen_solver", "dense-placeholder", "Choose SciPy sparse eigensolve or PINVIT"),
+        ("pinvit_max_iterations", 0, "PINVIT maximum iterations must be an integer"),
+        ("pinvit_tolerance", 0, "PINVIT eigenvalue tolerance must be between"),
+        ("static_enrichment", "yes", "Static load and boundary enrichment must be enabled or disabled"),
+    ],
+)
+def test_project_rejects_invalid_mechanical_rom_configuration(key, value, message):
+    project = new_3d_project("Invalid ROM settings")
+    project["study"].update(
+        physics="harmonic_mechanical",
+        mechanical_solution_method="modal_rom",
+    )
+    project["study"].setdefault("mechanical_rom", {})[key] = value
+
+    with pytest.raises(ValueError, match=message):
+        package_3d_project(project, {})
+
+
 @pytest.mark.parametrize(
     ("key", "value", "message"),
     [

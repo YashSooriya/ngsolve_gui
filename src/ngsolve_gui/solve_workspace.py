@@ -53,6 +53,10 @@ from .axisymmetric_model import (
     validate_model,
     validate_studies,
 )
+from .mechanical_rom import (
+    DEFAULT_MECHANICAL_ROM,
+    MECHANICAL_SOLUTION_METHODS,
+)
 from .units import UNIT_OPTIONS
 from .material_library import MaterialLibrary
 from .workspace_components import panel_header, property_editor_body
@@ -12177,6 +12181,16 @@ class SolveWorkspace(Div):
 
     def _solver_properties(self):
         solver = self.model["solver"]
+        stored_rom = solver.get("mechanical_rom", {})
+        if not isinstance(stored_rom, dict):
+            stored_rom = {}
+        rom = {**DEFAULT_MECHANICAL_ROM, **stored_rom}
+        mechanics_enabled = bool(
+            self.model.get("physics", {}).get("mechanics", {}).get("enabled", False)
+        )
+        harmonic_em_enabled = bool(
+            self.model.get("physics", {}).get("harmonic_electromagnetic", {}).get("enabled", False)
+        )
         anderson = QCheckbox(ui_label="Use Anderson acceleration", ui_model_value=solver["anderson"], ui_dense=True)
         anderson.on_update_model_value(lambda event: self._set_solver("anderson", bool(event.value)))
         depth = QInput(ui_label="Anderson depth", ui_type="number", ui_model_value=solver["anderson_depth"], ui_dense=True, ui_filled=True)
@@ -12187,7 +12201,7 @@ class SolveWorkspace(Div):
         tolerance.on_update_model_value(lambda event: self._set_solver("relative_tolerance", float(event.value)))
         iterations = QInput(ui_label="Maximum iterations", ui_type="number", ui_model_value=solver["maximum_iterations"], ui_dense=True, ui_filled=True)
         iterations.on_update_model_value(lambda event: self._set_solver("maximum_iterations", int(event.value)))
-        return [
+        children = [
             _section_title("Solver settings", "Controls for nonlinear and fixed-point iterations."),
             Div("Nonlinear / fixed-point solver", ui_style="font-weight:600; font-size:12px; padding-top:6px;"),
             anderson,
@@ -12198,6 +12212,84 @@ class SolveWorkspace(Div):
             Div("Direct sparse linear solver", ui_style="font-size:12px; padding:5px 0;"),
             Div("The axisymmetric solver currently uses its sparse direct backend.", ui_style="font-size:11px; color:var(--fg-muted); line-height:1.4;"),
         ]
+        if mechanics_enabled:
+            solution_method = solver.get("mechanical_solution_method", "full_order")
+            method_select = QSelect(
+                ui_label="Mechanical solution",
+                ui_options=[
+                    {
+                        "label": MECHANICAL_SOLUTION_METHODS["full_order"],
+                        "value": "full_order",
+                    },
+                    {
+                        "label": (
+                            MECHANICAL_SOLUTION_METHODS["modal_rom"]
+                            if harmonic_em_enabled
+                            else "Mechanical modal ROM (requires time-harmonic EM)"
+                        ),
+                        "value": "modal_rom",
+                        "disable": not harmonic_em_enabled,
+                    },
+                ],
+                ui_option_label="label",
+                ui_option_value="value",
+                ui_emit_value=True,
+                ui_map_options=True,
+                ui_model_value=solution_method,
+                ui_dense=True,
+                ui_filled=True,
+            )
+            method_select.on_update_model_value(
+                lambda event: self._set_mechanical_solution_method(event)
+            )
+            children.extend([
+                Div("Mechanical discretisation", ui_style="font-weight:600; font-size:12px; padding-top:8px;"),
+                method_select,
+            ])
+            if solution_method == "modal_rom":
+                modes = QInput(
+                    ui_label="Mechanical modes", ui_type="number",
+                    ui_model_value=rom["modes"], ui_dense=True, ui_filled=True,
+                )
+                modes.on_update_model_value(
+                    lambda event: self._set_solver_rom("modes", int(float(event.value)))
+                )
+                eigen_solver = QSelect(
+                    ui_label="Basis eigensolver",
+                    ui_options=[
+                        {"label": "SciPy sparse eigensolve", "value": "scipy"},
+                        {"label": "PINVIT iterative eigensolve", "value": "pinvit"},
+                    ],
+                    ui_option_label="label", ui_option_value="value",
+                    ui_emit_value=True, ui_map_options=True,
+                    ui_model_value=rom["eigen_solver"], ui_dense=True, ui_filled=True,
+                )
+                eigen_solver.on_update_model_value(
+                    lambda event: self._set_solver_rom("eigen_solver", str(event.value))
+                )
+                children.extend([modes, eigen_solver])
+                if rom["eigen_solver"] == "pinvit":
+                    for key, label, integer in (
+                        ("pinvit_max_iterations", "PINVIT maximum iterations", True),
+                        ("pinvit_tolerance", "PINVIT eigenvalue tolerance", False),
+                        ("pinvit_residual_tolerance", "PINVIT residual tolerance", False),
+                    ):
+                        field = QInput(
+                            ui_label=label, ui_type="number",
+                            ui_model_value=rom[key], ui_dense=True, ui_filled=True,
+                        )
+                        field.on_update_model_value(
+                            lambda event, setting=key, as_int=integer: self._set_solver_rom(
+                                setting,
+                                int(float(event.value)) if as_int else float(event.value),
+                            )
+                        )
+                        children.append(field)
+                children.append(Div(
+                    "The modal basis is built at the start of each solve and reused across its frequency sweep. The basis is not saved or reused between runs.",
+                    ui_style="font-size:11px; color:var(--fg-muted); line-height:1.4;",
+                ))
+        return children
 
     def _study_properties(self):
         studies = self.studies.get("studies", [])
@@ -13537,8 +13629,43 @@ class SolveWorkspace(Div):
     @_history_tracked
     def _set_physics(self, physics, key, value):
         self.model["physics"].setdefault(physics, {})[key] = value
+        if physics in {"mechanics", "harmonic_electromagnetic"} and key == "enabled":
+            physics_settings = self.model.get("physics", {})
+            if (
+                not physics_settings.get("mechanics", {}).get("enabled", False)
+                or not physics_settings.get("harmonic_electromagnetic", {}).get("enabled", False)
+            ):
+                self.model.setdefault("solver", {})[
+                    "mechanical_solution_method"
+                ] = "full_order"
         if self.active_section == "physics":
             self._render_inspector()
+
+    @_history_tracked
+    def _set_mechanical_solution_method(self, event):
+        value = str(getattr(event, "value", event) or "").strip().lower()
+        if value not in MECHANICAL_SOLUTION_METHODS:
+            self._message("Choose a supported mechanical solution method.", error=True)
+            self._render_inspector()
+            return False
+        physics = self.model.get("physics", {})
+        rom_supported = bool(
+            physics.get("mechanics", {}).get("enabled", False)
+            and physics.get("harmonic_electromagnetic", {}).get("enabled", False)
+        )
+        if value == "modal_rom" and not rom_supported:
+            self._message(
+                "Axisymmetric mechanical modal ROM requires time-harmonic EM to be enabled.",
+                error=True,
+            )
+            self._render_inspector()
+            return False
+        self.model.setdefault("solver", {})[
+            "mechanical_solution_method"
+        ] = value
+        self._render_inspector()
+        self._message("Mechanical solution set to " + MECHANICAL_SOLUTION_METHODS[value].lower() + ".")
+        return True
 
     @_history_tracked
     def _set_mesh(self, key, value):
@@ -13578,6 +13705,15 @@ class SolveWorkspace(Div):
     @_history_tracked
     def _set_solver(self, key, value):
         self.model["solver"][key] = value
+
+    @_history_tracked
+    def _set_solver_rom(self, key, value):
+        solver = self.model.setdefault("solver", {})
+        settings = solver.get("mechanical_rom")
+        if not isinstance(settings, dict):
+            settings = {}
+            solver["mechanical_rom"] = settings
+        settings[key] = value
 
     @_history_tracked
     def _set_study(self, study_id, key, value):

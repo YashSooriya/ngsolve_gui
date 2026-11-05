@@ -18,6 +18,10 @@ import uuid
 import zipfile
 
 from .units import parameter_dimensions as infer_parameter_dimensions, require_expression_unit
+from .mechanical_rom import (
+    DEFAULT_MECHANICAL_ROM,
+    validate_mechanical_solution,
+)
 
 
 SCHEMA = "ngsolve-gui.axisymmetric"
@@ -1446,6 +1450,11 @@ def new_model(name: str = "Untitled axisymmetric model") -> dict:
             "anderson_beta": 1.0,
             "relative_tolerance": 1e-6,
             "maximum_iterations": 50,
+            "mechanical_solution_method": "full_order",
+            "mechanical_rom": {
+                **copy.deepcopy(DEFAULT_MECHANICAL_ROM),
+                "static_enrichment": False,
+            },
         },
     }
 
@@ -2418,6 +2427,28 @@ def validate_model(model: dict, *, scope="solve") -> list[str]:
                 raise ValueError("maximum iterations must be a finite positive integer")
         if scope == "solve" and solver.get("linear_solver", "direct") != "direct":
             raise ValueError("Only the direct linear solver is currently supported")
+        if scope == "solve" and isinstance(physics, dict):
+            mechanics_active = bool(
+                isinstance(physics.get("mechanics"), dict)
+                and physics["mechanics"].get("enabled") is True
+            )
+            if mechanics_active:
+                harmonic_em_active = bool(
+                    isinstance(physics.get("harmonic_electromagnetic"), dict)
+                    and physics["harmonic_electromagnetic"].get("enabled") is True
+                )
+                if (
+                    solver.get("mechanical_solution_method", "full_order") == "modal_rom"
+                    and not harmonic_em_active
+                ):
+                    raise ValueError(
+                        "Axisymmetric mechanical modal ROM requires time-harmonic EM to be enabled."
+                    )
+                validate_mechanical_solution(
+                    solver.get("mechanical_solution_method", "full_order"),
+                    solver.get("mechanical_rom", DEFAULT_MECHANICAL_ROM),
+                    mechanics_active=True,
+                )
     except (TypeError, ValueError, OverflowError) as error:
         errors.append(f"Solver settings: {error}.")
 

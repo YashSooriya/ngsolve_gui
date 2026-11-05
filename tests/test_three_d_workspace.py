@@ -1216,6 +1216,10 @@ def test_mechanical_study_property_editor_exposes_only_relevant_configuration(mo
     }
 
     assert controls["Physics"].ui_model_value == "harmonic_mechanical"
+    assert controls["Solution method"].ui_model_value == "full_order"
+    assert {option["value"] for option in controls["Solution method"].ui_options} == {
+        "full_order", "modal_rom",
+    }
     assert {option["value"] for option in controls["Physics"].ui_options} == {
         "harmonic_em",
         "harmonic_mechanical",
@@ -1224,6 +1228,34 @@ def test_mechanical_study_property_editor_exposes_only_relevant_configuration(mo
     }
     assert {"Body force X (N/m³)", "Body force Y (N/m³)", "Body force Z (N/m³)"} <= set(controls)
     assert "Air-region padding (model spans)" not in controls
+
+    assert workspace._set_mechanical_solution_method(
+        SimpleNamespace(value="modal_rom")
+    ) is True
+    controls = {
+        getattr(child, "ui_label", None): child
+        for child in workspace._properties.ui_children
+    }
+    assert controls["Mechanical modes"].ui_model_value == 40
+    assert controls["Basis eigensolver"].ui_model_value == "scipy"
+    assert controls["Static load and boundary enrichment"].ui_model_value is True
+
+    assert workspace._set_mechanical_rom_setting(
+        "eigen_solver", SimpleNamespace(value="pinvit")
+    ) is True
+    controls = {
+        getattr(child, "ui_label", None): child
+        for child in workspace._properties.ui_children
+    }
+    assert {"PINVIT maximum iterations", "PINVIT eigenvalue tolerance", "PINVIT residual tolerance"} <= set(controls)
+    assert workspace._set_mechanical_rom_setting(
+        "modes", SimpleNamespace(value="501"), number=True, integer=True
+    ) is False
+    assert workspace.project["study"]["mechanical_rom"]["modes"] == 40
+    assert workspace._set_mechanical_solution_method(
+        SimpleNamespace(value="full_order")
+    ) is True
+
     assert workspace._set_mechanical_body_force(0, SimpleNamespace(value="1000")) is True
     assert workspace.project["study"]["mechanical_body_force_n_m3"] == [1000.0, 0.0, 0.0]
     assert workspace._run_study_button.ui_disable is False

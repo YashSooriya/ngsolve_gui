@@ -20,6 +20,7 @@ from ngapp.components import Div, QBtn, QIcon, QInput, QSelect, QSplitter, QTool
 
 from . import cerbsim_style as cb
 from .axisymmetric_model import builtin_materials
+from .mechanical_rom import MECHANICAL_SOLUTION_METHODS
 from .material_library import MaterialLibrary
 from .three_d_mesh import generate_step_mesh
 from .three_d_project import (
@@ -1087,6 +1088,53 @@ class ThreeDWorkspace(Div):
         self._set_status("3D study settings updated.")
         return True
 
+    def _set_mechanical_solution_method(self, event):
+        study = self.project.setdefault("study", {})
+        old_value = study.get("mechanical_solution_method", "full_order")
+        value = str(getattr(event, "value", event) or "").strip().lower()
+        study["mechanical_solution_method"] = value
+        try:
+            validate_3d_project(self.project, self.assets)
+        except (TypeError, ValueError, OverflowError) as error:
+            study["mechanical_solution_method"] = old_value
+            self._set_status(str(error), error=True)
+            self._rebuild_properties()
+            return False
+        self._mark_changed()
+        self._rebuild_properties()
+        self._set_status(
+            "Mechanical solution set to "
+            + MECHANICAL_SOLUTION_METHODS[value].lower() + "."
+        )
+        return True
+
+    def _set_mechanical_rom_setting(self, key, event, *, number=False, integer=False):
+        study = self.project.setdefault("study", {})
+        previous = copy.deepcopy(study.get("mechanical_rom", {}))
+        settings = dict(study.get("mechanical_rom", {}))
+        value = getattr(event, "value", event)
+        try:
+            if number:
+                value = float(value)
+                if not math.isfinite(value):
+                    raise ValueError("Enter a finite ROM setting.")
+                if integer:
+                    if not value.is_integer():
+                        raise ValueError("Enter an integer mode count or iteration limit.")
+                    value = int(value)
+            settings[key] = value
+            study["mechanical_rom"] = settings
+            validate_3d_project(self.project, self.assets)
+        except (TypeError, ValueError, OverflowError) as error:
+            study["mechanical_rom"] = previous
+            self._set_status(str(error), error=True)
+            self._rebuild_properties()
+            return False
+        self._mark_changed()
+        self._rebuild_properties()
+        self._set_status("Mechanical ROM settings updated.")
+        return True
+
     def _set_frequency_mode(self, event):
         study = self.project.setdefault("study", {})
         value = str(getattr(event, "value", event) or "")
@@ -1186,11 +1234,15 @@ class ThreeDWorkspace(Div):
             return False
         study = self.project.setdefault("study", {})
         old_value = study.get("physics", "harmonic_em")
+        old_solution_method = study.get("mechanical_solution_method", "full_order")
         study["physics"] = value
+        if value not in {"harmonic_mechanical", "coupled_magneto_mechanical"}:
+            study["mechanical_solution_method"] = "full_order"
         try:
             validate_3d_project(self.project, self.assets)
         except (TypeError, ValueError) as error:
             study["physics"] = old_value
+            study["mechanical_solution_method"] = old_solution_method
             self._set_status(str(error), error=True)
             self._rebuild_properties()
             return False
@@ -3910,6 +3962,87 @@ class ThreeDWorkspace(Div):
                      for order in (1, 2, 3, 4)],
                 ),
             ])
+            if physics in {"harmonic_mechanical", "coupled_magneto_mechanical"}:
+                solution_method = study.get("mechanical_solution_method", "full_order")
+                rom = study.get("mechanical_rom", {})
+                children.extend([
+                    Div("Mechanical solution", ui_style="font-size:12px; font-weight:600; padding-top:6px;"),
+                    self._select_options(
+                        "Solution method",
+                        solution_method,
+                        self._set_mechanical_solution_method,
+                        [
+                            {"label": label, "value": value}
+                            for value, label in MECHANICAL_SOLUTION_METHODS.items()
+                        ],
+                    ),
+                ])
+                if solution_method == "modal_rom":
+                    children.extend([
+                        _input(
+                            "Mechanical modes", rom.get("modes", 40),
+                            lambda event: self._set_mechanical_rom_setting(
+                                "modes", event, number=True, integer=True
+                            ),
+                            number=True, width="100%", on_commit=True,
+                        ),
+                        self._select_options(
+                            "Basis eigensolver", rom.get("eigen_solver", "scipy"),
+                            lambda event: self._set_mechanical_rom_setting(
+                                "eigen_solver", event
+                            ),
+                            [
+                                {"label": "SciPy sparse eigensolve", "value": "scipy"},
+                                {"label": "PINVIT iterative eigensolve", "value": "pinvit"},
+                            ],
+                        ),
+                    ])
+                    if rom.get("eigen_solver", "scipy") == "pinvit":
+                        children.extend([
+                            _input(
+                                "PINVIT maximum iterations",
+                                rom.get("pinvit_max_iterations", 80),
+                                lambda event: self._set_mechanical_rom_setting(
+                                    "pinvit_max_iterations", event,
+                                    number=True, integer=True,
+                                ),
+                                number=True, width="100%", on_commit=True,
+                            ),
+                            _input(
+                                "PINVIT eigenvalue tolerance",
+                                rom.get("pinvit_tolerance", 1e-8),
+                                lambda event: self._set_mechanical_rom_setting(
+                                    "pinvit_tolerance", event, number=True
+                                ),
+                                number=True, width="100%", on_commit=True,
+                            ),
+                            _input(
+                                "PINVIT residual tolerance",
+                                rom.get("pinvit_residual_tolerance", 1e-4),
+                                lambda event: self._set_mechanical_rom_setting(
+                                    "pinvit_residual_tolerance", event, number=True
+                                ),
+                                number=True, width="100%", on_commit=True,
+                            ),
+                        ])
+                    children.extend([
+                        self._select_options(
+                            "Static load and boundary enrichment",
+                            rom.get("static_enrichment", True),
+                            lambda event: self._set_mechanical_rom_setting(
+                                "static_enrichment", event
+                            ),
+                            [
+                                {"label": "Enabled", "value": True},
+                                {"label": "Disabled", "value": False},
+                            ],
+                        ),
+                        Div(
+                            "The mechanical modal basis is built for this run and reused across its frequency sweep. In coupled studies, electromagnetics remains full order.",
+                            ui_class="cb-muted",
+                            ui_style="font-size:10px; line-height:1.45; padding:8px; background:var(--panel-header); border-radius:5px;",
+                        ),
+                    ])
             if physics in {"magnetostatic_dc", "coupled_magneto_mechanical"}:
                 background = study.get("dc_background_field_t", [0.0, 0.0, 0.0])
                 for index, axis in enumerate("xyz"):

@@ -4092,6 +4092,53 @@ def test_model_tree_groups_sections_and_places_children_under_their_parent(stand
     assert "flex:1 1 auto" in workspace._properties_splitter._props["style"]
 
 
+def test_axisymmetric_solver_properties_expose_supported_mechanical_rom_controls(standalone_components):
+    workspace = SolveWorkspace()
+    assert "Mechanical solution" not in {
+        getattr(child, "ui_label", None) for child in workspace._solver_properties()
+    }
+
+    workspace.model["physics"]["harmonic_electromagnetic"]["enabled"] = False
+    workspace.model["physics"]["mechanics"]["enabled"] = True
+    controls = {
+        getattr(child, "ui_label", None): child
+        for child in workspace._solver_properties()
+    }
+    assert controls["Mechanical solution"].ui_model_value == "full_order"
+    rom_option = next(
+        option for option in controls["Mechanical solution"].ui_options
+        if option["value"] == "modal_rom"
+    )
+    assert rom_option["disable"] is True
+    assert "requires time-harmonic EM" in rom_option["label"]
+
+    workspace._set_physics("harmonic_electromagnetic", "enabled", True)
+    assert workspace._set_mechanical_solution_method(
+        SimpleNamespace(value="modal_rom")
+    ) is True
+    controls = {
+        getattr(child, "ui_label", None): child
+        for child in workspace._solver_properties()
+    }
+    assert controls["Mechanical modes"].ui_model_value == 40
+    assert controls["Basis eigensolver"].ui_model_value == "scipy"
+    assert "Static load and boundary enrichment" not in controls
+
+    workspace.model["solver"]["mechanical_rom"]["eigen_solver"] = "pinvit"
+    controls = {
+        getattr(child, "ui_label", None): child
+        for child in workspace._solver_properties()
+    }
+    assert {
+        "PINVIT maximum iterations",
+        "PINVIT eigenvalue tolerance",
+        "PINVIT residual tolerance",
+    } <= set(controls)
+
+    workspace._set_physics("harmonic_electromagnetic", "enabled", False)
+    assert workspace.model["solver"]["mechanical_solution_method"] == "full_order"
+
+
 def test_blank_axisymmetric_view_reserves_a_z_label_gutter(standalone_components):
     workspace = SolveWorkspace()
     project, unproject = workspace._canvas_projection()

@@ -345,6 +345,37 @@ def test_ngsmodel_round_trip_is_data_only_and_rejects_extra_files():
         unpack_model(malicious.getvalue())
 
 
+def test_axisymmetric_modal_rom_settings_survive_project_save_and_reopen():
+    model = new_model("Axisymmetric ROM project")
+    model["solver"].update(
+        mechanical_solution_method="modal_rom",
+        mechanical_rom={
+            "modes": 8,
+            "eigen_solver": "pinvit",
+            "pinvit_max_iterations": 100,
+            "pinvit_tolerance": 2e-8,
+            "pinvit_residual_tolerance": 3e-4,
+            "static_enrichment": False,
+        },
+    )
+
+    restored, _studies, _layout = unpack_model(package_model(model))
+
+    assert restored["solver"]["mechanical_solution_method"] == "modal_rom"
+    assert restored["solver"]["mechanical_rom"] == model["solver"]["mechanical_rom"]
+
+
+def test_axisymmetric_mechanics_only_rejects_modal_rom_as_unsupported():
+    model = new_model("Unsupported mechanics-only ROM")
+    model["physics"]["mechanics"]["enabled"] = True
+    model["physics"]["harmonic_electromagnetic"]["enabled"] = False
+    model["solver"]["mechanical_solution_method"] = "modal_rom"
+
+    errors = validate_model(model, scope="solve")
+
+    assert any("Axisymmetric mechanical modal ROM requires time-harmonic EM" in error for error in errors)
+
+
 def test_drafts_can_save_multiple_studies_but_solver_reports_unsupported_count():
     model = new_model()
     studies = new_studies()

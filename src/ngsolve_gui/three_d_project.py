@@ -15,6 +15,11 @@ import zipfile
 from pathlib import PurePosixPath
 from uuid import uuid4
 
+from .mechanical_rom import (
+    DEFAULT_MECHANICAL_ROM,
+    validate_mechanical_solution,
+)
+
 
 PROJECT_SUFFIX = ".mmfem3d"
 PROJECT_SCHEMA = "mm-fem.3d-project"
@@ -103,6 +108,8 @@ def new_3d_project(name="Untitled 3D project"):
             "mechanical_body_force_phase_deg": [0.0, 0.0, 0.0],
             "coupling_max_iterations": 15,
             "coupling_tolerance": 1e-4,
+            "mechanical_solution_method": "full_order",
+            "mechanical_rom": dict(DEFAULT_MECHANICAL_ROM),
         },
     }
 
@@ -868,6 +875,11 @@ def validate_3d_project(project, assets):
             coupling_tolerance = float(study.get("coupling_tolerance", 1e-4))
             if not math.isfinite(coupling_tolerance) or not 1e-12 <= coupling_tolerance <= 0.1:
                 raise ValueError("Coupling tolerance must be between 1e-12 and 0.1.")
+        mechanical_solution_method, mechanical_rom = validate_mechanical_solution(
+            study.get("mechanical_solution_method", "full_order"),
+            study.get("mechanical_rom", DEFAULT_MECHANICAL_ROM),
+            mechanics_active=mechanical,
+        )
     except (TypeError, ValueError, OverflowError) as error:
         raise ValueError(f"Invalid 3D study settings: {error}") from error
     study["physics"] = physics
@@ -887,6 +899,8 @@ def validate_3d_project(project, assets):
     if coupled:
         study["coupling_max_iterations"] = coupling_max_iterations
         study["coupling_tolerance"] = coupling_tolerance
+    study["mechanical_solution_method"] = mechanical_solution_method
+    study["mechanical_rom"] = mechanical_rom
 
     materials = project.setdefault("materials", [])
     if not isinstance(materials, list) or len(materials) > MAX_PROJECT_ITEMS:

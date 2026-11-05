@@ -8,6 +8,10 @@ import json
 from pathlib import Path
 
 from .axisymmetric_model import builtin_materials
+from .mechanical_rom import (
+    DEFAULT_MECHANICAL_ROM,
+    validate_mechanical_solution,
+)
 from .three_d_project import (
     UNASSIGNED_MATERIAL,
     SUPPORTED_3D_EM_SOURCE_MODES,
@@ -396,6 +400,11 @@ def validate_3d_study_setup(project):
         body_force_phase = [float(value) for value in study.get(
             "mechanical_body_force_phase_deg", [0.0, 0.0, 0.0]
         )] if mechanical else [0.0, 0.0, 0.0]
+        mechanical_solution_method, mechanical_rom = validate_mechanical_solution(
+            study.get("mechanical_solution_method", "full_order"),
+            study.get("mechanical_rom", DEFAULT_MECHANICAL_ROM),
+            mechanics_active=mechanical,
+        )
         raw_coupling_max_iterations = study.get("coupling_max_iterations", 15)
         coupling_max_iterations = float(raw_coupling_max_iterations) if coupled else 15
         coupling_tolerance = float(study.get("coupling_tolerance", 1e-4)) if coupled else 1e-4
@@ -607,6 +616,11 @@ def validate_3d_study_setup(project):
         "mechanical_body_force_by_domain": mechanical_body_force_by_domain,
         "coupling_max_iterations": coupling_max_iterations,
         "coupling_tolerance": coupling_tolerance,
+        "mechanical_solution_method": mechanical_solution_method,
+        "mechanical_rom": {
+            **mechanical_rom,
+            "enabled": mechanical and mechanical_solution_method == "modal_rom",
+        },
         "current_density_by_domain": current_density_by_domain,
         "dc_current_density_by_domain": dc_current_density_by_domain,
         "boundary_assignments": boundary_assignments,
@@ -1093,6 +1107,14 @@ def build_3d_study_problem(project, asset_paths):
         "Aux": {
             "study_type": study_type,
             "polynomial_order": polynomial_order,
+            "mechanical_rom": {
+                **validated["mechanical_rom"],
+                "solution_method": validated["mechanical_solution_method"],
+                "scope": (
+                    "mechanics block only; electromagnetics remains full order"
+                    if coupled else "mechanical system"
+                ) if mechanical else "not active for this physics",
+            },
             **({"frequency_hz": frequency_hz} if frequency_hz is not None else {}),
             **({"frequency_points_hz": list(frequency_points_hz)} if frequency_points_hz else {}),
             **({"applied_dc_background_field_t": list(dc_background)} if uses_dc else {}),
@@ -1191,6 +1213,8 @@ def build_3d_study_problem(project, asset_paths):
         "material_display_names": material_display_names,
         "coupling_max_iterations": validated["coupling_max_iterations"],
         "coupling_tolerance": validated["coupling_tolerance"],
+        "mechanical_solution_method": validated["mechanical_solution_method"],
+        "mechanical_rom": validated["mechanical_rom"],
     }
 
 

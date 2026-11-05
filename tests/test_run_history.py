@@ -1,6 +1,42 @@
 import json
 
-from ngsolve_gui.run_history import load_run_result_tree
+from ngsolve_gui.run_history import _diagnostic_summary, load_run_result_tree
+
+
+def test_run_history_identifies_reduced_mechanical_basis_and_build_cost():
+    summary = _diagnostic_summary({
+        "status": "complete",
+        "mechanical_rom": {"enabled": True, "modes": 6},
+        "rom_diagnostics": {
+            "actual_modes": 6,
+            "basis_construction_seconds": 0.125,
+            "online_harmonic_solve_seconds": 1.25,
+        },
+        "frequency_points": [{
+            "frequency_hz": 50.0,
+            "execution_status": "complete",
+            "scientific_status": "not_applicable",
+        }],
+        "progress": {"completed_frequencies": 1, "total_frequencies": 1},
+    })
+
+    assert summary.startswith("Mechanical modal ROM · 6/6 modes · basis 0.12 s")
+    assert "harmonic solve 1.25 s" in summary
+    assert "50 Hz: completed" in summary
+
+
+def test_run_history_reports_pinvit_convergence_separately_from_job_status():
+    summary = _diagnostic_summary({
+        "status": "complete",
+        "mechanical_rom": {"enabled": True, "modes": 4},
+        "rom_diagnostics": {
+            "actual_modes": 4,
+            "basis_construction_seconds": 0.25,
+            "pinvit": {"converged": True, "iterations": 7},
+        },
+    })
+
+    assert "PINVIT converged in 7 iterations" in summary
 
 
 def test_run_result_tree_exposes_default_field_alternates_and_mesh(tmp_path):
