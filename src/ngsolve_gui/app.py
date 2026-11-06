@@ -353,17 +353,22 @@ def _inject_lorentz_brand_styles(js):
   color: var(--lorentz-navy) !important;
 }
 .lorentz-wordmark-dark,
+.lorentz-home-banner-dark,
 .lorentz-about-banner-dark { display: none !important; }
 :root[data-theme="dark"] .lorentz-wordmark-light,
+:root[data-theme="dark"] .lorentz-home-banner-light,
 :root[data-theme="dark"] .lorentz-about-banner-light { display: none !important; }
 :root[data-theme="dark"] .lorentz-wordmark-dark,
+:root[data-theme="dark"] .lorentz-home-banner-dark,
 :root[data-theme="dark"] .lorentz-about-banner-dark { display: block !important; }
 .lorentz-wordmark-dark .q-img__image,
+.lorentz-home-banner-dark .q-img__image,
 .lorentz-about-banner-dark .q-img__image {
   opacity: 1 !important;
   visibility: visible !important;
 }
 .lorentz-wordmark-dark .q-img__loading,
+.lorentz-home-banner-dark .q-img__loading,
 .lorentz-about-banner-dark .q-img__loading { display: none !important; }
 a.powered-by { display: none !important; }
 """
@@ -1180,7 +1185,12 @@ class NGSolveGui(App):
                 QImg(
                     ui_src=self.load_asset("lorentz_home_light.png"),
                     ui_height="150px", ui_width="200px", ui_fit="contain",
-                    ui_alt="Lorentz",
+                    ui_alt="Lorentz", ui_class="lorentz-home-banner-light",
+                ),
+                QImg(
+                    ui_src=self.load_asset("lorentz_home_dark.png"),
+                    ui_height="150px", ui_width="200px", ui_fit="contain",
+                    ui_alt="Lorentz", ui_class="lorentz-home-banner-dark",
                 ),
                 ui_style="display:flex; justify-content:center; padding:18px 28px 8px;",
             ),
