@@ -1713,6 +1713,28 @@ def test_global_escape_returns_to_select_in_solve_workspace(standalone_component
     assert workspace.sketch_tool == "select"
 
 
+def test_global_escape_closes_axisymmetric_3d_preview_before_sketch_action(
+    standalone_components,
+):
+    from types import SimpleNamespace
+
+    app = NGSolveGui.__new__(NGSolveGui)
+    workspace = SolveWorkspace()
+    workspace._preview_3d_active = True
+    preview_closed = []
+    sketch_escape = []
+    workspace.toggle_3d_preview = lambda: preview_closed.append(True)
+    workspace._handle_sketch_escape = lambda: sketch_escape.append(True)
+    app.kb = SimpleNamespace(_mode=None, _help_visible=False, on_escape=lambda: None)
+    app._workspace_mode = "solve"
+    app.solve_workspace = workspace
+
+    app._handle_escape_shortcut()
+
+    assert preview_closed == [True]
+    assert sketch_escape == []
+
+
 def test_global_escape_closes_keyboard_overlay_before_changing_tool(standalone_components):
     from types import SimpleNamespace
 

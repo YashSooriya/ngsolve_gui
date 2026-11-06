@@ -1999,6 +1999,9 @@ class NGSolveGui(App):
             return
         workspace = getattr(self, "_solve_workspace_instance", None)
         if workspace is not None:
+            if getattr(workspace, "_preview_3d_active", False):
+                workspace.toggle_3d_preview()
+                return
             workspace._handle_sketch_escape()
 
     def _open_solve_section(self, section):

@@ -1,9 +1,9 @@
 # MagMechSim: Forward Development Roadmap
 
-**Planning baseline:** 5 November 2026 (Phase E3 accepted; Phase F1 active)
+**Planning baseline:** 6 November 2026 (Phase E3 accepted; Phase F1 complete for verified scope)
 **Status:** Living plan, not an immutable implementation contract  
 **Primary users:** Engineers familiar with industrial CAE tools  
-**Primary immediate scope:** Phase F1 cross-workspace UX consistency and native startup reliability
+**Primary immediate scope:** Phase F2 follow-on UX refinement, after independent review of Phase F1
 **Out of scope for now:** New results visualisation or a post-processing redesign (but existing Solve/Results navigation must remain fully functional)
 
 ## 1. Product objective and working agreement
@@ -20,7 +20,7 @@ MagMechSim should provide a complete, reliable and responsive workflow from geom
 
 The bullets below retain historical baseline evidence where useful. The accepted Phase A closeout and completed Phase B1/B2/C statuses below supersede earlier open/blank/recovery findings.
 
-**Latest verified status (5 November 2026):** Phases A, B1, B2, C, D1, D2, E1, E2 and E3 are accepted for their recorded scopes. Phase E3 adds independent 3D mesh geometry order, Rayleigh damping and configurable coupled Anderson controls; its package, numerical evidence and ROM assessment remain documented in the [Phase E3 report](reviews/2026-11-05-phase-e3.md). Persistent/offline ROM remains deferred. Phase F1 is active: it is correcting the native splash-to-first-frame handoff and applying small shared-shell and model-tree usability refinements. The previous maximized package `0.2.8.dev305` (SHA-256 `6de27c0ff2b48e4687333debab89fc0bb5c4115023153526c5f8321e4f1454e4`) and its E3 checks are a baseline only; their first launch included a white frame. This VM is on an SSD, and no controlled before/after performance comparison has been made. The CPU-only 2D field viewer remains retired and the tested WebGPU/WebGL fallback remains in place.
+**Latest verified status (6 November 2026):** Phases A, B1, B2, C, D1, D2, E1, E2 and E3 are accepted for their recorded scopes; Phase F1 is complete for the tested interface and startup workflows. The E3 controls, package and ROM assessment remain documented in the [Phase E3 report](reviews/2026-11-05-phase-e3.md). Persistent/offline ROM remains deferred. F1 retains the shared application shell and specialised workspace toolbars, improves contextual navigation, and changes the packaged startup sequence to paint a native renderer frame at its launch size before maximizing and verifying the final window. Two fresh packaged launches passed this native-pixel gate and all native UI workflow checks; see the [Phase F1 report](reviews/2026-11-06-phase-f1.md). The blank maximized-first frame was reproduced on this VM with the virtual graphics adapter; restore-first-paint followed by maximizing resolved it in both tested launches. This is evidence for this VM, not a universal Chromium or physical-GPU diagnosis. The VM is on an SSD, and no controlled before/after performance comparison has been made. The CPU-only 2D field viewer remains retired and the tested WebGPU/WebGL fallback remains in place.
 
 - The saved `Getting started - coupled coil` project rendered its square and circle regions in the first geometry-editor screenshot. The sketch grid filled the viewport at maximized and restored sizes with correct physical scaling. The earlier single blank capture was not reproduced; its cause remains unknown.
 - The axisymmetric geometry-creation 3D preview rendered both regions using Plotly WebGL. 3D STEP import, a 22,132-element bounded mesh, repeated native CAD selection, display switching, rotation and selection persistence all passed. The historical OOM did not reproduce; the test covered only three bounded cycles, so larger and longer sessions remain a risk.
@@ -308,15 +308,16 @@ Packaged desktop tests verified these controls in the maximized `0.2.8.dev305` a
 - Preserve axisymmetric sketching, arcs, lines, region behaviour, hp-layer controls and dedicated numerical semantics.
 - Remove duplicated infrastructure only where justified by maintainability or user benefit; avoid large numerical code migrations for visual uniformity alone.
 
-#### Phase F1. Cross-workspace cohesion and startup reliability (active; 5 November 2026)
+#### Phase F1. Cross-workspace cohesion and startup reliability (complete for verified scope; 6 November 2026)
 
 - Keep one shared application shell and command hierarchy while retaining distinct axisymmetric sketch and OCC CAD toolbars.
 - Compact the shared top navigation modestly; make long 3D assignment labels discoverable in the model tree; preserve contextual menus, quick actions and Model/Results navigation.
-- Verify fresh packaged launches on the real desktop: the target window must be maximized and foregrounded, and native pixels must show the application before the splash is removed. Do not use a fixed launch delay as a proxy for paint.
+- Keep Chromium's first native paint at a normal launch size, then maximize and independently verify the full native client before dismissing the splash. This avoids the reproduced blank surface from a maximized-first renderer on the VM without adding a fixed delay.
 - Exercise actual native input in both workflows: recent-project tiles, 3D geometry/property navigation, axisymmetric sketch selection and its 3D geometry-creation preview. Capture maximized full-desktop screenshots.
-- Preserve all specialist geometry, mesh and solver paths; avoid numerical refactoring.
+- Escape now closes the active axisymmetric 3D geometry preview before acting on the underlying sketch tool.
+- Preserve all specialist geometry, mesh and solver paths; avoid numerical refactoring. The startup reliability work changes only the native launcher; the GUI change is limited to safe preview dismissal.
 
-**F1 gate:** Repeatable unassisted splash handoff with a painted native frame; both interfaces navigable and responsive at full desktop size; relevant source and packaged tests pass. Stop for independent review after this stage.
+**F1 gate (passed):** Two fresh packaged launches at 1920×1094 painted native UI before maximizing, passed the full-window paint gate, and dismissed the splash 0.19 s after the maximized-frame signal. Total splash-to-ready was 8.55 s and 7.97 s. The actual packaged workflow passed native project opening, CAD and sketch selection, context menus, Model/Results navigation, axisymmetric 3D preview/escape, and maximized geometry display. The desktop harness recorded no remaining test-owned package processes; no solver run was made. The VM was moved to an SSD before these measurements; there is no controlled code-versus-storage comparison. See the [Phase F1 report](reviews/2026-11-06-phase-f1.md) and review ZIP. Stop for independent review before Phase F2.
 
 #### Phase F2. Follow-on UI refinement (planned; not started)
 
@@ -374,7 +375,7 @@ Phase D2: coupled workflow and verification refinement — accepted for tested s
             Advanced numerical settings and ROM assessment (Phase E3 — complete for tested scope)
                       |
                       v
-            Cross-workspace cohesion and startup reliability (Phase F1 — active)
+            Cross-workspace cohesion and startup reliability (Phase F1 — complete for tested scope)
                       |
                       v
             Follow-on UX refinement (Phase F2 — after F1 review)
@@ -410,7 +411,7 @@ Release, packaging and comprehensive quality gates occur throughout, with final 
 | Menus expose irrelevant commands | Confusing and potentially hazardous workflow | Context-aware command taxonomy and capability checks |
 | Axisymmetric sketch/preview rendering | Saved regions, full-pane grid and the geometry-creation Plotly WebGL preview are visible in the packaged app; physical-GPU behavior is unverified | Keep representative sketch/preview regression coverage; reopen if blank frames or fidelity issues recur |
 | Reload after a renderer crash can leave a blank window | Controlled recovery now restores styles, project state and a rendered viewport | Retain one-attempt recovery guard and packaged crash regression; revisit if broader crash reports occur |
-| Startup and first-frame reliability | The .dev285 package reached the maximized home workspace from a fresh profile in 9.344 s; two packaged workflow launches reached the maximized window at 7.670 s and 7.735 s. First-frame probes showed visible pixels at 0.469 s and 0.593 s, but earlier blank captures remain unexplained | Keep the five-second native first-frame probe; investigate if a blank screen persists or recurs in user launches. Timings are from the SSD-migrated VM and are not controlled comparisons |
+| Startup and first-frame reliability | Starting Chromium maximized repeatedly left the native client white on this VirtualBox display adapter despite a mounted DOM. F1 now paints and verifies a restored launch-size frame, maximizes, then verifies the full client before dismissing the splash. Two clean packaged launches passed in 8.55 s and 7.97 s. This verifies the VM path, not all physical GPU/driver combinations | Keep both native-pixel gates; monitor reports from physical Windows graphics drivers and treat SSD-migration timing comparisons as uncontrolled |
 | Documentation is linked to GitHub | Poor offline and packaged UX | Bundle local Sphinx HTML now; refresh/index in later documentation phase |
 | Broad CI has known failures | Can conceal regressions and waste iteration time | Keep focused gates, track known failures, schedule comprehensive checks |
 | Frequent rebuilds and tests | Slows development | Build/package once per milestone; use risk-based, cached focused tests |
@@ -419,4 +420,4 @@ Release, packaging and comprehensive quality gates occur throughout, with final 
 
 Suggested repository home for this plan: a documented planning location under the GUI repository, chosen by Codex after inspecting existing conventions. Keep this file as the **single current roadmap**, with date, completed milestones, changed priorities and links to implementation reports. Historical roadmaps may remain archived but should not conflict with the current one.
 
-**Current action (5 November 2026):** Phase E3 is accepted for its tested advanced numerical controls and ROM performance assessment. Persistent/offline ROM remains deferred; keep per-run basis construction and within-sweep reuse until larger repeated-model benchmarks establish a worthwhile benefit. Phase F1 is the active milestone. Require the packaged Win32 desktop harness, maximized screenshots, verified foreground HWND, an actual pre-splash-dismissal paint signal, and newest-full-app launcher smoke. Keep the CPU-only 2D viewer retired, preserve the WebGPU-to-WebGL fallback and E1 sweep references, and do not change the separate Mike variant. The VM's SSD move is a performance confounder, not a code improvement. Update this single roadmap with Phase F1 evidence, then stop for independent review before Phase F2.
+**Current action (6 November 2026):** Phase E3 and Phase F1 are accepted for their recorded scopes. Persistent/offline ROM remains deferred; keep per-run basis construction and within-sweep reuse until larger repeated-model benchmarks establish a worthwhile benefit. Phase F1 verified two fresh packaged launches with native first-paint gating, maximized full-resolution windows, and both workspace flows. Its first-paint fix creates a restored Chromium surface, verifies native pixels, maximizes, verifies again, and only then dismisses the splash. The VM's SSD move remains a performance confounder, not a code improvement. Keep the CPU-only 2D viewer retired, preserve WebGPU-to-WebGL fallback and E1 sweep references, and leave the separate Mike variant unchanged. Phase F2 is planned but not started; wait for independent F1 review before beginning it.
