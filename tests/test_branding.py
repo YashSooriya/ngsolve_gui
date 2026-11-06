@@ -65,6 +65,22 @@ def test_official_brand_assets_are_packaged_without_old_product_logos():
     assert sum((assets / name).stat().st_size for name in frontend_brand_assets) < 500 * 1024
 
 
+def test_home_and_about_artwork_has_transparent_backgrounds():
+    from PIL import Image
+
+    assets = Path(__file__).parents[1] / "src" / "ngsolve_gui" / "assets"
+    for name in (
+        "lorentz_home_light.png",
+        "lorentz_home_dark.png",
+        "lorentz_about_light.png",
+        "lorentz_about_dark.png",
+    ):
+        with Image.open(assets / name) as artwork:
+            alpha = artwork.convert("RGBA").getchannel("A")
+            assert alpha.getpixel((0, 0)) == 0, f"{name} has a visible canvas corner."
+            assert alpha.getextrema()[1] == 255, f"{name} contains no opaque logo pixels."
+
+
 def test_rebranded_app_keeps_existing_user_settings_namespace(monkeypatch):
     from types import SimpleNamespace
 
