@@ -1,4 +1,4 @@
-"""Build the supported 3D time-harmonic electromagnetic input for Lorentz."""
+"""Build the supported 3D time-harmonic electromagnetic input for LORENTZ."""
 
 from __future__ import annotations
 

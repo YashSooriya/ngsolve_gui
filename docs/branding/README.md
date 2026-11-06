@@ -1,6 +1,6 @@
-# Lorentz brand assets
+# LORENTZ brand assets
 
-`Lorentz-Brand-Kit.zip` is the original artwork package supplied for the application rebrand. Its SVG masters, palette, and animation notes are the source of truth. The app uses optimized PNG/ICO exports from that kit:
+`Lorentz-Brand-Kit.zip` is the original artwork package supplied for the application rebrand. Its SVG masters, palette, and animation notes are the source of truth. The LORENTZ app uses optimized PNG/ICO exports from that kit:
 
 | Asset | UI location |
 |---|---|

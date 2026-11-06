@@ -566,7 +566,7 @@ class SolveWorkspace(Div):
 
         self._canvas_background = _svg(
             "rect", x=0, y=0, width=self._canvas_width, height=self._canvas_height,
-            fill="var(--canvas-bg, #f4f6f8)",
+            fill="var(--sketch-canvas-bg, #f4f6f8)",
         )
         self._canvas_grid = Component("g")
         self._canvas_live_grid = Component("g")
@@ -576,7 +576,7 @@ class SolveWorkspace(Div):
         self._canvas_mesh_path = _svg(
             "path",
             fill="none",
-            stroke="#203c57",
+            stroke="var(--sketch-stroke, #203c57)",
             stroke_width="0.9",
             stroke_opacity="0.82",
             vector_effect="non-scaling-stroke",
@@ -614,7 +614,7 @@ class SolveWorkspace(Div):
             ),
             _svg(
                 "path", id="solve-sketch-line-chain-halo", d="",
-                fill="none", stroke="#ffffff", stroke_width="7",
+                fill="none", stroke="var(--sketch-halo, #ffffff)", stroke_width="7",
                 stroke_linecap="round", stroke_linejoin="round",
                 style="pointer-events:none;",
             ),
@@ -626,7 +626,7 @@ class SolveWorkspace(Div):
             ),
             _svg(
                 "path", id="solve-sketch-drag-line-halo", d="", display="none",
-                fill="none", stroke="#ffffff", stroke_width="7",
+                fill="none", stroke="var(--sketch-halo, #ffffff)", stroke_width="7",
                 stroke_linecap="round", stroke_linejoin="round",
                 style="pointer-events:none;",
             ),
@@ -638,7 +638,7 @@ class SolveWorkspace(Div):
             ),
             _svg(
                 "path", id="solve-sketch-drag-arc-halo", d="", display="none",
-                fill="none", stroke="#ffffff", stroke_width="7",
+                fill="none", stroke="var(--sketch-halo, #ffffff)", stroke_width="7",
                 stroke_linecap="round", stroke_linejoin="round",
                 style="pointer-events:none;",
             ),
@@ -650,7 +650,7 @@ class SolveWorkspace(Div):
             ),
             _svg(
                 "path", id="solve-sketch-construction-halo", d="",
-                fill="none", stroke="#ffffff", stroke_width="6",
+                fill="none", stroke="var(--sketch-halo, #ffffff)", stroke_width="6",
                 stroke_linecap="round", style="pointer-events:none;",
             ),
             _svg(
@@ -669,13 +669,13 @@ class SolveWorkspace(Div):
             "g",
             _svg(
                 "path", id="solve-sketch-inference-halo", d="", display="none",
-                fill="none", stroke="#ffffff", stroke_width="8",
+                fill="none", stroke="var(--sketch-halo, #ffffff)", stroke_width="8",
                 stroke_linecap="round", stroke_linejoin="round",
                 style="pointer-events:none; vector-effect:non-scaling-stroke;",
             ),
             _svg(
                 "path", id="solve-sketch-inference-marker", d="", display="none",
-                fill="#ffffff", stroke="#16814a", stroke_width="3.4",
+                fill="var(--sketch-halo, #ffffff)", stroke="#16814a", stroke_width="3.4",
                 stroke_linecap="round", stroke_linejoin="round",
                 style="pointer-events:none; vector-effect:non-scaling-stroke;",
             ),
@@ -714,7 +714,7 @@ class SolveWorkspace(Div):
             self._canvas_preview,
             self._canvas_inference,
             ui_class="solve-sketch-canvas",
-            ui_style="display:block; width:100%; height:100%; min-height:0; background:var(--canvas-bg, #f4f6f8); cursor:default; user-select:none; -webkit-user-select:none; touch-action:none; overscroll-behavior:contain;",
+            ui_style="display:block; width:100%; height:100%; min-height:0; background:var(--sketch-canvas-bg, #f4f6f8); cursor:default; user-select:none; -webkit-user-select:none; touch-action:none; overscroll-behavior:contain;",
         )
         self._canvas._props.update({
             "viewBox": "0 0 900 640",
@@ -1630,7 +1630,7 @@ class SolveWorkspace(Div):
             pass
         self._canvas.ui_style = (
             "display:block; width:100%; height:100%; min-height:0; "
-            "background:var(--canvas-bg, #f4f6f8); touch-action:none; "
+            "background:var(--sketch-canvas-bg, #f4f6f8); touch-action:none; "
             "overscroll-behavior:contain; cursor:"
             + ("crosshair;" if tool != "select" else "default;")
             + " user-select:none; -webkit-user-select:none;"
@@ -2293,7 +2293,7 @@ class SolveWorkspace(Div):
       liveGrid.appendChild(node);
       return node;
     };
-    const text = (size, anchor = null, fill = 'var(--fg-muted, #697586)', weight = null) => {
+    const text = (size, anchor = null, fill = 'var(--sketch-grid-label, #697586)', weight = null) => {
       const node = document.createElementNS(ns, 'text');
       node.setAttribute('font-size', String(size));
       node.setAttribute('fill', fill);
@@ -2306,14 +2306,14 @@ class SolveWorkspace(Div):
     };
     cache = {
       host: liveGrid,
-      minor: path('var(--grid-minor, #e8edf2)', 0.75),
-      major: path('var(--border, #d9dfe7)', 1),
-      axisX: path('#557187', 2, '6 4'),
-      axisY: path('#557187', 1.5),
+      minor: path('var(--sketch-grid-minor, #e8edf2)', 0.75),
+      major: path('var(--sketch-grid-major, #d9dfe7)', 1),
+      axisX: path('var(--sketch-axis-line, #557187)', 2, '6 4'),
+      axisY: path('var(--sketch-axis-line, #557187)', 1.5),
       radialLabels: [],
       axialLabels: [],
-      rotationLabel: text(12, null, '#405e75', 600),
-      zeroLabel: text(12, 'end', '#405e75'),
+      rotationLabel: text(12, null, 'var(--sketch-axis-label, #405e75)', 600),
+      zeroLabel: text(12, 'end', 'var(--sketch-axis-label, #405e75)'),
       radialUnit: text(12, 'end'),
       axialUnit: text(12),
       nodes: [],
@@ -2340,7 +2340,7 @@ class SolveWorkspace(Div):
     while (pool.length <= index) {
       const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
       label.setAttribute('font-size', '16');
-      label.setAttribute('fill', 'var(--fg-muted, #697586)');
+      label.setAttribute('fill', 'var(--sketch-grid-label, #697586)');
       label.setAttribute('pointer-events', 'none');
       label.setAttribute('style', 'user-select:none; -webkit-user-select:none;');
       label.setAttribute('text-anchor', anchor);
@@ -2585,7 +2585,7 @@ class SolveWorkspace(Div):
       const selected = line.getAttribute('data-sketch-selected') === 'true';
       const highlighted = line.getAttribute('data-sketch-condition-highlight') === 'true';
       const hovered = line.getAttribute('data-sketch-edge-id') === edgeId;
-      line.setAttribute('stroke', selected ? '#0877b9' : (hovered ? '#e29a12' : (highlighted ? '#c66f16' : '#263746')));
+      line.setAttribute('stroke', selected ? '#0877b9' : (hovered ? '#e29a12' : (highlighted ? '#c66f16' : 'var(--sketch-stroke, #263746)')));
       line.setAttribute('stroke-width', selected ? '4.6' : (hovered ? '4.4' : (highlighted ? '4.2' : '1.6')));
     });
     svg.querySelectorAll('[data-sketch-region-role="shape"]').forEach((shape) => {
@@ -6609,7 +6609,7 @@ class SolveWorkspace(Div):
 
             # A free-standing entity has no trim boundary. SolidWorks Power
             # Trim leaves it untouched; whole-entity deletion is a separate
-            # operation in Lorentz as well. Region boundary endpoints count as
+            # operation in LORENTZ as well. Region boundary endpoints count as
             # real trim boundaries even when a source curve intersection is
             # only approximate.
             if not intersections and not topology_parameters:
@@ -10558,7 +10558,7 @@ class SolveWorkspace(Div):
     line.setAttribute('data-sketch-selected', String(selected));
     line.setAttribute('data-sketch-condition-highlight', String(highlighted));
     const hovered = window.__ngsolveSketchBoundarySelection && window.__ngsolveSketchHoveredEdgeId === id;
-    line.setAttribute('stroke', selected ? '#0877b9' : (hovered ? '#e29a12' : (highlighted ? '#c66f16' : '#263746')));
+    line.setAttribute('stroke', selected ? '#0877b9' : (hovered ? '#e29a12' : (highlighted ? '#c66f16' : 'var(--sketch-stroke, #263746)')));
     line.setAttribute('stroke-width', selected ? '4.6' : (hovered ? '4.4' : (highlighted ? '4.2' : '1.6')));
   }});
   svg.querySelectorAll('[data-sketch-region-role="shape"]').forEach((shape) => {{
@@ -10602,7 +10602,7 @@ class SolveWorkspace(Div):
             x=x,
             y=y,
             text_anchor=anchor,
-            fill="#263746",
+            fill="var(--sketch-dimension-text, #263746)",
             font_size="11",
             font_weight="600",
             data_sketch_dimension_key=key,
@@ -10610,7 +10610,7 @@ class SolveWorkspace(Div):
             data_sketch_dimension_owner_kind=owner_kind,
             style=(
                 "pointer-events:all; cursor:text; user-select:none; "
-                "paint-order:stroke; stroke:#f4f6f8; stroke-width:4px; stroke-linejoin:round;"
+                "paint-order:stroke; stroke:var(--sketch-halo, #f4f6f8); stroke-width:4px; stroke-linejoin:round;"
             ),
             children=[
                 _svg("rect", x=x - (width / 2 if anchor == "middle" else 6), y=y - 17,
@@ -10636,7 +10636,7 @@ class SolveWorkspace(Div):
             p0, p1, p2, _ = [xy(point) for point in region["vertices"][:4]]
             width_m = float(shape_data.get("width", 0))
             height_m = float(shape_data.get("height", 0))
-            dim_style = "stroke:#455f78; stroke-width:1; fill:none; pointer-events:none;"
+            dim_style = "stroke:var(--sketch-dimension-line, #455f78); stroke-width:1; fill:none; pointer-events:none;"
             offset = 18
             return [
                 _svg("line", x1=p0[0], y1=p0[1] + offset, x2=p1[0], y2=p1[1] + offset, style=dim_style),
@@ -10659,7 +10659,7 @@ class SolveWorkspace(Div):
             radial = xy((shape_data["r_center"] + shape_data["radius"], shape_data["z_center"]))
             radius_m = float(shape_data.get("radius", 0))
             return [
-                _svg("line", x1=center[0], y1=center[1], x2=radial[0], y2=radial[1], stroke="#455f78", stroke_width="1", style="pointer-events:none;"),
+                _svg("line", x1=center[0], y1=center[1], x2=radial[0], y2=radial[1], stroke="var(--sketch-dimension-line, #455f78)", stroke_width="1", style="pointer-events:none;"),
                 self._editable_dimension_label(
                     "region", region["id"], "radius", f"solve-sketch-dimension-{region['id']}-radius",
                     (center[0] + radial[0]) / 2, center[1] - 7, f"R {radius_m:.4g} m",
@@ -10698,7 +10698,7 @@ class SolveWorkspace(Div):
         return [
             _svg(
                 "line", x1=center_xy[0], y1=center_xy[1], x2=point_xy[0], y2=point_xy[1],
-                stroke="#455f78", stroke_width="1", style="pointer-events:none;",
+                stroke="var(--sketch-dimension-line, #455f78)", stroke_width="1", style="pointer-events:none;",
             ),
             self._editable_dimension_label(
                 "edge", edge["id"], "radius", f"solve-sketch-dimension-{edge['id']}-radius",
@@ -12578,37 +12578,37 @@ class SolveWorkspace(Div):
             if abs(multiple - round(multiple)) <= 1e-8 or abs(value) <= snap_step * 1e-10:
                 continue
             x = xy((value, 0))[0]
-            grid_children.append(_svg("line", x1=x, y1=plot[1], x2=x, y2=plot[3], stroke="var(--grid-minor, #e8edf2)", stroke_width="0.75"))
+            grid_children.append(_svg("line", x1=x, y1=plot[1], x2=x, y2=plot[3], stroke="var(--sketch-grid-minor, #e8edf2)", stroke_width="0.75"))
         for value in axial_subticks:
             multiple = value / grid_step
             if abs(multiple - round(multiple)) <= 1e-8 or abs(value) <= snap_step * 1e-10:
                 continue
             y = xy((0, value))[1]
-            grid_children.append(_svg("line", x1=plot[0], y1=y, x2=plot[2], y2=y, stroke="var(--grid-minor, #e8edf2)", stroke_width="0.75"))
+            grid_children.append(_svg("line", x1=plot[0], y1=y, x2=plot[2], y2=y, stroke="var(--sketch-grid-minor, #e8edf2)", stroke_width="0.75"))
         for value in radial_ticks:
             if abs(value) <= grid_step * 1e-10:
                 continue
             x = xy((value, 0))[0]
-            grid_children.append(_svg("line", x1=x, y1=plot[1], x2=x, y2=plot[3], stroke="var(--border, #d9dfe7)", stroke_width="1"))
+            grid_children.append(_svg("line", x1=x, y1=plot[1], x2=x, y2=plot[3], stroke="var(--sketch-grid-major, #d9dfe7)", stroke_width="1"))
             label_x = min(max(x, plot[0] + 28), plot[2] - 28)
-            grid_children.append(_svg("text", x=label_x, y=plot[3] - 5, fill="var(--fg-muted, #697586)", font_size="16", text_anchor="middle", style=grid_text_style, children=f"{value:.5g}"))
+            grid_children.append(_svg("text", x=label_x, y=plot[3] - 5, fill="var(--sketch-grid-label, #697586)", font_size="16", text_anchor="middle", style=grid_text_style, children=f"{value:.5g}"))
         for value in axial_ticks:
             if abs(value) <= grid_step * 1e-10:
                 continue
             y = xy((0, value))[1]
-            grid_children.append(_svg("line", x1=plot[0], y1=y, x2=plot[2], y2=y, stroke="var(--border, #d9dfe7)", stroke_width="1"))
+            grid_children.append(_svg("line", x1=plot[0], y1=y, x2=plot[2], y2=y, stroke="var(--sketch-grid-major, #d9dfe7)", stroke_width="1"))
             label_y = min(max(y + 4, plot[1] + 12), plot[3] - 3)
-            grid_children.append(_svg("text", x=plot[0] + 6, y=label_y, fill="var(--fg-muted, #697586)", font_size="16", text_anchor="start", style=grid_text_style, children=f"{value:.5g}"))
+            grid_children.append(_svg("text", x=plot[0] + 6, y=label_y, fill="var(--sketch-grid-label, #697586)", font_size="16", text_anchor="start", style=grid_text_style, children=f"{value:.5g}"))
         if lower_left[0] <= 0 <= upper_right[0]:
             xaxis = xy((0, 0))[0]
-            grid_children.append(_svg("line", x1=xaxis, y1=plot[1], x2=xaxis, y2=plot[3], stroke="#557187", stroke_width="2", stroke_dasharray="6 4"))
-            grid_children.append(_svg("text", x=xaxis + 7, y=plot[1] + 15, fill="#405e75", font_size="12", font_weight="600", style=grid_text_style, children="Axis of rotation  ·  r = 0"))
+            grid_children.append(_svg("line", x1=xaxis, y1=plot[1], x2=xaxis, y2=plot[3], stroke="var(--sketch-axis-line, #557187)", stroke_width="2", stroke_dasharray="6 4"))
+            grid_children.append(_svg("text", x=xaxis + 7, y=plot[1] + 15, fill="var(--sketch-axis-label, #405e75)", font_size="12", font_weight="600", style=grid_text_style, children="Axis of rotation  ·  r = 0"))
         if lower_left[1] <= 0 <= upper_right[1]:
             zaxis = xy((0, 0))[1]
-            grid_children.append(_svg("line", x1=plot[0], y1=zaxis, x2=plot[2], y2=zaxis, stroke="#557187", stroke_width="1.5"))
-            grid_children.append(_svg("text", x=plot[2] - 4, y=zaxis - 5, fill="#405e75", font_size="12", text_anchor="end", style=grid_text_style, children="z = 0"))
-        grid_children.append(_svg("text", x=plot[2] - 6, y=height - 8, fill="var(--fg-muted, #697586)", font_size="12", text_anchor="end", style=grid_text_style, children="r  [m]"))
-        grid_children.append(_svg("text", x=plot[0] + 8, y=plot[1] + 15, fill="var(--fg-muted, #697586)", font_size="12", style=grid_text_style, children="z  [m]"))
+            grid_children.append(_svg("line", x1=plot[0], y1=zaxis, x2=plot[2], y2=zaxis, stroke="var(--sketch-axis-line, #557187)", stroke_width="1.5"))
+            grid_children.append(_svg("text", x=plot[2] - 4, y=zaxis - 5, fill="var(--sketch-axis-label, #405e75)", font_size="12", text_anchor="end", style=grid_text_style, children="z = 0"))
+        grid_children.append(_svg("text", x=plot[2] - 6, y=height - 8, fill="var(--sketch-grid-label, #697586)", font_size="12", text_anchor="end", style=grid_text_style, children="r  [m]"))
+        grid_children.append(_svg("text", x=plot[0] + 8, y=plot[1] + 15, fill="var(--sketch-grid-label, #697586)", font_size="12", style=grid_text_style, children="z  [m]"))
 
         material_index = {item["id"]: index for index, item in enumerate(self.model["materials"])}
         voids = self.model.get("geometry", {}).get("voids", [])
@@ -12732,7 +12732,7 @@ class SolveWorkspace(Div):
             region_id = region_for_edge.get(edge_id)
             selected = edge_id in self.selected_edge_ids or region_id in set(self._selected_region_ids_live())
             condition_highlight = edge_id in highlighted_edges
-            edge_color = "#ff8738" if condition_highlight else ("#0877b9" if selected else "#263746")
+            edge_color = "#ff8738" if condition_highlight else ("#0877b9" if selected else "var(--sketch-stroke, #263746)")
             curve_type = str(curve.get("type", "line")) if isinstance(curve, dict) else "line"
             editable_radius = curve_type == "arc" and any(
                 entity.get("id") == edge.get("sketch_entity_id")

@@ -290,8 +290,16 @@ def _set_window_title(js):
     js.document.title = PRODUCT_NAME
 
 
+def _set_axisymmetric_canvas_theme(js, value="light"):
+    """Keep the sketch readable by default, with an optional app-matched theme."""
+    theme = str(value or "light").lower()
+    if theme not in {"light", "match"}:
+        theme = "light"
+    js.document.documentElement.dataset.axisymmetricCanvasTheme = theme
+
+
 def _set_window_icon(js, icon_data_uri):
-    """Replace ngapp's default favicon with the Lorentz application mark."""
+    """Replace ngapp's default favicon with the LORENTZ application mark."""
     document = js.document
     old_icons = document.querySelectorAll(
         'link[rel="icon"], link[rel="shortcut icon"]'
@@ -307,7 +315,7 @@ def _set_window_icon(js, icon_data_uri):
 
 
 def _inject_lorentz_brand_styles(js):
-    """Apply Lorentz accents while preserving the active light/dark surfaces."""
+    """Apply LORENTZ accents while preserving the active light/dark surfaces."""
     style = js.document.createElement("style")
     style.id = "lorentz-brand-styles"
     style.textContent = """
@@ -321,15 +329,31 @@ def _inject_lorentz_brand_styles(js):
   --fg-on-accent: var(--lorentz-navy);
   --ring: color-mix(in srgb, var(--lorentz-copper) 42%, transparent);
   --link: #8B4D12;
+  --app-bg: var(--bg, #ffffff);
+  --surface-subtle: var(--bg-subtle, #f7f9fb);
+  --canvas-bg: #f4f6f8;
+  --sketch-canvas-bg: #f4f6f8;
+  --sketch-grid-minor: #e8edf2;
+  --sketch-grid-major: #d9dfe7;
+  --sketch-grid-label: #697586;
+  --sketch-stroke: #263746;
+  --sketch-halo: #ffffff;
+  --sketch-axis-line: #557187;
+  --sketch-axis-label: #405e75;
+  --sketch-dimension-line: #455f78;
+  --sketch-dimension-text: #263746;
 }
 :root[data-theme="dark"] {
   --bg: var(--lorentz-dark);
+  --app-bg: var(--lorentz-dark);
   --bg-subtle: #132135;
   --bg-muted: #1A2A3F;
   --surface: #15243A;
   --panel: #122036;
   --panel-header: #1A2A40;
   --viewport: #0E1929;
+  --canvas-bg: #0E1929;
+  --surface-subtle: #132135;
   --fg: var(--lorentz-soft-white);
   --fg-muted: #C0CCD9;
   --fg-subtle: #9BAEC2;
@@ -347,6 +371,19 @@ def _inject_lorentz_brand_styles(js):
   --ring: color-mix(in srgb, var(--lorentz-copper) 55%, transparent);
   --link: #E6A357;
 }
+:root[data-theme="dark"][data-axisymmetric-canvas-theme="match"] {
+  --sketch-canvas-bg: #0E1929;
+  --sketch-grid-minor: #1B2B40;
+  --sketch-grid-major: #2A3C53;
+  --sketch-grid-label: #B8C6D6;
+  --sketch-stroke: #C7D4E2;
+  --sketch-halo: #0E1929;
+  --sketch-axis-line: #7189A3;
+  --sketch-axis-label: #B8C6D6;
+  --sketch-dimension-line: #7089A2;
+  --sketch-dimension-text: #E2E9F0;
+}
+html, body, #app { background-color: var(--app-bg, var(--bg, #ffffff)); }
 .q-btn.bg-primary,
 .q-btn.bg-primary .q-icon,
 .q-btn.bg-primary .q-btn__content {
@@ -598,6 +635,11 @@ class Settings(Div):
             [("light", "Light"), ("dark", "Dark"), ("system", "System")],
             us.get("theme", "system"), self._on_theme,
         )
+        sketch_canvas_seg = Segmented(
+            [("light", "Light"), ("match", "Match app")],
+            us.get("axisymmetric_canvas_theme", "light"),
+            self._on_axisymmetric_canvas_theme,
+        )
         colormap_select = QSelect(
             ui_options=[
                 {"label": "Auto (theme)", "value": ""},
@@ -673,6 +715,7 @@ class Settings(Div):
         super().__init__(Div(
             Div("Appearance", ui_class=cb.menu_h),
             self._row("Theme", theme_seg),
+            self._row("Axisymmetric sketch", sketch_canvas_seg),
             self._row("Default colormap", colormap_select),
             self._row("Discrete colormap", self._switch("default_discrete_colormap", False)),
             self._row("Default N colors", ncolors),
@@ -718,6 +761,11 @@ class Settings(Div):
         self.app.usersettings.set("theme", val)
         cb.set_theme(self.app, val)
         self.app._apply_viewport_theme()
+
+    def _on_axisymmetric_canvas_theme(self, val):
+        theme = val if val in {"light", "match"} else "light"
+        self.app.usersettings.set("axisymmetric_canvas_theme", theme)
+        self.app.call_js(_set_axisymmetric_canvas_theme, theme)
 
     def _on_redraw(self, event):
         v = int(event.value)
@@ -945,7 +993,7 @@ class NGSolveGui(App):
                 ui_height="24px",
                 ui_width="158px",
                 ui_fit="contain",
-                ui_alt="Lorentz",
+                ui_alt=PRODUCT_NAME,
                 ui_class="lorentz-wordmark-light",
             ),
             QImg(
@@ -953,11 +1001,15 @@ class NGSolveGui(App):
                 ui_height="24px",
                 ui_width="158px",
                 ui_fit="contain",
-                ui_alt="Lorentz",
+                ui_alt=PRODUCT_NAME,
                 ui_class="lorentz-wordmark-dark",
             ),
             ui_class=cb.brand,
-            ui_style="display:flex; align-items:center; width:158px; height:28px; white-space:nowrap;",
+            ui_style=(
+                "display:flex; align-items:center; align-self:stretch; "
+                f"width:158px; height:{APP_HEADER_HEIGHT}px; box-sizing:border-box; "
+                "white-space:nowrap;"
+            ),
         )
         self._workspace_mode_toggle = WorkspaceModeToggle(
             "solve", self._set_workspace_mode
@@ -1112,12 +1164,12 @@ class NGSolveGui(App):
                     QImg(
                         ui_src=self.load_asset("lorentz_about_light.png"),
                         ui_height="198px", ui_width="352px", ui_fit="contain",
-                        ui_alt="Lorentz", ui_class="lorentz-about-banner-light",
+                        ui_alt=PRODUCT_NAME, ui_class="lorentz-about-banner-light",
                     ),
                     QImg(
                         ui_src=self.load_asset("lorentz_about_dark.png"),
                         ui_height="198px", ui_width="352px", ui_fit="contain",
-                        ui_alt="Lorentz", ui_class="lorentz-about-banner-dark",
+                        ui_alt=PRODUCT_NAME, ui_class="lorentz-about-banner-dark",
                     ),
                     ui_style="display:flex; justify-content:center; padding:18px 20px 4px;",
                 ),
@@ -1185,12 +1237,12 @@ class NGSolveGui(App):
                 QImg(
                     ui_src=self.load_asset("lorentz_home_light.png"),
                     ui_height="150px", ui_width="200px", ui_fit="contain",
-                    ui_alt="Lorentz", ui_class="lorentz-home-banner-light",
+                    ui_alt=PRODUCT_NAME, ui_class="lorentz-home-banner-light",
                 ),
                 QImg(
                     ui_src=self.load_asset("lorentz_home_dark.png"),
                     ui_height="150px", ui_width="200px", ui_fit="contain",
-                    ui_alt="Lorentz", ui_class="lorentz-home-banner-dark",
+                    ui_alt=PRODUCT_NAME, ui_class="lorentz-home-banner-dark",
                 ),
                 ui_style="display:flex; justify-content:center; padding:18px 28px 8px;",
             ),
@@ -1225,7 +1277,7 @@ class NGSolveGui(App):
             ui_style=(
                 "position:fixed; inset:0; z-index:1500; display:grid; "
                 "place-items:center; box-sizing:border-box; padding:24px; "
-                "overflow:hidden; background:#fff;"
+                "overflow:hidden; background:var(--app-bg, #fff);"
             ),
         )
         self._refresh_recent_projects_view()
@@ -1247,6 +1299,10 @@ class NGSolveGui(App):
         theme.dark = BRAND_DARK_BACKGROUND
         cb.install(self, default_theme=self.usersettings.get("theme", "system"))
         self.call_js(_inject_lorentz_brand_styles)
+        self.call_js(
+            _set_axisymmetric_canvas_theme,
+            self.usersettings.get("axisymmetric_canvas_theme", "light"),
+        )
         from .webgpu_tab import sync_default_viewport_clear
         sync_default_viewport_clear()
         keybinding_styles.inject(self)
@@ -1621,7 +1677,7 @@ class NGSolveGui(App):
             return "axisymmetric", (model, studies, layout), None
         except Exception as axis_error:
             raise ValueError(
-                "This file is not a supported Lorentz project. "
+                "This file is not a supported LORENTZ project. "
                 f"3D check: {three_d_error}. Axisymmetric check: {axis_error}"
             ) from axis_error
 
@@ -2085,7 +2141,7 @@ class NGSolveGui(App):
         index = find_documentation_index(solver_root)
         if index is None:
             self._notify(
-                "Local Lorentz documentation is not installed. Build the Sphinx HTML site from the solver docs or reinstall the packaged application.",
+                "Local LORENTZ documentation is not installed. Build the Sphinx HTML site from the solver docs or reinstall the packaged application.",
                 type="warning",
                 timeout=8000,
             )

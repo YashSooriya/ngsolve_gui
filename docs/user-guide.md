@@ -1,6 +1,6 @@
-# Lorentz user guide
+# LORENTZ user guide
 
-Lorentz is a finite-element application for magneto-mechanical simulation. It provides an axisymmetric workflow and a developing 3D time-harmonic electromagnetic workflow.
+LORENTZ is a finite-element application for magneto-mechanical simulation. It provides an axisymmetric workflow and a developing 3D time-harmonic electromagnetic workflow.
 
 ## Start or open a project
 

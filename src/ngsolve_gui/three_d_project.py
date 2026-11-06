@@ -943,10 +943,10 @@ def normalize_3d_numerical_settings(study, *, physics):
 
 def validate_3d_project(project, assets):
     if not isinstance(project, dict) or project.get("schema") != PROJECT_SCHEMA:
-        raise ValueError("This is not a Lorentz 3D project.")
+        raise ValueError("This is not a LORENTZ 3D project.")
     project_version = project.get("version")
     if isinstance(project_version, bool) or project_version not in {1, PROJECT_VERSION}:
-        raise ValueError(f"Unsupported Lorentz 3D project version: {project.get('version')}.")
+        raise ValueError(f"Unsupported LORENTZ 3D project version: {project.get('version')}.")
     geometries = project.get("geometries")
     trace_sets = project.get("wire_trace_sets")
     if not isinstance(geometries, list) or not isinstance(trace_sets, list):
@@ -1251,38 +1251,38 @@ def package_3d_project(project, assets):
 
 def unpack_3d_project(data):
     if not isinstance(data, (bytes, bytearray)) or len(data) > MAX_PROJECT_BYTES:
-        raise ValueError("The Lorentz 3D project is empty or exceeds the 512 MB limit.")
+        raise ValueError("The LORENTZ 3D project is empty or exceeds the 512 MB limit.")
     try:
         archive = zipfile.ZipFile(io.BytesIO(data), "r")
     except (OSError, zipfile.BadZipFile) as error:
-        raise ValueError(f"Could not read the Lorentz 3D project archive: {error}") from error
+        raise ValueError(f"Could not read the LORENTZ 3D project archive: {error}") from error
     with archive:
         infos = archive.infolist()
         if len(infos) > MAX_PROJECT_ITEMS * 3 + 1:
-            raise ValueError("The Lorentz 3D project contains too many files.")
+            raise ValueError("The LORENTZ 3D project contains too many files.")
         names = [item.filename for item in infos]
         if len(set(names)) != len(names):
-            raise ValueError("The Lorentz 3D project contains duplicate file entries.")
+            raise ValueError("The LORENTZ 3D project contains duplicate file entries.")
         if PROJECT_ENTRY not in names:
             raise ValueError(f"The archive does not contain {PROJECT_ENTRY}.")
         total_size = 0
         for info in infos:
             path = PurePosixPath(info.filename)
             if path.is_absolute() or ".." in path.parts or "\\" in info.filename:
-                raise ValueError(f"Unsafe path in Lorentz 3D project: {info.filename!r}.")
+                raise ValueError(f"Unsafe path in LORENTZ 3D project: {info.filename!r}.")
             if info.flag_bits & 0x1:
                 raise ValueError("Encrypted project files are not supported.")
             total_size += info.file_size
             if total_size > MAX_PROJECT_BYTES:
                 raise ValueError("The uncompressed project exceeds the 512 MB limit.")
             if info.filename != PROJECT_ENTRY and info.file_size > MAX_ASSET_BYTES:
-                raise ValueError("An asset in the Lorentz 3D project exceeds 256 MB.")
+                raise ValueError("An asset in the LORENTZ 3D project exceeds 256 MB.")
         try:
             project = json.loads(archive.read(PROJECT_ENTRY).decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError(f"Invalid Lorentz 3D project metadata: {error}") from error
+            raise ValueError(f"Invalid LORENTZ 3D project metadata: {error}") from error
         if not isinstance(project, dict):
-            raise ValueError("Lorentz 3D project metadata must be a JSON object.")
+            raise ValueError("LORENTZ 3D project metadata must be a JSON object.")
         geometries = project.get("geometries")
         trace_sets = project.get("wire_trace_sets")
         if not isinstance(geometries, list) or not isinstance(trace_sets, list):
@@ -1290,18 +1290,18 @@ def unpack_3d_project(data):
         asset_paths = set()
         for geometry in geometries:
             if not isinstance(geometry, dict) or not isinstance(geometry.get("asset"), str):
-                raise ValueError("Invalid geometry metadata in the Lorentz 3D project.")
+                raise ValueError("Invalid geometry metadata in the LORENTZ 3D project.")
             asset_paths.add(geometry["asset"])
         for trace_set in trace_sets:
             if not isinstance(trace_set, dict) or not isinstance(trace_set.get("traces"), list):
-                raise ValueError("Invalid wire trace metadata in the Lorentz 3D project.")
+                raise ValueError("Invalid wire trace metadata in the LORENTZ 3D project.")
             for trace in trace_set["traces"]:
                 if not isinstance(trace, dict) or not isinstance(trace.get("filename"), str):
-                    raise ValueError("Invalid wire trace metadata in the Lorentz 3D project.")
+                    raise ValueError("Invalid wire trace metadata in the LORENTZ 3D project.")
                 asset_paths.add(trace["filename"])
         unexpected = set(names) - {PROJECT_ENTRY} - asset_paths
         if unexpected:
-            raise ValueError("The Lorentz 3D project contains unsupported files: " + ", ".join(sorted(unexpected)))
+            raise ValueError("The LORENTZ 3D project contains unsupported files: " + ", ".join(sorted(unexpected)))
         assets = {path: archive.read(path) for path in asset_paths if path in names}
     validate_3d_project(project, assets)
     return project, assets

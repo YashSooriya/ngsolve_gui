@@ -7,7 +7,7 @@ def test_product_identity_uses_package_version_and_local_documentation(monkeypat
     from ngsolve_gui.branding import PRODUCT_NAME
     from ngsolve_gui.documentation import find_documentation_index
 
-    assert PRODUCT_NAME == config.name == "Lorentz"
+    assert PRODUCT_NAME == config.name == "LORENTZ"
     assert config.version == __version__
     monkeypatch.delenv("MMFEM_DOCUMENTATION_DIR", raising=False)
     monkeypatch.delenv("COUPLED_SOLVER_ROOT", raising=False)
@@ -18,6 +18,33 @@ def test_product_identity_uses_package_version_and_local_documentation(monkeypat
     index.write_text("<html>offline</html>", encoding="utf-8")
     monkeypatch.setenv("MMFEM_DOCUMENTATION_DIR", str(docs))
     assert find_documentation_index() == index
+
+
+def test_window_title_uses_the_uppercase_product_name():
+    from types import SimpleNamespace
+
+    from ngsolve_gui.app import _set_window_title
+    from ngsolve_gui.branding import PRODUCT_NAME
+
+    js = SimpleNamespace(document=SimpleNamespace(title="ngapp"))
+    _set_window_title(js)
+    assert js.document.title == "LORENTZ"
+    assert PRODUCT_NAME == "LORENTZ"
+
+
+def test_axisymmetric_canvas_theme_defaults_to_light_and_can_match_the_app():
+    from types import SimpleNamespace
+
+    from ngsolve_gui.app import _set_axisymmetric_canvas_theme
+
+    root = SimpleNamespace(dataset=SimpleNamespace())
+    js = SimpleNamespace(document=SimpleNamespace(documentElement=root))
+    _set_axisymmetric_canvas_theme(js)
+    assert root.dataset.axisymmetricCanvasTheme == "light"
+    _set_axisymmetric_canvas_theme(js, "match")
+    assert root.dataset.axisymmetricCanvasTheme == "match"
+    _set_axisymmetric_canvas_theme(js, "unsupported")
+    assert root.dataset.axisymmetricCanvasTheme == "light"
 
 
 def test_official_brand_assets_are_packaged_without_old_product_logos():
@@ -131,6 +158,10 @@ def test_lorentz_palette_sets_the_brand_tokens_on_the_frontend_document():
     assert ".lorentz-about-banner-dark .q-img__image" in style.textContent
     assert ".lorentz-home-banner-dark .q-img__image" in style.textContent
     assert ".lorentz-wordmark-dark .q-img__loading" in style.textContent
+    assert "--sketch-canvas-bg: #f4f6f8" in style.textContent
+    assert ':root[data-theme="dark"][data-axisymmetric-canvas-theme="match"]' in style.textContent
+    assert "--canvas-bg: #0E1929" in style.textContent
+    assert "--app-bg: var(--lorentz-dark)" in style.textContent
     assert "a.powered-by { display: none !important; }" in style.textContent
     assert variables == {
         "--lorentz-copper": BRAND_COPPER,

@@ -1,6 +1,6 @@
-"""User-facing Lorentz product identity and brand palette."""
+"""User-facing LORENTZ product identity and brand palette."""
 
-PRODUCT_NAME = "Lorentz"
+PRODUCT_NAME = "LORENTZ"
 PRODUCT_DESCRIPTION = "Magneto-mechanical finite-element simulation"
 
 BRAND_COPPER = "#D98A38"

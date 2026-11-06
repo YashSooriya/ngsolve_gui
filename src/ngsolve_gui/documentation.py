@@ -1,4 +1,4 @@
-"""Locate the locally installed Sphinx documentation for Lorentz."""
+"""Locate the locally installed Sphinx documentation for LORENTZ."""
 
 from __future__ import annotations
 

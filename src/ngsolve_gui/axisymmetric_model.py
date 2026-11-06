@@ -2973,7 +2973,7 @@ def unpack_model(data: bytes) -> tuple[dict, dict, dict]:
             studies = metadata.get("studies", new_studies()) if isinstance(metadata, dict) else new_studies()
             layout = metadata.get("layout", {}) if isinstance(metadata, dict) else {}
         else:
-            raise ValueError("JSON file is not a Lorentz axisymmetric problem project.")
+            raise ValueError("JSON file is not a LORENTZ axisymmetric problem project.")
         return _validate_unpacked_model(model, studies, layout)
 
     with zipfile.ZipFile(io.BytesIO(data), "r") as archive:
