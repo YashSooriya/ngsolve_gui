@@ -12,6 +12,29 @@ def _read_json(path):
     return value if isinstance(value, dict) else {}
 
 
+def _execution_status_label(manifest):
+    """Name process completion and the numerical outcome separately."""
+    execution_status = str(
+        manifest.get("execution_status", manifest.get("status", "complete"))
+    ).casefold()
+    status = execution_status.replace("_", " ").title()
+    if status == "Running":
+        return "Interrupted"
+    if status != "Complete":
+        return status
+
+    scientific_status = str(manifest.get("scientific_status", "")).casefold()
+    if scientific_status in {"nonconverged", "nonconverged_diagnostic_data"}:
+        return "Execution finished · not converged"
+    if scientific_status in {"converged", "all_frequencies_converged"}:
+        return "Execution finished · converged"
+    if scientific_status == "partial":
+        return "Execution finished · partial results"
+    if scientific_status == "unavailable":
+        return "Execution finished · no valid results"
+    return status
+
+
 def _output_file(output_root, base_directory, value):
     if not isinstance(value, str) or not value.strip():
         return None

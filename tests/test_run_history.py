@@ -242,7 +242,7 @@ def test_run_result_tree_lists_each_sweep_point_status(tmp_path):
 
     tree = load_run_result_tree({
         "id": "sweep-run",
-        "status": "Complete · not converged",
+        "status": "Execution finished · not converged",
         "output_path": str(output),
     })
 

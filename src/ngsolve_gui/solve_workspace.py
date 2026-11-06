@@ -239,21 +239,16 @@ def _load_saved_run_history(root=None, limit=40):
             manifest = None
         if isinstance(manifest, dict) and manifest.get("schema") == "mm-fem.run":
             kind = str(manifest.get("kind", "study")).title()
-            execution_status = str(
-                manifest.get("execution_status", manifest.get("status", "complete"))
-            ).casefold()
-            status = execution_status.replace("_", " ").title()
-            if status == "Running":
-                status = "Interrupted"
-            scientific_status = str(manifest.get("scientific_status", "")).casefold()
-            if status == "Complete" and scientific_status == "nonconverged":
-                status = "Complete · not converged"
             try:
-                from .run_history import _diagnostic_summary
+                from .run_history import _diagnostic_summary, _execution_status_label
 
                 diagnostic_summary = _diagnostic_summary(manifest)
+                status = _execution_status_label(manifest)
             except (TypeError, ValueError, OverflowError):
                 diagnostic_summary = None
+                status = str(
+                    manifest.get("execution_status", manifest.get("status", "complete"))
+                ).replace("_", " ").title()
             name = str(manifest.get("run_name") or f"{kind}: {manifest.get('model_name', directory.name)}")
             finished = str(manifest.get("finished_utc") or manifest.get("created_utc") or "")
         else:
@@ -11157,7 +11152,12 @@ class SolveWorkspace(Div):
                 "var(--negative)" if status == "Failed"
                 else "var(--warning)" if (
                     status in {"Cancelled", "Interrupted"}
-                    or "not converged" in str(status).casefold()
+                    or any(
+                        phrase in str(status).casefold()
+                        for phrase in (
+                            "not converged", "partial results", "no valid results"
+                        )
+                    )
                 )
                 else "var(--positive)"
             )
@@ -14374,6 +14374,27 @@ class SolveWorkspace(Div):
         if run_kind:
             status = "Failed" if error else "Cancelled" if cancelled else "Complete"
             run_output_path = str(output_path or "")
+            details = {}
+            if not error and not cancelled and run_output_path:
+                try:
+                    from .run_history import (
+                        _diagnostic_summary,
+                        _execution_status_label,
+                        _read_json,
+                    )
+
+                    manifest = _read_json(Path(run_output_path) / "run_manifest.json")
+                    if manifest:
+                        status = _execution_status_label(manifest)
+                        diagnostic_summary = _diagnostic_summary(manifest)
+                        if manifest.get("scientific_status") is not None:
+                            details["scientific_status"] = manifest[
+                                "scientific_status"
+                            ]
+                        if diagnostic_summary:
+                            details["diagnostic_summary"] = diagnostic_summary
+                except (OSError, TypeError, ValueError, OverflowError):
+                    pass
             self.runs.append({
                 "id": _run_history_path_key(run_output_path) if run_output_path else new_id("run"),
                 "name": run_name or run_kind,
@@ -14381,6 +14402,7 @@ class SolveWorkspace(Div):
                 "status": status,
                 "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "output_path": run_output_path,
+                **details,
             })
             self._refresh_model_tree()
             if self.active_section == "runs":

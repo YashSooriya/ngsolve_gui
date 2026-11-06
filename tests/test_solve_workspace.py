@@ -601,6 +601,37 @@ def test_solver_job_can_be_cancelled_and_is_recorded(standalone_components):
     assert workspace.runs[-1]["status"] == "Cancelled"
 
 
+def test_live_axisymmetric_run_history_exposes_nonconvergence(tmp_path, standalone_components):
+    run_dir = tmp_path / "nonconverged-study"
+    run_dir.mkdir()
+    (run_dir / "run_manifest.json").write_text(json.dumps({
+        "schema": "mm-fem.run",
+        "status": "complete",
+        "scientific_status": "nonconverged",
+        "coupling_convergence": {
+            "all_converged": False,
+            "maximum_iterations": 3,
+            "relative_tolerance": 1e-6,
+            "frequencies": [{
+                "converged": False,
+                "iterations": 3,
+                "termination_reason": "maximum_iterations_reached",
+            }],
+        },
+    }), encoding="utf-8")
+
+    workspace = SolveWorkspace(on_run=lambda: None, on_cancel=lambda: None)
+    workspace.finish_solver_job(
+        "Study finished", run_kind="Study", output_path=run_dir
+    )
+
+    assert workspace.runs[-1]["status"] == "Execution finished · not converged"
+    assert workspace.runs[-1]["scientific_status"] == "nonconverged"
+    assert workspace.runs[-1]["diagnostic_summary"].startswith(
+        "Not converged · maximum iterations reached · diagnostic fields only"
+    )
+
+
 def test_solver_timestamp_import_is_not_shadowed_by_component_star_import():
     assert callable(app_module._datetime.now)
     assert app_module._timezone.utc is not None
@@ -645,6 +676,36 @@ def test_saved_run_history_preserves_nonconverged_scientific_status(tmp_path):
     assert len(runs) == 1
     assert runs[0]["status"] == "Nonconverged"
     assert runs[0]["name"] == "Study: Coupled diagnostic"
+
+
+@pytest.mark.parametrize(
+    ("scientific_status", "expected_status"),
+    [
+        ("converged", "Execution finished · converged"),
+        ("all_frequencies_converged", "Execution finished · converged"),
+        ("nonconverged", "Execution finished · not converged"),
+        ("nonconverged_diagnostic_data", "Execution finished · not converged"),
+        ("partial", "Execution finished · partial results"),
+        ("unavailable", "Execution finished · no valid results"),
+    ],
+)
+def test_completed_solver_runs_name_execution_and_numerical_outcome(
+    tmp_path, scientific_status, expected_status
+):
+    run_dir = tmp_path / scientific_status
+    run_dir.mkdir()
+    (run_dir / "run_manifest.json").write_text(json.dumps({
+        "schema": "mm-fem.run",
+        "status": "complete",
+        "execution_status": "complete",
+        "scientific_status": scientific_status,
+        "created_utc": "2026-11-06T12:00:00+00:00",
+    }), encoding="utf-8")
+
+    runs = _load_saved_run_history(tmp_path)
+
+    assert len(runs) == 1
+    assert runs[0]["status"] == expected_status
 
 
 def test_run_history_context_menu_hides_entry_and_preserves_output(standalone_components, tmp_path):

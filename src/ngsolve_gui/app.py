@@ -3669,9 +3669,7 @@ class NGSolveGui(App):
         self._refresh_recent_projects_view()
         self.app_data._update = self._update_from_app_data
         # Ask Chromium for a fresh compositor frame after the frontend mounts.
-        # Mike is a separate stripped application and keeps its own startup.
-        if PRODUCT_NAME == "MagMechSim":
-            self.call_js(_schedule_initial_renderer_frame_pulse)
+        self.call_js(_schedule_initial_renderer_frame_pulse)
 
     def _click_tab(self, tabname):
         if tabname == self.app_data.active_tab and self.tab_panel.comp is not None:
