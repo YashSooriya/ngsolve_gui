@@ -23,7 +23,12 @@ def _execution_status_label(manifest):
     if status != "Complete":
         return status
 
-    scientific_status = str(manifest.get("scientific_status", "")).casefold()
+    raw_scientific_status = manifest.get("scientific_status")
+    scientific_status = (
+        str(raw_scientific_status).casefold()
+        if isinstance(raw_scientific_status, str) and raw_scientific_status.strip()
+        else "not_reported"
+    )
     if scientific_status in {"nonconverged", "nonconverged_diagnostic_data"}:
         return "Execution finished · not converged"
     if scientific_status in {"converged", "all_frequencies_converged"}:
@@ -32,6 +37,8 @@ def _execution_status_label(manifest):
         return "Execution finished · partial results"
     if scientific_status == "unavailable":
         return "Execution finished · no valid results"
+    if scientific_status == "not_reported":
+        return "Execution finished · numerical status unavailable"
     return status
 
 

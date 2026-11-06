@@ -687,20 +687,25 @@ def test_saved_run_history_preserves_nonconverged_scientific_status(tmp_path):
         ("nonconverged_diagnostic_data", "Execution finished · not converged"),
         ("partial", "Execution finished · partial results"),
         ("unavailable", "Execution finished · no valid results"),
+        (None, "Execution finished · numerical status unavailable"),
     ],
 )
 def test_completed_solver_runs_name_execution_and_numerical_outcome(
     tmp_path, scientific_status, expected_status
 ):
-    run_dir = tmp_path / scientific_status
+    run_dir = tmp_path / (scientific_status or "unreported")
     run_dir.mkdir()
-    (run_dir / "run_manifest.json").write_text(json.dumps({
+    manifest = {
         "schema": "mm-fem.run",
         "status": "complete",
         "execution_status": "complete",
-        "scientific_status": scientific_status,
         "created_utc": "2026-11-06T12:00:00+00:00",
-    }), encoding="utf-8")
+    }
+    if scientific_status is not None:
+        manifest["scientific_status"] = scientific_status
+    (run_dir / "run_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
 
     runs = _load_saved_run_history(tmp_path)
 
