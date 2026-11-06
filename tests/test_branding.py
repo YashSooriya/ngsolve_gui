@@ -109,6 +109,8 @@ def test_lorentz_palette_sets_the_brand_tokens_on_the_frontend_document():
     assert style.id == "lorentz-brand-styles"
     assert ':root[data-theme="dark"]' in style.textContent
     assert "lorentz-wordmark-dark" in style.textContent
+    assert ".lorentz-about-banner-dark .q-img__image" in style.textContent
+    assert ".lorentz-wordmark-dark .q-img__loading" in style.textContent
     assert "a.powered-by { display: none !important; }" in style.textContent
     assert variables == {
         "--lorentz-copper": BRAND_COPPER,

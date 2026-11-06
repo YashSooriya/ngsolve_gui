@@ -358,6 +358,13 @@ def _inject_lorentz_brand_styles(js):
 :root[data-theme="dark"] .lorentz-about-banner-light { display: none !important; }
 :root[data-theme="dark"] .lorentz-wordmark-dark,
 :root[data-theme="dark"] .lorentz-about-banner-dark { display: block !important; }
+.lorentz-wordmark-dark .q-img__image,
+.lorentz-about-banner-dark .q-img__image {
+  opacity: 1 !important;
+  visibility: visible !important;
+}
+.lorentz-wordmark-dark .q-img__loading,
+.lorentz-about-banner-dark .q-img__loading { display: none !important; }
 a.powered-by { display: none !important; }
 """
     existing = js.document.getElementById(style.id)
