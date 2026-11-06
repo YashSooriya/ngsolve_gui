@@ -728,7 +728,7 @@ class ThreeDWorkspace(Div):
             else True
         )
         if hasattr(self, "_run_study_button"):
-            self._run_study_button.ui_disable = (
+            run_disabled = (
                 running
                 or not self.project.get("geometries")
                 or not study_source_ready
@@ -737,6 +737,8 @@ class ThreeDWorkspace(Div):
                 or not mechanical_load_ready
                 or not mechanical_support_ready
             )
+            self._run_study_button.ui_disable = run_disabled
+            self._run_study_button.ui_color = "grey-7" if run_disabled else "primary"
         if hasattr(self, "_cancel_study_button"):
             self._cancel_study_button.ui_disable = not running
 

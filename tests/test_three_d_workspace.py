@@ -75,16 +75,19 @@ def test_3d_study_waits_for_a_real_material_assignment(monkeypatch):
 
     assert geometry["material"] == UNASSIGNED_MATERIAL
     assert workspace._run_study_button.ui_disable is True
+    assert workspace._run_study_button.ui_color == "grey-7"
 
     workspace._set_material_reference(geometry, SimpleNamespace(value="Copper"))
 
     assert geometry["material"] == "Copper"
     assert workspace._run_study_button.ui_disable is False
+    assert workspace._run_study_button.ui_color == "primary"
 
     geometry["material"] = UNASSIGNED_MATERIAL
     workspace._update_study_controls()
     assert workspace._has_resolved_study_materials() is False
     assert workspace._run_study_button.ui_disable is True
+    assert workspace._run_study_button.ui_color == "grey-7"
 
 
 def test_3d_side_panels_collapse_and_reopen_without_losing_width(monkeypatch):
