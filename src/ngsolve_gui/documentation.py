@@ -1,4 +1,4 @@
-"""Locate the locally installed Sphinx documentation for MagMechSim."""
+"""Locate the locally installed Sphinx documentation for Lorentz."""
 
 from __future__ import annotations
 

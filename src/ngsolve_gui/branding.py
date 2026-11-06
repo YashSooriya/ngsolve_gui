@@ -1,13 +1,18 @@
-"""User-facing MagMechSim product identity and shared iconography."""
+"""User-facing Lorentz product identity and brand palette."""
 
-PRODUCT_NAME = "MagMechSim"
+PRODUCT_NAME = "Lorentz"
 PRODUCT_DESCRIPTION = "Magneto-mechanical finite-element simulation"
+
+BRAND_COPPER = "#D98A38"
+BRAND_NAVY = "#06264B"
+BRAND_SOFT_WHITE = "#EDF2F7"
+BRAND_DARK_BACKGROUND = "#101B2B"
 
 # A meridional r-z section with a rotation cue, deliberately distinct from the
 # three-axis icon used for a full 3D project.
 AXISYMMETRIC_ICON = (
     "img:data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' "
-    "viewBox='0 0 24 24' fill='none' stroke='%230f4c81' stroke-width='1.8' "
+    "viewBox='0 0 24 24' fill='none' stroke='%2306264B' stroke-width='1.8' "
     "stroke-linecap='round' stroke-linejoin='round'%3E"
     "%3Cpath d='M5 20V4m0 16h15'/%3E"
     "%3Cpath d='m3 6 2-2 2 2m11 12 2 2-2 2'/%3E"

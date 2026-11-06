@@ -27,7 +27,7 @@ _REGION_COLORS = ("#d7e4f0", "#efddce", "#d9e8dc", "#e7deec", "#eee8d0", "#d4e8e
 
 
 def cache_directory() -> Path:
-    """Return a per-user MagMechSim cache directory."""
+    """Return the existing per-user thumbnail cache directory."""
     local = os.environ.get("LOCALAPPDATA")
     if local:
         return Path(local) / "MagMechSim" / "ProjectThumbnails"

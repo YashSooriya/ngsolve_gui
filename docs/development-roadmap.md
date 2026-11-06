@@ -1,17 +1,17 @@
-# MagMechSim: Forward Development Roadmap
+# Lorentz: Forward Development Roadmap
 
 **Planning baseline:** 6 November 2026 (Phase F2 complete for tested scope; independent review pending)
 **Status:** Living plan, not an immutable implementation contract  
 **Primary users:** Engineers familiar with industrial CAE tools  
-**Primary immediate scope:** Independent review of Phase F2; Phase G follows acceptance
+**Primary immediate scope:** Independent review of Phase F2 and adoption of the Lorentz identity; Phase G follows acceptance
 **Out of scope for now:** New results visualisation or a post-processing redesign (but existing Solve/Results navigation must remain fully functional)
 
 ## 1. Product objective and working agreement
 
-MagMechSim should provide a complete, reliable and responsive workflow from geometry creation/STEP import to supported electromagnetic, mechanical and coupled FEM studies. Engineers should recognise the organisation and interaction patterns from industrial CAE applications without needing to learn a fundamentally new interface.
+Lorentz should provide a complete, reliable and responsive workflow from geometry creation/STEP import to supported electromagnetic, mechanical and coupled FEM studies. Engineers should recognise the organisation and interaction patterns from industrial CAE applications without needing to learn a fundamentally new interface.
 
 - **Codex owns repository-level architecture and implementation choices.** This document states goals, dependencies, behaviours and acceptance criteria. Inspect the actual code and use sound judgement rather than treating example layouts or implementation suggestions as mandates.
-- **Preserve working numerical and specialised functionality.** In particular, the axisymmetric drawing/geometry workflow, project loading, STEP and coil-trace assets, materials, meshing and solver paths must not regress. Preserve project compatibility, stable storage identifiers and the shared NGSolve solver while maintaining only the MagMechSim application.
+- **Preserve working numerical and specialised functionality.** In particular, the axisymmetric drawing/geometry workflow, project loading, STEP and coil-trace assets, materials, meshing and solver paths must not regress. Preserve project compatibility, stable storage identifiers and the shared NGSolve solver while maintaining only the Lorentz application.
 - **UI controls must be genuine.** Do not present unsupported physics, algorithms or conditions as operational.
 - **Performance, quality and Git hygiene are permanent requirements.** Use fast relevant tests while iterating; milestone-level integration tests; comprehensive tests at appropriate gates. Make focused commits and push verified work. Provide honest reports of skipped or failing checks.
 - **One coherent milestone at a time.** Keep this roadmap current when discoveries change the order. Do not implement every section in one Codex turn.

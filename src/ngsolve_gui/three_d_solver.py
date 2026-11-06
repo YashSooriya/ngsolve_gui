@@ -1,4 +1,4 @@
-"""Build the supported 3D time-harmonic electromagnetic input for MagMechSim."""
+"""Build the supported 3D time-harmonic electromagnetic input for Lorentz."""
 
 from __future__ import annotations
 

@@ -21,7 +21,7 @@ class _NodeList:
         return self._items[index]
 
 
-def test_window_icon_replaces_ngapp_favicons_with_mm_fem_icon():
+def test_window_icon_replaces_ngapp_favicons_with_lorentz_mark():
     old_links = [_Link(), _Link()]
     appended = []
     document = SimpleNamespace(
@@ -40,12 +40,12 @@ def test_window_icon_replaces_ngapp_favicons_with_mm_fem_icon():
     assert icon.href == "data:image/png;base64,mmfem"
 
 
-def test_magmechsim_png_and_all_ico_sizes_have_transparent_corners():
+def test_lorentz_mark_and_all_ico_sizes_have_transparent_corners():
     from PIL import Image
 
     assets = Path(__file__).parents[1] / "src" / "ngsolve_gui" / "assets"
-    png_path = assets / "magmechsim_icon_128x128.png"
-    ico_path = assets / "magmechsim_icon.ico"
+    png_path = assets / "lorentz_mark_128x128.png"
+    ico_path = assets / "lorentz_icon.ico"
 
     with Image.open(png_path) as icon:
         rgba = icon.convert("RGBA")

@@ -1,8 +1,8 @@
-# MagMechSim
+# Lorentz
 
-MagMechSim is a desktop finite-element application for magneto-mechanical modelling. Its mature axisymmetric workflow and developing 3D time-harmonic electromagnetic workflow are built on [NGSolve](https://ngsolve.org) and the ngapp interface stack.
+Lorentz is a desktop finite-element application for magneto-mechanical modelling. Its mature axisymmetric workflow and developing 3D time-harmonic electromagnetic workflow are built on [NGSolve](https://ngsolve.org) and the ngapp interface stack.
 
-The [MagMechSim user guide](docs/user-guide.md) covers project setup, geometry, meshing, studies, and saved results.
+The [Lorentz user guide](docs/user-guide.md) covers project setup, geometry, meshing, studies, and saved results.
 
 This repository is also the Python package used to develop and run the application. The `ngsolve_gui` package name, Python import path, user-settings identifiers, file suffixes, and internal `mm-fem.*` schemas remain stable for compatibility.
 

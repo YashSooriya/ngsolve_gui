@@ -33,7 +33,15 @@ from .mesh_geometry import axisymmetric_mesh_edge_polylines
 from .axisymmetric_model import new_model, new_studies, unpack_model, package_model, serialize_model_json
 from .three_d_project import PROJECT_SUFFIX, package_3d_project, unpack_3d_project
 from . import __version__
-from .branding import AXISYMMETRIC_ICON, PRODUCT_DESCRIPTION, PRODUCT_NAME
+from .branding import (
+    AXISYMMETRIC_ICON,
+    BRAND_COPPER,
+    BRAND_DARK_BACKGROUND,
+    BRAND_NAVY,
+    BRAND_SOFT_WHITE,
+    PRODUCT_DESCRIPTION,
+    PRODUCT_NAME,
+)
 from .documentation import find_documentation_index
 from .project_thumbnails import cached_thumbnail, generate_project_thumbnail
 from .result_files import (
@@ -283,7 +291,7 @@ def _set_window_title(js):
 
 
 def _set_window_icon(js, icon_data_uri):
-    """Replace ngapp's default favicon with the MagMechSim application icon."""
+    """Replace ngapp's default favicon with the Lorentz application mark."""
     document = js.document
     old_icons = document.querySelectorAll(
         'link[rel="icon"], link[rel="shortcut icon"]'
@@ -296,6 +304,70 @@ def _set_window_icon(js, icon_data_uri):
     icon.type = "image/png"
     icon.href = icon_data_uri
     document.head.appendChild(icon)
+
+
+def _inject_lorentz_brand_styles(js):
+    """Apply Lorentz accents while preserving the active light/dark surfaces."""
+    style = js.document.createElement("style")
+    style.id = "lorentz-brand-styles"
+    style.textContent = """
+:root {
+  --accent: #A6601B;
+  --accent-hover: #8B4D12;
+  --accent-active: #733D0B;
+  --accent-subtle: color-mix(in srgb, var(--lorentz-copper) 12%, transparent);
+  --accent-border: rgba(166, 96, 27, .38);
+  --accent-fg: #06264B;
+  --fg-on-accent: var(--lorentz-navy);
+  --ring: color-mix(in srgb, var(--lorentz-copper) 42%, transparent);
+  --link: #8B4D12;
+}
+:root[data-theme="dark"] {
+  --bg: var(--lorentz-dark);
+  --bg-subtle: #132135;
+  --bg-muted: #1A2A3F;
+  --surface: #15243A;
+  --panel: #122036;
+  --panel-header: #1A2A40;
+  --viewport: #0E1929;
+  --fg: var(--lorentz-soft-white);
+  --fg-muted: #C0CCD9;
+  --fg-subtle: #9BAEC2;
+  --fg-faint: #7C91A8;
+  --border: #2A3C53;
+  --border-strong: #3D536C;
+  --border-faint: #1E3046;
+  --accent: #D98A38;
+  --accent-hover: #E6A357;
+  --accent-active: #F0B978;
+  --accent-subtle: color-mix(in srgb, var(--lorentz-copper) 18%, transparent);
+  --accent-border: color-mix(in srgb, var(--lorentz-copper) 42%, transparent);
+  --accent-fg: var(--lorentz-navy);
+  --fg-on-accent: var(--lorentz-navy);
+  --ring: color-mix(in srgb, var(--lorentz-copper) 55%, transparent);
+  --link: #E6A357;
+}
+.q-btn.bg-primary,
+.q-btn.bg-primary .q-icon,
+.q-btn.bg-primary .q-btn__content {
+  color: var(--lorentz-navy) !important;
+}
+.lorentz-wordmark-dark,
+.lorentz-about-banner-dark { display: none !important; }
+:root[data-theme="dark"] .lorentz-wordmark-light,
+:root[data-theme="dark"] .lorentz-about-banner-light { display: none !important; }
+:root[data-theme="dark"] .lorentz-wordmark-dark,
+:root[data-theme="dark"] .lorentz-about-banner-dark { display: block !important; }
+"""
+    existing = js.document.getElementById(style.id)
+    if existing:
+        existing.remove()
+    js.document.head.appendChild(style)
+    root = js.document.documentElement
+    root.style.setProperty("--lorentz-copper", BRAND_COPPER)
+    root.style.setProperty("--lorentz-navy", BRAND_NAVY)
+    root.style.setProperty("--lorentz-soft-white", BRAND_SOFT_WHITE)
+    root.style.setProperty("--lorentz-dark", BRAND_DARK_BACKGROUND)
 
 
 def _schedule_initial_renderer_frame_pulse(js):
@@ -856,17 +928,23 @@ class NGSolveGui(App):
 
         app_brand = Div(
             QImg(
-                ui_src=self.load_asset("magmechsim_icon_128x128.png"),
-                ui_height="30px",
-                ui_width="30px",
+                ui_src=self.load_asset("lorentz_wordmark_light.png"),
+                ui_height="24px",
+                ui_width="158px",
                 ui_fit="contain",
+                ui_alt="Lorentz",
+                ui_class="lorentz-wordmark-light",
             ),
-            Div(
-                PRODUCT_NAME,
-                ui_style="font-size:15px; font-weight:700; letter-spacing:.01em; color:var(--fg);",
+            QImg(
+                ui_src=self.load_asset("lorentz_wordmark_dark.png"),
+                ui_height="24px",
+                ui_width="158px",
+                ui_fit="contain",
+                ui_alt="Lorentz",
+                ui_class="lorentz-wordmark-dark",
             ),
             ui_class=cb.brand,
-            ui_style="display:flex; align-items:center; gap:7px; white-space:nowrap;",
+            ui_style="display:flex; align-items:center; width:158px; height:28px; white-space:nowrap;",
         )
         self._workspace_mode_toggle = WorkspaceModeToggle(
             "solve", self._set_workspace_mode
@@ -1019,13 +1097,19 @@ class NGSolveGui(App):
             QCard(
                 QCardSection(
                     QImg(
-                        ui_src=self.load_asset("magmechsim_about_page_banner.png"),
+                        ui_src=self.load_asset("lorentz_about_light.png"),
                         ui_height="198px", ui_width="352px", ui_fit="contain",
+                        ui_alt="Lorentz", ui_class="lorentz-about-banner-light",
+                    ),
+                    QImg(
+                        ui_src=self.load_asset("lorentz_about_dark.png"),
+                        ui_height="198px", ui_width="352px", ui_fit="contain",
+                        ui_alt="Lorentz", ui_class="lorentz-about-banner-dark",
                     ),
                     ui_style="display:flex; justify-content:center; padding:18px 20px 4px;",
                 ),
                 QCardSection(
-                    Div(PRODUCT_NAME, ui_style="font-size:18px; font-weight:700; color:var(--fg);"),
+                    Div(f"About {PRODUCT_NAME}", ui_style="font-size:18px; font-weight:700; color:var(--fg);"),
                     Div(f"Version {__version__}", ui_style="font-size:12px; color:var(--fg-muted); margin-top:4px;"),
                     Div(PRODUCT_DESCRIPTION, ui_class=cb.hint),
                     Div("Powered by NGSolve and Netgen", ui_style="font-size:11px; color:var(--fg-muted); margin-top:8px;"),
@@ -1086,8 +1170,9 @@ class NGSolveGui(App):
         self._startup_card = QCard(
             QCardSection(
                 QImg(
-                    ui_src=self.load_asset("magmechsim_full_logo_light.png"),
+                    ui_src=self.load_asset("lorentz_home_light.png"),
                     ui_height="150px", ui_width="200px", ui_fit="contain",
+                    ui_alt="Lorentz",
                 ),
                 ui_style="display:flex; justify-content:center; padding:18px 28px 8px;",
             ),
@@ -1139,14 +1224,18 @@ class NGSolveGui(App):
         # Keep the footer's mode indicator in sync with the keybinding manager.
         self._wire_footer_mode()
 
+        theme.primary = BRAND_COPPER
+        theme.accent = BRAND_COPPER
+        theme.dark = BRAND_DARK_BACKGROUND
         cb.install(self, default_theme=self.usersettings.get("theme", "system"))
+        self.call_js(_inject_lorentz_brand_styles)
         from .webgpu_tab import sync_default_viewport_clear
         sync_default_viewport_clear()
         keybinding_styles.inject(self)
         self.call_js(_inject_solve_status_styles)
         self.call_js(_inject_recent_project_tile_styles)
         self.call_js(_set_window_title)
-        self.call_js(_set_window_icon, self.load_asset("magmechsim_icon_128x128.png"))
+        self.call_js(_set_window_icon, self.load_asset("lorentz_mark_128x128.png"))
         self.on_load(self.__on_load)
 
         # Start in Model while retaining the mounted Results workspace so its
@@ -1514,7 +1603,7 @@ class NGSolveGui(App):
             return "axisymmetric", (model, studies, layout), None
         except Exception as axis_error:
             raise ValueError(
-                "This file is not a supported MagMechSim project. "
+                "This file is not a supported Lorentz project. "
                 f"3D check: {three_d_error}. Axisymmetric check: {axis_error}"
             ) from axis_error
 
@@ -1593,8 +1682,8 @@ class NGSolveGui(App):
         )
         try:
             path, data = self._pick_artifact(
-                title="Open MagMechSim project",
-                description="MagMechSim projects",
+                title=f"Open {PRODUCT_NAME} project",
+                description=f"{PRODUCT_NAME} projects",
                 extension=".json",
                 additional_extensions=(".ngsmodel", PROJECT_SUFFIX),
                 force_native=True,
@@ -1978,7 +2067,7 @@ class NGSolveGui(App):
         index = find_documentation_index(solver_root)
         if index is None:
             self._notify(
-                "Local MagMechSim documentation is not installed. Build the Sphinx HTML site from the solver docs or reinstall the packaged application.",
+                "Local Lorentz documentation is not installed. Build the Sphinx HTML site from the solver docs or reinstall the packaged application.",
                 type="warning",
                 timeout=8000,
             )

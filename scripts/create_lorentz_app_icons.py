@@ -1,4 +1,4 @@
-"""Create transparent Windows/web icons from the MagMechSim app mark."""
+"""Create transparent Windows/web icons from the Lorentz application mark."""
 
 from collections import deque
 from pathlib import Path
@@ -7,8 +7,8 @@ from PIL import Image, ImageDraw
 
 
 ASSETS = Path(__file__).resolve().parents[1] / "src" / "ngsolve_gui" / "assets"
-PNG = ASSETS / "magmechsim_icon_128x128.png"
-ICO = ASSETS / "magmechsim_icon.ico"
+PNG = ASSETS / "lorentz_mark_128x128.png"
+ICO = ASSETS / "lorentz_icon.ico"
 ICO_SIZES = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
 
 

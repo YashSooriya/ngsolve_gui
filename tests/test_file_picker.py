@@ -48,7 +48,7 @@ def test_project_picker_can_force_native_path_picker(monkeypatch):
     path, data = NGSolveGui._pick_artifact(
         gui,
         title="Open project",
-        description="MagMechSim project",
+        description="Lorentz project",
         extension=".json",
         additional_extensions=(".ngsmodel", ".mmfem3d"),
         force_native=True,
@@ -73,7 +73,7 @@ def test_browser_picker_omits_invalid_hyphenated_bundle_extension(monkeypatch):
     assert NGSolveGui._pick_artifact(
         gui,
         title="Load mesh",
-        description="MagMechSim mesh bundle",
+        description="Lorentz mesh bundle",
         extension=".mmfem-mesh",
     ) == (None, None)
     assert options == [{"multiple": False}]
@@ -93,7 +93,7 @@ def test_browser_picker_keeps_filter_for_valid_extension(monkeypatch):
     NGSolveGui._pick_artifact(
         gui,
         title="Load problem",
-        description="MagMechSim problem file",
+        description="Lorentz problem file",
         extension=".ngsmodel",
     )
 
