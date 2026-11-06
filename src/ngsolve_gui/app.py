@@ -358,6 +358,7 @@ def _inject_lorentz_brand_styles(js):
 :root[data-theme="dark"] .lorentz-about-banner-light { display: none !important; }
 :root[data-theme="dark"] .lorentz-wordmark-dark,
 :root[data-theme="dark"] .lorentz-about-banner-dark { display: block !important; }
+a.powered-by { display: none !important; }
 """
     existing = js.document.getElementById(style.id)
     if existing:
