@@ -298,6 +298,35 @@ def _set_window_icon(js, icon_data_uri):
     document.head.appendChild(icon)
 
 
+def _schedule_initial_renderer_frame_pulse(js):
+    """Commit a short identity transform so Chromium presents its first surface.
+
+    The native startup gate has observed cases where the mounted page and a
+    Chromium capture were correct while the Windows app window remained white.
+    A temporary compositor layer update requests a real renderer frame without
+    resizing the page or changing model state. The original inline styles are
+    restored within three animation frames.
+    """
+    js.eval("""(() => {
+  const root = document.querySelector('#q-app');
+  if (!root || root.dataset.mmfemStartupPaintPulse === 'pending'
+      || root.dataset.mmfemStartupPaintPulse === 'complete') return;
+  const originalTransform = root.style.transform;
+  const originalWillChange = root.style.willChange;
+  root.dataset.mmfemStartupPaintPulse = 'pending';
+  root.style.willChange = 'transform';
+  root.style.transform = originalTransform
+    ? `${originalTransform} translateZ(0)` : 'translateZ(0)';
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    root.style.transform = originalTransform;
+    requestAnimationFrame(() => {
+      root.style.willChange = originalWillChange;
+      root.dataset.mmfemStartupPaintPulse = 'complete';
+    });
+  }));
+})();""")
+
+
 class _WorkspaceLogBuffer(io.StringIO):
     """Capture solver output and publish it to the Solve log as it arrives."""
 
@@ -3639,6 +3668,10 @@ class NGSolveGui(App):
         self._update()
         self._refresh_recent_projects_view()
         self.app_data._update = self._update_from_app_data
+        # Ask Chromium for a fresh compositor frame after the frontend mounts.
+        # Mike is a separate stripped application and keeps its own startup.
+        if PRODUCT_NAME == "MagMechSim":
+            self.call_js(_schedule_initial_renderer_frame_pulse)
 
     def _click_tab(self, tabname):
         if tabname == self.app_data.active_tab and self.tab_panel.comp is not None:
