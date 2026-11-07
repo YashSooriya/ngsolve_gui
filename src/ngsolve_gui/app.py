@@ -125,12 +125,16 @@ def _wire_documentation_search_keyboard(js):
     js.eval("""(() => {
       if (window.__lorentzDocumentationSearchBound) return true;
       const inputSelector = '.lorentz-doc-search-input';
-      const panelSelector = '#lorentz-doc-search-results';
+      const panelSelector = '.lorentz-doc-search-results';
       let previousFocus = null;
       let activeIndex = -1;
       const isSearchInput = target => target instanceof Element
         && target.matches(inputSelector);
-      const panel = () => document.querySelector(panelSelector);
+      const panel = () => {
+        const list = document.querySelector(panelSelector);
+        if (list && !list.id) list.id = 'lorentz-doc-search-results';
+        return list;
+      };
       const options = () => [...(panel()?.querySelectorAll(
         '.lorentz-doc-search-result') || [])];
       const closeResults = () => {
