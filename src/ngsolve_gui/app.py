@@ -2576,8 +2576,10 @@ class NGSolveGui(App):
 
             if not webbrowser.open(url, new=2):
                 raise RuntimeError("The default browser did not accept the local section URL.")
-            self._documentation_search_results.ui_hidden = True
-            self.call_js(_update_documentation_search_accessibility, 0, False)
+            query = str(
+                getattr(self._documentation_search_input, "ui_model_value", "") or ""
+            ).strip()
+            self._dismiss_documentation_search(query)
             return True
         except Exception as error:
             self._notify(
@@ -2596,12 +2598,12 @@ class NGSolveGui(App):
         except Exception:
             return False
 
-    def _dismiss_documentation_search(self):
+    def _dismiss_documentation_search(self, query=""):
         results = getattr(self, "_documentation_search_results", None)
         if results is not None:
             results.ui_hidden = True
         try:
-            self.call_js(_update_documentation_search_accessibility, 0, False)
+            self.call_js(_update_documentation_search_accessibility, 0, False, query)
             self.js.eval(
                 "window.__lorentzDocumentationSearchDismiss?.()"
             )
