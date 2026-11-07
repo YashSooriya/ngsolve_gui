@@ -381,7 +381,7 @@ The shared application header now searches an offline index generated from the a
 
 **Limits:** Search relevance was checked against a representative, bounded set of engineering queries, not an exhaustive vocabulary or every document configuration. The packaged desktop check used the VM's available renderer and did not add physical-GPU validation. No numerical simulation or broad historical suite was needed for this documentation/UI-only milestone. No numerical solver algorithm, dependency or project format changed.
 
-**Gate:** Phase G2 is complete for this tested scope and ready for independent review. The report is committed at `docs/reviews/2026-11-07-phase-g2.md`; raw package provenance, test records, startup comparisons and full-desktop screenshots remain in `C:\Users\Yash\Documents\MM-FEM\Development\LORENTZ-PhaseG2-2026-11-07\evidence`.
+**Gate:** Phase G2 is complete for this tested scope and ready for independent review. The report is committed at `docs/reviews/2026-11-07-phase-g2.md`; package provenance is under `C:\Users\Yash\Documents\MM-FEM\Development\LORENTZ-PhaseG2-2026-11-07\package\Build-info`, while test records, startup comparisons and full-desktop screenshots remain under `C:\Users\Yash\Documents\MM-FEM\Development\LORENTZ-PhaseG2-2026-11-07\evidence`.
 ### Phase H. Release-quality performance, robustness and packaging
 
 **Outcome:** A stable Windows product ready for sustained engineering use.
