@@ -1,9 +1,9 @@
 # LORENTZ: Forward Development Roadmap
 
-**Planning baseline:** 6 November 2026 (Phase F2, brand presentation, and startup handoff follow-up complete for tested scope; independent review pending)
+**Planning baseline:** 7 November 2026 (Phase F2 accepted; Phase G1 offline documentation and packaged Help verification in progress)
 **Status:** Living plan, not an immutable implementation contract  
 **Primary users:** Engineers familiar with industrial CAE tools  
-**Primary immediate scope:** Independent review of Phase F2 and the completed LORENTZ branding/startup follow-up; Phase G follows acceptance
+**Primary immediate scope:** Phase G1: accurate, version-matched offline engineering documentation and verification through the packaged app; Phase G2 contextual search remains deferred
 **Out of scope for now:** New results visualisation or a post-processing redesign (but existing Solve/Results navigation must remain fully functional)
 
 ## 1. Product objective and working agreement
@@ -349,13 +349,25 @@ Packaged desktop tests verified these controls in the maximized `0.2.8.dev305` a
 
 ### Phase G. Sphinx documentation, in-app help and documentation search
 
-**Outcome:** Useful, offline-capable, version-matched product documentation with fast contextual discovery.
+**Outcome:** Accurate, offline-capable, version-matched product documentation with fast contextual discovery.
 
-- Update the Sphinx documentation to match the actual MagMechSim workflows; include core geometry, CAD scoping, materials, supported BCs, meshing, studies, coupling, errors and examples. Build/version/package with the app.
-- Add context-sensitive Help links from settings where helpful, without cluttering panels.
-- **Then** add the desired upper-right documentation search: rank actual indexed sections, show up to **five results** with title and useful excerpt, keyboard navigation, and deep links to local Sphinx heading anchors. Ensure acceptable startup impact and offline operation; no fabricated results or hard-coded examples.
+- Keep step-by-step LORENTZ GUI workflows as the primary documentation; retain Python/API, research notebooks and solver-internal material in a clearly labelled advanced reference. Describe only controls and numerical capabilities verified in the application.
+- Build Sphinx from saved notebook outputs without executing numerical notebooks. Package the site and its dependencies locally, identify the product version in the site and build manifest, and verify local links, heading anchors, theme assets, scripts and mathematical fonts with network access blocked.
+- Verify **Help → Documentation** opens the bundled site from both axisymmetric and 3D workspaces in the maximized packaged Windows application. Preserve the installed side-by-side package; update the canonical `Launch-Latest-LORENTZ.cmd` only after testing the replacement package.
+- Capture full-desktop screenshots and record package hashes, source revisions, test results and launch target in the review ZIP. Do not search, restore, archive, move or delete historical Mike artifacts as part of this documentation milestone.
+- **Phase G2, deferred until G1 review:** add the upper-right documentation search; rank actual indexed sections, show up to **five results** with title and useful excerpt, support keyboard navigation and deep links to local Sphinx heading anchors, and measure startup impact. Do not fabricate results or hard-code examples.
 
-**Gate:** Docs build reliably; links and section anchors work offline in packaged builds; search results reflect real content and open the correct section.
+#### Phase G1. Accurate, version-matched offline engineering documentation (in progress; 7 November 2026)
+
+The local Help integration already exists. G1 audits the current application workflows, expands the user guide, moves Python/API and research material under a clearly separated advanced reference, bundles all runtime documentation assets, proves the site is version-matched and offline-capable, and verifies Help through actual maximized packaged-app workspaces. This phase does not implement contextual search or new solver/UI features.
+
+**Acceptance:** Strict Sphinx build succeeds; generated links and static assets resolve locally; MathJax equations load local font assets with external network access blocked; Help opens the matching version in packaged axisymmetric and 3D applications; final package, canonical launcher, screenshots, test evidence, roadmap and ZIP agree on the same build provenance.
+
+#### Phase G2. Contextual documentation search (planned after G1 review)
+
+Implement the existing upper-right search request against actual generated Sphinx sections, with up to five ranked results, useful excerpts, keyboard interaction, and local heading-anchor navigation. Keep search offline, fast and version-matched. G2 starts only after independent review of G1.
+
+**Gate:** Search results reflect the packaged site, open the correct local section, and do not add material startup or interaction delays.
 
 ### Phase H. Release-quality performance, robustness and packaging
 
@@ -401,9 +413,12 @@ Phase D2: coupled workflow and verification refinement — accepted for tested s
             Engineering workflow refinement and legacy variant retirement (Phase F2 — complete for tested scope)
                       |
                       v
-        Sphinx documentation and contextual search (Phase G — after F2 review)
+        Version-matched offline user documentation (Phase G1 — active)
+                      |
+                      v
+             Contextual Help search (Phase G2 — after G1 review)
 
-Local Sphinx access starts NOW; comprehensive docs and 5-result search follow in Phase G.
+Local Help already exists; G1 aligns its complete contents and runtime assets with the packaged product. G2 search is deferred until G1 is reviewed.
 Release, packaging and comprehensive quality gates occur throughout, with final signoff in Phase H.
 ```
 
@@ -419,7 +434,7 @@ Release, packaging and comprehensive quality gates occur throughout, with final 
 6. **Git discipline:** Protect existing work, logically commit and push verified changes, and report branch/SHAs, clean/dirty working tree and blockers.
 7. **Native review evidence:** Build a Windows executable from the current reviewed source, launch it and capture the real native app; record exact revisions, version and executable hash. The tested executable must be the newest source version and open maximized. Capture screenshots at the full native display resolution (at least a normal 1920×1080-class screen), never in a smaller restored window. Do this once at a milestone gate, not after every trivial code change. Preserve a currently running side-by-side installation.
 8. **Native input verification:** Do not make a milestone depend on Codex Computer Use availability. The Windows packaged-app harness uses Win32 mouse/keyboard/wheel input and Pillow full-desktop screenshots, with Playwright over test-only loopback CDP for read-only DOM checks and timing. Test actual controls and visible state transitions, including geometry selection and viewport response. Keep browser-only Playwright results clearly separate from genuine packaged-desktop checks. Do not bypass Computer Use security checks or any mandatory stop instruction; use the independent desktop harness through normal development tools instead. Document the exact input and screenshot methods in the handoff.
-9. **Latest executable:** Keep `Launch-Latest-LORENTZ.cmd` pointed at the newest tested full LORENTZ package; `Launch-Latest-MagMechSim.cmd` is a compatibility forwarding script. Execute the canonical launcher itself in a fresh profile; verify the real app reaches its mounted workspace, the “Downloading App” overlay clears, and Win32 confirms the main window is maximized on the full native display. Record the executable SHA-256, launcher target and exact GUI/solver source revisions. Include the launcher smoke log and full-desktop screenshot in the review ZIP. LORENTZ is the sole maintained application; preserve compatible legacy IDs and storage paths only where required for users and project files.
+9. **Latest executable:** Keep `Launch-Latest-LORENTZ.cmd` pointed at the newest tested full LORENTZ package. There is no `Launch-Latest-MagMechSim.cmd` compatibility launcher in the current Development directory; do not claim that it exists. Execute the canonical launcher itself in a fresh profile; verify the real app reaches its mounted workspace, the “Downloading App” overlay clears, and Win32 confirms the main window is maximized on the full native display. Record the executable SHA-256, launcher target and exact GUI/solver source revisions. Include the launcher smoke log and full-desktop screenshot in the review ZIP. LORENTZ is the sole maintained application; preserve compatible legacy IDs and storage paths only where required for users and project files.
 10. **Handoff:** Concise report, actual full-resolution screenshots, focused test evidence, performance observations, outstanding issues, next recommendation and a ZIP. Record that the VM moved to SSD and do not attribute timing changes to code without a controlled same-hardware comparison. Never claim native rendering or splash behaviour from a browser screenshot alone. Do not use or package the retired CPU-only 2D field viewer. When WebGPU is unavailable, include actual packaged adapter/device/render diagnostics and the supported path to a 3D-capable graphics adapter; do not represent a 2D view as equivalent to 3D rendering.
 
 ## 7. Risk register
@@ -435,7 +450,7 @@ Release, packaging and comprehensive quality gates occur throughout, with final 
 | Axisymmetric sketch/preview rendering | Saved regions, full-pane grid and the geometry-creation Plotly WebGL preview are visible in the packaged app; physical-GPU behavior is unverified | Keep representative sketch/preview regression coverage; reopen if blank frames or fidelity issues recur |
 | Reload after a renderer crash can leave a blank window | Controlled recovery now restores styles, project state and a rendered viewport | Retain one-attempt recovery guard and packaged crash regression; revisit if broader crash reports occur |
 | Startup and first-frame reliability | The no-flag blank/delayed native frame was reproduced on the Windows VM and controlled A/B testing tied it to Chromium native-window occlusion. The final package passed five fresh launches across full workflows and the public launcher. | Keep the splash/native-pixel gates and MagMechSim-only occlusion workaround. Verify on physical Windows graphics and other Chromium/driver versions when available; monitor resource use while the app is occluded/minimized. Do not attribute timing changes to the SSD move. |
-| Documentation is linked to GitHub | Poor offline and packaged UX | Bundle local Sphinx HTML now; refresh/index in later documentation phase |
+| Documentation can drift from the running executable or request online assets | Users may follow controls that moved or fail to read help offline | Build docs using the committed package version, record source revisions and hashes, audit local links/assets, and exercise Help in the packaged GUI with network access blocked |
 | Broad CI has known failures | Can conceal regressions and waste iteration time | Keep focused gates, track known failures, schedule comprehensive checks |
 | Frequent rebuilds and tests | Slows development | Build/package once per milestone; use risk-based, cached focused tests |
 
@@ -443,4 +458,4 @@ Release, packaging and comprehensive quality gates occur throughout, with final 
 
 Suggested repository home for this plan: a documented planning location under the GUI repository, chosen by Codex after inspecting existing conventions. Keep this file as the **single current roadmap**, with date, completed milestones, changed priorities and links to implementation reports. Historical roadmaps may remain archived but should not conflict with the current one.
 
-**Current action (6 November 2026):** Phase F2 and the brand presentation follow-up are complete for their documented, tested scopes; prepare the review ZIP and stop for independent review. Preserve the `CalculateNativeWinOcclusion` workaround and native first-paint gates; physical Windows/driver verification remains a later release check. The SSD move remains a performance confounder, not a code improvement. Persistent/offline ROM remains deferred; retain the CPU-only 2D viewer removal, WebGPU-to-WebGL fallback and E1 sweep references. Phase G begins only after independent review accepts F2 and this follow-up.
+**Current action (7 November 2026):** Phase F2 and the LORENTZ branding/startup handoff are accepted for their documented scopes. Complete Phase G1's actual packaged Help checks, build a new version-matched package from committed sources, update `Launch-Latest-LORENTZ.cmd`, then capture and package the evidence. Keep the existing installation untouched. Do not start G2 search until G1 is independently reviewed. Preserve the `CalculateNativeWinOcclusion` workaround and native first-paint gates; physical Windows/driver verification remains a later release check. The SSD move remains a performance confounder, not a code improvement. Persistent/offline ROM remains deferred; retain the CPU-only 2D viewer removal and WebGPU-to-WebGL fallback.
