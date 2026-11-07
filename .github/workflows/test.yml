@@ -2,30 +2,124 @@ name: Tests
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, testing]
   pull_request:
+    branches: [main, master, testing]
+    types: [opened, synchronize, reopened, labeled]
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      comprehensive:
+        description: Run the comprehensive test suite
+        required: true
+        type: boolean
+        default: false
 
 jobs:
-  test:
+  core-preprocessing:
+    name: Core preprocessing and branding
+    if: >-
+      github.event_name != 'schedule' &&
+      (github.event_name != 'push' || github.ref_name == 'testing') &&
+      !(github.event_name == 'workflow_dispatch' && inputs.comprehensive) &&
+      !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'comprehensive-tests'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           lfs: true
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Build test image
-        run: docker build -t ngsolve-gui-tests .
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Run tests
+      - name: Build cached test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: ngsolve-gui-tests
+          load: true
+          cache-from: type=gha,scope=ngsolve-gui-tests
+          cache-to: type=gha,scope=ngsolve-gui-tests,mode=max
+
+      # Keep viewport-sensitive generic renderer screenshots in the full suite below.
+      # The fake-solver lifecycle cases are small and do not execute FEM workloads.
+      - name: Run core preprocessing checks
         run: |
+          mkdir -p tests/output
           docker run --rm \
             -v "${{ github.workspace }}/tests/output:/app/tests/output" \
-            ngsolve-gui-tests
+            -e MMFEM_UI_SCREENSHOT_DIR=/app/tests/output \
+            -e MMFEM_H1_1_EVIDENCE_DIR=/app/tests/output/h1_1_3d_pick \
+            ngsolve-gui-tests pytest -q \
+            tests/test_branding.py \
+            tests/test_axisymmetric_model.py \
+            tests/test_axisymmetric_geometry_preview_e2e.py \
+            tests/test_file_loader.py \
+            tests/test_project_startup.py \
+            tests/test_run_history.py \
+            tests/test_three_d_mesh.py \
+            tests/test_three_d_preview.py \
+            tests/test_three_d_project.py \
+            tests/test_three_d_solver_setup.py \
+            tests/test_three_d_workspace.py \
+            tests/test_three_d_workspace_e2e.py \
+            tests/test_three_d_solver_e2e.py::test_3d_failed_process_finishes_with_actionable_diagnostics \
+            tests/test_three_d_solver_e2e.py::test_3d_cancelled_process_finishes_with_cancelled_status
 
-      - name: Upload test output
+      - name: Upload focused 3D pick evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-3d-pick-evidence
+          path: tests/output/h1_1_3d_pick/
+          if-no-files-found: ignore
+
+      - name: Upload core test output
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-output
+          name: core-test-output
           path: tests/output/
+
+  test:
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'push' && github.ref_name != 'testing') ||
+      (github.event_name == 'workflow_dispatch' && inputs.comprehensive) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'comprehensive-tests'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build cached test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: ngsolve-gui-tests
+          load: true
+          cache-from: type=gha,scope=ngsolve-gui-tests
+          cache-to: type=gha,scope=ngsolve-gui-tests,mode=max
+
+      - name: Run comprehensive suite
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/tests/output:/app/tests/output" \
+            ngsolve-gui-tests pytest -q --junitxml=/app/tests/output/comprehensive-junit.xml
+
+      - name: Upload comprehensive test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: comprehensive-test-output
+          path: tests/output/
+          if-no-files-found: warn

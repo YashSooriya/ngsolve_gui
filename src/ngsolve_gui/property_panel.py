@@ -155,6 +155,8 @@ class PropertyPanel(Div):
             except Exception as e:
                 print(f"Error building section {cls.__name__}: {e}")
         if not sections:
+            if getattr(comp, "suppress_empty_property_message", False):
+                return []
             return [Div("No settings available.", ui_class=field_label + " q-pa-md")]
         return sections
 

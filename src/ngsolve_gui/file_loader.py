@@ -1,6 +1,8 @@
+import json
 import os
 import sys
 import threading
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from pathlib import Path
 import numpy as np
@@ -20,6 +22,9 @@ from ngapp.components import Component
 
 _appdata: AppData
 _redraw_func: Callable | None = None
+_ui_dispatch_func: Callable | None = None
+_ui_thread_id: int | None = None
+_open_result_field_func: Callable | None = None
 
 
 def _file_extension_matches(path: Path, suffixes: Iterable[str]) -> bool:
@@ -33,28 +38,29 @@ def _build_loader_snippet(filename: str, name: str) -> tuple[str, str]:
     """
     path = Path(filename)
     ext = path.suffix.lower()
+    filename_literal = repr(filename)
 
     if _file_extension_matches(path, (".vol", ".vol.gz")):
         return f"""import ngsolve
-mesh = ngsolve.Mesh('{filename}')
+mesh = ngsolve.Mesh({filename_literal})
 ngsolve.Draw(mesh, '{name}')""", "<ngsolve_gui:mesh>"
 
     if ext in {".step", ".iges", ".stp", ".brep"}:
         return f"""import netgen.occ
 import ngsolve
-geometry = netgen.occ.OCCGeometry("{filename}")
+geometry = netgen.occ.OCCGeometry({filename_literal})
 ngsolve.Draw(geometry, name='{name}')""", "<ngsolve_gui:geometry>"
 
     if ext == ".pkl":
         return f"""import netgen.occ
 import ngsolve, pickle
-import netgen.occ
-obj = pickle.load(open("{filename}", "rb"))
+obj = pickle.load(open({filename_literal}, "rb"))
 print("Loaded object of type", type(obj))
 if isinstance(obj, netgen.occ.TopoDS_Shape):
     obj = netgen.occ.OCCGeometry(obj)
 print("Loaded object of type", type(obj))
-ngsolve.Draw(obj, name='{name}')""", "<ngsolve_gui:pickle>"
+from ngsolve_gui.file_loader import _draw_pickle_object
+_draw_pickle_object(obj, '{name}', field_path={filename_literal})""", "<ngsolve_gui:pickle>"
 
     if ext == ".py":
         import tokenize
@@ -335,6 +341,36 @@ def _is_plot_candidate(obj: Any) -> bool:
     return mod.startswith("plotly.") or mod.startswith("matplotlib.")
 
 
+def _add_tab(title: str, component: type, *args, **kwargs):
+    """Create result components on the app loop when loading a file in a worker.
+
+    Script execution and pickle reads stay off the UI loop, but WebGPU-backed
+    components own frontend references and must be created on the thread that
+    services the app's UI events.
+    """
+    if (
+        not callable(_ui_dispatch_func)
+        or _ui_thread_id is None
+        or threading.get_ident() == _ui_thread_id
+    ):
+        return _appdata.add_tab(title, component, *args, **kwargs)
+
+    result = Future()
+
+    def create_component():
+        try:
+            result.set_result(_appdata.add_tab(title, component, *args, **kwargs))
+        except BaseException as error:
+            result.set_exception(error)
+
+    if not _ui_dispatch_func(create_component):
+        return _appdata.add_tab(title, component, *args, **kwargs)
+    try:
+        return result.result(timeout=60)
+    except FutureTimeoutError as error:
+        raise RuntimeError("Timed out while creating a result view") from error
+
+
 def DrawImpl(
     obj: Any,
     mesh: ngs.Mesh | ngs.Region | None = None,
@@ -365,9 +401,14 @@ def DrawImpl(
         from .plot import PlotComponent
 
         data["obj"] = obj
-        return _appdata.add_tab(name or "Plot", PlotComponent, data, _appdata)
+        return _add_tab(name or "Plot", PlotComponent, data, _appdata)
 
-    if type(obj) not in _DRAW_DISPATCH:
+    if isinstance(obj, ngs.GridFunction):
+        # Keep the GridFunction object intact. Besides retaining its FESpace
+        # for result-specific display handling, the FunctionComponent uses it
+        # for pick evaluation and volume-side traces.
+        default_name, comp = "Function", FunctionComponent
+    elif type(obj) not in _DRAW_DISPATCH:
         try:
             # try to convert to CoefficientFunction
             obj = ngs.CF(obj)
@@ -377,7 +418,255 @@ def DrawImpl(
     else:
         default_name, comp = _DRAW_DISPATCH[type(obj)]
     data["obj"] = obj
-    return _appdata.add_tab(name or default_name, comp, data, _appdata)
+    return _add_tab(name or default_name, comp, data, _appdata)
+
+
+def _pickle_metadata_for_path(filename):
+    """Return adjacent solver metadata and the matching field descriptor."""
+    if not filename:
+        return None, None
+    source_path = Path(filename).resolve()
+    for directory in (source_path.parent, *source_path.parents):
+        metadata_path = directory / "metadata.json"
+        if not metadata_path.is_file():
+            continue
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for item in metadata.get("field_files", []):
+            if not isinstance(item, dict) or not item.get("file"):
+                continue
+            try:
+                expected = (metadata_path.parent / item["file"]).resolve()
+                if os.path.normcase(str(expected)) == os.path.normcase(str(source_path)):
+                    return metadata, item
+            except (OSError, TypeError, ValueError):
+                continue
+        if metadata.get("default_solution_file"):
+            try:
+                expected = (
+                    metadata_path.parent / metadata["default_solution_file"]
+                ).resolve()
+                if os.path.normcase(str(expected)) == os.path.normcase(str(source_path)):
+                    return metadata, metadata.get("default_field", {})
+            except (OSError, TypeError, ValueError):
+                continue
+    return None, None
+
+
+def _run_manifest_for_path(filename):
+    """Find the completed or in-progress run that owns a result field."""
+    if not filename:
+        return None
+    try:
+        source_path = Path(filename).resolve()
+    except (OSError, TypeError, ValueError):
+        return None
+    for directory in source_path.parents:
+        manifest_path = directory / "run_manifest.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if isinstance(manifest, dict) and manifest.get("schema") == "mm-fem.run":
+            return manifest
+    return None
+
+
+def _apply_run_material_display_names(mesh, run_metadata):
+    """Replace internal solver region tags with saved display names in memory."""
+    display_names = (
+        run_metadata.get("material_display_names")
+        if isinstance(run_metadata, dict) else None
+    )
+    if mesh.dim != 3 or not isinstance(display_names, dict):
+        return
+
+    for domain_id, solver_name in enumerate(mesh.GetMaterials(), start=1):
+        display_name = display_names.get(str(solver_name))
+        if display_name and str(display_name) != str(solver_name):
+            mesh.ngmesh.SetMaterial(domain_id, str(display_name))
+
+
+def _result_field_choices(filename, metadata, field_metadata):
+    """Resolve sibling GUI field pickles for the study information panel."""
+    if not filename or not isinstance(metadata, dict):
+        return []
+    try:
+        source_path = Path(filename).resolve()
+    except (OSError, TypeError, ValueError):
+        return []
+
+    metadata_directory = next(
+        (
+            directory
+            for directory in source_path.parents
+            if (directory / "metadata.json").is_file()
+        ),
+        None,
+    )
+    if metadata_directory is None:
+        return []
+
+    current_key = field_metadata.get("field_key") if isinstance(field_metadata, dict) else None
+    current_snapshot = (
+        field_metadata.get("snapshot_index") if isinstance(field_metadata, dict) else None
+    )
+    choices = []
+    for item in metadata.get("field_files", []):
+        if not isinstance(item, dict) or not item.get("file"):
+            continue
+        try:
+            path = (metadata_directory / item["file"]).resolve()
+        except (OSError, TypeError, ValueError):
+            continue
+        if not path.is_file():
+            continue
+        field_key = item.get("field_key")
+        snapshot_index = item.get("snapshot_index")
+        same_field_snapshot = (
+            current_key is not None
+            and field_key == current_key
+            and (current_snapshot is None or snapshot_index == current_snapshot)
+        )
+        same_path = os.path.normcase(str(path)) == os.path.normcase(str(source_path))
+        if same_field_snapshot or same_path:
+            continue
+        label = item.get("label") or field_key or path.stem
+        choices.append({
+            "path": str(path),
+            "label": str(label),
+            "field_key": field_key,
+            "snapshot_index": snapshot_index,
+        })
+    return choices
+
+
+def _mesh_has_nonnegative_radial_coordinate(mesh) -> bool:
+    """Recognize a metadata-less meridian mesh from its nonnegative radius axis.
+
+    A browser file picker uploads only the selected pickle, not the adjacent
+    solver metadata.json. Axisymmetric meridian meshes use coordinate 0 as
+    radius and therefore cannot extend into negative values. Explicit metadata
+    remains authoritative where it is available.
+    """
+    if getattr(mesh, "dim", None) != 2:
+        return False
+    try:
+        radii = [float(vertex.point[0]) for vertex in mesh.vertices]
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return False
+    if not radii:
+        return False
+    scale = max(abs(radius) for radius in radii)
+    tolerance = max(scale * 1e-9, 1e-14)
+    return min(radii) >= -tolerance and max(radii) - min(radii) > tolerance
+
+
+def _is_axisymmetric_pickle(filename, mesh=None) -> bool:
+    """Use solver metadata, or infer axisymmetry for a standalone 2D pickle."""
+    metadata, _field = _pickle_metadata_for_path(filename)
+    domain = metadata.get("problem_domain") if metadata else None
+    if domain is not None:
+        return str(domain).strip().lower() == "axisymmetric"
+    return _mesh_has_nonnegative_radial_coordinate(mesh)
+
+
+def _draw_pickle_object(obj, name: str, field_path=None):
+    """Draw a pickled NGSolve field with clean, fast result-view defaults."""
+    if not isinstance(obj, ngs.GridFunction):
+        return DrawImpl(obj, name=name)
+
+    mesh = obj.space.mesh
+    saved_curve_order = int(mesh.GetCurveOrder())
+    if mesh.dim == 3:
+        display_curve_order = min(saved_curve_order, 4)
+    elif mesh.dim == 2:
+        # The current WebGPU surface renderer produces broken facets for
+        # cubic-curved 2D result meshes. Keep quadratic geometry in the viewer;
+        # the pickle on disk and the solver mesh are unchanged.
+        display_curve_order = min(saved_curve_order, 2)
+    else:
+        display_curve_order = saved_curve_order
+    if display_curve_order < saved_curve_order:
+        mesh.Curve(display_curve_order)
+        print(
+            "Saved mesh curve order:", saved_curve_order,
+            "| viewer curve order:", display_curve_order,
+        )
+
+    field_name = name.lower()
+    is_mechanical_field = any(
+        key in field_name for key in ("displacement", "velocity")
+    )
+    run_metadata = _run_manifest_for_path(field_path)
+    if run_metadata is not None:
+        _apply_run_material_display_names(mesh, run_metadata)
+    material_names = {str(material) for material in mesh.GetMaterials()}
+    seed_material = (
+        "Air"
+        if mesh.dim == 3 and obj.dim == 3 and "Air" in material_names
+        and not is_mechanical_field
+        else None
+    )
+    draw_options = {
+        "wireframe": False,
+        "subdivision": -1,
+        "fieldlines_num_lines": 20,
+        "fieldlines_thickness": 0.0001,
+    }
+    _metadata, field_metadata = _pickle_metadata_for_path(field_path)
+    if field_path:
+        try:
+            draw_options["_ngsolve_gui_result_path"] = str(Path(field_path).resolve())
+        except (OSError, TypeError, ValueError):
+            draw_options["_ngsolve_gui_result_path"] = str(field_path)
+    if isinstance(field_metadata, dict):
+        draw_options["_ngsolve_gui_field_metadata"] = field_metadata
+    field_choices = _result_field_choices(field_path, _metadata, field_metadata)
+    if field_choices:
+        draw_options["_ngsolve_gui_result_fields"] = field_choices
+    if run_metadata is not None:
+        draw_options["_ngsolve_gui_run_metadata"] = run_metadata
+    if mesh.dim == 3:
+        field_description = " ".join(
+            str(value)
+            for value in (
+                name,
+                (field_metadata or {}).get("field_key", ""),
+                (field_metadata or {}).get("label", ""),
+            )
+        ).lower()
+        magnetic_field_markers = (
+            "magnetic flux density",
+            "magnetic induction",
+            "magnetic field",
+            "gfbdc",
+            "gfbac",
+            "b_dc",
+            "b_ac",
+            "h_dc",
+            "h_ac",
+        )
+        draw_options["_ngsolve_gui_symmetry_vector_kind"] = (
+            "axial"
+            if any(marker in field_description for marker in magnetic_field_markers)
+            else "polar"
+        )
+    if _is_axisymmetric_pickle(field_path, mesh):
+        draw_options["_ngsolve_gui_axisymmetric"] = True
+        if obj.dim == 2:
+            # Axisymmetric vector pickles store the meridian components in
+            # (r, z) order. Keep the serialized object a normal NGSolve
+            # GridFunction; this only changes the GUI's selector labels.
+            draw_options["_ngsolve_gui_component_names"] = ("r", "z")
+    if mesh.dim == 3 and obj.dim == 3:
+        draw_options["_ngsolve_gui_fast_fieldlines"] = True
+        draw_options["_ngsolve_gui_fieldline_seed_material"] = seed_material
+    return DrawImpl(obj, name=name, **draw_options)
 
 
 def RedrawImpl(*args, **kwargs):
@@ -409,9 +698,22 @@ def load_file(filename, app):
     :param app: The running application instance providing app data and redraw hooks.
     :return: ``(thread, done_event)`` tuple, or ``None`` if no loading was started.
     """
-    global _appdata, _redraw_func
+    global _appdata, _redraw_func, _ui_dispatch_func, _ui_thread_id
+    global _open_result_field_func
     _appdata = app.app_data
     _redraw_func = app.redraw
+    _ui_dispatch_func = getattr(app, "_dispatch_to_ui", None)
+    _open_result_field_func = getattr(app, "_open_run_result", None)
+    try:
+        from webgpu import platform
+
+        _ui_thread_id = getattr(
+            getattr(platform.websocket_server, "_callback_thread", None),
+            "ident",
+            None,
+        )
+    except Exception:
+        _ui_thread_id = None
     if filename is None:
         return None
 
@@ -421,6 +723,37 @@ def load_file(filename, app):
             return None
 
     path = Path(filename).resolve()
+    if path.suffix.lower() == ".mmfem-solutions":
+        import json
+
+        retained = getattr(app, "_solution_import_dirs", None)
+        if retained is None:
+            retained = []
+            app._solution_import_dirs = retained
+        source = (
+            "from ngsolve_gui.result_files import extract_solution_bundle_from_path\n"
+            f"_mmfem_solution_directory, _mmfem_field_paths = extract_solution_bundle_from_path({json.dumps(str(path))})\n"
+            "_mmfem_solution_app._solution_import_dirs.append(_mmfem_solution_directory)\n"
+            "import pickle\n"
+            "from pathlib import Path\n"
+            "from ngsolve_gui.file_loader import _draw_pickle_object\n"
+            "for _mmfem_field_path in _mmfem_field_paths:\n"
+            "    with open(_mmfem_field_path, 'rb') as _mmfem_field_stream:\n"
+            "        _mmfem_field = pickle.load(_mmfem_field_stream)\n"
+            "    _draw_pickle_object(\n"
+            "        _mmfem_field, Path(_mmfem_field_path).stem,\n"
+            "        field_path=_mmfem_field_path,\n"
+            "    )\n"
+        )
+        script_globals = {
+            "__name__": "__main__",
+            "__file__": str(path),
+            "__builtins__": __builtins__,
+            "_mmfem_solution_app": app,
+        }
+        code = compile(source, str(path), "exec")
+        return _run_script(code, script_globals, app)
+
     name = path.stem
     source, compile_name = _build_loader_snippet(str(path), name)
 

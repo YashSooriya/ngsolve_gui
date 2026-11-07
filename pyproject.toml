@@ -11,6 +11,7 @@ dependencies = [
     "ngsolve_webgpu>=0.5.6",
     "ngsolve",
     "numpy",
+    "plotly",
     "anywidget",
     "psutil; sys_platform != 'emscripten'",
     "requests; sys_platform != 'emscripten'",
@@ -18,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu-monitor = ["pynvml"]
-plotting = ["plotly", "matplotlib"]
+plotting = ["matplotlib"]
 interactive = ["IPython"]
 
 [project.scripts]
@@ -27,6 +28,9 @@ ngsolve_gui = "ngsolve_gui.run:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+ngsolve_gui = ["assets/*.png", "assets/*.ico", "assets/*.js"]
 
 [tool.setuptools_scm]
 version_file = "src/ngsolve_gui/_version.py"

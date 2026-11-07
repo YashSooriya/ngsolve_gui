@@ -3,6 +3,10 @@ try:
 except (ImportError, ModuleNotFoundError):
     __version__ = "0.0.0.dev0"
 
+from ._render_runtime import install_renderer_taskmanager_guard
+
+install_renderer_taskmanager_guard()
+
 
 def __getattr__(name):
     if name == "NGSolveGui":

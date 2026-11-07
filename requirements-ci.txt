@@ -1,0 +1,9 @@
+# Top-level GUI test stack pinned to the revisions used by the 2026-10-31 CI
+# run. Update these deliberately after reviewing the full GUI regression suite.
+webgpu @ git+https://github.com/CERBSim/webgpu.git@3e5bc065e94e10d4146527833a59fde865fd0404
+ngsolve_webgpu @ git+https://github.com/CERBSim/ngsolve_webgpu.git@f74e02dc852704f45fce1895b3a07249a3fcff5b
+ngapp[e2e] @ git+https://github.com/CERBSim/ngapp.git@a34ab970532ed462388859bd1cb36150b79e91f5
+cerbsim_ngapp_style @ git+https://github.com/CERBSim/cerbsim_ngapp_style.git@df2a21e669b025ca60a7a86f299217dddd254330
+ngsolve==6.2.2608.post166.dev0
+plotly==7.1.0
+psutil==7.2.2

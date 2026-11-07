@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from playwright.sync_api import Page
+from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 
 
 def _setup_file_loader(app):
@@ -13,13 +13,48 @@ def _setup_file_loader(app):
     fl._redraw_func = app.redraw
 
 
-def _draw(app, obj, **kwargs):
+def _draw(app, obj, *, page: Page | None = None, **kwargs):
     """Draw an object into the app via the file_loader dispatch."""
+    if getattr(app, "_active_project_type", None) is None:
+        # The legacy file_loader/result viewer is hosted by the shared
+        # axisymmetric workspace. Starting from the welcome chooser leaves
+        # its canvas hidden; the app_test defaults no longer create a project.
+        app._start_new_problem()
+    app._set_workspace_mode("post_process")
     _setup_file_loader(app)
     from ngsolve_gui.file_loader import DrawImpl
 
     DrawImpl(obj, **kwargs)
     app._update()
+    if page is not None:
+        # app_test's page.goto() only guarantees document load. It can return
+        # before the WebGPU component has a laid-out canvas; reading back a
+        # zero-sized surface then produces an opaque Pillow encoder error.
+        try:
+            page.wait_for_function(
+                """() => Array.from(document.querySelectorAll('canvas')).some(canvas => {
+                    const rect = canvas.getBoundingClientRect();
+                    return canvas.width > 0 && canvas.height > 0
+                        && rect.width > 0 && rect.height > 0;
+                })""",
+                timeout=10000,
+            )
+        except Exception:
+            print(
+                "WebGPU viewport failed to attach after draw:",
+                {
+                    "url": page.url,
+                    "title": page.title(),
+                    "body": page.locator("body").inner_text()[:1000],
+                    "canvas_count": page.locator("canvas").count(),
+                    "page_errors": [str(error) for error in page.page_errors()],
+                    "console": [
+                        {"type": message.type, "text": message.text}
+                        for message in page.console_messages()
+                    ],
+                },
+            )
+            raise
 
 
 def make_mesh_2d():
@@ -111,12 +146,43 @@ def collapse_section(page: Page, name: str) -> None:
 
 
 def click_in_section(page: Page, section: str, name: str) -> None:
-    """Click a chip/toggle by label *inside* a named property section.
+    """Click a chip/toggle in the result toolbar or a property section.
 
     Disambiguates labels that exist in more than one section - e.g. "Surface"
     is both the Display surface-field chip and the Vectors & Flow surface-arrows
-    chip. Expands the section first so its controls are visible/clickable.
+    chip. Result sections are hosted in toolbar menus; other sections remain in
+    the property panel.
     """
+    toolbar_group = page.get_by_role("button", name=section, exact=False)
+    if toolbar_group.count():
+        toolbar_group.first.click()
+        menu = page.locator(".q-menu:visible").last
+        try:
+            menu.wait_for(state="visible", timeout=5000)
+        except PlaywrightTimeoutError as error:
+            menus = page.locator(".q-menu").evaluate_all(
+                "nodes => nodes.map(node => {const s=getComputedStyle(node);const r=node.getBoundingClientRect();return {display:s.display,visibility:s.visibility,opacity:s.opacity,rect:[r.x,r.y,r.width,r.height],text:node.textContent,html:node.outerHTML.slice(0,900)}})"
+            )
+            buttons = toolbar_group.evaluate_all(
+                "nodes => nodes.map(node => {const r=node.getBoundingClientRect();const s=getComputedStyle(node);return {ariaExpanded:node.getAttribute('aria-expanded'),rect:[r.x,r.y,r.width,r.height],display:s.display,visibility:s.visibility,html:node.outerHTML.slice(0,800)}})"
+            )
+            raise AssertionError(
+                f"Toolbar section {section!r} did not open; buttons={buttons!r}; menus={menus!r}; "
+                f"body={page.locator('body').inner_text()[:1600]!r}; "
+                f"page_errors={[str(item) for item in page.page_errors()]!r}; "
+                f"console={[item.text for item in page.console_messages()]!r}"
+            ) from error
+        section_panel = menu.locator(".cb-psec").filter(
+            has=menu.locator(".cb-psec-title").filter(has_text=section)
+        ).first
+        control = section_panel.locator(
+            ".cb-opt-chip, .cb-prop-toggle"
+        ).filter(has_text=name).first
+        control.wait_for(state="visible", timeout=5000)
+        control.click()
+        page.wait_for_timeout(150)
+        return
+
     sec = page.locator(".cb-psec").filter(
         has=page.locator(".cb-psec-title").filter(has_text=section)
     ).first

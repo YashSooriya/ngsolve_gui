@@ -1,13 +1,25 @@
-# NGSolve GUI
+# LORENTZ
 
-The desktop GUI we use internally at CERBSim for working with [NGSolve](https://ngsolve.org). Built on our in-house development stack:
+LORENTZ is a desktop finite-element application for magneto-mechanical modelling. Its mature axisymmetric workflow and developing 3D time-harmonic electromagnetic workflow are built on [NGSolve](https://ngsolve.org) and the ngapp interface stack.
+
+The [LORENTZ user guide](docs/user-guide.md) covers project setup, geometry, meshing, studies, and saved results.
+
+This repository is also the Python package used to develop and run the application. The `ngsolve_gui` package name, Python import path, user-settings identifiers, file suffixes, and internal `mm-fem.*` schemas remain stable for compatibility.
+
+## Application workflows
+
+- **Axisymmetric** — 2D radial–axial geometry, specialised sketch tools, materials, time-harmonic physics and the existing magneto-mechanical study workflow.
+- **3D** — STEP and wire-trace geometry, named selections, materials, mesh controls, and supported time-harmonic electromagnetic studies.
+- **Post-processing** — inspect saved meshes, fields, and solver output with the existing visualization workspaces.
+
+## Technology
 
 - **[Netgen/NGSolve](https://ngsolve.org)** — meshing & finite elements
 - **[ngapp](https://github.com/CERBSim/ngapp)** — application framework (UI components, keybindings, state management)
 - **[webgpu](https://github.com/CERBSim/webgpu)** — GPU-accelerated rendering
 - **[ngsolve_webgpu](https://github.com/CERBSim/ngsolve_webgpu)** — NGSolve-specific WebGPU renderers (meshes, functions, picking)
 
-## Features
+## Interface capabilities
 
 - **Geometry viewer** — visualize and inspect OCC geometries, pick faces/edges/vertices
 - **Mesh viewer** — display 2D/3D meshes with wireframe, curved elements, volume shrink, region coloring
@@ -38,6 +50,10 @@ ngsolve script.py
 ```
 
 ngsolve.Draw and ngsolve.Redraw commands are automatically redirected to draw a new GUI item.
+
+For a local app served from a headless machine, set
+`NGSOLVE_GUI_FILE_PICKER=browser` to use the browser's file picker instead of
+opening a native dialog on the server.
 
 ## Reuse
 
