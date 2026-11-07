@@ -126,18 +126,41 @@ def _wire_documentation_search_keyboard(js):
       if (window.__lorentzDocumentationSearchBound) return true;
       const inputSelector = '.lorentz-doc-search-input';
       const panelSelector = '.lorentz-doc-search-results';
+      const resultSelector = '.lorentz-doc-search-result';
       let previousFocus = null;
       let activeIndex = -1;
+      let queryRevision = 0;
+      let dismissedRevision = -1;
+      let pointerSelecting = false;
       const isSearchInput = target => target instanceof Element
         && target.matches(inputSelector);
+      const queryValue = input => String(input?.value || '').trim();
       const panel = () => {
         const list = document.querySelector(panelSelector);
         if (list && !list.id) list.id = 'lorentz-doc-search-results';
         return list;
       };
+      const isVisible = element => {
+        if (!(element instanceof Element) || !element.isConnected
+            || !element.getClientRects().length) return false;
+        const style = getComputedStyle(element);
+        return style.display !== 'none' && style.visibility !== 'hidden'
+          && Number(style.opacity) !== 0;
+      };
+      const allOptions = () => [...(panel()?.querySelectorAll(resultSelector) || [])];
+      const panelIsCurrent = () => {
+        const input = document.querySelector(inputSelector);
+        const list = panel();
+        return Boolean(input && list && dismissedRevision !== queryRevision
+          && input.getAttribute('aria-expanded') === 'true'
+          && !list.classList.contains('is-dismissed')
+          && list.dataset.query === queryValue(input)
+          && list.dataset.queryRevision === String(queryRevision)
+          && isVisible(list));
+      };
       const options = () => {
-        const items = [...(panel()?.querySelectorAll(
-          '.lorentz-doc-search-result') || [])];
+        if (!panelIsCurrent()) return [];
+        const items = allOptions();
         items.forEach((option, index) => {
           if (!option.id) option.id = `lorentz-doc-search-result-${index}`;
           option.setAttribute('role', 'option');
@@ -146,49 +169,100 @@ def _wire_documentation_search_keyboard(js):
           }
           option.tabIndex = -1;
         });
-        return items;
+        return items.filter(isVisible);
       };
-      const closeResults = () => {
+      const clearSelection = () => {
+        allOptions().forEach(option => {
+          option.classList.remove('is-active');
+          option.setAttribute('aria-selected', 'false');
+        });
+      };
+      const closeResults = invalidate => {
         const list = panel();
         const input = document.querySelector(inputSelector);
-        if (list) list.classList.add('is-dismissed');
+        if (list) {
+          list.classList.add('is-dismissed');
+          if (invalidate) {
+            delete list.dataset.query;
+            list.dataset.queryRevision = '-1';
+          }
+        }
         if (input) {
           input.setAttribute('aria-expanded', 'false');
           input.removeAttribute('aria-activedescendant');
         }
+        clearSelection();
         activeIndex = -1;
       };
+      const dismissCurrentQuery = () => {
+        dismissedRevision = queryRevision;
+        closeResults(false);
+      };
       document.addEventListener('pointerdown', event => {
-        if (!isSearchInput(event.target)) return;
+        const target = event.target;
+        const list = panel();
+        if (target instanceof Element && list?.contains(target)
+            && target.closest(resultSelector)) {
+          pointerSelecting = true;
+        }
+        if (!isSearchInput(target)) return;
         const old = document.activeElement;
-        if (old && old !== event.target && !isSearchInput(old)) previousFocus = old;
+        if (old && old !== target && !isSearchInput(old)) previousFocus = old;
+      }, true);
+      document.addEventListener('pointerup', () => {
+        window.setTimeout(() => { pointerSelecting = false; }, 0);
+      }, true);
+      document.addEventListener('input', event => {
+        if (!isSearchInput(event.target)) return;
+        queryRevision += 1;
+        dismissedRevision = -1;
+        closeResults(true);
       }, true);
       document.addEventListener('focusout', event => {
-        if (event.target instanceof Element && !isSearchInput(event.target)
-            && event.target !== document.body && event.target !== document.documentElement) {
-          previousFocus = event.target;
+        const target = event.target;
+        if (isSearchInput(target)) {
+          const next = event.relatedTarget;
+          const list = panel();
+          const focusRemainsInSearch = isSearchInput(next)
+            || (next instanceof Element && list?.contains(next));
+          if (!focusRemainsInSearch && !pointerSelecting) dismissCurrentQuery();
+          return;
         }
+        if (target instanceof Element && target !== document.body
+            && target !== document.documentElement) previousFocus = target;
       }, true);
+      document.addEventListener('click', event => {
+        const target = event.target;
+        const list = panel();
+        if (!(target instanceof Element) || !list?.contains(target)
+            || !target.closest(resultSelector) || !panelIsCurrent()) return;
+        dismissCurrentQuery();
+        pointerSelecting = false;
+        previousFocus = null;
+      });
       document.addEventListener('keydown', event => {
         if (!isSearchInput(event.target)) return;
-        const list = options();
-        if (event.key === 'ArrowDown' && list.length) {
+        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+          const visibleOptions = options();
+          if (visibleOptions.length) {
+            event.preventDefault();
+            if (event.key === 'ArrowDown') {
+              activeIndex = Math.min(activeIndex + 1, visibleOptions.length - 1);
+            } else {
+              activeIndex = activeIndex <= 0 ? 0 : activeIndex - 1;
+            }
+            updateActive(visibleOptions);
+          }
+        } else if (event.key === 'Enter') {
           event.preventDefault();
-          activeIndex = Math.min(activeIndex + 1, list.length - 1);
-          updateActive();
-        } else if (event.key === 'ArrowUp' && list.length) {
-          event.preventDefault();
-          activeIndex = activeIndex <= 0 ? 0 : activeIndex - 1;
-          updateActive();
-        } else if (event.key === 'Enter' && list.length) {
-          event.preventDefault();
-          (list[activeIndex < 0 ? 0 : activeIndex])?.click();
+          const visibleOptions = options();
+          const selected = visibleOptions[activeIndex < 0 ? 0 : activeIndex];
+          if (selected && panelIsCurrent() && isVisible(selected)) selected.click();
         } else if (event.key === 'Escape') {
           event.preventDefault();
           window.__lorentzDocumentationSearchDismiss();
         }
-        // Keep normal input editing, but prevent application/window keybinding
-        // listeners from treating search text as workspace commands.
+        // Search keys must never leak into application/workspace shortcuts.
         event.stopPropagation();
         event.stopImmediatePropagation();
       }, true);
@@ -200,55 +274,72 @@ def _wire_documentation_search_keyboard(js):
       }, true);
       window.__lorentzDocumentationSearchBound = true;
       window.__lorentzDocumentationSearchDismiss = () => {
-        closeResults();
+        dismissCurrentQuery();
         const input = document.querySelector(inputSelector);
         input?.blur();
         if (previousFocus?.isConnected) previousFocus.focus();
         previousFocus = null;
       };
-      window.__lorentzDocumentationSearchUpdate = (count, expanded) => {
+      window.__lorentzDocumentationSearchUpdate = (count, expanded, responseQuery) => {
         const input = document.querySelector(inputSelector);
         const list = panel();
+        const currentQuery = queryValue(input);
+        const resultQuery = String(responseQuery || '').trim();
         if (input) {
           input.setAttribute('role', 'combobox');
           input.setAttribute('aria-label', 'Search offline documentation');
           input.setAttribute('aria-autocomplete', 'list');
           input.setAttribute('aria-controls', 'lorentz-doc-search-results');
-          input.setAttribute('aria-expanded', String(Boolean(expanded)));
-          input.removeAttribute('aria-activedescendant');
         }
-        if (list) {
-          list.setAttribute('role', 'listbox');
-          list.setAttribute('aria-label', 'Documentation search results');
-          list.setAttribute('aria-live', 'polite');
-          list.classList.remove('is-dismissed');
-          options().forEach(option => option.setAttribute('aria-selected', 'false'));
-          if (!count) list.setAttribute('role', 'status');
+        // An older response must not hide a newer query's visible results.
+        // Query edits already invalidate the previous panel synchronously.
+        if (currentQuery !== resultQuery) return false;
+        const responseIsCurrent = Boolean(input && list && expanded
+          && currentQuery
+          && dismissedRevision !== queryRevision
+          && (document.activeElement === input || list.contains(document.activeElement)));
+        if (!responseIsCurrent) {
+          closeResults(!currentQuery);
+          return false;
         }
+        list.dataset.query = currentQuery;
+        list.dataset.queryRevision = String(queryRevision);
+        list.setAttribute('role', count ? 'listbox' : 'status');
+        list.setAttribute('aria-label', count
+          ? 'Documentation search results' : 'Documentation search status');
+        list.setAttribute('aria-live', 'polite');
+        list.classList.remove('is-dismissed');
+        clearSelection();
+        input.setAttribute('aria-expanded', 'true');
+        input.removeAttribute('aria-activedescendant');
         activeIndex = -1;
+        return true;
       };
-      function updateActive() {
-        const list = options();
-        list.forEach((option, index) => {
+      function updateActive(visibleOptions) {
+        visibleOptions.forEach((option, index) => {
           const active = index === activeIndex;
           option.classList.toggle('is-active', active);
           option.setAttribute('aria-selected', String(active));
         });
         const input = document.querySelector(inputSelector);
-        if (input && list[activeIndex]) {
-          input.setAttribute('aria-activedescendant', list[activeIndex].id);
-          list[activeIndex].scrollIntoView({block: 'nearest'});
+        if (input && visibleOptions[activeIndex]) {
+          input.setAttribute('aria-activedescendant', visibleOptions[activeIndex].id);
+          visibleOptions[activeIndex].scrollIntoView({block: 'nearest'});
         }
       }
       return true;
     })()""")
 
 
-def _update_documentation_search_accessibility(js, count, expanded):
+def _update_documentation_search_accessibility(js, count, expanded, query=""):
     js.eval("""(() => {
       const update = window.__lorentzDocumentationSearchUpdate;
-      if (typeof update === 'function') update(%d, %s);
-    })()""" % (int(count), "true" if expanded else "false"))
+      if (typeof update === 'function') update(%d, %s, %s);
+    })()""" % (
+        int(count),
+        "true" if expanded else "false",
+        json.dumps(str(query or "")),
+    ))
 
 
 def _solver_process_failure_detail(return_code):
@@ -2413,7 +2504,7 @@ class NGSolveGui(App):
         if not query:
             self._documentation_search_results.ui_children = []
             self._documentation_search_results.ui_hidden = True
-            self.call_js(_update_documentation_search_accessibility, 0, False)
+            self.call_js(_update_documentation_search_accessibility, 0, False, query)
             return
         if self._documentation_search_error is not None:
             return
@@ -2432,7 +2523,7 @@ class NGSolveGui(App):
                 )
             ]
             self._documentation_search_results.ui_hidden = False
-            self.call_js(_update_documentation_search_accessibility, 0, True)
+            self.call_js(_update_documentation_search_accessibility, 0, True, query)
             return
 
         result_buttons = []
@@ -2474,6 +2565,7 @@ class NGSolveGui(App):
             _update_documentation_search_accessibility,
             len(results),
             True,
+            query,
         )
 
     def _open_documentation_result(self, result):
