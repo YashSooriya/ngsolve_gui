@@ -42,7 +42,12 @@ from .branding import (
     PRODUCT_DESCRIPTION,
     PRODUCT_NAME,
 )
-from .documentation import find_documentation_index
+from .documentation import find_documentation_index, find_documentation_site
+from .documentation_search import (
+    DocumentationSearch,
+    DocumentationSearchError,
+    tokens,
+)
 from .project_thumbnails import cached_thumbnail, generate_project_thumbnail
 from .result_files import (
     MESH_SUFFIX,
@@ -57,6 +62,183 @@ from .result_files import (
 
 APP_MENU_BAR_HEIGHT = 32
 APP_HEADER_HEIGHT = 50
+
+
+def _inject_documentation_search_styles(js):
+    js.eval("""(() => {
+      const id = 'lorentz-documentation-search-styles';
+      if (document.getElementById(id)) return;
+      const style = document.createElement('style');
+      style.id = id;
+      style.textContent = `
+        .lorentz-doc-search-host {
+          position: relative; flex: 0 1 340px; min-width: 190px;
+          max-width: 360px; margin-left: auto; z-index: 2100;
+        }
+        .lorentz-doc-search-field {
+          display: flex; align-items: center; gap: 6px; width: 100%;
+        }
+        .lorentz-doc-search-input { min-width: 0; flex: 1 1 auto; }
+        .lorentz-doc-search-qfield .q-field__control { min-height: 30px; height: 30px; }
+        .lorentz-doc-search-qfield .q-field__label { font-size: 12px; }
+        .lorentz-doc-search-results {
+          position: absolute; top: calc(100% + 5px); right: 0;
+          width: min(560px, calc(100vw - 24px));
+          max-height: min(68vh, 560px); overflow-y: auto;
+          padding: 6px; display: flex; flex-direction: column; gap: 3px;
+          color: var(--fg, #182334); background: var(--app-bg, #fff);
+          border: 1px solid var(--border, #cbd2da); border-radius: 8px;
+          box-shadow: 0 12px 34px rgba(0,0,0,.22);
+        }
+        .lorentz-doc-search-results.is-dismissed { display: none !important; }
+        .lorentz-doc-search-result { display: flex; width: 100%; min-height: 0;
+          padding: 8px 10px; text-align: left; white-space: normal; }
+        .lorentz-doc-search-result .q-btn__content { display: block; width: 100%;
+          text-align: left; white-space: normal; }
+        .lorentz-doc-search-result.is-active,
+        .lorentz-doc-search-result[aria-selected="true"] {
+          outline: 2px solid var(--lorentz-copper, #d98a32); outline-offset: -2px;
+          background: color-mix(in srgb, var(--lorentz-copper, #d98a32) 14%, transparent);
+        }
+        .lorentz-doc-result-title { color: var(--fg, #182334); font-size: 13px;
+          font-weight: 700; line-height: 1.35; }
+        .lorentz-doc-result-context { margin-top: 2px; color: var(--fg-muted, #607080);
+          font-size: 11px; line-height: 1.35; }
+        .lorentz-doc-result-excerpt { margin-top: 4px; color: var(--fg, #28394a);
+          font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+        .lorentz-doc-search-empty { padding: 11px 12px; color: var(--fg-muted, #607080);
+          font-size: 12px; }
+        @media (max-width: 1100px) {
+          .lorentz-doc-search-host { flex-basis: 260px; min-width: 175px; }
+        }
+        @media (max-width: 780px) {
+          .lorentz-doc-search-host { flex-basis: 195px; min-width: 145px; }
+          .mmfem-app-menu-bar { gap: 0 !important; padding-left: 5px !important;
+            padding-right: 5px !important; }
+        }
+      `;
+      document.head.appendChild(style);
+    })()""")
+
+
+def _wire_documentation_search_keyboard(js):
+    js.eval("""(() => {
+      if (window.__lorentzDocumentationSearchBound) return true;
+      const inputSelector = '.lorentz-doc-search-input';
+      const panelSelector = '#lorentz-doc-search-results';
+      let previousFocus = null;
+      let activeIndex = -1;
+      const isSearchInput = target => target instanceof Element
+        && target.matches(inputSelector);
+      const panel = () => document.querySelector(panelSelector);
+      const options = () => [...(panel()?.querySelectorAll(
+        '.lorentz-doc-search-result') || [])];
+      const closeResults = () => {
+        const list = panel();
+        const input = document.querySelector(inputSelector);
+        if (list) list.classList.add('is-dismissed');
+        if (input) {
+          input.setAttribute('aria-expanded', 'false');
+          input.removeAttribute('aria-activedescendant');
+        }
+        activeIndex = -1;
+      };
+      document.addEventListener('pointerdown', event => {
+        if (!isSearchInput(event.target)) return;
+        const old = document.activeElement;
+        if (old && old !== event.target && !isSearchInput(old)) previousFocus = old;
+      }, true);
+      document.addEventListener('focusout', event => {
+        if (event.target instanceof Element && !isSearchInput(event.target)
+            && event.target !== document.body && event.target !== document.documentElement) {
+          previousFocus = event.target;
+        }
+      }, true);
+      document.addEventListener('keydown', event => {
+        if (!isSearchInput(event.target)) return;
+        const list = options();
+        if (event.key === 'ArrowDown' && list.length) {
+          event.preventDefault();
+          activeIndex = Math.min(activeIndex + 1, list.length - 1);
+          updateActive();
+        } else if (event.key === 'ArrowUp' && list.length) {
+          event.preventDefault();
+          activeIndex = activeIndex <= 0 ? 0 : activeIndex - 1;
+          updateActive();
+        } else if (event.key === 'Enter' && list.length) {
+          event.preventDefault();
+          (list[activeIndex < 0 ? 0 : activeIndex])?.click();
+        } else if (event.key === 'Escape') {
+          event.preventDefault();
+          window.__lorentzDocumentationSearchDismiss();
+        }
+        // Keep normal input editing, but prevent application/window keybinding
+        // listeners from treating search text as workspace commands.
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+      }, true);
+      document.addEventListener('keyup', event => {
+        if (isSearchInput(event.target)) {
+          event.stopPropagation();
+          event.stopImmediatePropagation();
+        }
+      }, true);
+      window.__lorentzDocumentationSearchBound = true;
+      window.__lorentzDocumentationSearchDismiss = () => {
+        closeResults();
+        const input = document.querySelector(inputSelector);
+        input?.blur();
+        if (previousFocus?.isConnected) previousFocus.focus();
+        previousFocus = null;
+      };
+      window.__lorentzDocumentationSearchUpdate = (count, expanded) => {
+        const input = document.querySelector(inputSelector);
+        const list = panel();
+        if (input) {
+          input.setAttribute('role', 'combobox');
+          input.setAttribute('aria-label', 'Search offline documentation');
+          input.setAttribute('aria-autocomplete', 'list');
+          input.setAttribute('aria-controls', 'lorentz-doc-search-results');
+          input.setAttribute('aria-expanded', String(Boolean(expanded)));
+          input.removeAttribute('aria-activedescendant');
+        }
+        if (list) {
+          list.setAttribute('role', 'listbox');
+          list.setAttribute('aria-label', 'Documentation search results');
+          list.setAttribute('aria-live', 'polite');
+          list.classList.remove('is-dismissed');
+          [...list.querySelectorAll('.lorentz-doc-search-result')].forEach((option, index) => {
+            if (!option.id) option.id = `lorentz-doc-search-result-${index}`;
+            option.setAttribute('role', 'option');
+            option.setAttribute('aria-selected', 'false');
+            option.tabIndex = -1;
+          });
+          if (!count) list.setAttribute('role', 'status');
+        }
+        activeIndex = -1;
+      };
+      function updateActive() {
+        const list = options();
+        list.forEach((option, index) => {
+          const active = index === activeIndex;
+          option.classList.toggle('is-active', active);
+          option.setAttribute('aria-selected', String(active));
+        });
+        const input = document.querySelector(inputSelector);
+        if (input && list[activeIndex]) {
+          input.setAttribute('aria-activedescendant', list[activeIndex].id);
+          list[activeIndex].scrollIntoView({block: 'nearest'});
+        }
+      }
+      return true;
+    })()""")
+
+
+def _update_documentation_search_accessibility(js, count, expanded):
+    js.eval("""(() => {
+      const update = window.__lorentzDocumentationSearchUpdate;
+      if (typeof update === 'function') update(%d, %s);
+    })()""" % (int(count), "true" if expanded else "false"))
 
 
 def _solver_process_failure_detail(return_code):
@@ -1196,6 +1378,8 @@ class NGSolveGui(App):
         )
         # Keep the older attribute for the project save/load helpers.
         self._three_d_project_dialog = None
+        self._documentation_search_engine = None
+        self._documentation_search_error = None
         self._menu_bar = self._build_application_menu_bar()
 
         self._startup_status = Div(
@@ -1299,6 +1483,7 @@ class NGSolveGui(App):
         theme.dark = BRAND_DARK_BACKGROUND
         cb.install(self, default_theme=self.usersettings.get("theme", "system"))
         self.call_js(_inject_lorentz_brand_styles)
+        self.call_js(_inject_documentation_search_styles)
         self.call_js(
             _set_axisymmetric_canvas_theme,
             self.usersettings.get("axisymmetric_canvas_theme", "light"),
@@ -1319,12 +1504,12 @@ class NGSolveGui(App):
 
         # -- Global keybindings (always active) --
         kb = self.kb
-        kb.add("h", kb.toggle_help, "Show keyboard shortcuts", "General")
+        kb.add("h", lambda *a: self._run_menu_shortcut(kb.toggle_help), "Show keyboard shortcuts", "General")
         kb.add("ctrl+n", lambda *a: self._run_menu_shortcut(self.new_problem), "New problem", "File")
         kb.add("ctrl+o", lambda *a: self._run_menu_shortcut(self.open_project_file), "Open project", "File")
         kb.add("ctrl+s", lambda *a: self._run_menu_shortcut(self.save_problem_file), "Save problem", "File")
         kb.add("ctrl+shift+s", lambda *a: self._run_menu_shortcut(self._save_as_project_file), "Save project as", "File")
-        kb.add("delete", self._delete_selected_region_shortcut, "Delete selected geometry", "Solve")
+        kb.add("delete", lambda *a: self._run_menu_shortcut(self._delete_selected_region_shortcut), "Delete selected geometry", "Solve")
         for key, tool, description in (
             ("l", "line", "Line tool"),
             ("c", "circle", "Circle tool"),
@@ -1340,14 +1525,14 @@ class NGSolveGui(App):
             )
         kb.add("ctrl+z", self._undo_solve_action, "Undo model change", "Solve")
         kb.add("ctrl+y", self._redo_solve_action, "Redo model change", "Solve")
-        kb.add("ctrl+b", self._toggle_navigator, "Toggle navigator", "Panels")
+        kb.add("ctrl+b", lambda *a: self._run_menu_shortcut(self._toggle_navigator), "Toggle navigator", "Panels")
         kb.add(
-            "ctrl+alt+b", self._toggle_property_panel, "Toggle property panel", "Panels"
+            "ctrl+alt+b", lambda *a: self._run_menu_shortcut(self._toggle_property_panel), "Toggle property panel", "Panels"
         )
         for i in range(1, 10):
             kb.add(
                 str(i),
-                lambda n=i: self.navigator.select_by_index(n),
+                lambda n=i: self._run_menu_shortcut(lambda: self.navigator.select_by_index(n)),
                 f"Select item {i}",
                 "Navigation",
             )
@@ -1926,13 +2111,53 @@ class NGSolveGui(App):
             button = _app_menu_button(label, entries)
             self._application_menu_buttons[label] = button
             self._application_menu_items[label] = button._mmfem_menu_items
+        self._documentation_search_input = QInput(
+            ui_id="lorentz-doc-search-field",
+            ui_model_value="",
+            ui_type="search",
+            ui_label="Search Help",
+            ui_dense=True,
+            ui_outlined=True,
+            ui_clearable=True,
+            ui_hide_bottom_space=True,
+            ui_debounce=120,
+            ui_maxlength=200,
+            ui_class="lorentz-doc-search-qfield",
+            ui_input_class="lorentz-doc-search-input",
+            ui_input_style="font-size:12px;",
+            ui_style="width:100%;",
+        )
+        self._documentation_search_input.on_update_model_value(
+            self._on_documentation_search_update
+        )
+        self._documentation_search_results = Div(
+            ui_id="lorentz-doc-search-results",
+            ui_class="lorentz-doc-search-results",
+            ui_style=(
+                "position:absolute; top:calc(100% + 5px); right:0; "
+                "z-index:2400; width:min(560px, calc(100vw - 24px)); "
+                "max-height:min(68vh, 560px); overflow:auto;"
+            ),
+            ui_hidden=True,
+        )
+        documentation_search = Div(
+            Div(
+                QIcon(ui_name="mdi-magnify", ui_size="16px"),
+                self._documentation_search_input,
+                ui_class="lorentz-doc-search-field",
+            ),
+            self._documentation_search_results,
+            ui_class="lorentz-doc-search-host",
+        )
         return Div(
             *self._application_menu_buttons.values(),
+            Div(ui_style="flex:1 1 auto; min-width:8px;"),
+            documentation_search,
             ui_class="mmfem-app-menu-bar",
             ui_style=(
                 "display:flex; align-items:center; gap:2px; flex:0 0 auto; "
                 f"min-height:{APP_MENU_BAR_HEIGHT}px; "
-                "padding:0 12px; box-sizing:border-box; "
+                "padding:0 12px; box-sizing:border-box; position:relative; "
                 "background:var(--panel-header); border-bottom:1px solid var(--border);"
             ),
         )
@@ -2160,6 +2385,127 @@ class NGSolveGui(App):
             )
             return False
 
+    def _documentation_search_engine_for_app(self):
+        if self._documentation_search_engine is not None:
+            return self._documentation_search_engine
+        try:
+            solver_root = self._find_solver_root()
+        except Exception:
+            solver_root = None
+        site_root = find_documentation_site(solver_root)
+        if site_root is None:
+            raise DocumentationSearchError("The local documentation site is not installed.")
+        self._documentation_search_engine = DocumentationSearch(site_root, __version__)
+        return self._documentation_search_engine
+
+    def _on_documentation_search_update(self, event):
+        query = str(getattr(event, "value", "") or "").strip()
+        if not query:
+            self._documentation_search_results.ui_children = []
+            self._documentation_search_results.ui_hidden = True
+            self.call_js(_update_documentation_search_accessibility, 0, False)
+            return
+        if self._documentation_search_error is not None:
+            return
+
+        try:
+            engine = self._documentation_search_engine_for_app()
+            results = engine.search(query)
+        except Exception as error:
+            self._documentation_search_error = error
+            self._documentation_search_input.ui_disable = True
+            self._documentation_search_input.ui_label = "Help search unavailable"
+            self._documentation_search_results.ui_children = [
+                Div(
+                    "Offline search is unavailable. Use Help → Documentation to browse the local guide.",
+                    ui_class="lorentz-doc-search-empty",
+                )
+            ]
+            self._documentation_search_results.ui_hidden = False
+            self.call_js(_update_documentation_search_accessibility, 0, True)
+            return
+
+        result_buttons = []
+        for index, result in enumerate(results):
+            context = result["page_title"]
+            if " ".join(tokens(context)) == " ".join(tokens(result["title"])):
+                context = ""
+            content = [
+                Div(result["title"], ui_class="lorentz-doc-result-title"),
+            ]
+            if context:
+                content.append(Div(context, ui_class="lorentz-doc-result-context"))
+            if result["excerpt"]:
+                content.append(Div(result["excerpt"], ui_class="lorentz-doc-result-excerpt"))
+            button = QBtn(
+                Div(*content),
+                ui_id=f"lorentz-doc-search-result-{index}",
+                ui_class="lorentz-doc-search-result",
+                ui_flat=True,
+                ui_dense=True,
+                ui_no_caps=True,
+                ui_style=(
+                    "display:flex; width:100%; min-height:0; padding:8px 10px; "
+                    "text-align:left; white-space:normal;"
+                ),
+            )
+            button.on_click(
+                lambda *args, selected=result: self._open_documentation_result(selected)
+            )
+            result_buttons.append(button)
+
+        if not result_buttons:
+            result_buttons.append(
+                Div("No matching sections.", ui_class="lorentz-doc-search-empty")
+            )
+        self._documentation_search_results.ui_children = result_buttons
+        self._documentation_search_results.ui_hidden = False
+        self.call_js(
+            _update_documentation_search_accessibility,
+            len(results),
+            True,
+        )
+
+    def _open_documentation_result(self, result):
+        try:
+            engine = self._documentation_search_engine_for_app()
+            url = engine.local_url(result)
+            import webbrowser
+
+            if not webbrowser.open(url, new=2):
+                raise RuntimeError("The default browser did not accept the local section URL.")
+            self._documentation_search_results.ui_hidden = True
+            self.call_js(_update_documentation_search_accessibility, 0, False)
+            return True
+        except Exception as error:
+            self._notify(
+                f"Could not open this local documentation section: {error}",
+                type="negative",
+                timeout=8000,
+            )
+            return False
+
+    def _documentation_search_has_focus(self):
+        try:
+            return bool(self.js.eval(
+                "(() => { const e = document.activeElement; return !!e && "
+                "e.matches('.lorentz-doc-search-input'); })()"
+            ))
+        except Exception:
+            return False
+
+    def _dismiss_documentation_search(self):
+        results = getattr(self, "_documentation_search_results", None)
+        if results is not None:
+            results.ui_hidden = True
+        try:
+            self.call_js(_update_documentation_search_accessibility, 0, False)
+            self.js.eval(
+                "window.__lorentzDocumentationSearchDismiss?.()"
+            )
+        except Exception:
+            pass
+
     def _global_shortcut_context_active(self):
         try:
             focused = self.js.eval(
@@ -2177,6 +2523,9 @@ class NGSolveGui(App):
 
     def _handle_escape_shortcut(self, event=None):
         """Close active overlays first; otherwise return Solve sketching to Select."""
+        if self._documentation_search_has_focus():
+            self._dismiss_documentation_search()
+            return
         kb = getattr(self, "kb", None)
         overlay_was_open = bool(
             kb
@@ -3831,6 +4180,8 @@ class NGSolveGui(App):
         self._update()
         self._refresh_recent_projects_view()
         self.app_data._update = self._update_from_app_data
+        self.call_js(_wire_documentation_search_keyboard)
+        self.call_js(_update_documentation_search_accessibility, 0, False)
         # Ask Chromium for a fresh compositor frame after the frontend mounts.
         self.call_js(_schedule_initial_renderer_frame_pulse)
 

@@ -45,3 +45,9 @@ def find_documentation_index(solver_root: str | os.PathLike[str] | None = None) 
         if resolved.is_file():
             return resolved
     return None
+
+
+def find_documentation_site(solver_root: str | os.PathLike[str] | None = None) -> Path | None:
+    """Return the root of the installed local Sphinx site, if present."""
+    index = find_documentation_index(solver_root)
+    return index.parent if index is not None else None
