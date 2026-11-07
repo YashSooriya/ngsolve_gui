@@ -12,6 +12,8 @@ from playwright.sync_api import Page
 
 from ngsolve_gui.three_d_project import (
     UNASSIGNED_MATERIAL,
+    package_3d_project,
+    unpack_3d_project,
 )
 
 
@@ -283,6 +285,7 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     bounds = graph.bounding_box()
     assert bounds is not None
     click_attempts = []
+    projected_targets = []
     physical_click_latency_ms = None
     physical_pick_xy = None
     for fraction_x, fraction_y in (
@@ -292,12 +295,50 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     ):
         click_x = bounds["x"] + bounds["width"] * fraction_x
         click_y = bounds["y"] + bounds["height"] * fraction_y
+        target_before_move = page.evaluate(
+            """({x, y}) => {
+                const target = document.elementFromPoint(x, y);
+                const rect = target && target.getBoundingClientRect();
+                return target && {
+                    tag: target.tagName,
+                    className: String(target.className || ''),
+                    rect: rect && {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
+                };
+            }""",
+            {"x": click_x, "y": click_y},
+        )
         page.mouse.move(click_x, click_y)
         page.wait_for_timeout(120)
+        hover_after_move = graph.evaluate("""element => ({
+            points: element._hoverdata && element._hoverdata.map(point => ({
+                curveNumber: point.curveNumber, pointNumber: point.pointNumber,
+                pointIndex: point.pointIndex, traceType: point.trace && point.trace.type,
+            })),
+            bridge: element._mmfemPickBridge && element._mmfemPickBridge.lastHover,
+        })""")
         physical_click_started = time.perf_counter()
         page.mouse.click(click_x, click_y)
         page.wait_for_timeout(120)
         click_attempts.append((fraction_x, fraction_y))
+        hover_after_click = graph.evaluate("""element => ({
+            points: element._hoverdata && element._hoverdata.map(point => ({
+                curveNumber: point.curveNumber, pointNumber: point.pointNumber,
+                pointIndex: point.pointIndex, traceType: point.trace && point.trace.type,
+            })),
+            bridge: element._mmfemPickBridge && element._mmfemPickBridge.lastHover,
+            clickStats: element._mmfemPickBridge && element._mmfemPickBridge.clickStats,
+        })""")
+        projected_targets.append({
+            "fraction": [fraction_x, fraction_y],
+            "viewport_css": [click_x, click_y],
+            "device_pixel_ratio": page.evaluate("window.devicePixelRatio"),
+            "dom_target_before_move": target_before_move,
+            "hover_after_move": hover_after_move,
+            "hover_after_click": hover_after_click,
+            "selection_region_ids": list(
+                workspace._selection_draft.get("region_ids", [])
+            ),
+        })
         if workspace._selection_draft.get("region_ids"):
             physical_click_latency_ms = (
                 time.perf_counter() - physical_click_started
@@ -319,18 +360,33 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
             scene: describe(scene),
             internals: describe(internals),
             glplot: describe(internals && internals.glplot),
-            canvas: Array.from(element.querySelectorAll('canvas')).map(canvas => ({
-                rect: (() => { const r = canvas.getBoundingClientRect(); return [r.x, r.y, r.width, r.height]; })(),
-                className: canvas.className,
-                webgl2: Boolean(canvas.getContext('webgl2')),
-                webgl: Boolean(canvas.getContext('webgl')),
-            })),
+            canvas: Array.from(element.querySelectorAll('canvas')).map(canvas => {
+                const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+                const debug = gl && gl.getExtension('WEBGL_debug_renderer_info');
+                const r = canvas.getBoundingClientRect();
+                return {
+                    rect: [r.x, r.y, r.width, r.height],
+                    backingSize: [canvas.width, canvas.height],
+                    className: canvas.className,
+                    webgl2: Boolean(gl && typeof WebGL2RenderingContext !== 'undefined'
+                        && gl instanceof WebGL2RenderingContext),
+                    webgl: Boolean(gl),
+                    contextAttributes: gl && gl.getContextAttributes(),
+                    vendor: gl && gl.getParameter(debug ? debug.UNMASKED_VENDOR_WEBGL : gl.VENDOR),
+                    renderer: gl && gl.getParameter(debug ? debug.UNMASKED_RENDERER_WEBGL : gl.RENDERER),
+                    version: gl && gl.getParameter(gl.VERSION),
+                };
+            }),
             clickBridge: (() => {
                 const bridge = element._mmfemPickBridge;
                 return bridge && {
                     bound: bridge.bound,
                     lastHover: bridge.lastHover || null,
                     cancelled: bridge.cancelled,
+                    attempts: bridge.attempts,
+                    clickStats: bridge.clickStats,
+                    pointerDragged: bridge.pointerDragged,
+                    suppressClickUntil: bridge.suppressClickUntil,
                 };
             })(),
         };
@@ -343,42 +399,155 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
         index: point.index,
         traceType: point.trace && point.trace.type,
     }))""")
-    if screenshot_dir:
-        (Path(screenshot_dir) / "3d-pick-diagnostics.json").write_text(
-            json.dumps({
-                "bounds": bounds,
-                "attempts": click_attempts,
-                "pointer_targets": pointer_targets,
-                "physical_hovers": physical_hovers[-10:],
-                "physical_clicks": physical_clicks,
-                "dom_clicks": dom_clicks,
-                "hover_data": hover_data,
-                "selection": workspace._selection,
-                "selection_draft": workspace._selection_draft,
-                "python_interaction_bridge": {
-                    "listeners_bound": interaction_plot._click_listeners_bound,
-                    "bind_error": interaction_plot._click_bind_error,
+    if not workspace._selection_draft.get("region_ids"):
+        try:
+            renderer_environment = page.evaluate("""async () => {
+                const graph = document.querySelector(
+                    '.mmfem-3d-viewport .js-plotly-plot');
+                const gpu = navigator.gpu;
+                const webgpu = {
+                    navigatorApiAvailable: Boolean(gpu),
+                    adapterStatus: gpu ? 'requesting' : 'api-unavailable',
+                };
+                if (gpu) {
+                    try {
+                        const adapter = await Promise.race([
+                            gpu.requestAdapter(),
+                            new Promise(resolve => setTimeout(() => resolve('timeout'), 1200)),
+                        ]);
+                        if (adapter === 'timeout') {
+                            webgpu.adapterStatus = 'request-timeout';
+                        } else if (!adapter) {
+                            webgpu.adapterStatus = 'no-adapter';
+                        } else {
+                            webgpu.adapterStatus = 'available';
+                            let info = adapter.info || null;
+                            if (!info && typeof adapter.requestAdapterInfo === 'function') {
+                                try { info = await adapter.requestAdapterInfo(); } catch (_) {}
+                            }
+                            webgpu.adapterInfo = info && {
+                                vendor: info.vendor || null,
+                                architecture: info.architecture || null,
+                                device: info.device || null,
+                                description: info.description || null,
+                            };
+                            webgpu.features = Array.from(adapter.features || []);
+                        }
+                    } catch (error) {
+                        webgpu.adapterStatus = 'request-error';
+                        webgpu.error = `${error.name}: ${error.message}`;
+                    }
+                }
+                const graphRect = graph && graph.getBoundingClientRect();
+                const canvases = graph ? Array.from(graph.querySelectorAll('canvas')) : [];
+                return {
+                    window: {
+                        innerWidth: window.innerWidth, innerHeight: window.innerHeight,
+                        devicePixelRatio: window.devicePixelRatio,
+                    },
+                    webgpu,
+                    cadViewport: graphRect && {
+                        x: graphRect.x, y: graphRect.y,
+                        width: graphRect.width, height: graphRect.height,
+                    },
+                    plotly: graph && {
+                        dataTypes: (graph.data || []).map(trace => trace.type),
+                        fullLayoutReady: Boolean(graph._fullLayout),
+                        sceneReady: Boolean(graph._fullLayout && graph._fullLayout.scene),
+                        canvases: canvases.map(canvas => ({
+                            width: canvas.width, height: canvas.height,
+                            css: (() => { const r = canvas.getBoundingClientRect();
+                                return {x: r.x, y: r.y, width: r.width, height: r.height}; })(),
+                        })),
+                    },
+                };
+            }""")
+        except Exception as error:
+            renderer_environment = {"probe_error": repr(error)}
+        region_by_id = {
+            int(region["id"]): region
+            for region in mesh_result.get("boundary_regions", [])
+        }
+        boundary_ids_for_pick = list(mesh_result.get("boundary_region_ids", []))
+        hover_point_number = None
+        if hover_data:
+            try:
+                hover_point_number = int(hover_data[0]["pointNumber"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                pass
+        hovered_cad_identity = None
+        if (
+            hover_point_number is not None
+            and 0 <= hover_point_number < len(boundary_ids_for_pick)
+        ):
+            hovered_region_id = int(boundary_ids_for_pick[hover_point_number])
+            hovered_cad_identity = region_by_id.get(hovered_region_id)
+        diagnostics = {
+            "message": "Trusted mouse clicks reached the 3D canvas but selected no boundary.",
+            "viewport": renderer_environment,
+            "viewport_bounds_css": bounds,
+            "click_attempts_fraction": click_attempts,
+            "projected_click_targets": projected_targets,
+            "pointer_targets": pointer_targets,
+            "physical_hovers": physical_hovers[-10:],
+            "physical_clicks": physical_clicks,
+            "dom_clicks": dom_clicks,
+            "hover_data": hover_data,
+            "hovered_cad_identity": hovered_cad_identity,
+            "cad_model": {
+                "geometry_id": geometry.get("id"),
+                "geometry_name": geometry.get("name"),
+                "asset_id": geometry.get("asset"),
+                "sha256": geometry.get("sha256"),
+                "mesh_boundary_regions": [
+                    {
+                        key: region.get(key)
+                        for key in ("id", "name", "boundary_tag", "domain_tag", "elements")
+                    }
+                    for region in mesh_result.get("boundary_regions", [])
+                ],
+            },
+            "selection": workspace._selection,
+            "selection_draft": workspace._selection_draft,
+            "renderer_mode": "Plotly gl3d Mesh3d using WebGL; WebGPU is probed separately and is not the CAD canvas renderer.",
+            "webgl_fallback": {
+                "active": getattr(workspace._preview, "_webgl_fallback_active", False),
+                "reason": getattr(workspace._preview, "_webgl_fallback_reason", None),
+            },
+            "python_interaction_bridge": {
+                "listeners_bound": interaction_plot._click_listeners_bound,
+                "bind_error": interaction_plot._click_bind_error,
                 "component_id": interaction_plot._id,
-                },
+            },
             "document_pick_bridge_status": page.evaluate(
                 "({bootstrap: document.documentElement.getAttribute('data-mmfem-pick-bridge-bootstrap'), "
                 "status: document.documentElement.getAttribute('data-mmfem-pick-bridge-status')})"
             ),
             "console_errors": console_errors[-20:],
-                "pick_api": pick_api,
-            }, indent=2),
-            encoding="utf-8",
+            "page_errors": page_errors[-20:],
+            "plotly_3d_pick_api": pick_api,
+        }
+        diagnostic_root = Path(
+            os.environ.get("MMFEM_H1_1_EVIDENCE_DIR")
+            or os.environ.get("MMFEM_UI_SCREENSHOT_DIR")
+            or Path(__file__).parent / "output"
         )
-    assert workspace._selection_draft.get("region_ids"), {
-        "message": "Trusted mouse clicks reached the 3D canvas but did not select a boundary.",
-        "bounds": bounds,
-        "attempts": click_attempts,
-        "pointer_targets": pointer_targets,
-        "dom_clicks": dom_clicks,
-        "plotly_hover_events": physical_hovers[-5:],
-        "selection_draft": workspace._selection_draft,
-        "plotly_3d_pick_api": pick_api,
-    }
+        diagnostic_root.mkdir(parents=True, exist_ok=True)
+        diagnostics_path = diagnostic_root / "3d-pick-diagnostics.json"
+        diagnostics_path.write_text(
+            json.dumps(diagnostics, indent=2, default=str), encoding="utf-8"
+        )
+        try:
+            page.screenshot(
+                path=str(diagnostic_root / "3d-pick-failure.png"), full_page=True
+            )
+        except Exception as error:
+            diagnostics["screenshot_error"] = repr(error)
+            diagnostics_path.write_text(
+                json.dumps(diagnostics, indent=2, default=str), encoding="utf-8"
+            )
+        print("THREED_PICK_DIAGNOSTICS " + json.dumps(diagnostics, default=str))
+        raise AssertionError(json.dumps(diagnostics, default=str))
     assert dom_clicks and dom_clicks[-1]["trusted"]
     assert dom_clicks[-1]["tag"] == "CANVAS"
     physical_pick_fraction = (
@@ -393,6 +562,7 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     boundary_by_id = {
         int(item["id"]): item for item in mesh_result["boundary_regions"]
     }
+    physical_cad_identity = boundary_by_id.get(physical_boundary)
 
     def wait_for_region_editor(region_id, selected, *, timeout=5000):
         region = boundary_by_id[int(region_id)]
@@ -445,6 +615,7 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
         "physical_boundary": physical_boundary,
         "boundary_regions": mesh_result["boundary_regions"],
     }
+    assert physical_cad_identity == boundary
     deadline = time.monotonic() + 5
     while (
         physical_boundary not in workspace._selection_draft.get("region_ids", [])
@@ -1025,6 +1196,7 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     selection = live_geometry["boundary_selections"][0]
     assert selection["boundary_condition"] == "magnetic_potential_zero"
     assert len(selection["boundary_tags"]) == 1
+    assert selection["boundary_tags"] == [physical_cad_identity["boundary_tag"]]
     assert workspace._selection == ("named_selection", selection["id"])
     try:
         page.wait_for_function(
@@ -1126,6 +1298,19 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
         page.wait_for_timeout(50)
     assert selection["boundary_ids"] == [selected_boundary]
     assert selection["boundary_tags"] == [expected_boundary_tag]
+    restored_project, _restored_assets = unpack_3d_project(
+        package_3d_project(workspace.project, workspace.assets)
+    )
+    restored_geometry = next(
+        item for item in restored_project["geometries"]
+        if item["id"] == geometry["id"]
+    )
+    restored_selection = next(
+        item for item in restored_geometry["boundary_selections"]
+        if item["id"] == selection["id"]
+    )
+    assert restored_selection["boundary_ids"] == [selected_boundary]
+    assert restored_selection["boundary_tags"] == [physical_cad_identity["boundary_tag"]]
     deadline = time.monotonic() + 5
     while workspace._run_study_button.ui_disable and time.monotonic() < deadline:
         page.wait_for_timeout(10)
@@ -1145,6 +1330,46 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
         "geometry_material": geometry.get("material"),
         "wire_trace_material": workspace.project.get("wire_trace_sets", [{}])[0].get("material"),
     }, default=str)
+    pick_evidence_dir = Path(
+        os.environ.get("MMFEM_H1_1_EVIDENCE_DIR")
+        or os.environ.get("MMFEM_UI_SCREENSHOT_DIR")
+        or Path(__file__).parent / "output"
+    )
+    pick_evidence_dir.mkdir(parents=True, exist_ok=True)
+    (pick_evidence_dir / "3d-pick-selection-identity.json").write_text(
+        json.dumps({
+            "renderer_mode": "Plotly gl3d Mesh3d using WebGL",
+            "viewport": page.evaluate("({width: innerWidth, height: innerHeight, devicePixelRatio})"),
+            "geometry": {
+                "id": geometry.get("id"),
+                "name": geometry.get("name"),
+                "asset": geometry.get("asset"),
+                "sha256": geometry.get("sha256"),
+            },
+            "trusted_dom_click": dom_clicks[-1],
+            "projected_click_target": projected_targets[-1],
+            "plotly_hover": physical_hovers[-1][0] if physical_hovers else None,
+            "selected_boundary": physical_cad_identity,
+            "selection_after_save": {
+                "id": selection["id"],
+                "boundary_ids": selection["boundary_ids"],
+                "boundary_tags": selection["boundary_tags"],
+                "boundary_condition": selection["boundary_condition"],
+            },
+            "stale_assignment_recovery": {
+                "reassigned": True,
+                "boundary_ids": selection["boundary_ids"],
+                "boundary_tags": selection["boundary_tags"],
+                "restored_archive_boundary_ids": restored_selection["boundary_ids"],
+                "restored_archive_boundary_tags": restored_selection["boundary_tags"],
+                "stable_cad_identity_preserved": (
+                    restored_selection["boundary_tags"]
+                    == [physical_cad_identity["boundary_tag"]]
+                ),
+            },
+        }, indent=2, default=str),
+        encoding="utf-8",
+    )
     if screenshot_dir:
         _capture_review_screenshot(
             page, Path(screenshot_dir) / "04b-3d-reassigned-boundary.png"

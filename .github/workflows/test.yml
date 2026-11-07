@@ -48,8 +48,11 @@ jobs:
       # The fake-solver lifecycle cases are small and do not execute FEM workloads.
       - name: Run core preprocessing checks
         run: |
+          mkdir -p tests/output
           docker run --rm \
             -v "${{ github.workspace }}/tests/output:/app/tests/output" \
+            -e MMFEM_UI_SCREENSHOT_DIR=/app/tests/output \
+            -e MMFEM_H1_1_EVIDENCE_DIR=/app/tests/output/h1_1_3d_pick \
             ngsolve-gui-tests pytest -q \
             tests/test_branding.py \
             tests/test_axisymmetric_model.py \
@@ -65,6 +68,14 @@ jobs:
             tests/test_three_d_workspace_e2e.py \
             tests/test_three_d_solver_e2e.py::test_3d_failed_process_finishes_with_actionable_diagnostics \
             tests/test_three_d_solver_e2e.py::test_3d_cancelled_process_finishes_with_cancelled_status
+
+      - name: Upload focused 3D pick evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-3d-pick-evidence
+          path: tests/output/h1_1_3d_pick/
+          if-no-files-found: ignore
 
       - name: Upload core test output
         if: failure()

@@ -231,8 +231,31 @@ def _exercise_axisymmetric_run(page, app, root):
     magnitude = math.sqrt(sum(abs(value) ** 2 for value in field_value))
     assert math.isfinite(magnitude) and magnitude > 1e-9
 
+    # Preserve the completed run before any history assertion can fail. This
+    # makes a regression in the UI status contract diagnosable even though the
+    # test's temporary project directory is removed during teardown.
+    evidence_dir = os.environ.get("MMFEM_H1_1_EVIDENCE_DIR")
+    if evidence_dir:
+        evidence_dir = Path(evidence_dir)
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(output_dir, evidence_dir / "axisymmetric-first-run", dirs_exist_ok=True)
+        (evidence_dir / "axisymmetric-first-live-history.json").write_text(
+            json.dumps(workspace.runs[-1], indent=2), encoding="utf-8"
+        )
+
     assert app._workspace_mode == "solve"
-    assert workspace.runs[-1]["status"] == "Complete"
+    direct_history_status = "Execution finished · numerical status unavailable"
+    assert manifest["status"] == "complete"
+    assert manifest["physics"]["coupling"]["enabled"] is False
+    assert manifest["physics"]["harmonic_electromagnetic"]["enabled"] is True
+    # This is an EM-only direct solve. The runner reports successful execution
+    # and the test independently verifies a finite, nonzero field, but no
+    # coupled convergence metric is reported. Do not infer convergence from a
+    # zero process exit, mesh, or field file.
+    assert manifest.get("scientific_status") is None
+    assert manifest.get("coupling_convergence") is None
+    assert workspace.runs[-1]["status"] == direct_history_status
+    assert workspace.runs[-1].get("scientific_status") is None
 
     # Run the same saved axisymmetric setup again without restarting the app.
     # This catches stale solver-job state and verifies the second run receives
@@ -256,13 +279,64 @@ def _exercise_axisymmetric_run(page, app, root):
     assert second_manifest["status"] == "complete"
     assert second_manifest["frequency_hz"] == manifest["frequency_hz"]
     assert second_manifest["mesh_settings"]["polynomial_order"] == 2
+    assert second_manifest["physics"]["coupling"]["enabled"] is False
+    assert second_manifest.get("scientific_status") is None
+    assert second_manifest.get("coupling_convergence") is None
     assert (second_output_dir / "ngsolve_gui" / "fields" / "B_AC.pkl").is_file()
+    assert len(workspace.runs) == 2
+    assert [run["status"] for run in workspace.runs] == [
+        direct_history_status, direct_history_status,
+    ]
+
+    # A new workspace uses this loader on application/project startup. Re-read
+    # both manifests from disk and ensure the direct-solve status remains
+    # truthful after reopening instead of being inferred from output files.
+    with patch.object(
+        solve_workspace, "default_run_history_root", lambda: root / "runs"
+    ):
+        reopened_workspace = solve_workspace.SolveWorkspace()
+    assert len(reopened_workspace.runs) == 2
+    assert [run["status"] for run in reopened_workspace.runs] == [
+        direct_history_status, direct_history_status,
+    ]
+    assert all(run.get("scientific_status") is None for run in reopened_workspace.runs)
 
     workspace.select_section("runs")
     app._update()
+    history_status = page.get_by_text(direct_history_status, exact=True)
+    history_status.first.wait_for(timeout=10_000)
+    assert history_status.count() == 2
     if screenshot_dir:
         _capture_review_screenshot(
             page, Path(screenshot_dir) / "09-axisymmetric-completed-run-history.png"
+        )
+    if evidence_dir:
+        shutil.copytree(
+            second_output_dir,
+            evidence_dir / "axisymmetric-second-run",
+            dirs_exist_ok=True,
+        )
+        (evidence_dir / "axisymmetric-run-history-reopened.json").write_text(
+            json.dumps(reopened_workspace.runs, indent=2), encoding="utf-8"
+        )
+        (evidence_dir / "axisymmetric-run-status-contract.json").write_text(
+            json.dumps({
+                "direct_run": True,
+                "frequency_hz": manifest["frequency_hz"],
+                "coupling_enabled": manifest["physics"]["coupling"]["enabled"],
+                "manifest_status": [manifest["status"], second_manifest["status"]],
+                "scientific_status": [
+                    manifest.get("scientific_status"),
+                    second_manifest.get("scientific_status"),
+                ],
+                "live_history_status": [run["status"] for run in workspace.runs],
+                "reopened_history_status": [
+                    run["status"] for run in reopened_workspace.runs
+                ],
+                "ui_history_status_text": direct_history_status,
+                "field_sample_magnitude_T": magnitude,
+            }, indent=2),
+            encoding="utf-8",
         )
     evidence_dir = os.environ.get("MMFEM_STAGE8A_EVIDENCE_DIR")
     if evidence_dir:
