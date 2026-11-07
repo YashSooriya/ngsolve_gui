@@ -2112,7 +2112,7 @@ class NGSolveGui(App):
             self._application_menu_buttons[label] = button
             self._application_menu_items[label] = button._mmfem_menu_items
         self._documentation_search_input = QInput(
-            ui_id="lorentz-doc-search-field",
+            id="lorentz-doc-search-field",
             ui_model_value="",
             ui_type="search",
             ui_label="Search Help",
@@ -2131,7 +2131,7 @@ class NGSolveGui(App):
             self._on_documentation_search_update
         )
         self._documentation_search_results = Div(
-            ui_id="lorentz-doc-search-results",
+            id="lorentz-doc-search-results",
             ui_class="lorentz-doc-search-results",
             ui_style=(
                 "position:absolute; top:calc(100% + 5px); right:0; "
@@ -2439,7 +2439,7 @@ class NGSolveGui(App):
                 content.append(Div(result["excerpt"], ui_class="lorentz-doc-result-excerpt"))
             button = QBtn(
                 Div(*content),
-                ui_id=f"lorentz-doc-search-result-{index}",
+                id=f"lorentz-doc-search-result-{index}",
                 ui_class="lorentz-doc-search-result",
                 ui_flat=True,
                 ui_dense=True,
