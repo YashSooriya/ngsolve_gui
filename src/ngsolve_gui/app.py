@@ -134,6 +134,14 @@ def _wire_documentation_search_keyboard(js):
       let pointerSelecting = false;
       const isSearchInput = target => target instanceof Element
         && target.matches(inputSelector);
+      const focusRestoreTarget = target => {
+        if (!(target instanceof Element)) return null;
+        return target.closest(
+          'button:not([disabled]), a[href], input:not([disabled]), '
+          + 'select:not([disabled]), textarea:not([disabled]), '
+          + '[tabindex]:not([tabindex="-1"]), [contenteditable="true"]'
+        );
+      };
       const queryValue = input => String(input?.value || '').trim();
       const panel = () => {
         const list = document.querySelector(panelSelector);
@@ -207,7 +215,9 @@ def _wire_documentation_search_keyboard(js):
         }
         if (!isSearchInput(target)) return;
         const old = document.activeElement;
-        if (old && old !== target && !isSearchInput(old)) previousFocus = old;
+        if (old && old !== target && !isSearchInput(old)) {
+          previousFocus = focusRestoreTarget(old);
+        }
       }, true);
       document.addEventListener('pointerup', () => {
         window.setTimeout(() => { pointerSelecting = false; }, 0);
@@ -229,7 +239,9 @@ def _wire_documentation_search_keyboard(js):
           return;
         }
         if (target instanceof Element && target !== document.body
-            && target !== document.documentElement) previousFocus = target;
+            && target !== document.documentElement) {
+          previousFocus = focusRestoreTarget(target);
+        }
       }, true);
       document.addEventListener('click', event => {
         const target = event.target;
