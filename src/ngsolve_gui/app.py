@@ -135,8 +135,19 @@ def _wire_documentation_search_keyboard(js):
         if (list && !list.id) list.id = 'lorentz-doc-search-results';
         return list;
       };
-      const options = () => [...(panel()?.querySelectorAll(
-        '.lorentz-doc-search-result') || [])];
+      const options = () => {
+        const items = [...(panel()?.querySelectorAll(
+          '.lorentz-doc-search-result') || [])];
+        items.forEach((option, index) => {
+          if (!option.id) option.id = `lorentz-doc-search-result-${index}`;
+          option.setAttribute('role', 'option');
+          if (!option.hasAttribute('aria-selected')) {
+            option.setAttribute('aria-selected', 'false');
+          }
+          option.tabIndex = -1;
+        });
+        return items;
+      };
       const closeResults = () => {
         const list = panel();
         const input = document.querySelector(inputSelector);
@@ -211,12 +222,7 @@ def _wire_documentation_search_keyboard(js):
           list.setAttribute('aria-label', 'Documentation search results');
           list.setAttribute('aria-live', 'polite');
           list.classList.remove('is-dismissed');
-          [...list.querySelectorAll('.lorentz-doc-search-result')].forEach((option, index) => {
-            if (!option.id) option.id = `lorentz-doc-search-result-${index}`;
-            option.setAttribute('role', 'option');
-            option.setAttribute('aria-selected', 'false');
-            option.tabIndex = -1;
-          });
+          options().forEach(option => option.setAttribute('aria-selected', 'false'));
           if (!count) list.setAttribute('role', 'status');
         }
         activeIndex = -1;
