@@ -301,6 +301,10 @@ def _exercise_axisymmetric_run(page, app, root):
     ]
     assert all(run.get("scientific_status") is None for run in reopened_workspace.runs)
 
+    # Render the records reconstructed by a fresh workspace through the live
+    # Run History panel as well as checking the reopened model data.
+    workspace.runs = reopened_workspace.runs
+    workspace._refresh_model_tree()
     workspace.select_section("runs")
     app._update()
     history_status = page.get_by_text(direct_history_status, exact=True)
@@ -308,7 +312,7 @@ def _exercise_axisymmetric_run(page, app, root):
     assert history_status.count() == 2
     if screenshot_dir:
         _capture_review_screenshot(
-            page, Path(screenshot_dir) / "09-axisymmetric-completed-run-history.png"
+            page, Path(screenshot_dir) / "09-axisymmetric-reopened-run-history.png"
         )
     if evidence_dir:
         shutil.copytree(
