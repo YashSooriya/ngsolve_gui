@@ -1386,7 +1386,7 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     viewport_resize_ms = (time.perf_counter() - viewport_resize_started) * 1000
     workspace.select_item("study")
     app._update()
-    page.get_by_text("Harmonic study", exact=True).wait_for(timeout=10_000)
+    page.get_by_text("Time-harmonic EM", exact=True).wait_for(timeout=10_000)
     page.get_by_label("Frequency (Hz)").wait_for(timeout=10_000)
     if screenshot_dir:
         _capture_review_screenshot(

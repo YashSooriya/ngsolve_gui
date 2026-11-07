@@ -191,7 +191,7 @@ def _exercise_3d_run_handoff(page, app, tmp_path):
         page.wait_for_timeout(100)
     assert workspace.project["study"]["frequency_hz"] == 63.0
 
-    page.get_by_label("Finite-element order").click()
+    page.get_by_label("Finite-element approximation order").click()
     page.get_by_text("2 · quadratic", exact=True).last.click()
     deadline = time.monotonic() + 5
     while workspace.project["study"]["polynomial_order"] != 2 and time.monotonic() < deadline:
@@ -206,7 +206,7 @@ def _exercise_3d_run_handoff(page, app, tmp_path):
         page.wait_for_timeout(100)
     assert workspace.project["study"]["air_padding"] == 1.5
     page.keyboard.press("Escape")
-    page.get_by_text("Harmonic study", exact=True).click()
+    page.get_by_text("Time-harmonic EM", exact=True).click()
     page.wait_for_timeout(500)
     screenshot_dir = os.environ.get("MMFEM_UI_SCREENSHOT_DIR")
     if screenshot_dir:
