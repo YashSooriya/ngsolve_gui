@@ -8,7 +8,7 @@ import threading
 from unittest.mock import patch
 
 from ngapp.e2e import app_test
-from playwright.sync_api import Page
+from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from ngsolve_gui.three_d_project import (
     UNASSIGNED_MATERIAL,
@@ -307,8 +307,37 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
             }""",
             {"x": click_x, "y": click_y},
         )
+        prior_hover_at = graph.evaluate(
+            "element => Number(element._mmfemPickBridge?.lastHover?.at || 0)"
+        )
         page.mouse.move(click_x, click_y)
-        page.wait_for_timeout(120)
+        hover_wait_started = time.perf_counter()
+        hover_ready = False
+        try:
+            # Plotly computes Mesh3d hover asynchronously. A fixed sleep can
+            # let a trusted click race that calculation on slower CI renderers.
+            # Wait for a new real Plotly hover event; the following click is
+            # still sent by Playwright's trusted native mouse input.
+            page.wait_for_function(
+                """({priorAt}) => {
+                    const graph = document.querySelector(
+                        '.mmfem-3d-viewport .js-plotly-plot');
+                    const hover = graph && graph._mmfemPickBridge
+                        && graph._mmfemPickBridge.lastHover;
+                    return Boolean(hover && Number(hover.at) > priorAt
+                        && hover.pointNumber !== null
+                        && hover.pointNumber !== undefined
+                        && Number.isFinite(Number(hover.pointNumber)));
+                }""",
+                arg={"priorAt": prior_hover_at},
+                timeout=1200,
+            )
+            hover_ready = True
+        except PlaywrightTimeoutError:
+            # Still deliver the trusted click so the failure evidence shows
+            # whether the canvas receives it without a current hit result.
+            pass
+        hover_wait_ms = (time.perf_counter() - hover_wait_started) * 1000
         hover_after_move = graph.evaluate("""element => ({
             points: element._hoverdata && element._hoverdata.map(point => ({
                 curveNumber: point.curveNumber, pointNumber: point.pointNumber,
@@ -333,6 +362,8 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
             "viewport_css": [click_x, click_y],
             "device_pixel_ratio": page.evaluate("window.devicePixelRatio"),
             "dom_target_before_move": target_before_move,
+            "hover_ready_before_click": hover_ready,
+            "hover_wait_ms": hover_wait_ms,
             "hover_after_move": hover_after_move,
             "hover_after_click": hover_after_click,
             "selection_region_ids": list(
@@ -399,71 +430,89 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
         index: point.index,
         traceType: point.trace && point.trace.type,
     }))""")
-    if not workspace._selection_draft.get("region_ids"):
-        try:
-            renderer_environment = page.evaluate("""async () => {
-                const graph = document.querySelector(
-                    '.mmfem-3d-viewport .js-plotly-plot');
-                const gpu = navigator.gpu;
-                const webgpu = {
-                    navigatorApiAvailable: Boolean(gpu),
-                    adapterStatus: gpu ? 'requesting' : 'api-unavailable',
-                };
-                if (gpu) {
-                    try {
-                        const adapter = await Promise.race([
-                            gpu.requestAdapter(),
-                            new Promise(resolve => setTimeout(() => resolve('timeout'), 1200)),
-                        ]);
-                        if (adapter === 'timeout') {
-                            webgpu.adapterStatus = 'request-timeout';
-                        } else if (!adapter) {
-                            webgpu.adapterStatus = 'no-adapter';
-                        } else {
-                            webgpu.adapterStatus = 'available';
-                            let info = adapter.info || null;
-                            if (!info && typeof adapter.requestAdapterInfo === 'function') {
-                                try { info = await adapter.requestAdapterInfo(); } catch (_) {}
-                            }
-                            webgpu.adapterInfo = info && {
-                                vendor: info.vendor || null,
-                                architecture: info.architecture || null,
-                                device: info.device || null,
-                                description: info.description || null,
-                            };
-                            webgpu.features = Array.from(adapter.features || []);
+    try:
+        renderer_environment = page.evaluate("""async () => {
+            const graph = document.querySelector(
+                '.mmfem-3d-viewport .js-plotly-plot');
+            const gpu = navigator.gpu;
+            const webgpu = {
+                navigatorApiAvailable: Boolean(gpu),
+                adapterStatus: gpu ? 'requesting' : 'api-unavailable',
+            };
+            if (gpu) {
+                try {
+                    const adapter = await Promise.race([
+                        gpu.requestAdapter(),
+                        new Promise(resolve => setTimeout(() => resolve('timeout'), 1200)),
+                    ]);
+                    if (adapter === 'timeout') {
+                        webgpu.adapterStatus = 'request-timeout';
+                    } else if (!adapter) {
+                        webgpu.adapterStatus = 'no-adapter';
+                    } else {
+                        webgpu.adapterStatus = 'available';
+                        let info = adapter.info || null;
+                        if (!info && typeof adapter.requestAdapterInfo === 'function') {
+                            try { info = await adapter.requestAdapterInfo(); } catch (_) {}
                         }
-                    } catch (error) {
-                        webgpu.adapterStatus = 'request-error';
-                        webgpu.error = `${error.name}: ${error.message}`;
+                        webgpu.adapterInfo = info && {
+                            vendor: info.vendor || null,
+                            architecture: info.architecture || null,
+                            device: info.device || null,
+                            description: info.description || null,
+                        };
+                        webgpu.features = Array.from(adapter.features || []);
                     }
+                } catch (error) {
+                    webgpu.adapterStatus = 'request-error';
+                    webgpu.error = `${error.name}: ${error.message}`;
                 }
-                const graphRect = graph && graph.getBoundingClientRect();
-                const canvases = graph ? Array.from(graph.querySelectorAll('canvas')) : [];
-                return {
-                    window: {
-                        innerWidth: window.innerWidth, innerHeight: window.innerHeight,
-                        devicePixelRatio: window.devicePixelRatio,
-                    },
-                    webgpu,
-                    cadViewport: graphRect && {
-                        x: graphRect.x, y: graphRect.y,
-                        width: graphRect.width, height: graphRect.height,
-                    },
-                    plotly: graph && {
-                        dataTypes: (graph.data || []).map(trace => trace.type),
-                        fullLayoutReady: Boolean(graph._fullLayout),
-                        sceneReady: Boolean(graph._fullLayout && graph._fullLayout.scene),
-                        canvases: canvases.map(canvas => ({
+            }
+            const graphRect = graph && graph.getBoundingClientRect();
+            const canvases = graph ? Array.from(graph.querySelectorAll('canvas')) : [];
+            return {
+                window: {
+                    innerWidth: window.innerWidth, innerHeight: window.innerHeight,
+                    devicePixelRatio: window.devicePixelRatio,
+                },
+                cadRenderer: 'Plotly gl3d Mesh3d using WebGL',
+                webgpu,
+                cadViewport: graphRect && {
+                    x: graphRect.x, y: graphRect.y,
+                    width: graphRect.width, height: graphRect.height,
+                },
+                plotly: graph && {
+                    dataTypes: (graph.data || []).map(trace => trace.type),
+                    fullLayoutReady: Boolean(graph._fullLayout),
+                    sceneReady: Boolean(graph._fullLayout && graph._fullLayout.scene),
+                    canvases: canvases.map(canvas => {
+                        const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+                        const debug = gl && gl.getExtension('WEBGL_debug_renderer_info');
+                        const rect = canvas.getBoundingClientRect();
+                        return {
                             width: canvas.width, height: canvas.height,
-                            css: (() => { const r = canvas.getBoundingClientRect();
-                                return {x: r.x, y: r.y, width: r.width, height: r.height}; })(),
-                        })),
-                    },
-                };
-            }""")
-        except Exception as error:
-            renderer_environment = {"probe_error": repr(error)}
+                            css: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
+                            contextAttributes: gl && gl.getContextAttributes(),
+                            webgl2: Boolean(gl && typeof WebGL2RenderingContext !== 'undefined'
+                                && gl instanceof WebGL2RenderingContext),
+                            webgl: Boolean(gl),
+                            vendor: gl && gl.getParameter(
+                                debug ? debug.UNMASKED_VENDOR_WEBGL : gl.VENDOR),
+                            renderer: gl && gl.getParameter(
+                                debug ? debug.UNMASKED_RENDERER_WEBGL : gl.RENDERER),
+                            version: gl && gl.getParameter(gl.VERSION),
+                        };
+                    }),
+                },
+            };
+        }""")
+    except Exception as error:
+        renderer_environment = {"probe_error": repr(error)}
+    webgl_fallback = {
+        "active": getattr(workspace._preview, "_webgl_fallback_active", False),
+        "reason": getattr(workspace._preview, "_webgl_fallback_reason", None),
+    }
+    if not workspace._selection_draft.get("region_ids"):
         region_by_id = {
             int(region["id"]): region
             for region in mesh_result.get("boundary_regions", [])
@@ -509,11 +558,10 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
             },
             "selection": workspace._selection,
             "selection_draft": workspace._selection_draft,
-            "renderer_mode": "Plotly gl3d Mesh3d using WebGL; WebGPU is probed separately and is not the CAD canvas renderer.",
-            "webgl_fallback": {
-                "active": getattr(workspace._preview, "_webgl_fallback_active", False),
-                "reason": getattr(workspace._preview, "_webgl_fallback_reason", None),
-            },
+            "renderer_mode": renderer_environment.get(
+                "cadRenderer", "Plotly gl3d Mesh3d using WebGL"
+            ),
+            "webgl_fallback": webgl_fallback,
             "python_interaction_bridge": {
                 "listeners_bound": interaction_plot._click_listeners_bound,
                 "bind_error": interaction_plot._click_bind_error,
@@ -1338,8 +1386,9 @@ def test_three_d_viewport_renders_and_selects_model_items(page: Page, app):
     pick_evidence_dir.mkdir(parents=True, exist_ok=True)
     (pick_evidence_dir / "3d-pick-selection-identity.json").write_text(
         json.dumps({
-            "renderer_mode": "Plotly gl3d Mesh3d using WebGL",
-            "viewport": page.evaluate("({width: innerWidth, height: innerHeight, devicePixelRatio})"),
+            "renderer": renderer_environment,
+            "webgl_fallback": webgl_fallback,
+            "projected_click_targets": projected_targets,
             "geometry": {
                 "id": geometry.get("id"),
                 "name": geometry.get("name"),
